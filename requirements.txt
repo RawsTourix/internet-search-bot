@@ -1,0 +1,19 @@
+# Основные веб-фреймворки и серверы
+fastapi
+uvicorn
+
+# Model Context Protocol
+mcp
+
+# HTTP-клиенты
+httpx
+aiohttp
+
+# Telegram Bot
+python-telegram-bot
+
+# Валидация данных
+pydantic
+
+# Загрузка переменных окружения
+python-dotenv
