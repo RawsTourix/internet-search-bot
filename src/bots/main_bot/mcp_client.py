@@ -5,9 +5,11 @@ import json
 import logging
 import shutil
 import asyncio
+import time
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
+from dataclasses import dataclass, field
 from pathlib import Path
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
@@ -45,6 +47,11 @@ class ServerConfigType(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     instructions: Optional[str] = None
+
+@dataclass
+class SessionMemory:
+    messages: List[Dict[str, Any]] = field(default_factory=list)
+    last_seen: float = field(default_factory=time.time)
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -227,13 +234,30 @@ class MCPClient:
         
         # Настройка для LLM
         self.llm_config = llm_config
-        self.http_client = httpx.AsyncClient(headers=llm_config.headers)
+
+        headers = dict(llm_config.headers or {})
+
+        if llm_config.api_key:
+            has_auth = any(k.lower() == "authorization" for k in headers)
+            if not has_auth:
+                headers["Authorization"] = f"Bearer {llm_config.api_key}"
+        
+        headers.setdefault("Content-Type", "application/json")
+        headers.setdefault("Accept", "application/json")
+
+        self.http_client = httpx.AsyncClient(headers=headers)
+        self.llm_config.headers = headers
+
         self.instructions = "Ты ассистент, задача которого помогать пользователю в решении его задач."
         self.available_tools = []
         
         # Настройки таймаутов
         self.tool_call_timeout = 300.0  # Таймаут для вызова инструментов
         self.llm_call_timeout = 300.0   # Таймаут для вызова LLM
+
+        # Память сессий
+        self.sessions: Dict[str, SessionMemory] = {}
+        self.max_history_messages = 24
         
     async def connect_to_server(self, server_config: ServerConfigType):
         """
@@ -434,7 +458,7 @@ class MCPClient:
         """
         return self.available_tools
         
-    async def process_query(self, query: str) -> str:
+    async def process_query(self, query: str, session_id: str = "default") -> str:
         """
         Description:
         ---------------
@@ -458,12 +482,12 @@ class MCPClient:
         try:
             # Составляем системное сообщение с инструкциями
             system_message = self._create_system_message()
-            
+
             # Инициализируем диалог
-            messages = [
-                {"role": "system", "content": system_message},
-                {"role": "user", "content": query}
-            ]
+            session = self._get_or_create_session(session_id, system_message)
+            messages = session.messages
+            messages.append({"role": "user", "content": query})
+            
             logger.debug(f"Сообщения для LLM: {messages}")
             
             # Преобразуем инструменты в формат для LLM
@@ -494,7 +518,12 @@ class MCPClient:
                         final_text.append(content)
                     
                     if not tool_calls:
-                        # Если нет вызовов инструментов, завершаем обработку
+                        # Финальный ответ без вызовов инструментов — сохраняем в историю
+                        if content:
+                            messages.append({
+                                "role": "assistant",
+                                "content": content
+                            })
                         logger.info("Нет вызовов инструментов, завершаем обработку")
                         break
                     
@@ -601,7 +630,8 @@ class MCPClient:
                     final_text.append(f"\n{error_message}")
                     break
             
-            result = final_text[len(final_text) - 1] if len(final_text) > 0 else "Пустой ответ."#"\n".join([text for text in final_text if text])
+            result = final_text[len(final_text) - 1] if len(final_text) > 0 else "Пустой ответ."
+            self._trim_session_messages(session)
             logger.info(f"Завершение обработки запроса. Результат: {result}")
             return result
             
@@ -930,6 +960,77 @@ class MCPClient:
                 self.exit_stack = None
 
         logger.info(f"Соединение с {self.server_name} закрыто")
+
+    def _get_or_create_session(
+        self,
+        session_id: str,
+        system_message: str
+    ) -> SessionMemory:
+        """
+        Description:
+        ---------------
+            Возвращает существующую сессию или создаёт новую.
+            
+        Args:
+            ---------------
+            session_id (str): Уникальный идентификатор сессии
+            system_message (str): Системное сообщение для LLM
+        """
+        session = self.sessions.get(session_id)
+
+        if session is None:
+            session = SessionMemory(
+                messages=[{"role": "system", "content": system_message}]
+            )
+            self.sessions[session_id] = session
+        else:
+            session.last_seen = time.time()
+
+            # Системное сообщение держим актуальным:
+            if not session.messages:
+                session.messages = [{"role": "system", "content": system_message}]
+            elif session.messages[0].get("role") == "system":
+                session.messages[0] = {"role": "system", "content": system_message}
+            else:
+                session.messages.insert(0, {"role": "system", "content": system_message})
+
+        return session
+
+
+    def _trim_session_messages(self, session: SessionMemory) -> None:
+        """
+        Description:
+            ---------------
+            Обрезает историю, оставляя system + последние N сообщений.
+
+        Args:
+            session (SessionMemory): Текущая сессия
+        """
+        if not session.messages:
+            return
+
+        if session.messages[0].get("role") == "system":
+            system_message = session.messages[0]
+            body = session.messages[1:]
+            if len(body) > self.max_history_messages:
+                body = body[-self.max_history_messages:]
+            session.messages = [system_message] + body
+        else:
+            if len(session.messages) > self.max_history_messages:
+                session.messages = session.messages[-self.max_history_messages:]
+
+
+    def clear_session(self, session_id: str) -> None:
+        """
+        Description:
+        ---------------
+            Полностью очищает память сессии.
+
+        Args:
+        ---------------
+            session_id (str): Уникальный идентификатор сессии
+        """
+        self.sessions.pop(session_id, None)
 
 
 def load_config(config_path: str) -> Tuple[ServerConfigType, LLMConfigType]:

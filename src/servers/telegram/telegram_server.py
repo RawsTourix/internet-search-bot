@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status
 from telegram import Update, BotCommand
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
+from telegram.error import TimedOut, NetworkError
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
@@ -127,7 +128,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.debug(f"Получено сообщение: {payload}")
     logger.info(f"Сообщение [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {payload.get('content')}")
 
-    await update.message.reply_text(f"Сообщение принято! Обрабатываю...")
+    try:
+        await update.message.reply_text(f"Сообщение принято! Обрабатываю...")
+    except (TimedOut, NetworkError) as e:
+        logger.warning(f"Не удалось отправить промежуточный ответ в Telegram: {e}")
 
     success, message = await send_to_gateway(payload)
     if success:
@@ -158,6 +162,7 @@ async def lifespan(app: FastAPI):
     commands = [
         BotCommand("start", "Приветствие"),
         BotCommand("status", "Статус системы"),
+        BotCommand("reset", "Очистка памяти"),
         BotCommand("help", "Справка"),
     ]
     await application.bot.set_my_commands(commands)

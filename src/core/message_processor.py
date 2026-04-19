@@ -69,6 +69,16 @@ class MessageProcessor:
                 content=f"Произошла ошибка при обработке сообщения: {str(e)}",
                 response_type=MessageType.TEXT
             )
+        
+    def _build_session_id(self, message: UnifiedMessage) -> str:
+        """Строит идентификатор сессии. Для Telegram лучше привязывать память к chat_id."""
+        metadata = message.metadata or {}
+        chat_id = metadata.get("chat_id")
+
+        if chat_id is not None:
+            return f"{message.client_type.value}:chat:{chat_id}"
+
+        return f"{message.client_type.value}:user:{message.user_id}"
     
     async def _generate_response(self, message: UnifiedMessage) -> str:
         """Обработка запроса"""
@@ -76,7 +86,11 @@ class MessageProcessor:
             response_content = await self._handle_command(message)
         elif message.message_type == MessageType.TEXT:
             try:
-                response_content = await API.process_query(message.content)
+                session_id = self._build_session_id(message)
+                response_content = await API.process_query(
+                    message.content,
+                    session_id=session_id
+                )
             except Exception as e:
                 response_content = f"Сообщение не обработано: {e}"
         
@@ -93,12 +107,22 @@ class MessageProcessor:
         """Обработка команд"""
         command = message.content.strip()
         
+        # Запуск
         if command == "/start":
             return f"Привет, {message.user_name or message.user_id}! Я интеллектуальный помощник с доступом к интернет-поиску. Задавай любые вопросы — буду рад ответить! 😊"
+        # Статус
         elif command == "/status":
             return await self._get_status_text()
+        # Справка
         elif command == "/help":
             return self._get_help_text()
+        # Очистка памяти сессии
+        elif command == "/reset":
+            try:
+                API.reset(self._build_session_id(message))
+                return "Память успешно очищена."
+            except Exception as e:
+                return f"Ошибка очистки памяти: {e}."
         else:
             return f"Неизвестная команда: {command}"
     
@@ -108,6 +132,7 @@ class MessageProcessor:
 Доступные команды:
 /start - приветствие
 /status - статус системы
+/reset - очиска памяти
 /help - справка
 
 Вы можете отправлять любые текстовые сообщения для обработки.

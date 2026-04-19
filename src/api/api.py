@@ -63,21 +63,29 @@ class Api:
         except Exception as e:
             logger.critical(f"Ошибка подключения к серверу: {e}")
 
-    async def process_query(self, message: str) -> str:
+    async def process_query(self, message: str, session_id: str = "default") -> str:
         """Вызов главного бота"""
         try:
-            if not self.main_bot_client.list_tools():
+            if not await self.main_bot_client.list_tools():
                 logger.warning("list_tools главного бота пустой")
 
             logger.info("Вызов главного бота")
             logger.debug(f"message: {message}")
+            logger.debug(f"session_id: {session_id}")
 
-            response = await self.main_bot_client.process_query(message)
+            response = await self.main_bot_client.process_query(
+                message,
+                session_id=session_id
+            )
             logger.info("Ответ получен")
             return response
         except Exception as e:
             logger.error(f"Ошибка при вызове главного бота: {e}")
             return f"Ошибка при обработке запроса: {e}"
+        
+    async def reset(self, session_id: str):
+        """Очистка памяти сессии"""
+        self.main_bot_client.clear_session(session_id)
     
     async def stop(self):
         """Отключение от сервера главного бота"""
@@ -88,6 +96,7 @@ class Api:
 
 API = Api(MAIN_BOT_CONFIG_PATH)
 
+"""
 # Тестирование
 async def main():
     try:
@@ -101,3 +110,4 @@ async def main():
 if __name__ == '__main__':
     import asyncio
     asyncio.run(main())
+"""

@@ -461,3 +461,66 @@ class YandexSearchAPI:
         except Exception as e:
             self.logger.error(f"Ошибка поиска: {str(e)}")
             return []
+        
+if __name__ == '__main__':
+    import os, asyncio
+
+    YANDEX_SEARCH_API_KEY = os.getenv("YANDEX_SEARCH_API_KEY")
+    YANDEX_CLOUD_FOLDER_ID = os.getenv("YANDEX_CLOUD_FOLDER_ID")
+
+    client = YandexSearchAPI(api_key=YANDEX_SEARCH_API_KEY, folder_id=YANDEX_CLOUD_FOLDER_ID)
+    
+    async def search_internet(
+        query: str,
+        num: int = 5,
+    ) -> str:
+        """
+        Description:
+        ---------------
+            Поиск в интернете
+        Args:
+        ---------------
+            query (str): Поисковый запрос
+            num (int): Количество результатов поиска (от 1 до 10)
+        Returns:
+        ---------------
+            str: Результаты поиска
+        Examples:
+        ---------------
+            Tool call:
+            {
+                "name": "search",
+                "arguments": {
+                    "query": "новости искусственного интеллекта",
+                    "num": 5
+                }
+            }
+        """
+        try:
+            # Предварительная проверка
+            if not query:
+                raise ValueError("Запрос не может быть пустым")
+            
+            if num > 10: num = 10
+            if num < 1: num = 1
+
+
+            # Поиск результатов
+            results = await client.search(
+                query_text=query,
+                groups_on_page=num
+            )
+
+            # Оптимизация данных
+            optimized_results = optimize_results(
+                parsed_results=results,
+                min_length=30
+            )
+
+            # Возврат в понятном формате
+            return format_results(optimized_results, query)
+
+        except Exception as e:
+            return f"Ошибка поиска: {e}"
+        
+    print(asyncio.run(search_internet("погода", 3)))
