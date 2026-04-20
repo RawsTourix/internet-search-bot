@@ -538,7 +538,39 @@ class MCPClient:
                     
                     if not tool_calls:
                         cleaned_content = self._strip_agent_markers(content) if content else ""
-                        agent_status = self._extract_agent_status(content) if content else AgentStatus.DONE
+                        agent_status = self._extract_agent_status(content) if content else None
+
+                        if agent_status is None:
+                            logger.error("Отсутсвует маркер статуса! Пробуем повторно спросить его у LLM.")
+                            marker_prompt = (
+                                "Определи статус предыдущего ответа. "
+                                "Верни только один маркер без пояснений: "
+                                "[AGENT_STATUS=WAITING_USER] или [AGENT_STATUS=CONTINUE] или [AGENT_STATUS=DONE]."
+                            )
+                            messages.append({"role": "user", "content": marker_prompt})
+
+                            logger.debug(f"Сообщения для LLM: {messages}")
+
+                            llm_response = await asyncio.wait_for(
+                                self._call_llm(messages, tools),
+                                timeout=self.llm_call_timeout
+                            )
+                            logger.debug(f"Получен ответ от модели: {llm_response}")
+
+                            marker = llm_response.get("content", "")
+                            agent_status = self._extract_agent_status(marker) if marker else AgentStatus.ERROR
+
+                            if agent_status is AgentStatus.ERROR:
+                                state.status = AgentStatus.ERROR
+                                state.last_error = "LLM response missing AGENT_STATUS marker"
+                                cleaned_content = self._strip_agent_markers(content) if content else ""
+                                if cleaned_content:
+                                    messages.append({
+                                        "role": "assistant",
+                                        "content": cleaned_content
+                                    })
+                                final_text = [cleaned_content or "Ошибка на стороне LLM. Ответ модели не содержит обязательный маркер статуса."]
+                                break
 
                         if cleaned_content:
                             messages.append({
@@ -1145,7 +1177,7 @@ class MCPClient:
             return AgentStatus.RUNNING
         if "[AGENT_STATUS=DONE]" in text:
             return AgentStatus.DONE
-        return AgentStatus.DONE
+        return None
     
     def _strip_agent_markers(self, text: str) -> str:
         """
