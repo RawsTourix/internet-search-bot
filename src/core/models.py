@@ -92,3 +92,19 @@ class ServerConfigType(BaseModel):
     host: Optional[str] = None
     port: Optional[int] = None
     instructions: Optional[str] = None
+
+class AgentStatus(str, Enum):
+    IDLE = "idle"
+    RUNNING = "running"
+    WAITING_USER = "waiting_user"
+    DONE = "done"
+    ERROR = "error"
+
+
+class AgentResult(BaseModel):
+    content: str
+    status: AgentStatus
+    session_id: Optional[str] = None
+    iterations: int = 0
+    tools_used: List[str] = []
+    error: Optional[str] = None

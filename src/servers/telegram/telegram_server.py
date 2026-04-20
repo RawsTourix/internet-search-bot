@@ -96,7 +96,7 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     logger.debug(f"Получена команда: {payload}")
     logger.info(f"Команда [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {payload.get('command')}")
     
-    await update.message.reply_text(f"Ваш запрос принят в обработку.")
+    await update.message.reply_text(f"Ваш запрос принят в обработку...")
 
     success, message = await send_to_gateway(payload)
     if success:
@@ -142,7 +142,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         logger.error(f"Ответ на сообщение [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
 
 # Регистрация обработчиков
-application.add_handler(CommandHandler(['start', 'status', 'help'], command_handler)) # Команды обрабатываются в API
+application.add_handler(CommandHandler(['start', 'status', 'reset', 'help'], command_handler)) # Команды обрабатываются в API
 application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
 
 @asynccontextmanager

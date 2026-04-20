@@ -82,24 +82,37 @@ class MessageProcessor:
     
     async def _generate_response(self, message: UnifiedMessage) -> str:
         """Обработка запроса"""
+        response_content = ""
+        response_metadata = {}
+
         if message.message_type == MessageType.COMMAND:
             response_content = await self._handle_command(message)
         elif message.message_type == MessageType.TEXT:
             try:
                 session_id = self._build_session_id(message)
-                response_content = await API.process_query(
+                agent_result  = await API.process_query(
                     message.content,
                     session_id=session_id
                 )
+                response_content = agent_result.content
+                response_metadata = {
+                    "agent_status": agent_result.status,
+                    "session_id": agent_result.session_id,
+                    "iterations": agent_result.iterations,
+                    "tools_used": agent_result.tools_used,
+                    "error": agent_result.error,
+                }
+
             except Exception as e:
                 response_content = f"Сообщение не обработано: {e}"
         
         response = UnifiedResponse(
-                message_id=message.id,
-                client_type=message.client_type,
-                content=response_content,
-                response_type=MessageType.TEXT
-            )
+            message_id=message.id,
+            client_type=message.client_type,
+            content=response_content,
+            response_type=MessageType.TEXT,
+            metadata=response_metadata
+        )
         
         return response
         
@@ -119,7 +132,7 @@ class MessageProcessor:
         # Очистка памяти сессии
         elif command == "/reset":
             try:
-                API.reset(self._build_session_id(message))
+                await API.reset(self._build_session_id(message))
                 return "Память успешно очищена."
             except Exception as e:
                 return f"Ошибка очистки памяти: {e}."

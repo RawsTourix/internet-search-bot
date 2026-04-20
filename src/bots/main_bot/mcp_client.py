@@ -20,6 +20,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 
+from ...core.models import AgentStatus, AgentResult
+
 # Модели
 class ServerConnectType(str, Enum):
     """Перечисление типов подключения к серверу"""
@@ -52,6 +54,15 @@ class ServerConfigType(BaseModel):
 class SessionMemory:
     messages: List[Dict[str, Any]] = field(default_factory=list)
     last_seen: float = field(default_factory=time.time)
+
+@dataclass
+class SessionState:
+    status: AgentStatus = AgentStatus.IDLE
+    last_seen: float = field(default_factory=time.time)
+    iterations: int = 0
+    tools_used: List[str] = field(default_factory=list)
+    last_error: Optional[str] = None
+    awaiting_user_input: bool = False
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -231,6 +242,7 @@ class MCPClient:
         self.session = None
         self.exit_stack = AsyncExitStack()
         self.server_name = 'Unnamed'
+        self.max_iterations = 20
         
         # Настройка для LLM
         self.llm_config = llm_config
@@ -257,6 +269,7 @@ class MCPClient:
 
         # Память сессий
         self.sessions: Dict[str, SessionMemory] = {}
+        self.session_states: Dict[str, SessionState] = {}
         self.max_history_messages = 24
         
     async def connect_to_server(self, server_config: ServerConfigType):
@@ -458,7 +471,7 @@ class MCPClient:
         """
         return self.available_tools
         
-    async def process_query(self, query: str, session_id: str = "default") -> str:
+    async def process_query(self, query: str, session_id: str = "default") -> AgentResult:
         """
         Description:
         ---------------
@@ -470,7 +483,7 @@ class MCPClient:
             
         Returns:
         ---------------
-            str: Результат обработки запроса
+            AgentResult: Результат обработки запроса
             
         Raises:
         ---------------
@@ -480,6 +493,14 @@ class MCPClient:
         final_text = []
         
         try:
+            # Создание состояния сессии
+            state = self._get_or_create_state(session_id)
+            state.status = AgentStatus.RUNNING
+            state.iterations = 0
+            state.tools_used = []
+            state.last_error = None
+            state.awaiting_user_input = False
+
             # Составляем системное сообщение с инструкциями
             system_message = self._create_system_message()
 
@@ -493,15 +514,13 @@ class MCPClient:
             # Преобразуем инструменты в формат для LLM
             tools = self._format_tools_for_llm()
             
-            # Основной цикл обработки
-            max_iterations = 10  # Ограничиваем количество итераций
-            
-            for i in range(max_iterations):
-                logger.info(f"Итерация {i+1}/{max_iterations}")
+            # Основной цикл обработки            
+            for i in range(self.max_iterations):
+                state.iterations = i + 1
+                logger.info(f"Итерация {state.iterations}/{self.max_iterations}")
                 
                 try:
                     # Вызываем LLM с таймаутом
-                    
                     llm_response = await asyncio.wait_for(
                         self._call_llm(messages, tools),
                         timeout=self.llm_call_timeout
@@ -518,13 +537,20 @@ class MCPClient:
                         final_text.append(content)
                     
                     if not tool_calls:
-                        # Финальный ответ без вызовов инструментов — сохраняем в историю
-                        if content:
+                        cleaned_content = self._strip_agent_markers(content) if content else ""
+                        agent_status = self._extract_agent_status(content) if content else AgentStatus.DONE
+
+                        if cleaned_content:
                             messages.append({
                                 "role": "assistant",
-                                "content": content
+                                "content": cleaned_content
                             })
-                        logger.info("Нет вызовов инструментов, завершаем обработку")
+
+                        state.status = agent_status
+                        state.awaiting_user_input = agent_status == AgentStatus.WAITING_USER
+
+                        logger.info(f"Нет вызовов инструментов, завершаем обработку со статусом {agent_status}")
+                        final_text = [cleaned_content] if cleaned_content else ["Пустой ответ."]
                         break
                     
                     # Обрабатываем вызовы инструментов
@@ -541,6 +567,9 @@ class MCPClient:
                         tool_name = function.get("name", "")
                         tool_call_id = tool_call.get("id", "")
                         
+                        if tool_name and tool_name not in state.tools_used:
+                            state.tools_used.append(tool_name)
+
                         logger.info(f"Вызов инструмента: {tool_name}")
                         
                         try:
@@ -603,7 +632,7 @@ class MCPClient:
                             })
                     
                     # Если последняя итерация и были вызовы, получаем финальный ответ
-                    if i == max_iterations - 1 and tool_results:
+                    if i == self.max_iterations - 1 and tool_results:
                         try:
                             final_response = await asyncio.wait_for(
                                 self._call_llm(messages, tools),
@@ -630,15 +659,43 @@ class MCPClient:
                     final_text.append(f"\n{error_message}")
                     break
             
-            result = final_text[len(final_text) - 1] if len(final_text) > 0 else "Пустой ответ."
+            if state.iterations >= self.max_iterations and state.status == AgentStatus.RUNNING:
+                state.status = AgentStatus.ERROR
+                state.last_error = f"Достигнут лимит итераций: {self.max_iterations}"
+            
+            result_text = final_text[-1] if final_text else "Пустой ответ."
             self._trim_session_messages(session)
-            logger.info(f"Завершение обработки запроса. Результат: {result}")
-            return result
+
+            if state.status == AgentStatus.RUNNING:
+                state.status = AgentStatus.DONE
+
+            logger.info(f"Завершение обработки запроса. Результат: {result_text}")
+
+            return AgentResult(
+                content=result_text,
+                status=state.status,
+                session_id=session_id,
+                iterations=state.iterations,
+                tools_used=state.tools_used,
+                error=state.last_error
+            )
             
         except Exception as e:
             error_message = f"Критическая ошибка при обработке запроса: {str(e)}"
             logger.error(error_message)
-            return error_message
+
+            state = self._get_or_create_state(session_id)
+            state.status = AgentStatus.ERROR
+            state.last_error = error_message
+
+            return AgentResult(
+                content=error_message,
+                status=AgentStatus.ERROR,
+                session_id=session_id,
+                iterations=state.iterations,
+                tools_used=state.tools_used,
+                error=error_message
+            )
     
     def _format_tool_result(self, content_list: List[Any]) -> str:
         """
@@ -669,7 +726,15 @@ class MCPClient:
             str: Текст системного сообщения
         """
         
-        return f"{self.instructions}\n\nУ тебя есть доступ к следующим инструментам:\n{self._tools_description()}"
+        return (
+            f"{self.instructions}\n\n"
+            "Правила агентного режима:\n"
+            "1. Если тебе нужен ответ или действие пользователя, заканчивай ответ маркером [AGENT_STATUS=WAITING_USER]\n"
+            "2. Если нужно продолжать работу через инструменты, используй [AGENT_STATUS=CONTINUE]\n"
+            "3. Если задача завершена, заканчивай ответ маркером [AGENT_STATUS=DONE]\n"
+            "4. Никогда не пропускай маркер статуса\n\n"
+            f"У тебя есть доступ к следующим инструментам:\n{self._tools_description()}"
+        )
     
     def _tools_description(self) -> List[Dict[str, Any]]:
         """
@@ -1019,6 +1084,37 @@ class MCPClient:
             if len(session.messages) > self.max_history_messages:
                 session.messages = session.messages[-self.max_history_messages:]
 
+    def _get_or_create_state(self, session_id: str) -> SessionState:
+        """
+        Description:
+        ---------------
+            Возвращает существующий статус сессии или создаёт новый.
+            
+        Args:
+            ---------------
+            session_id (str): Уникальный идентификатор сессии
+        """
+        state = self.session_states.get(session_id)
+
+        if state is None:
+            state = SessionState()
+            self.session_states[session_id] = state
+
+        state.last_seen = time.time()
+        return state
+
+
+    def get_session_state(self, session_id: str) -> Optional[SessionState]:
+        """
+        Description:
+        ---------------
+            Возвращает текущий статус сессии.
+        
+        Args:
+            ---------------
+            session_id (str): Уникальный идентификатор сессии
+        """
+        return self.session_states.get(session_id)
 
     def clear_session(self, session_id: str) -> None:
         """
@@ -1031,6 +1127,43 @@ class MCPClient:
             session_id (str): Уникальный идентификатор сессии
         """
         self.sessions.pop(session_id, None)
+        self.session_states.pop(session_id, None)
+
+    def _extract_agent_status(self, text: str) -> AgentStatus:
+        """
+        Description:
+        ---------------
+            Ищет маркеры состояний и возвращает статус сессии.
+
+        Args:
+        ---------------
+            text (str): Текст ИИ-агента
+        """
+        if "[AGENT_STATUS=WAITING_USER]" in text:
+            return AgentStatus.WAITING_USER
+        if "[AGENT_STATUS=CONTINUE]" in text:
+            return AgentStatus.RUNNING
+        if "[AGENT_STATUS=DONE]" in text:
+            return AgentStatus.DONE
+        return AgentStatus.DONE
+    
+    def _strip_agent_markers(self, text: str) -> str:
+        """
+        Description:
+        ---------------
+            Очищает маркеры состояний из текста.
+
+        Args:
+        ---------------
+            text (str): Текст ИИ-агента
+        """
+        for marker in (
+            "[AGENT_STATUS=WAITING_USER]",
+            "[AGENT_STATUS=CONTINUE]",
+            "[AGENT_STATUS=DONE]",
+        ):
+            text = text.replace(marker, "")
+        return text.strip()
 
 
 def load_config(config_path: str) -> Tuple[ServerConfigType, LLMConfigType]:

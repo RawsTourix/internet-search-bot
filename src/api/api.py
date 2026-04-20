@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
 # Импорт модулей
 from .config import HTTP_PROXY, HTTPS_PROXY, MAIN_BOT_CONFIG_PATH
 from ..bots.main_bot.mcp_client import MCPClient, load_config
+from ..core.models import AgentStatus, AgentResult
 
 # Настройка прокси
 os.environ['http_proxy'] = HTTP_PROXY
@@ -63,7 +64,7 @@ class Api:
         except Exception as e:
             logger.critical(f"Ошибка подключения к серверу: {e}")
 
-    async def process_query(self, message: str, session_id: str = "default") -> str:
+    async def process_query(self, message: str, session_id: str = "default") -> AgentResult:
         """Вызов главного бота"""
         try:
             if not await self.main_bot_client.list_tools():
@@ -73,15 +74,31 @@ class Api:
             logger.debug(f"message: {message}")
             logger.debug(f"session_id: {session_id}")
 
-            response = await self.main_bot_client.process_query(
+            agent_result = await self.main_bot_client.process_query(
                 message,
                 session_id=session_id
             )
             logger.info("Ответ получен")
-            return response
+            return agent_result
         except Exception as e:
             logger.error(f"Ошибка при вызове главного бота: {e}")
-            return f"Ошибка при обработке запроса: {e}"
+
+            state = None
+            try:
+                state = self.main_bot_client.get_session_state(session_id)
+            except Exception:
+                state = None
+
+            result_text = f"Ошибка при обработке запроса: {e}"
+
+            return AgentResult(
+                content=result_text,
+                status=AgentStatus.ERROR,
+                session_id=session_id,
+                iterations=state.iterations if state else 0,
+                tools_used=state.tools_used if state else [],
+                error=str(e)
+            )
         
     async def reset(self, session_id: str):
         """Очистка памяти сессии"""
