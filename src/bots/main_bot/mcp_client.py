@@ -21,6 +21,7 @@ from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 
 from ...core.models import AgentStatus, AgentResult
+from ...core.errors import LLMError, LLMHTTPError, LLMTimeoutError, LLMTransportError
 
 # Модели
 class ServerConnectType(str, Enum):
@@ -672,23 +673,50 @@ class MCPClient:
                             )
                             final_content = final_response.get("content", "")
                             if final_content:
-                                final_text.append(f"\nИтоговый ответ: {final_content}")
+                                final_text.clear()
+                                final_text.append(final_content)
+
+                            state.status = AgentStatus.DONE
+
+                        except LLMTimeoutError as e:
+                            error_message = f"Таймаут при получении финального ответа: {e}"
+                            self._finish_with_error(state, final_text, error_message)
+                        except LLMHTTPError as e:
+                            error_message = f"HTTP-ошибка при получении финального ответа: {e}"
+                            self._finish_with_error(state, final_text, error_message)
+                        except LLMTransportError as e:
+                            error_message = f"Сетевая ошибка при получении финального ответа: {e}"
+                            self._finish_with_error(state, final_text, error_message)
                         except asyncio.TimeoutError:
-                            logger.error("Таймаут при получении финального ответа")
-                            final_text.append("\nТаймаут при получении финального ответа")
+                            error_message = "Общий таймаут при получении финального ответа"
+                            self._finish_with_error(state, final_text, error_message)
                         except Exception as e:
-                            logger.error(f"Ошибка при получении финального ответа: {e}")
+                            error_message = f"Ошибка при получении финального ответа: {type(e).__name__}: {e!r}"
+                            self._finish_with_error(state, final_text, error_message, log_exception=True)
                             
-                except asyncio.TimeoutError:  # Обработка таймаута LLM
-                    error_message = f"Таймаут LLM на итерации {i+1}"
-                    logger.error(error_message)
-                    final_text.append(f"\n{error_message}")
+                except LLMTimeoutError as e:
+                    error_message = f"Таймаут LLM на итерации {i+1}: {e}"
+                    self._finish_with_error(state, final_text, error_message)
                     break
-                    
+
+                except LLMHTTPError as e:
+                    error_message = f"HTTP-ошибка LLM на итерации {i+1}: {e}"
+                    self._finish_with_error(state, final_text, error_message)
+                    break
+
+                except LLMTransportError as e:
+                    error_message = f"Сетевая ошибка LLM на итерации {i+1}: {e}"
+                    self._finish_with_error(state, final_text, error_message)
+                    break
+
+                except asyncio.TimeoutError:
+                    error_message = f"Общий таймаут обработки LLM на итерации {i+1}"
+                    self._finish_with_error(state, final_text, error_message)
+                    break
+
                 except Exception as e:
-                    error_message = f"Ошибка на итерации {i+1}: {str(e)}"
-                    logger.error(error_message)
-                    final_text.append(f"\n{error_message}")
+                    error_message = f"Ошибка на итерации {i+1}: {type(e).__name__}: {e!r}"
+                    self._finish_with_error(state, final_text, error_message, log_exception=True)
                     break
             
             if state.iterations >= self.max_iterations and state.status == AgentStatus.RUNNING:
@@ -765,6 +793,8 @@ class MCPClient:
             "2. Если нужно продолжать работу через инструменты, используй [AGENT_STATUS=CONTINUE]\n"
             "3. Если задача завершена, заканчивай ответ маркером [AGENT_STATUS=DONE]\n"
             "4. Никогда не пропускай маркер статуса\n\n"
+            "Прежде чем ответить, оцени неопределённость своего ответа.\n"
+            "Если она больше 0.1, задай мне уточняющие вопросы, пока она не станет 0.1 или ниже.\n\n"
             f"У тебя есть доступ к следующим инструментам:\n{self._tools_description()}"
         )
     
@@ -886,17 +916,16 @@ class MCPClient:
                     # Для API, не совместимых с OpenAI
                     return self._parse_custom_llm_response(result)
             else:
-                error_message = (
-                    f"Ошибка при вызове LLM: "
-                    f"{response.status_code} - {response.text}"
+                raise LLMHTTPError(
+                    f"Ошибка LLM API: {response.status_code} - {response.text}"
                 )
-                logger.error(error_message)
-                return {"content": error_message}
                 
+        except httpx.TimeoutException as e:
+            raise LLMTimeoutError(f"Таймаут LLM: {repr(e)}") from e
+        except httpx.RequestError as e:
+            raise LLMTransportError(f"Сетевая ошибка LLM: {repr(e)}") from e
         except Exception as e:
-            error_message = f"Ошибка при обращении к LLM: {str(e)}"
-            logger.error(error_message)
-            return {"content": error_message}
+            raise LLMError(f"Ошибка при обращении к LLM: {repr(e)}")
     
     def _format_messages_for_custom_llm(
         self, 
@@ -1196,6 +1225,25 @@ class MCPClient:
         ):
             text = text.replace(marker, "")
         return text.strip()
+    
+    def _finish_with_error(
+        self,
+        state: SessionState,
+        final_text: list[str],
+        message: str,
+        *,
+        log_exception: bool = False
+    ) -> None:
+        state.status = AgentStatus.ERROR
+        state.last_error = message
+
+        if log_exception:
+            logger.exception(message)
+        else:
+            logger.error(message)
+
+        final_text.clear()
+        final_text.append(message)
 
 
 def load_config(config_path: str) -> Tuple[ServerConfigType, LLMConfigType]:
