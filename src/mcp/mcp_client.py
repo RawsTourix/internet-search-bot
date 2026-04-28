@@ -20,8 +20,8 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 
-from ...core.models import AgentStatus, AgentResult
-from ...core.errors import LLMError, LLMHTTPError, LLMTimeoutError, LLMTransportError
+from ..core.models import AgentStatus, AgentResult
+from ..core.errors import LLMError, LLMHTTPError, LLMTimeoutError, LLMTransportError
 
 # Модели
 class ServerConnectType(str, Enum):
@@ -792,7 +792,9 @@ class MCPClient:
             "1. Если тебе нужен ответ или действие пользователя, заканчивай ответ маркером [AGENT_STATUS=WAITING_USER]\n"
             "2. Если нужно продолжать работу через инструменты, используй [AGENT_STATUS=CONTINUE]\n"
             "3. Если задача завершена, заканчивай ответ маркером [AGENT_STATUS=DONE]\n"
-            "4. Никогда не пропускай маркер статуса\n\n"
+            "4. Никогда не пропускай маркер статуса\n"
+            "5. Если ты вызвал инструмент и получил результат, обязательно сформируй ответ пользователю "
+            "на основе результата инструмента.\n\n"
             "Прежде чем ответить, оцени неопределённость своего ответа.\n"
             "Если она больше 0.1, задай мне уточняющие вопросы, пока она не станет 0.1 или ниже.\n\n"
             f"У тебя есть доступ к следующим инструментам:\n{self._tools_description()}"

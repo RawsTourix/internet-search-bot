@@ -4,7 +4,7 @@ from logging.handlers import RotatingFileHandler
 
 # Импорт модулей
 from .config import HTTP_PROXY, HTTPS_PROXY, MAIN_BOT_CONFIG_PATH
-from ..bots.main_bot.mcp_client import MCPClient, load_config
+from ..mcp.mcp_client import MCPClient, load_config
 from ..core.models import AgentStatus, AgentResult
 
 # Настройка прокси

@@ -7,10 +7,10 @@ from typing import List, Dict, Any, Union, Optional
 from logging.handlers import RotatingFileHandler
 from mcp.server.fastmcp import FastMCP
 
-from yandex_search import YandexSearchAPI, format_results, optimize_results
+from yandex_search_library import YandexSearchAPI, format_results, optimize_results
 
 # Импорт модулей
-from config import HTTP_PROXY, HTTPS_PROXY, YANDEX_SEARCH_API_KEY, YANDEX_CLOUD_FOLDER_ID
+from yandex_search_config import HTTP_PROXY, HTTPS_PROXY, YANDEX_SEARCH_API_KEY, YANDEX_CLOUD_FOLDER_ID
 
 # Настройка прокси
 os.environ['http_proxy'] = HTTP_PROXY
