@@ -1,4 +1,5 @@
 import os
+import re
 import httpx
 import asyncio
 import uuid
@@ -6,13 +7,15 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status
 from telegram import Update, BotCommand
+from telegram.constants import ParseMode
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from telegram.error import TimedOut, NetworkError
+from telegram.error import TimedOut, NetworkError, BadRequest
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 # Импорт модулей
 from .config import BOT_TOKEN, WEBHOOK_SECRET, WEBHOOK_DOMAIN, TELEGRAM_API_KEY, GATEWAY_URL
+from ...utils.telegram_formatting import markdown_to_telegram_html, split_telegram_message
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -46,26 +49,40 @@ application = Application.builder().token(BOT_TOKEN).build()
 async def send_to_gateway(payload: dict) -> tuple[bool, str]:
     """Отправляет данные в Gateway и возвращает статус успеха и сообщение"""
     try:
-        async with httpx.AsyncClient(timeout=300.0) as client:
+        timeout = httpx.Timeout(
+            connect=10.0,
+            read=900.0,
+            write=30.0,
+            pool=10.0
+        )
+
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.post(
                 f"{GATEWAY_URL}/message",
                 json=payload,
                 headers={
                     "Content-Type": "application/json",
-                    "X-API-Key": TELEGRAM_API_KEY # API ключ (внутренний)
+                    "X-API-Key": TELEGRAM_API_KEY
                 }
             )
             response.raise_for_status()
-            logger.info(f"Сообщение успешно отправлено в Gateway")
+            logger.info("Сообщение успешно отправлено в Gateway")
             return True, response.json().get("response", "Успешно отправлено в Gateway")
+
+    except httpx.TimeoutException as e:
+        logger.error(f"Таймаут при ожидании ответа от Gateway: {type(e).__name__}: {e!r}")
+        return False, "Gateway обрабатывал запрос слишком долго и не успел вернуть ответ."
+
     except httpx.RequestError as e:
-        logger.error(f"Ошибка при отправке в Gateway: {e}")
+        logger.error(f"Ошибка при отправке в Gateway: {type(e).__name__}: {e!r}")
         return False, f"Не удалось подключиться к Gateway: {e}"
+
     except httpx.HTTPStatusError as e:
         logger.error(f"HTTP error from Gateway: {e.response.status_code} - {e.response.text}")
         return False, f"Ошибка от Gateway: {e.response.status_code} - {e.response.text}"
+
     except Exception as e:
-        logger.error(f"Неизвестная ошибка: {e}")
+        logger.exception(f"Неизвестная ошибка при отправке в Gateway: {type(e).__name__}: {e!r}")
         return False, f"Неизвестная ошибка: {e}"
 
 async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -100,7 +117,7 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success, message = await send_to_gateway(payload)
     if success:
-        await update.message.reply_text(message)
+        await send_telegram_markdown_reply(update, message)
         logger.info(f"Ответ на команду [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
     else:
         await update.message.reply_text(f"Произошла ошибка при обработке запроса: {message}")
@@ -138,8 +155,34 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(message)
         logger.info(f"Ответ на сообщение [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
     else:
-        await update.message.reply_text(f"Произошла ошибка при обработке запроса: {message}")
+        await send_telegram_markdown_reply(
+            update,
+            f"**Произошла ошибка при обработке запроса:**\n{message}"
+        )
         logger.error(f"Ответ на сообщение [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
+
+async def send_telegram_markdown_reply(update, text: str):
+    html_text = markdown_to_telegram_html(text)
+
+    chunks = split_telegram_message(html_text)
+
+    for chunk in chunks:
+        try:
+            await update.message.reply_text(
+                chunk,
+                parse_mode=ParseMode.HTML,
+                disable_web_page_preview=True
+            )
+        except BadRequest as e:
+            # Если Telegram не принял HTML, отправляем обычный текст
+            logger.warning(f"Ошибка Telegram HTML formatting: {e}")
+
+            plain_chunk = re.sub(r"<[^>]+>", "", chunk)
+
+            await update.message.reply_text(
+                plain_chunk,
+                disable_web_page_preview=True
+            )
 
 # Регистрация обработчиков
 application.add_handler(CommandHandler(['start', 'status', 'reset', 'help'], command_handler)) # Команды обрабатываются в API

@@ -94,21 +94,20 @@ web_adapter = WebAdapter(message_processor)
 async def lifespan(app: FastAPI):
     """Асинхронное управление жизненным циклом"""
     logger.info("Запуск Multi-Protocol Gateway...")
-    await asyncio.gather(
-        telegram_adapter.initialize(),
-        web_adapter.initialize(),
-        API.start()
-    )
+
+    await telegram_adapter.initialize()
+    await web_adapter.initialize()
+    await API.start()
+
     logger.info("Gateway успешно запущен")
     
     yield
     
     logger.info("Остановка Gateway...")
-    await asyncio.gather(
-        telegram_adapter.shutdown(),
-        web_adapter.shutdown(),
-        API.stop()
-    )
+    
+    await API.stop()
+    await web_adapter.shutdown()
+    await telegram_adapter.shutdown()
 
 # CORS configuration
 origins = os.getenv("CORS_ORIGINS", "*").split(",")

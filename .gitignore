@@ -16,3 +16,7 @@ __pycache__/
 
 # Тестирование отдельных компонентов
 *test.py
+
+# Временные элементы MCP-серверов
+.playwright-mcp
+playwright_docs.md

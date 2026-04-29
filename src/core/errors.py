@@ -10,7 +10,20 @@ class LLMTransportError(LLMError):
 
 class LLMHTTPError(LLMError):
     """Некорректный HTTP-ответ от LLM API."""
-    pass
+
+    def __init__(
+        self,
+        status_code: int,
+        response_text: str,
+        retry_after: float | None = None
+    ):
+        self.status_code = status_code
+        self.response_text = response_text
+        self.retry_after = retry_after
+
+        super().__init__(
+            f"Ошибка LLM API: {status_code} - {response_text}"
+        )
 
 
 class LLMTimeoutError(LLMTransportError):

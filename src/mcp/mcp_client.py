@@ -1,5 +1,6 @@
 import os
 import re
+import gc
 import sys
 import json
 import logging
@@ -264,7 +265,7 @@ class MCPClient:
         self.session = None
         self.exit_stack = AsyncExitStack()
         self.server_name = 'Unnamed'
-        self.max_iterations = 20
+        self.max_iterations = 50
         
         # Настройка для LLM
         self.llm_config = llm_config
@@ -293,6 +294,13 @@ class MCPClient:
         # Настройки таймаутов
         self.tool_call_timeout = 120.0  # Таймаут для вызова инструментов
         self.llm_call_timeout = 60.0   # Таймаут для вызова LLM
+
+        # Настройка повторных запросов
+        self.llm_max_retries = 3
+        self.llm_retry_base_delay = 5.0
+        self.llm_retry_max_delay = 60.0
+
+        self.llm_retryable_http_statuses = {429, 500, 502, 503, 504}
 
         # Память сессий
         self.sessions: Dict[str, SessionMemory] = {}
@@ -518,9 +526,10 @@ class MCPClient:
                 
                 try:
                     # Вызываем LLM с таймаутом
-                    llm_response = await asyncio.wait_for(
-                        self._call_llm(messages, tools),
-                        timeout=self.llm_call_timeout
+                    llm_response = await self._call_llm_with_retries(
+                        messages,
+                        tools,
+                        context=f"Итерация {i + 1}"
                     )
                     logger.debug(f"Получен ответ от модели: {llm_response}")
                     
@@ -548,9 +557,10 @@ class MCPClient:
 
                             logger.debug(f"Сообщения для LLM: {messages}")
 
-                            llm_response = await asyncio.wait_for(
-                                self._call_llm(messages, tools),
-                                timeout=self.llm_call_timeout
+                            llm_response = await self._call_llm_with_retries(
+                                marker_prompt,
+                                tools,
+                                context=f"Marker repair на итерации {i + 1}"
                             )
                             logger.debug(f"Получен ответ от модели: {llm_response}")
 
@@ -567,6 +577,22 @@ class MCPClient:
                                         "content": cleaned_content
                                     })
                                 final_text = [cleaned_content or "Ошибка на стороне LLM. Ответ модели не содержит обязательный маркер статуса."]
+                                break
+                        
+                        if agent_status is None:
+                            logger.warning(
+                                "LLM не вернула маркер статуса даже после повторного запроса. "
+                                "Использую fallback-статус."
+                            )
+
+                            if cleaned_content:
+                                agent_status = AgentStatus.DONE
+                            else:
+                                self._finish_with_error(
+                                    state,
+                                    final_text,
+                                    "LLM не вернула ни содержательный ответ, ни маркер статуса"
+                                )
                                 break
 
                         if cleaned_content:
@@ -654,9 +680,10 @@ class MCPClient:
                     # Если последняя итерация и были вызовы, получаем финальный ответ
                     if i == self.max_iterations - 1 and tool_results:
                         try:
-                            final_response = await asyncio.wait_for(
-                                self._call_llm(messages, tools),
-                                timeout=self.llm_call_timeout
+                            final_response = await self._call_llm_with_retries(
+                                messages,
+                                tools,
+                                context="Финальный ответ после tool calls"
                             )
                             final_content = final_response.get("content", "")
                             if final_content:
@@ -669,8 +696,16 @@ class MCPClient:
                             error_message = f"Таймаут при получении финального ответа: {e}"
                             self._finish_with_error(state, final_text, error_message)
                         except LLMHTTPError as e:
-                            error_message = f"HTTP-ошибка при получении финального ответа: {e}"
+                            if e.status_code == 429:
+                                error_message = (
+                                    f"LLM временно перегружена или достигнут лимит запросов. "
+                                    f"Повторы исчерпаны на итерации {i + 1}: {e}"
+                                )
+                            else:
+                                error_message = f"HTTP-ошибка LLM на итерации {i + 1}: {e}"
+
                             self._finish_with_error(state, final_text, error_message)
+                            break
                         except LLMTransportError as e:
                             error_message = f"Сетевая ошибка при получении финального ответа: {e}"
                             self._finish_with_error(state, final_text, error_message)
@@ -782,9 +817,11 @@ class MCPClient:
             "4. Никогда не пропускай маркер статуса\n"
             "5. Если ты вызвал инструмент и получил результат, обязательно сформируй ответ пользователю "
             "на основе результата инструмента.\n\n"
+            f"У тебя есть доступ к следующим инструментам:\n{self._tools_description()}\n\n"
             "Прежде чем ответить, оцени неопределённость своего ответа.\n"
             "Если она больше 0.1, задай мне уточняющие вопросы, пока она не станет 0.1 или ниже.\n\n"
-            f"У тебя есть доступ к следующим инструментам:\n{self._tools_description()}"
+            "Перед финальным ответом проверяй команды, имена инструментов, "
+            "URL и названия пакетов по найденному источнику. Не изменяй символы в командах."
         )
     
     def _tools_description(self) -> List[Dict[str, Any]]:
@@ -839,6 +876,30 @@ class MCPClient:
             
         return llm_tools
     
+    def _parse_retry_after(self, value: str | None) -> float | None:
+        if not value:
+            return None
+
+        try:
+            delay = float(value)
+            if delay >= 0:
+                return delay
+        except ValueError:
+            return None
+
+        return None
+    
+    def _get_llm_retry_delay(
+        self,
+        error: LLMHTTPError | None,
+        attempt: int
+    ) -> float:
+        if error is not None and error.retry_after is not None:
+            return min(error.retry_after, self.llm_retry_max_delay)
+
+        delay = self.llm_retry_base_delay * (2 ** (attempt - 1))
+        return min(delay, self.llm_retry_max_delay)
+
     async def _call_llm(
         self, 
         messages: List[Dict[str, Any]], 
@@ -902,21 +963,84 @@ class MCPClient:
                     if choices:
                         message = choices[0].get("message", {})
                         return message
+                    
                     return {"content": "Получен пустой ответ от LLM"}
-                else:
-                    # Для API, не совместимых с OpenAI
-                    return self._parse_custom_llm_response(result)
-            else:
-                raise LLMHTTPError(
-                    f"Ошибка LLM API: {response.status_code} - {response.text}"
-                )
+
+                # Для API, не совместимых с OpenAI
+                return self._parse_custom_llm_response(result)
+            
+            retry_after = self._parse_retry_after(
+                response.headers.get("Retry-After")
+            )
+
+            raise LLMHTTPError(
+                status_code=response.status_code,
+                response_text=response.text,
+                retry_after=retry_after
+            )
                 
         except httpx.TimeoutException as e:
             raise LLMTimeoutError(f"Таймаут LLM: {repr(e)}") from e
+        
         except httpx.RequestError as e:
             raise LLMTransportError(f"Сетевая ошибка LLM: {repr(e)}") from e
+        
+        except LLMError:
+            raise
+        
         except Exception as e:
             raise LLMError(f"Ошибка при обращении к LLM: {repr(e)}")
+        
+    async def _call_llm_with_retries(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        *,
+        context: str = "LLM call"
+    ) -> Dict[str, Any]:
+        max_attempts = self.llm_max_retries + 1
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                return await self._call_llm(messages, tools)
+
+            except LLMHTTPError as e:
+                can_retry = e.status_code in self.llm_retryable_http_statuses
+
+                if not can_retry or attempt >= max_attempts:
+                    logger.error(
+                        f"{context}: LLM HTTP error без дальнейших повторов "
+                        f"(attempt {attempt}/{max_attempts}): {e}"
+                    )
+                    raise
+
+                delay = self._get_llm_retry_delay(e, attempt)
+
+                logger.warning(
+                    f"{context}: LLM HTTP {e.status_code}. "
+                    f"Повтор через {delay:.1f} сек. "
+                    f"Попытка {attempt}/{max_attempts}"
+                )
+
+                await asyncio.sleep(delay)
+
+            except (LLMTimeoutError, LLMTransportError) as e:
+                if attempt >= max_attempts:
+                    logger.error(
+                        f"{context}: LLM transport error без дальнейших повторов "
+                        f"(attempt {attempt}/{max_attempts}): {e}"
+                    )
+                    raise
+
+                delay = self._get_llm_retry_delay(None, attempt)
+
+                logger.warning(
+                    f"{context}: временная ошибка LLM: {e}. "
+                    f"Повтор через {delay:.1f} сек. "
+                    f"Попытка {attempt}/{max_attempts}"
+                )
+
+                await asyncio.sleep(delay)
     
     def _format_messages_for_custom_llm(
         self, 
@@ -1056,29 +1180,51 @@ class MCPClient:
         ---------------
             Освобождает ресурсы клиента.
         """
-        try:
-            await self.http_client.aclose()
-        except Exception:
-            pass
+        # Закрытие MCP-серверов в ОБРАТНОМ порядке
+        for runtime in reversed(list(self.server_runtimes.values())):
+            try:
+                logger.info(f"Закрытие MCP-сервера {runtime.name}...")
 
-        for runtime in self.server_runtimes.values():
-            if runtime.http_client is not None:
-                try:
+                if runtime.http_client is not None:
                     await runtime.http_client.close()
-                except Exception:
-                    pass
 
-            if runtime.exit_stack is not None:
-                try:
+                if runtime.exit_stack is not None:
                     await runtime.exit_stack.aclose()
-                except Exception as e:
-                    logger.error(
-                        f"Ошибка при закрытии MCP-сервера {runtime.name}: {e}"
-                    )
 
+                logger.info(f"MCP-сервер {runtime.name} отключён")
+
+            except asyncio.CancelledError as e:
+                # На shutdown anyio/mcp иногда пробрасывает CancelledError.
+                # Для штатного завершения приложения лучше не валить весь shutdown.
+                logger.warning(
+                    f"Закрытие MCP-сервера {runtime.name} было отменено: {e!r}"
+                )
+
+            except BaseException as e:
+                logger.exception(
+                    f"Ошибка при закрытии MCP-сервера {runtime.name}: {type(e).__name__}: {e!r}"
+                )
+
+            finally:
+                runtime.session = None
+                runtime.http_client = None
+                runtime.exit_stack = None
+
+        # Очистка реестров
         self.server_runtimes.clear()
         self.tool_registry.clear()
         self.available_tools.clear()
+
+        # Закрытие HTTP-клиента LLM
+        try:
+            await self.http_client.aclose()
+        except Exception as e:
+            logger.warning(f"Ошибка при закрытии HTTP-клиента LLM: {e!r}")
+
+        # Очистка "мусора"
+        await asyncio.sleep(0.5)
+        gc.collect()
+        await asyncio.sleep(0)
 
         logger.info("Все MCP-серверы отключены")
 
