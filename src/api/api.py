@@ -3,7 +3,7 @@ import logging
 from logging.handlers import RotatingFileHandler
 
 # Импорт модулей
-from .config import HTTP_PROXY, HTTPS_PROXY, MAIN_BOT_CONFIG_PATH
+from .config import HTTP_PROXY, HTTPS_PROXY, AGENT_CONFIG_PATH
 from ..mcp.mcp_client import MCPClient, load_config
 from ..core.models import AgentStatus, AgentResult
 
@@ -38,54 +38,54 @@ logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
 class Api:
-    """API для работы с ботами"""
+    """API для работы с агентом"""
     def __init__(self, config_path):
         """Инициализация Api"""
         try:
             # Загрузка конфигурации
-            logger.info("Загрузка конфигурации главного бота")
-            self.server_config, self.llm_config = load_config(config_path)
+            logger.info("Загрузка конфигурации MCP-серверов и LLM")
+            self.server_configs, self.llm_config = load_config(config_path)
 
             # Логирование конфигурации
-            logger.debug(f"server_config: {self.server_config}")
+            logger.debug(f"server_configs: {self.server_configs}")
             logger.debug(f"llm_config: {self.llm_config}")
 
             # Создание и запуск клиента
-            logger.info("Инициализация клиента главного бота")
-            self.main_bot_client = MCPClient(self.llm_config)
+            logger.info("Инициализация MCP-клиента")
+            self.mcp_client = MCPClient(self.llm_config)
         except Exception as e:
             logger.critical(f"Ошибка инициализации Api: {e}")
 
     async def start(self):
-        """Подключение к серверу главного бота"""
+        """Подключение к MCP-серверам"""
         try:
-            logger.info("Подключение к серверу главного бота")
-            await self.main_bot_client.connect_to_server(self.server_config)
+            logger.info("Подключение к MCP-серверам")
+            await self.mcp_client.connect_to_servers(self.server_configs)
         except Exception as e:
-            logger.critical(f"Ошибка подключения к серверу: {e}")
+            logger.critical(f"Ошибка подключения к MCP-серверам: {e}")
 
-    async def process_query(self, message: str, session_id: str = "default") -> AgentResult:
-        """Вызов главного бота"""
+    async def call_agent(self, message: str, session_id: str = "default") -> AgentResult:
+        """Обращение к MCP-клиенту"""
         try:
-            if not await self.main_bot_client.list_tools():
-                logger.warning("list_tools главного бота пустой")
+            if not await self.mcp_client.list_tools():
+                logger.warning("Нет зарегистрированных инструментов")
 
             logger.info("Вызов главного бота")
             logger.debug(f"message: {message}")
             logger.debug(f"session_id: {session_id}")
 
-            agent_result = await self.main_bot_client.process_query(
+            agent_result = await self.mcp_client.process_query(
                 message,
                 session_id=session_id
             )
             logger.info("Ответ получен")
             return agent_result
         except Exception as e:
-            logger.error(f"Ошибка при вызове главного бота: {e}")
+            logger.error(f"Ошибка при обращении к MCP-клиенту: {e}")
 
             state = None
             try:
-                state = self.main_bot_client.get_session_state(session_id)
+                state = self.mcp_client.get_session_state(session_id)
             except Exception:
                 state = None
 
@@ -102,23 +102,23 @@ class Api:
         
     async def reset(self, session_id: str):
         """Очистка памяти сессии"""
-        self.main_bot_client.clear_session(session_id)
+        self.mcp_client.clear_session(session_id)
     
     async def stop(self):
         """Отключение от сервера главного бота"""
         try:
-            await self.main_bot_client.cleanup()
+            await self.mcp_client.cleanup()
         except Exception as e:
             logger.error(f"Ошибка при отключении от сервера: {e}")
 
-API = Api(MAIN_BOT_CONFIG_PATH)
+API = Api(AGENT_CONFIG_PATH)
 
 """
 # Тестирование
 async def main():
     try:
         await API.start()
-        response = await API.process_query("")
+        response = await API.call_agent("")
         logger.info(f"response: {response}")
     finally:
         await API.stop()

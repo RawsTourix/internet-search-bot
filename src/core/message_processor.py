@@ -90,7 +90,7 @@ class MessageProcessor:
         elif message.message_type == MessageType.TEXT:
             try:
                 session_id = self._build_session_id(message)
-                agent_result  = await API.process_query(
+                agent_result  = await API.call_agent(
                     message.content,
                     session_id=session_id
                 )

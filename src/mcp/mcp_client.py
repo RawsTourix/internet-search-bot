@@ -39,17 +39,19 @@ class LLMConfigType(BaseModel):
     is_openai_compatible: bool = True
     max_tokens: int = 1000
     temperature: float = 0.7
+    instructions: Optional[str] = None
 
 class ServerConfigType(BaseModel):
     """Конфигурация для MCP сервера"""
-    connect_type: ServerConnectType
     name: Optional[str] = None
+    alias: Optional[str] = None
+    connect_type: ServerConnectType = ServerConnectType.EXECUTABLE
     executable: Optional[str] = None
     args: Optional[List[str]] = None
     env: Optional[Dict[str, str]] = None
     host: Optional[str] = None
     port: Optional[int] = None
-    instructions: Optional[str] = None
+    enabled: bool = True
 
 @dataclass
 class SessionMemory:
@@ -64,6 +66,25 @@ class SessionState:
     tools_used: List[str] = field(default_factory=list)
     last_error: Optional[str] = None
     awaiting_user_input: bool = False
+
+@dataclass
+class MCPServerRuntime:
+    name: str
+    alias: str
+    connect_type: ServerConnectType
+    session: Any = None
+    http_client: Any = None
+    exit_stack: Optional[AsyncExitStack] = None
+    tools: List[Any] = field(default_factory=list)
+
+@dataclass
+class MCPToolBinding:
+    public_name: str
+    server_name: str
+    server_alias: str
+    remote_name: str
+    description: str
+    input_schema: Dict[str, Any]
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -261,203 +282,144 @@ class MCPClient:
         self.http_client = httpx.AsyncClient(headers=headers)
         self.llm_config.headers = headers
 
-        self.instructions = "Ты ассистент, задача которого помогать пользователю в решении его задач."
-        self.available_tools = []
+        self.instructions = (
+            llm_config.instructions
+            or "Ты ассистент, задача которого — помогать пользователю решать его задачи."
+        )
+        self.server_runtimes: Dict[str, MCPServerRuntime] = {}
+        self.tool_registry: Dict[str, MCPToolBinding] = {}
+        self.available_tools: List[MCPToolBinding] = []
         
         # Настройки таймаутов
-        self.tool_call_timeout = 300.0  # Таймаут для вызова инструментов
-        self.llm_call_timeout = 300.0   # Таймаут для вызова LLM
+        self.tool_call_timeout = 120.0  # Таймаут для вызова инструментов
+        self.llm_call_timeout = 60.0   # Таймаут для вызова LLM
 
         # Память сессий
         self.sessions: Dict[str, SessionMemory] = {}
         self.session_states: Dict[str, SessionState] = {}
         self.max_history_messages = 24
-        
-    async def connect_to_server(self, server_config: ServerConfigType):
+    
+    async def _connect_executable_server(
+        self,
+        server_config: ServerConfigType,
+        server_name: str,
+        server_alias: str
+    ) -> MCPServerRuntime:
+        executable = server_config.executable
+
+        if not executable:
+            executable = find_python_executable()
+
+        executable_path = shutil.which(executable)
+        if not executable_path:
+            raise FileNotFoundError(f"Исполняемый файл не найден: {executable}")
+
+        env = server_config.env or {}
+        env.update({
+            "PYTHONIOENCODING": "utf-8",
+            "PYTHONUTF8": "1",
+            "PYTHONLEGACYWINDOWSSTDIO": "0",
+            "LC_ALL": "C.UTF-8",
+            "LANG": "C.UTF-8",
+        })
+
+        server_params = StdioServerParameters(
+            command=executable_path,
+            args=server_config.args or [],
+            env=env
+        )
+
+        exit_stack = AsyncExitStack()
+
+        stdio_transport = await exit_stack.enter_async_context(
+            stdio_client(server_params)
+        )
+
+        stdio, write = stdio_transport
+
+        session = await exit_stack.enter_async_context(
+            ClientSession(stdio, write)
+        )
+
+        await session.initialize()
+
+        response = await session.list_tools()
+        tools = response.tools
+
+        logger.info(
+            f"MCP-сервер {server_name} подключён. "
+            f"Инструменты: {[tool.name for tool in tools]}"
+        )
+
+        return MCPServerRuntime(
+            name=server_name,
+            alias=server_alias,
+            connect_type=server_config.connect_type,
+            session=session,
+            exit_stack=exit_stack,
+            tools=tools
+        )
+
+    async def _connect_single_server(self, server_config: ServerConfigType) -> MCPServerRuntime:
+        server_name = server_config.name or "unnamed"
+        server_alias = server_config.alias or server_name
+
+        logger.info(f"Подключение к MCP-серверу: {server_name}")
+
+        if server_config.connect_type == ServerConnectType.EXECUTABLE:
+            return await self._connect_executable_server(server_config, server_name, server_alias)
+
+        if server_config.connect_type == ServerConnectType.HTTP:
+            return await self._connect_http_server(server_config, server_name, server_alias)
+
+        if server_config.connect_type == ServerConnectType.MCP_LOOKUP:
+            return await self._connect_lookup_server(server_config, server_name, server_alias)
+
+        raise ValueError(f"Неизвестный тип подключения: {server_config.connect_type}")
+    
+    def _register_server_tools(self, runtime: MCPServerRuntime) -> None:
+        for tool in runtime.tools:
+            public_name = f"{runtime.alias}_{tool.name}"
+
+            if public_name in self.tool_registry:
+                raise ValueError(f"Конфликт имён инструментов: {public_name}")
+
+            binding = MCPToolBinding(
+                public_name=public_name,
+                server_name=runtime.name,
+                server_alias=runtime.alias,
+                remote_name=tool.name,
+                description=tool.description or "",
+                input_schema=tool.inputSchema or {}
+            )
+
+            self.tool_registry[public_name] = binding
+            self.available_tools.append(binding)
+
+    async def connect_to_servers(self, server_configs: List[ServerConfigType]):
         """
         Description:
         ---------------
-            Подключение к MCP серверу.
+            Подключение к MCP серверам.
             
         Args:
         ---------------
-            server_config: Конфигурация сервера
-            
-        Raises:
-        ---------------
-            FileNotFoundError: Если исполняемый файл не найден
-            ValueError: Если неверный тип подключения или отсутствует 
-                        обязательный параметр
+            server_configs (List[ServerConfigType]): Конфигурации серверов
         """
-        self.server_name = server_config.name
-        self.instructions = server_config.instructions
+        for server_config in server_configs:
+            if not server_config.enabled:
+                logger.info(f"Сервер {server_config.name} отключён, пропускаю")
+                continue
+
+            runtime = await self._connect_single_server(server_config)
+            self.server_runtimes[runtime.name] = runtime
+            self._register_server_tools(runtime)
+
         logger.info(
-            f"Подключение к серверу: {self.server_name}"
+            f"Подключено MCP-серверов: {list(self.server_runtimes.keys())}"
         )
-        
-        if server_config.connect_type == ServerConnectType.HTTP:
-            if not server_config.host or not server_config.port:
-                raise ValueError(
-                    "Для типа подключения HTTP необходимо указать хост и порт сервера"
-                )
-            
-            logger.info(f"Подключение к HTTP серверу: {server_config.host}:{server_config.port}")
-            
-            # Создаем HTTP-клиент
-            self.mcp_client = MCPHttpClient(server_config.host, server_config.port)
-            await self.mcp_client.initialize()
-            
-            # Получаем список доступных инструментов
-            response = await self.mcp_client.list_tools()
-            self.available_tools = response.tools
-            
-        elif server_config.connect_type == ServerConnectType.EXECUTABLE:
-            if not server_config.executable:
-                # Автоматически определяем Python
-                logger.info(
-                    "Исполняемый файл не указан, пытаемся определить "
-                    "Python автоматически"
-                )
-                server_config.executable = find_python_executable()
-                
-            # Проверяем, существует ли исполняемый файл
-            executable_path = shutil.which(server_config.executable)
-            if not executable_path:
-                raise FileNotFoundError(
-                    f"Исполняемый файл не найден: {server_config.executable}"
-                )
-            
-            logger.info(f"Исполняемый файл найден: {executable_path}")
-            
-            # Настройка переменных окружения для корректной работы с Unicode
-            env = server_config.env or {}
-            env.update({
-                'PYTHONIOENCODING': 'utf-8',
-                'PYTHONUTF8': '1',
-                'PYTHONLEGACYWINDOWSSTDIO': '0',
-                'LC_ALL': 'C.UTF-8',
-                'LANG': 'C.UTF-8'
-            })
-                
-            server_params = StdioServerParameters(
-                command=executable_path,
-                args=server_config.args,
-                env=env  # Используем обновленные переменные окружения
-            )
-            
-            logger.info(
-                f"Запуск сервера: {executable_path} "
-                f"{' '.join(server_config.args)}"
-            )
-            try:
-                stdio_transport = await self.exit_stack.enter_async_context(
-                    stdio_client(server_params)
-                )
-            except FileNotFoundError as e:
-                raise FileNotFoundError(
-                    f"Ошибка при запуске сервера: {str(e)}\n"
-                    f"Проверьте путь к исполняемому файлу и аргументы."
-                )
-            
-            # Инициализация сессии для stdio
-            self.stdio, self.write = stdio_transport
-            self.session = await self.exit_stack.enter_async_context(
-                ClientSession(self.stdio, self.write)
-            )
-            await self.session.initialize()
-
-            # Получаем список доступных инструментов
-            response = await self.session.list_tools()
-            self.available_tools = response.tools
-                
-        elif server_config.connect_type == ServerConnectType.MCP_LOOKUP:
-            if not server_config.name:
-                raise ValueError(
-                    "Для типа подключения MCP_LOOKUP необходимо "
-                    "указать имя сервера"
-                )
-                
-            # Поиск сервера в конфигурации Claude Desktop или MCP-клиента
-            config_paths = [
-                Path.home() / ".config" / "mcp" / "config.json"
-            ]
-            
-            server_found = False
-            for config_path in config_paths:
-                if config_path.exists():
-                    logger.info(f"Найдена конфигурация MCP: {config_path}")
-                    try:
-                        with open(config_path, 'r', encoding='utf-8') as f:
-                            config = json.load(f)
-                            
-                        if ("mcpServers" in config and 
-                                server_config.name in config["mcpServers"]):
-                            server_info = config["mcpServers"][
-                                server_config.name
-                            ]
-                            command = server_info.get("command")
-                            
-                            # Проверяем наличие команды
-                            command_path = shutil.which(command)
-                            if not command_path:
-                                logger.warning(
-                                    f"Команда '{command}' не найдена, "
-                                    f"пытаемся определить Python автоматически"
-                                )
-                                command = find_python_executable()
-                            
-                            server_params = StdioServerParameters(
-                                command=command,
-                                args=server_info.get("args", []),
-                                env=server_info.get("env", {})
-                            )
-                            
-                            logger.info(
-                                f"Используется сервер из конфигурации: "
-                                f"{server_config.name}"
-                            )
-                            try:
-                                stdio_transport = (
-                                    await self.exit_stack.enter_async_context(
-                                        stdio_client(server_params)
-                                    )
-                                )
-                                # Инициализация сессии для stdio
-                                self.stdio, self.write = stdio_transport
-                                self.session = await self.exit_stack.enter_async_context(
-                                    ClientSession(self.stdio, self.write)
-                                )
-                                await self.session.initialize()
-
-                                # Получаем список доступных инструментов
-                                response = await self.session.list_tools()
-                                self.available_tools = response.tools
-                                server_found = True
-                                break
-                            except FileNotFoundError as e:
-                                logger.error(
-                                    f"Ошибка при запуске сервера из "
-                                    f"конфигурации: {str(e)}"
-                                )
-                    except Exception as e:
-                        logger.error(
-                            f"Ошибка при чтении конфигурации {config_path}: {e}"
-                        )
-                        
-            if not server_found:
-                raise ValueError(
-                    f"Сервер с именем '{server_config.name}' не найден "
-                    f"в конфигурации MCP или не удалось запустить"
-                )
-                
-        else:
-            raise ValueError(
-                f"Неизвестный тип подключения: {server_config.connect_type}"
-            )
-        
         logger.info(
-            f"Подключено к серверу. Доступные инструменты: "
-            f"{[tool.name for tool in self.available_tools]}"
+            f"Доступные инструменты: {list(self.tool_registry.keys())}"
         )
     
     async def list_tools(self):
@@ -471,6 +433,40 @@ class MCPClient:
             Список доступных инструментов
         """
         return self.available_tools
+    
+    async def _call_registered_tool(
+        self,
+        public_tool_name: str,
+        arguments: Dict[str, Any]
+    ):
+        binding = self.tool_registry.get(public_tool_name)
+
+        if binding is None:
+            raise ValueError(f"Неизвестный инструмент: {public_tool_name}")
+
+        runtime = self.server_runtimes.get(binding.server_name)
+
+        if runtime is None:
+            raise RuntimeError(
+                f"Сервер для инструмента {public_tool_name} не подключён: "
+                f"{binding.server_name}"
+            )
+
+        if runtime.session is not None:
+            return await runtime.session.call_tool(
+                binding.remote_name,
+                arguments
+            )
+
+        if runtime.http_client is not None:
+            return await runtime.http_client.call_tool(
+                binding.remote_name,
+                arguments
+            )
+
+        raise RuntimeError(
+            f"У сервера {binding.server_name} нет активного клиента"
+        )
         
     async def process_query(self, query: str, session_id: str = "default") -> AgentResult:
         """
@@ -611,19 +607,10 @@ class MCPClient:
                             logger.debug(f"Аргументы инструмента {tool_name}: {arguments}")
                             
                             # Вызываем инструмент через соответствующий клиент с таймаутом
-                            if hasattr(self, "mcp_client"):
-                                # Для HTTP-клиента
-                                result = await asyncio.wait_for(
-                                    self.mcp_client.call_tool(tool_name, arguments),
-                                    timeout=self.tool_call_timeout
-                                )
-                            else:
-                                # Для stdio-клиента
-                                result = await asyncio.wait_for(
-                                    self.session.call_tool(tool_name, arguments),
-                                    timeout=self.tool_call_timeout
-                                )
-                                logger.debug(f"Ответ от stdio-клиента: {result}")
+                            result = await asyncio.wait_for(
+                                self._call_registered_tool(tool_name, arguments),
+                                timeout=self.tool_call_timeout
+                            )
                             
                             # Преобразуем результат в текст
                             tool_result = self._format_tool_result(result.content)
@@ -809,15 +796,20 @@ class MCPClient:
         Returns:
         ---------------
             List[Dict[str, Any]]: Список описания инструментов
-        """        
-        tools_description = [
-            {
-                'name': tool.name,
-                'description': re.sub(r' {2,}', ' ', re.sub(r'\n|\t|-{5,}', ' ', tool.description)).strip(),
-                'inputSchema': tool.inputSchema
-            }
-            for tool in self.available_tools
-        ]
+        """
+        tools_description = []
+
+        for binding in self.available_tools:
+            tools_description.append({
+                "name": binding.public_name,
+                "server": binding.server_alias,
+                "description": re.sub(
+                    r" {2,}",
+                    " ",
+                    re.sub(r"\n|\t|-{5,}", " ", binding.description)
+                ).strip(),
+                "inputSchema": binding.input_schema
+            })
 
         return tools_description
     
@@ -833,14 +825,11 @@ class MCPClient:
         """
         llm_tools = []
         
-        for tool in self.available_tools:
-            # Преобразуем схему инструмента в формат, понятный LLM
-            input_schema = tool.inputSchema or {}
-            
+        for binding in self.available_tools:
             function_spec = {
-                "name": tool.name,
-                "description": tool.description,
-                "parameters": input_schema
+                "name": binding.public_name,
+                "description": binding.description,
+                "parameters": binding.input_schema
             }
             
             llm_tools.append({
@@ -1070,24 +1059,28 @@ class MCPClient:
         try:
             await self.http_client.aclose()
         except Exception:
-            pass  # Игнорируем ошибки закрытия HTTP-клиента
-        
-        if hasattr(self, "mcp_client"):
-            try:
-                await self.mcp_client.close()
-            except Exception:
-                pass  # Игнорируем ошибки закрытия MCP-клиента
-        
-        if hasattr(self, "exit_stack"):
-            try:
-                await self.exit_stack.aclose()
-            except Exception as e:
-                logger.error(f"Ошибка при закрытии соединения: {e}")
-            finally:
-                # Гарантируем очистку ресурсов
-                self.exit_stack = None
+            pass
 
-        logger.info(f"Соединение с {self.server_name} закрыто")
+        for runtime in self.server_runtimes.values():
+            if runtime.http_client is not None:
+                try:
+                    await runtime.http_client.close()
+                except Exception:
+                    pass
+
+            if runtime.exit_stack is not None:
+                try:
+                    await runtime.exit_stack.aclose()
+                except Exception as e:
+                    logger.error(
+                        f"Ошибка при закрытии MCP-сервера {runtime.name}: {e}"
+                    )
+
+        self.server_runtimes.clear()
+        self.tool_registry.clear()
+        self.available_tools.clear()
+
+        logger.info("Все MCP-серверы отключены")
 
     def _get_or_create_session(
         self,
@@ -1248,7 +1241,7 @@ class MCPClient:
         final_text.append(message)
 
 
-def load_config(config_path: str) -> Tuple[ServerConfigType, LLMConfigType]:
+def load_config(config_path: str) -> Tuple[List[ServerConfigType], LLMConfigType]:
     """
     Description:
     ---------------
@@ -1256,11 +1249,11 @@ def load_config(config_path: str) -> Tuple[ServerConfigType, LLMConfigType]:
         
     Args:
     ---------------
-        config_path: Путь к файлу конфигурации
+        config_path (str): Путь к файлу конфигурации
         
     Returns:
     ---------------
-        Tuple[ServerConfig, LLMConfig]: Конфигурации для сервера и LLM
+        Tuple[List[ServerConfigType], LLMConfigType]: Конфигурации серверов и LLM
         
     Raises:
         ImportError: Если требуется YAML, но библиотека не установлена
@@ -1268,67 +1261,99 @@ def load_config(config_path: str) -> Tuple[ServerConfigType, LLMConfigType]:
         Exception: При ошибке загрузки конфигурации
         
     Examples:
-        >>> server_config, llm_config = load_config("config.json")
+        >>> server_configs, llm_config = load_config("config.json")
     """
     try:
-        with open(config_path, 'r', encoding='utf-8') as f:
+        with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
-        
-        # Загрузка конфигурации сервера
-        server_config_data = config.get('server', {})
-        server_connect_type = ServerConnectType(
-            server_config_data.get('connect_type', 'executable')
-        )
-        
-        if server_connect_type == ServerConnectType.HTTP:
-            server_config = ServerConfigType(
-                connect_type=server_connect_type,
-                host=server_config_data.get('host', '127.0.0.1'),
-                port=server_config_data.get('port', 8080)
-            )
+
+        # === Загрузка MCP-серверов ===
+
+        if "servers" in config:
+            servers_data = config.get("servers") or []
+        elif "server" in config:
+            # Обратная совместимость со старым конфигом
+            servers_data = [config.get("server") or {}]
         else:
-            # Обработка пути к исполняемому файлу
-            executable = server_config_data.get('executable')
+            raise ValueError("В конфиге нет ни 'servers', ни 'server'")
+
+        if not isinstance(servers_data, list):
+            raise ValueError("Поле 'servers' должно быть списком")
+
+        server_configs: List[ServerConfigType] = []
+
+        for index, server_data in enumerate(servers_data):
+            if not isinstance(server_data, dict):
+                raise ValueError(
+                    f"Описание MCP-сервера #{index + 1} должно быть объектом"
+                )
+
+            connect_type = ServerConnectType(
+                server_data.get("connect_type", ServerConnectType.EXECUTABLE)
+            )
+
+            name = server_data.get("name") or f"server_{index + 1}"
+            alias = server_data.get("alias") or name
+
+            executable = server_data.get("executable")
+
+            # Небольшой фикс для macOS, если когда-нибудь пригодится
             if executable == "python" and sys.platform == "darwin":
-                # На macOS автоматически используем python3
                 logger.info("Обнаружена macOS, меняем 'python' на 'python3'")
                 executable = "python3"
-            
+
             server_config = ServerConfigType(
-                connect_type=server_connect_type,
-                name=server_config_data.get('name'),
+                name=name,
+                alias=alias,
+                connect_type=connect_type,
                 executable=executable,
-                args=server_config_data.get('args', []),
-                env=server_config_data.get('env', {}),
-                instructions=server_config_data.get('instructions')
+                args=server_data.get("args", []),
+                env=server_data.get("env", {}),
+                host=server_data.get("host"),
+                port=server_data.get("port"),
+                enabled=server_data.get("enabled", True)
             )
-        
-        # Загрузка конфигурации LLM
-        llm_config_data = config.get('llm', {})
-        
-        # Проверяем наличие API ключа в переменных окружения
-        api_key = llm_config_data.get('api_key')
+
+            server_configs.append(server_config)
+
+        if not server_configs:
+            raise ValueError("Список MCP-серверов пуст")
+
+        enabled_servers = [server for server in server_configs if server.enabled]
+
+        if not enabled_servers:
+            raise ValueError("Нет включённых MCP-серверов: enabled=true")
+
+        # === Загрузка LLM ===
+
+        llm_data = config.get("llm", {})
+
+        api_key = llm_data.get("api_key")
+
         if not api_key:
-            """
             api_key = os.environ.get("LLM_API_KEY", "")
+
             if api_key:
-                logger.info("Использую API ключ из переменной окружения LLM_API_KEY")
-            """
-            logger.warning("Не указан api key в конфигурации LLM")
-        
+                logger.info("Использую API-ключ LLM из переменной LLM_API_KEY")
+            else:
+                logger.warning("Не указан api_key для LLM")
+
         llm_config = LLMConfigType(
-            api_url=llm_config_data.get('api_url', ''),
+            api_url=llm_data.get("api_url", ""),
             api_key=api_key,
-            model=llm_config_data.get('model', 'default'),
-            is_openai_compatible=llm_config_data.get(
-                'is_openai_compatible', True
-            ),
-            max_tokens=llm_config_data.get('max_tokens', 1000),
-            temperature=llm_config_data.get('temperature', 0.7)
+            model=llm_data.get("model", "default"),
+            headers=llm_data.get("headers"),
+            is_openai_compatible=llm_data.get("is_openai_compatible", True),
+            max_tokens=llm_data.get("max_tokens", 1000),
+            temperature=llm_data.get("temperature", 0.7),
+            instructions=llm_data.get("instructions")
         )
-        
-        return server_config, llm_config
-    
+
+        if not llm_config.api_url:
+            raise ValueError("В конфиге LLM не указан api_url")
+
+        return server_configs, llm_config
+
     except Exception as e:
-        logger.error(f"Ошибка при загрузке конфигурации: {e}")
+        logger.error(f"Ошибка при загрузке конфигурации: {type(e).__name__}: {e!r}")
         raise
