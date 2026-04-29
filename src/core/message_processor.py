@@ -71,10 +71,14 @@ class MessageProcessor:
             )
         
     def _build_session_id(self, message: UnifiedMessage) -> str:
-        """Строит идентификатор сессии. Для Telegram лучше привязывать память к chat_id."""
+        """Строит идентификатор сессии"""
         metadata = message.metadata or {}
-        chat_id = metadata.get("chat_id")
 
+        session_id = metadata.get("session_id")
+        if session_id is not None:
+            return f"{message.client_type.value}:session:{session_id}"
+
+        chat_id = metadata.get("chat_id")
         if chat_id is not None:
             return f"{message.client_type.value}:chat:{chat_id}"
 

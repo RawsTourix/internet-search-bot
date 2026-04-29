@@ -1,15 +1,18 @@
 import os
+import uuid
 import logging
 import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status, Depends
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 
 from .adapters.telegram_adapter import TelegramAdapter
+from .adapters.web_adapter import WebAdapter
 from .core.message_processor import MessageProcessor
-from .core.models import UnifiedMessage, ClientType
+from .core.models import UnifiedMessage, WebMessage, MessageType, ClientType
 from .api.api import API
 
 from dotenv import load_dotenv
@@ -85,6 +88,7 @@ async def api_key_auth(api_key: str = Depends(API_KEY_HEADER)):
 # Инициализация компонентов
 message_processor = MessageProcessor()
 telegram_adapter = TelegramAdapter(message_processor)
+web_adapter = WebAdapter(message_processor)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -92,6 +96,7 @@ async def lifespan(app: FastAPI):
     logger.info("Запуск Multi-Protocol Gateway...")
     await asyncio.gather(
         telegram_adapter.initialize(),
+        web_adapter.initialize(),
         API.start()
     )
     logger.info("Gateway успешно запущен")
@@ -101,6 +106,7 @@ async def lifespan(app: FastAPI):
     logger.info("Остановка Gateway...")
     await asyncio.gather(
         telegram_adapter.shutdown(),
+        web_adapter.shutdown(),
         API.stop()
     )
 
@@ -117,7 +123,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
     allow_credentials=True,
-    allow_methods=["POST", "GET"],
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
@@ -131,14 +137,56 @@ async def unified_message_handler(message: UnifiedMessage):
     try:
         processor = {
             ClientType.TELEGRAM: telegram_adapter.handle_unified_message,
+            ClientType.WEB: web_adapter.handle_unified_message,
         }[message.client_type]
         
         response = await processor(message)
-        return {"status": "ok", "response": response.content}
+        return {"status": "ok",
+                "response": response.content,
+                "metadata": response.metadata}
     except KeyError:
         raise HTTPException(status_code=400, detail="Unsupported client type")
     except Exception as e:
         logger.exception(f"Ошибка обработки сообщения: {e}")
+        raise HTTPException(status_code=500, detail="Internal server error")
+
+##########################
+## WEB MESSAGE ENDPOINT ##
+##########################
+
+@app.post("/web/message")
+async def web_message_handler(message: WebMessage):
+    """Эндпоинт для веб-интерфейса."""
+    try:
+        session_id = message.session_id or str(uuid.uuid4())
+
+        unified_message = UnifiedMessage(
+            id=str(uuid.uuid4()),
+            timestamp=datetime.now(),
+            client_type=ClientType.WEB,
+            message_type=message.message_type or MessageType.TEXT,
+            content=message.content,
+            user_id=message.user_id,
+            user_name=None,
+            metadata={
+                "session_id": session_id
+            }
+        )
+
+        response = await web_adapter.handle_unified_message(unified_message)
+
+        return JSONResponse(
+            content={
+                "status": "ok",
+                "response": response.content,
+                "session_id": session_id,
+                "metadata": response.metadata
+            },
+            media_type="application/json; charset=utf-8"
+        )
+
+    except Exception as e:
+        logger.exception(f"Ошибка обработки web-сообщения: {e}")
         raise HTTPException(status_code=500, detail="Internal server error")
 
 #################################
@@ -153,6 +201,7 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "adapters": {
             "telegram": await telegram_adapter.health_check(),
+            "web": await web_adapter.health_check(),
         }
     }
 
