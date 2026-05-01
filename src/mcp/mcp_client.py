@@ -21,7 +21,7 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.types import TextContent
 
-from ..core.models import AgentStatus, AgentResult
+from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import LLMError, LLMHTTPError, LLMTimeoutError, LLMTransportError
 
 # Модели
@@ -292,12 +292,12 @@ class MCPClient:
         self.available_tools: List[MCPToolBinding] = []
         
         # Настройки таймаутов
-        self.tool_call_timeout = 120.0  # Таймаут для вызова инструментов
-        self.llm_call_timeout = 60.0   # Таймаут для вызова LLM
+        self.tool_call_timeout = 240.0  # Таймаут для вызова инструментов
+        self.llm_call_timeout = 120.0   # Таймаут для вызова LLM
 
         # Настройка повторных запросов
-        self.llm_max_retries = 3
-        self.llm_retry_base_delay = 5.0
+        self.llm_max_retries = 4
+        self.llm_retry_base_delay = 10.0
         self.llm_retry_max_delay = 60.0
 
         self.llm_retryable_http_statuses = {429, 500, 502, 503, 504}
@@ -475,8 +475,72 @@ class MCPClient:
         raise RuntimeError(
             f"У сервера {binding.server_name} нет активного клиента"
         )
-        
-    async def process_query(self, query: str, session_id: str = "default") -> AgentResult:
+    
+    async def _force_final_answer(
+        self,
+        messages: list[dict],
+        *,
+        context: str = "Forced final answer"
+    ) -> str:
+        """
+        Просит LLM сформировать финальный ответ, если модель завершила задачу
+        только маркером [AGENT_STATUS=DONE] без содержательного текста.
+        """
+
+        final_prompt = {
+            "role": "user",
+            "content": (
+                "Ты завершил задачу, но не дал пользователю содержательный ответ. "
+                "На основе всей истории диалога и результатов инструментов сформируй полный финальный ответ пользователю. "
+                "Не вызывай больше инструменты. "
+                "Ответ должен быть полезным, структурированным и содержать результат выполненной работы. "
+                "В конце добавь маркер [AGENT_STATUS=DONE]."
+            )
+        }
+
+        # Важно: не загрязняем основную историю
+        probe_messages = messages + [final_prompt]
+
+        # Лучше вызвать LLM без инструментов, чтобы она не ушла снова в browser_close/tabs
+        final_response = await self._call_llm_with_retries(
+            probe_messages,
+            [],
+            context=context
+        )
+
+        content = final_response.get("content", "") or ""
+        return self._strip_agent_markers(content).strip()
+    
+    def _client_instructions(self, client_type: str | None) -> str:
+        if client_type == ClientType.TELEGRAM:
+            return "\n".join([
+                "Контекст клиента:",
+                "- Текущий клиент: Telegram.",
+                "- Ответ будет читаться в мессенджере, часто на телефоне.",
+                "- Не используй Markdown-таблицы, ASCII-схемы, многострочные схемы и выравнивание пробелами.",
+                "- Для архитектуры используй только короткие строки со стрелками без второй строки и без псевдографики.",
+                "- Для сравнений используй списки по пунктам.",
+                "- Для архитектуры используй формат: Компонент → Компонент → Компонент.",
+                "- Кодовые блоки только короткие, до 20 строк.",
+            ])
+
+        if client_type == ClientType.WEB:
+            return "\n".join([
+                "Контекст клиента:",
+                "- Текущий клиент: Web.",
+                "- Можно использовать полноценный Markdown, таблицы и более длинные кодовые блоки.",
+            ])
+
+        return "\n".join([
+            "Контекст клиента:",
+            "- Клиент неизвестен. Используй компактный универсальный Markdown без широких таблиц и ASCII-схем.",
+        ])
+
+    async def process_query(
+        self, query: str,
+        session_id: str = "default",
+        client_type: ClientType | None = None
+    ) -> AgentResult:
         """
         Description:
         ---------------
@@ -507,7 +571,7 @@ class MCPClient:
             state.awaiting_user_input = False
 
             # Составляем системное сообщение с инструкциями
-            system_message = self._create_system_message()
+            system_message = self._create_system_message(client_type)
 
             # Инициализируем диалог
             session = self._get_or_create_session(session_id, system_message)
@@ -539,46 +603,55 @@ class MCPClient:
                     
                     # Добавляем текстовый ответ
                     if content:
-                        logger.info(f"Получен текстовый ответ от модели: {content}")
-                        final_text.append(content)
+                        logger.info(
+                            f"Получен текстовый ответ от модели:"
+                            f"{content}"
+                        )
                     
                     if not tool_calls:
                         cleaned_content = self._strip_agent_markers(content) if content else ""
                         agent_status = self._extract_agent_status(content) if content else None
 
+                        # Если маркера нет — пробуем получить только статус
                         if agent_status is None:
-                            logger.error("Отсутсвует маркер статуса! Пробуем повторно спросить его у LLM.")
+                            logger.error(
+                                "Отсутствует маркер статуса! Пробуем повторно спросить его у LLM."
+                            )
+
                             marker_prompt = (
                                 "Определи статус предыдущего ответа. "
                                 "Верни только один маркер без пояснений: "
                                 "[AGENT_STATUS=WAITING_USER] или [AGENT_STATUS=CONTINUE] или [AGENT_STATUS=DONE]."
                             )
-                            messages.append({"role": "user", "content": marker_prompt})
 
-                            logger.debug(f"Сообщения для LLM: {messages}")
+                            # Важно: НЕ добавляем marker_prompt в основную историю messages
+                            probe_messages = messages.copy()
+
+                            if content:
+                                probe_messages.append({
+                                    "role": "assistant",
+                                    "content": content
+                                })
+
+                            probe_messages.append({
+                                "role": "user",
+                                "content": marker_prompt
+                            })
+
+                            logger.debug(f"Сообщения для подтверждения маркера статуса: {probe_messages}")
 
                             llm_response = await self._call_llm_with_retries(
-                                marker_prompt,
+                                probe_messages,
                                 tools,
-                                context=f"Marker repair на итерации {i + 1}"
+                                context=f"Подтверждение маркера статуса на итерации {i + 1}"
                             )
-                            logger.debug(f"Получен ответ от модели: {llm_response}")
+
+                            logger.debug(f"Получен ответ от модели после подтверждения маркера статуса: {llm_response}")
 
                             marker = llm_response.get("content", "")
-                            agent_status = self._extract_agent_status(marker) if marker else AgentStatus.ERROR
+                            agent_status = self._extract_agent_status(marker) if marker else None
 
-                            if agent_status is AgentStatus.ERROR:
-                                state.status = AgentStatus.ERROR
-                                state.last_error = "LLM response missing AGENT_STATUS marker"
-                                cleaned_content = self._strip_agent_markers(content) if content else ""
-                                if cleaned_content:
-                                    messages.append({
-                                        "role": "assistant",
-                                        "content": cleaned_content
-                                    })
-                                final_text = [cleaned_content or "Ошибка на стороне LLM. Ответ модели не содержит обязательный маркер статуса."]
-                                break
-                        
+                        # Fallback, если модель всё равно не дала статус
                         if agent_status is None:
                             logger.warning(
                                 "LLM не вернула маркер статуса даже после повторного запроса. "
@@ -595,6 +668,7 @@ class MCPClient:
                                 )
                                 break
 
+                        # Если есть нормальный текст — сохраняем его
                         if cleaned_content:
                             messages.append({
                                 "role": "assistant",
@@ -604,8 +678,63 @@ class MCPClient:
                         state.status = agent_status
                         state.awaiting_user_input = agent_status == AgentStatus.WAITING_USER
 
-                        logger.info(f"Нет вызовов инструментов, завершаем обработку со статусом {agent_status}")
-                        final_text = [cleaned_content] if cleaned_content else ["Пустой ответ."]
+                        logger.info(
+                            f"Нет вызовов инструментов, завершаем обработку со статусом {agent_status}"
+                        )
+
+                        # Нормальный финальный ответ
+                        if cleaned_content:
+                            final_text = [cleaned_content]
+
+                        # DONE без текста — принудительно просим финальный ответ
+                        elif agent_status == AgentStatus.DONE:
+                            logger.warning(
+                                "LLM вернула DONE без содержательного ответа. "
+                                "Пробуем принудительно получить финальный ответ."
+                            )
+
+                            try:
+                                forced_answer = await self._force_final_answer(
+                                    messages,
+                                    context=f"Forced final answer на итерации {i + 1}"
+                                )
+
+                                if forced_answer:
+                                    final_text = [forced_answer]
+                                    messages.append({
+                                        "role": "assistant",
+                                        "content": forced_answer
+                                    })
+                                else:
+                                    self._finish_with_error(
+                                        state,
+                                        final_text,
+                                        "LLM завершила задачу, но не сформировала финальный ответ."
+                                    )
+
+                            except Exception as e:
+                                self._finish_with_error(
+                                    state,
+                                    final_text,
+                                    (
+                                        "Не удалось получить финальный ответ после пустого DONE: "
+                                        f"{type(e).__name__}: {e!r}"
+                                    ),
+                                    log_exception=True
+                                )
+
+                        elif agent_status == AgentStatus.WAITING_USER:
+                            final_text = [
+                                "Нужен ответ пользователя, но модель не сформулировала вопрос."
+                            ]
+
+                        else:
+                            self._finish_with_error(
+                                state,
+                                final_text,
+                                "LLM не вернула содержательный ответ."
+                            )
+
                         break
                     
                     # Обрабатываем вызовы инструментов
@@ -745,7 +874,15 @@ class MCPClient:
                 state.status = AgentStatus.ERROR
                 state.last_error = f"Достигнут лимит итераций: {self.max_iterations}"
             
-            result_text = final_text[-1] if final_text else "Пустой ответ."
+            if not final_text:
+                self._finish_with_error(
+                    state,
+                    final_text,
+                    "Агент завершил обработку, но не сформировал содержательный ответ."
+                )
+
+            result_text = final_text[-1]
+
             self._trim_session_messages(session)
 
             if state.status == AgentStatus.RUNNING:
@@ -797,7 +934,10 @@ class MCPClient:
             [item.text for item in content_list if hasattr(item, 'text')]
         )
     
-    def _create_system_message(self) -> str:
+    def _create_system_message(
+        self,
+        client_type: ClientType | None = None
+    ) -> str:
         """
         Description:
         ---------------
@@ -810,18 +950,71 @@ class MCPClient:
         
         return (
             f"{self.instructions}\n\n"
-            "Правила агентного режима:\n"
-            "1. Если тебе нужен ответ или действие пользователя, заканчивай ответ маркером [AGENT_STATUS=WAITING_USER]\n"
-            "2. Если нужно продолжать работу через инструменты, используй [AGENT_STATUS=CONTINUE]\n"
-            "3. Если задача завершена, заканчивай ответ маркером [AGENT_STATUS=DONE]\n"
-            "4. Никогда не пропускай маркер статуса\n"
-            "5. Если ты вызвал инструмент и получил результат, обязательно сформируй ответ пользователю "
-            "на основе результата инструмента.\n\n"
-            f"У тебя есть доступ к следующим инструментам:\n{self._tools_description()}\n\n"
-            "Прежде чем ответить, оцени неопределённость своего ответа.\n"
-            "Если она больше 0.1, задай мне уточняющие вопросы, пока она не станет 0.1 или ниже.\n\n"
-            "Перед финальным ответом проверяй команды, имена инструментов, "
-            "URL и названия пакетов по найденному источнику. Не изменяй символы в командах."
+            f"{self._client_instructions(client_type)}\n\n"
+
+            "Ты работаешь в режиме ИИ-агента с доступом к MCP-инструментам.\n"
+            "Твоя задача — помогать пользователю эффективно: понимать запрос, выбирать подходящие инструменты, "
+            "использовать их экономно и формировать полезный итоговый ответ.\n\n"
+
+            "Статусы агентного режима:\n"
+            "1. Если задача завершена и пользователь получил итоговый ответ, закончи текст маркером [AGENT_STATUS=DONE].\n"
+            "2. Если для продолжения нужен ответ, выбор, подтверждение или недостающие данные от пользователя, "
+            "закончи текст маркером [AGENT_STATUS=WAITING_USER].\n"
+            "3. Если ты возвращаешь текстовый ответ без вызова инструментов, маркер статуса обязателен.\n"
+            "4. Если ты вызываешь инструмент через tool_call, не нужно добавлять маркер статуса в content этого tool_call-сообщения.\n"
+            "5. После получения результатов инструментов обязательно либо вызови следующий нужный инструмент, "
+            "либо сформируй итоговый ответ пользователю с маркером [AGENT_STATUS=DONE].\n"
+            "6. Никогда не возвращай только маркер статуса без содержательного ответа, если задача уже выполнена.\n\n"
+
+            "Доступные инструменты:\n"
+            f"{self._tools_description()}\n\n"
+
+            "Правила выбора инструментов:\n"
+            "1. Используй только те инструменты, которые перечислены выше. Не выдумывай имена инструментов.\n"
+            "2. Имена инструментов, параметры, URL, команды и названия пакетов передавай точно, без изменения символов.\n"
+            "3. Если пользователь явно просит использовать браузер, используй browser-инструменты. "
+            "web_search можно применять только для поиска правильного URL или дополнительного источника, "
+            "после чего нужно вернуться к браузеру, если задача требует браузерной проверки.\n"
+            "4. Используй web_search для быстрого поиска источников, новостей, документации и актуальной информации.\n"
+            "5. Используй browser-инструменты, когда нужно открыть страницу, прочитать её фактическое содержимое, "
+            "работать с динамическим сайтом, переходить по ссылкам или проверять интерфейс.\n"
+            "6. Используй специализированные MCP-серверы, если они лучше подходят задаче, чем общий поиск или браузер.\n"
+            "7. Если подключены пользовательские MCP-серверы, опирайся на их названия, описания и схемы параметров. "
+            "Не делай предположений о возможностях сервера сверх того, что указано в описании инструментов.\n\n"
+
+            "Экономичная агентная работа:\n"
+            "1. Перед использованием инструмента коротко оцени, действительно ли он нужен.\n"
+            "2. Не вызывай инструменты без необходимости, если данных уже достаточно для ответа.\n"
+            "3. Не повторяй один и тот же неудачный вызов инструмента с теми же параметрами.\n"
+            "4. Если инструмент вернул ошибку selector / element not found / strict mode violation / 404, "
+            "измени стратегию: используй snapshot, evaluate, поиск правильного URL или другой подход.\n"
+            "5. Если страница уже дала нужную информацию, не продолжай навигацию ради полноты без явной необходимости.\n"
+            "6. Не закрывай браузер вручную, если пользователь не просил закрыть браузер или завершить браузерную сессию.\n"
+            "7. Для длинных задач двигайся по этапам: найти источник → извлечь данные → проверить главное → сформировать ответ.\n"
+            "8. Если задача становится слишком широкой, выполни полезную разумную часть и ясно укажи границы результата.\n\n"
+
+            "Безопасность и подтверждения:\n"
+            "1. Не выполняй действия, которые могут изменить данные пользователя, отправить форму, удалить файл, купить товар, "
+            "опубликовать сообщение, отправить письмо или выполнить команду в системе, без явного подтверждения пользователя.\n"
+            "2. Разрешены безопасные read-only действия: поиск, чтение публичных страниц, открытие документации, анализ текста, "
+            "просмотр расписания и получение справочной информации.\n"
+            "3. Если действие потенциально необратимое или затрагивает приватные данные, сначала объясни действие и запроси подтверждение.\n\n"
+
+            "Работа с неопределённостью:\n"
+            "1. Если информации достаточно для разумного ответа, отвечай без лишних уточнений.\n"
+            "2. Если неопределённость можно снизить с помощью доступных инструментов, используй инструменты.\n"
+            "3. Если без уточнения пользователя задача может быть выполнена неправильно, опасно или не туда, "
+            "закончи вопросом и маркером [AGENT_STATUS=WAITING_USER].\n"
+            "4. Ясно отделяй подтверждённые факты от предположений.\n\n"
+
+            "Финальный ответ:\n"
+            "1. Отвечай на языке пользователя.\n"
+            "2. Соблюдай формат, который попросил пользователь: Markdown, список, таблица, краткий отчёт, кодовый блок и т.д.\n"
+            "3. Если пользователь просит кратко, отвечай компактно и не добавляй лишние разделы.\n"
+            "4. Если использовались инструменты, формируй ответ на основе их результатов, а не по памяти.\n"
+            "5. Не утверждай точное количество инструментов, функций, версий или возможностей, если это не было проверено источником "
+            "или списком доступных инструментов.\n"
+            "6. В конце финального текстового ответа обязательно добавь маркер [AGENT_STATUS=DONE]."
         )
     
     def _tools_description(self) -> List[Dict[str, Any]]:
@@ -1165,8 +1358,9 @@ class MCPClient:
                     break
 
                 print("Обработка запроса...")
-                response = await self.process_query(query)
-                #print("\nФинальный ответ: " + response)
+                response = await self.process_query(
+                    query=query
+                )
 
             except Exception as e:
                 print(f"\nОшибка: {str(e)}")

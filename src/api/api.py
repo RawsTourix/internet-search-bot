@@ -5,7 +5,7 @@ from logging.handlers import RotatingFileHandler
 # Импорт модулей
 from .config import HTTP_PROXY, HTTPS_PROXY, AGENT_CONFIG_PATH
 from ..mcp.mcp_client import MCPClient, load_config
-from ..core.models import AgentStatus, AgentResult
+from ..core.models import ClientType, AgentStatus, AgentResult
 
 # Настройка прокси
 os.environ['http_proxy'] = HTTP_PROXY
@@ -64,19 +64,25 @@ class Api:
         except Exception as e:
             logger.critical(f"Ошибка подключения к MCP-серверам: {e}")
 
-    async def call_agent(self, message: str, session_id: str = "default") -> AgentResult:
+    async def call_agent(
+        self, message: str,
+        session_id: str = "default",
+        client_type: ClientType | None = None
+    ) -> AgentResult:
         """Обращение к MCP-клиенту"""
         try:
             if not await self.mcp_client.list_tools():
                 logger.warning("Нет зарегистрированных инструментов")
 
-            logger.info("Вызов главного бота")
+            logger.info("Вызов ИИ-агента")
             logger.debug(f"message: {message}")
             logger.debug(f"session_id: {session_id}")
+            logger.debug(f"client_type: {client_type}")
 
             agent_result = await self.mcp_client.process_query(
                 message,
-                session_id=session_id
+                session_id=session_id,
+                client_type=client_type
             )
             logger.info("Ответ получен")
             return agent_result

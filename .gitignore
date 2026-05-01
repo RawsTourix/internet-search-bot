@@ -15,8 +15,10 @@ __pycache__/
 *.log
 
 # Тестирование отдельных компонентов
-*test.py
+test/
 
 # Временные элементы MCP-серверов
-.playwright-mcp
-playwright_docs.md
+*playwright*
+
+# Файлы агента
+file/

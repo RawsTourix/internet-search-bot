@@ -94,9 +94,11 @@ class MessageProcessor:
         elif message.message_type == MessageType.TEXT:
             try:
                 session_id = self._build_session_id(message)
+                client_type = message.client_type
                 agent_result  = await API.call_agent(
                     message.content,
-                    session_id=session_id
+                    session_id=session_id,
+                    client_type=client_type
                 )
                 response_content = agent_result.content
                 response_metadata = {

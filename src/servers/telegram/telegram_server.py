@@ -3,6 +3,7 @@ import re
 import httpx
 import asyncio
 import uuid
+import html
 import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status
@@ -51,7 +52,7 @@ async def send_to_gateway(payload: dict) -> tuple[bool, str]:
     try:
         timeout = httpx.Timeout(
             connect=10.0,
-            read=900.0,
+            read=1800.0,
             write=30.0,
             pool=10.0
         )
@@ -118,10 +119,19 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     success, message = await send_to_gateway(payload)
     if success:
         await send_telegram_markdown_reply(update, message)
-        logger.info(f"Ответ на команду [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
+        logger.info(
+            f"Ответ на команду [id: {payload.get('id')}] "
+            f"от {payload.get('user_name') or payload.get('user_id')}: {message}"
+        )
     else:
-        await update.message.reply_text(f"Произошла ошибка при обработке запроса: {message}")
-        logger.error(f"Ответ на команду [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
+        await send_telegram_markdown_reply(
+            update,
+            f"**Произошла ошибка при обработке запроса:**\n{message}"
+        )
+        logger.error(
+            f"Ответ на команду [id: {payload.get('id')}] "
+            f"от {payload.get('user_name') or payload.get('user_id')}: {message}"
+        )
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик текстовых сообщений"""
@@ -152,37 +162,87 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     success, message = await send_to_gateway(payload)
     if success:
-        await update.message.reply_text(message)
-        logger.info(f"Ответ на сообщение [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
+        await send_telegram_markdown_reply(update, message)
+        logger.info(
+            f"Ответ на сообщение [id: {payload.get('id')}] "
+            f"от {payload.get('user_name') or payload.get('user_id')}: {message}"
+        )
     else:
         await send_telegram_markdown_reply(
             update,
             f"**Произошла ошибка при обработке запроса:**\n{message}"
         )
-        logger.error(f"Ответ на сообщение [id: {payload.get('id')}] от {payload.get('user_name') or payload.get('user_id')}: {message}")
+        logger.error(
+            f"Ответ на сообщение [id: {payload.get('id')}] "
+            f"от {payload.get('user_name') or payload.get('user_id')}: {message}"
+        )
+
+async def telegram_reply_with_retries(
+    update: Update,
+    text: str,
+    *,
+    parse_mode=None,
+    disable_web_page_preview: bool = True,
+    max_retries: int = 5,
+    base_delay: float = 2.0
+):
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            return await update.message.reply_text(
+                text,
+                parse_mode=parse_mode,
+                disable_web_page_preview=disable_web_page_preview
+            )
+
+        except (TimedOut, NetworkError) as e:
+            last_error = e
+            delay = base_delay * (2 ** (attempt - 1))
+
+            logger.warning(
+                f"Telegram send timeout/network error. "
+                f"Попытка {attempt}/{max_retries}, повтор через {delay:.1f} сек: {e!r}"
+            )
+
+            if attempt >= max_retries:
+                break
+
+            await asyncio.sleep(delay)
+
+    raise last_error
 
 async def send_telegram_markdown_reply(update, text: str):
     html_text = markdown_to_telegram_html(text)
-
     chunks = split_telegram_message(html_text)
 
     for chunk in chunks:
         try:
-            await update.message.reply_text(
+            await telegram_reply_with_retries(
+                update,
                 chunk,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True
             )
+
         except BadRequest as e:
             # Если Telegram не принял HTML, отправляем обычный текст
             logger.warning(f"Ошибка Telegram HTML formatting: {e}")
 
-            plain_chunk = re.sub(r"<[^>]+>", "", chunk)
+            plain_chunk = html.unescape(re.sub(r"<[^>]+>", "", chunk))
 
-            await update.message.reply_text(
+            await telegram_reply_with_retries(
+                update,
                 plain_chunk,
+                parse_mode=None,
                 disable_web_page_preview=True
             )
+
+        except (TimedOut, NetworkError) as e:
+            logger.error(
+                f"Не удалось отправить сообщение в Telegram после retry: {e!r}"
+            )
+            break
 
 # Регистрация обработчиков
 application.add_handler(CommandHandler(['start', 'status', 'reset', 'help'], command_handler)) # Команды обрабатываются в API
