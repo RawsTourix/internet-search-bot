@@ -7,6 +7,7 @@ import logging
 import shutil
 import asyncio
 import time
+import inspect
 from pydantic import BaseModel
 from typing import Optional, List, Dict, Any, Tuple
 from enum import Enum
@@ -511,29 +512,32 @@ class MCPClient:
         content = final_response.get("content", "") or ""
         return self._strip_agent_markers(content).strip()
     
-    def _client_instructions(self, client_type: str | None) -> str:
+    def _client_instructions(self, client_type: ClientType | None) -> str:
         if client_type == ClientType.TELEGRAM:
             return "\n".join([
-                "Контекст клиента:",
-                "- Текущий клиент: Telegram.",
-                "- Ответ будет читаться в мессенджере, часто на телефоне.",
-                "- Не используй Markdown-таблицы, ASCII-схемы, многострочные схемы и выравнивание пробелами.",
-                "- Для архитектуры используй только короткие строки со стрелками без второй строки и без псевдографики.",
-                "- Для сравнений используй списки по пунктам.",
-                "- Для архитектуры используй формат: Компонент → Компонент → Компонент.",
-                "- Кодовые блоки только короткие, до 20 строк.",
+                "Контекст клиента: Telegram.",
+                "Требования к выводу:",
+                "- Пиши короткими абзацами и списками.",
+                "- Запрещены Markdown-таблицы, ASCII-схемы, многострочные схемы и выравнивание пробелами.",
+                "- Для сравнений используй списки: вариант → плюсы → минусы → вывод.",
+                "- Для архитектуры используй одну короткую строку со стрелками или список этапов.",
+                "- Кодовые блоки используй только при необходимости, до 20 строк.",
+                "- Если пользователь просит формат, который плохо читается в Telegram, адаптируй его под эти ограничения.",
             ])
 
         if client_type == ClientType.WEB:
             return "\n".join([
-                "Контекст клиента:",
-                "- Текущий клиент: Web.",
-                "- Можно использовать полноценный Markdown, таблицы и более длинные кодовые блоки.",
+                "Контекст клиента: Web.",
+                "Требования к выводу:",
+                "- Можно использовать полноценный Markdown.",
+                "- Таблицы, схемы и длинные кодовые блоки допустимы, если они реально улучшают ответ.",
             ])
 
         return "\n".join([
-            "Контекст клиента:",
-            "- Клиент неизвестен. Используй компактный универсальный Markdown без широких таблиц и ASCII-схем.",
+            "Контекст клиента: неизвестен.",
+            "Требования к выводу:",
+            "- Используй компактный универсальный Markdown.",
+            "- Не используй широкие таблицы, ASCII-схемы и многострочное выравнивание пробелами.",
         ])
 
     async def process_query(
@@ -982,16 +986,14 @@ class MCPClient:
             "7. Если подключены пользовательские MCP-серверы, опирайся на их названия, описания и схемы параметров. "
             "Не делай предположений о возможностях сервера сверх того, что указано в описании инструментов.\n\n"
 
-            "Экономичная агентная работа:\n"
-            "1. Перед использованием инструмента коротко оцени, действительно ли он нужен.\n"
-            "2. Не вызывай инструменты без необходимости, если данных уже достаточно для ответа.\n"
-            "3. Не повторяй один и тот же неудачный вызов инструмента с теми же параметрами.\n"
-            "4. Если инструмент вернул ошибку selector / element not found / strict mode violation / 404, "
-            "измени стратегию: используй snapshot, evaluate, поиск правильного URL или другой подход.\n"
-            "5. Если страница уже дала нужную информацию, не продолжай навигацию ради полноты без явной необходимости.\n"
-            "6. Не закрывай браузер вручную, если пользователь не просил закрыть браузер или завершить браузерную сессию.\n"
-            "7. Для длинных задач двигайся по этапам: найти источник → извлечь данные → проверить главное → сформировать ответ.\n"
-            "8. Если задача становится слишком широкой, выполни полезную разумную часть и ясно укажи границы результата.\n\n"
+            "Экономичная работа:\n"
+            "1. Не вызывай инструменты, если можно надёжно ответить без них.\n"
+            "2. Не продолжай исследование, если данных уже достаточно для качественного ответа.\n"
+            "3. Не повторяй тот же неудачный вызов с теми же параметрами.\n"
+            "4. При ошибках selector / element not found / strict mode violation / 404 меняй стратегию: snapshot, другой URL, web_search или итог по уже собранным данным.\n"
+            "5. Если страница дала нужную информацию, не продолжай навигацию ради полноты.\n"
+            "6. Не закрывай браузер вручную, если пользователь этого не просил.\n"
+            "7. Для длинных задач двигайся по этапам: источник → извлечение → проверка главного → ответ.\n\n"
 
             "Безопасность и подтверждения:\n"
             "1. Не выполняй действия, которые могут изменить данные пользователя, отправить форму, удалить файл, купить товар, "
@@ -1009,15 +1011,51 @@ class MCPClient:
 
             "Финальный ответ:\n"
             "1. Отвечай на языке пользователя.\n"
-            "2. Соблюдай формат, который попросил пользователь: Markdown, список, таблица, краткий отчёт, кодовый блок и т.д.\n"
-            "3. Если пользователь просит кратко, отвечай компактно и не добавляй лишние разделы.\n"
-            "4. Если использовались инструменты, формируй ответ на основе их результатов, а не по памяти.\n"
-            "5. Не утверждай точное количество инструментов, функций, версий или возможностей, если это не было проверено источником "
-            "или списком доступных инструментов.\n"
-            "6. В конце финального текстового ответа обязательно добавь маркер [AGENT_STATUS=DONE]."
+            "2. Соблюдай формат пользователя, если он не конфликтует с ограничениями текущего клиента.\n"
+            "3. Ограничения текущего клиента важнее предпочтительного формата пользователя.\n"
+            "4. Если пользователь просит кратко, отвечай компактно и не добавляй лишние разделы.\n"
+            "5. Если использовались инструменты, формируй ответ на основе их результатов, а не по памяти.\n"
+            "6. Не утверждай точное количество инструментов, функций, версий или возможностей, если это не было проверено источником или списком доступных инструментов.\n"
+            "7. В конце финального текстового ответа обязательно добавь маркер [AGENT_STATUS=DONE]."
         )
     
-    def _tools_description(self) -> List[Dict[str, Any]]:
+    def _normalize_tool_description(self, description: str) -> str:
+        if not description:
+            return ""
+
+        text = inspect.cleandoc(description)
+        text = re.sub(r"[-]{5,}", " ", text)
+        text = re.sub(r"[\t\r]+", " ", text)
+
+        first_paragraph = text.split("\n\n", 1)[0]
+        first_paragraph = re.sub(r"\s+", " ", first_paragraph).strip()
+
+        return first_paragraph
+    
+    def _schema_to_args_summary(self, schema: Dict[str, Any]) -> str:
+        if not schema:
+            return ""
+
+        properties = schema.get("properties") or {}
+        required = set(schema.get("required") or [])
+
+        if not properties:
+            return ""
+
+        args = []
+
+        for name, meta in properties.items():
+            suffix = "*" if name in required else ""
+            arg_type = meta.get("type")
+
+            if arg_type:
+                args.append(f"{name}{suffix}:{arg_type}")
+            else:
+                args.append(f"{name}{suffix}")
+
+        return ", ".join(args)
+    
+    def _tools_description(self) -> str:
         """
         Description:
         ---------------
@@ -1027,21 +1065,32 @@ class MCPClient:
         ---------------
             List[Dict[str, Any]]: Список описания инструментов
         """
-        tools_description = []
+        lines = []
 
         for binding in self.available_tools:
-            tools_description.append({
-                "name": binding.public_name,
-                "server": binding.server_alias,
-                "description": re.sub(
-                    r" {2,}",
-                    " ",
-                    re.sub(r"\n|\t|-{5,}", " ", binding.description)
-                ).strip(),
-                "inputSchema": binding.input_schema
-            })
+            description = self._normalize_tool_description(binding.description)
 
-        return tools_description
+            if not description:
+                description = "Инструмент MCP."
+
+            args = self._schema_to_args_summary(binding.input_schema)
+
+            line = f"- {binding.public_name} [{binding.server_alias}]: {description}"
+
+            if args:
+                line += f" Аргументы: {args}"
+
+            lines.append(line)
+
+        return "\n".join(lines)
+    
+    def _schema_to_short_description(self, schema: Dict[str, Any]) -> str:
+        args = self._schema_to_args_summary(schema)
+
+        if args:
+            return f"Инструмент MCP. Аргументы: {args}."
+
+        return "Инструмент MCP."
     
     def _format_tools_for_llm(self) -> List[Dict[str, Any]]:
         """
@@ -1054,20 +1103,25 @@ class MCPClient:
             List[Dict[str, Any]]: Список инструментов в формате для LLM
         """
         llm_tools = []
-        
+
         for binding in self.available_tools:
             function_spec = {
                 "name": binding.public_name,
-                "description": binding.description,
-                "parameters": binding.input_schema
+                "description": binding.description or "",
+                "parameters": binding.input_schema or {
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": False
+                }
             }
-            
+
             llm_tools.append({
                 "type": "function",
                 "function": function_spec
             })
-            
+
         return llm_tools
+
     
     def _parse_retry_after(self, value: str | None) -> float | None:
         if not value:

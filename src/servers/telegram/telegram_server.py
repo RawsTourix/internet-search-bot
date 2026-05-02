@@ -16,7 +16,7 @@ from logging.handlers import RotatingFileHandler
 
 # Импорт модулей
 from .config import BOT_TOKEN, WEBHOOK_SECRET, WEBHOOK_DOMAIN, TELEGRAM_API_KEY, GATEWAY_URL
-from ...utils.telegram_formatting import markdown_to_telegram_html, split_telegram_message
+from ...utils.telegram_formatting import markdown_to_telegram_html, split_telegram_message, split_markdown_for_telegram, markdown_to_plain_text
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -195,6 +195,10 @@ async def telegram_reply_with_retries(
                 parse_mode=parse_mode,
                 disable_web_page_preview=disable_web_page_preview
             )
+        
+        except BadRequest:
+            # Ошибка HTML/Markdown-разметки. Повторять бессмысленно.
+            raise
 
         except (TimedOut, NetworkError) as e:
             last_error = e
@@ -213,14 +217,15 @@ async def telegram_reply_with_retries(
     raise last_error
 
 async def send_telegram_markdown_reply(update, text: str):
-    html_text = markdown_to_telegram_html(text)
-    chunks = split_telegram_message(html_text)
+    markdown_chunks = split_markdown_for_telegram(text)
 
-    for chunk in chunks:
+    for markdown_chunk in markdown_chunks:
+        html_chunk = markdown_to_telegram_html(markdown_chunk)
+
         try:
             await telegram_reply_with_retries(
                 update,
-                chunk,
+                html_chunk,
                 parse_mode=ParseMode.HTML,
                 disable_web_page_preview=True
             )
@@ -229,7 +234,7 @@ async def send_telegram_markdown_reply(update, text: str):
             # Если Telegram не принял HTML, отправляем обычный текст
             logger.warning(f"Ошибка Telegram HTML formatting: {e}")
 
-            plain_chunk = html.unescape(re.sub(r"<[^>]+>", "", chunk))
+            plain_chunk = markdown_to_plain_text(markdown_chunk)
 
             await telegram_reply_with_retries(
                 update,

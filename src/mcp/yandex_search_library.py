@@ -397,7 +397,7 @@ class YandexSearchAPI:
                             "query_text": query_text,
                             "family_mode": kwargs.get("family_mode", self.family_mode),
                             "page": page,
-                            "fix_yypo_mode": kwargs.get("fix_typo_mode", "FIX_TYPO_MODE_ON")
+                            "fix_typo_mode": kwargs.get("fix_typo_mode", "FIX_TYPO_MODE_ON")
                         },
                         "sort_spec": {
                             "sort_mode": kwargs.get("sort_mode", "SORT_MODE_BY_RELEVANCE"),

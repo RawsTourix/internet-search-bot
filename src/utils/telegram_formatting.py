@@ -2,6 +2,85 @@ import re
 import html
 from typing import List
 
+def markdown_to_plain_text(text: str) -> str:
+    text = re.sub(r"```[a-zA-Z0-9_+-]*\n(.*?)```", r"\1", text, flags=re.DOTALL)
+    text = re.sub(r"`([^`\n]+)`", r"\1", text)
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+    text = re.sub(r"__(.+?)__", r"\1", text)
+    text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", r"\1: \2", text)
+    text = re.sub(r"^\s*[-*]\s+", "• ", text, flags=re.MULTILINE)
+    text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
+    return html.unescape(text).strip()
+
+def split_markdown_for_telegram(text: str, limit: int = 3000) -> list[str]:
+    if not text:
+        return [""]
+
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+
+    chunks = []
+    current = ""
+    in_code_block = False
+    block = []
+
+    for line in text.split("\n"):
+        if line.startswith("```"):
+            in_code_block = not in_code_block
+
+        block.append(line)
+
+        if not in_code_block and line.strip() == "":
+            paragraph = "\n".join(block).strip()
+            block = []
+
+            if not paragraph:
+                continue
+
+            candidate = current + ("\n\n" if current else "") + paragraph
+
+            if len(candidate) <= limit:
+                current = candidate
+            else:
+                if current:
+                    chunks.append(current)
+                current = paragraph
+
+    if block:
+        paragraph = "\n".join(block).strip()
+        candidate = current + ("\n\n" if current else "") + paragraph
+
+        if len(candidate) <= limit:
+            current = candidate
+        else:
+            if current:
+                chunks.append(current)
+            current = paragraph
+
+    if current:
+        chunks.append(current)
+
+    return chunks
+
+def preprocess_markdown_lines(text: str) -> str:
+    lines = []
+
+    for line in text.split("\n"):
+        stripped = line.strip()
+
+        if stripped.startswith("### "):
+            line = f"**{stripped[4:]}**"
+        elif stripped.startswith("## "):
+            line = f"**{stripped[3:]}**"
+        elif stripped.startswith("# "):
+            line = f"**{stripped[2:]}**"
+        elif re.match(r"^\s*[-*]\s+", line):
+            line = re.sub(r"^\s*[-*]\s+", "• ", line)
+        elif re.match(r"^\s*\d+\.\s+", line):
+            line = stripped
+
+        lines.append(line)
+
+    return "\n".join(lines)
 
 def markdown_to_telegram_html(text: str) -> str:
     """
@@ -64,7 +143,8 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", replace_link, text)
 
-    # 4. Escape everything else
+    # 4. Preprocess markdown lines + Escape everything else
+    text = preprocess_markdown_lines(text)
     text = html.escape(text)
 
     # 5. Bold

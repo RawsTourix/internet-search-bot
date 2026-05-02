@@ -65,7 +65,7 @@ yc_logger.addHandler(yc_console_handler)
 client = YandexSearchAPI(api_key=YANDEX_SEARCH_API_KEY, folder_id=YANDEX_CLOUD_FOLDER_ID, logger=yc_logger)
 
 # Инициализация сервера
-mcp = FastMCP(name="main-bot")
+mcp = FastMCP(name="yandex-search")
 
 ######################################
 ## ОСНОВНЫЕ ФУНКЦИИ С ИНСТРУМЕНТАМИ ##
@@ -74,43 +74,22 @@ mcp = FastMCP(name="main-bot")
 @mcp.tool()
 async def search_internet(
     query: str,
-    num: int = 5,
+    results: int = 5,
 ) -> str:
-    """
-    Description:
-    ---------------
-        Поиск в интернете
-    Args:
-    ---------------
-        query (str): Поисковый запрос
-        num (int): Количество результатов поиска (от 1 до 10)
-    Returns:
-    ---------------
-        str: Результаты поиска
-    Examples:
-    ---------------
-        Tool call:
-        {
-            "name": "search",
-            "arguments": {
-                "query": "новости искусственного интеллекта",
-                "num": 5
-            }
-        }
-    """
+    """Найти в интернете результаты по запросу и вернуть ссылки с краткими описаниями."""
     try:
         # Предварительная проверка
         if not query:
             raise ValueError("Запрос не может быть пустым")
         
-        if num > 10: num = 10
-        if num < 1: num = 1
+        if results > 10: results = 10
+        if results < 1: results = 1
 
 
         # Поиск результатов
         results = await client.search(
             query_text=query,
-            groups_on_page=num
+            groups_on_page=results
         )
 
         # Оптимизация данных
@@ -127,7 +106,7 @@ async def search_internet(
 
 async def main() -> None:
     """Основная точка входа"""
-    parser = argparse.ArgumentParser(description="Main Bot Server")
+    parser = argparse.ArgumentParser(description="Yandex Search MCP Server")
     parser.add_argument("--debug", action="store_true", help="Включить подробное логирование")
     args = parser.parse_args()
 
@@ -138,15 +117,15 @@ async def main() -> None:
     )
 
     try:
-        main_logger.info("Запуск главного бота")
+        main_logger.info("Запуск MCP-сервера поиска в интернете")
         await mcp.run_stdio_async()
     except KeyboardInterrupt:
         main_logger.info("Сервер остановлен пользователем")
     except Exception as e:
-        main_logger.exception(f"Критическая ошибка: {e}")
+        main_logger.exception(f"Критическая ошибка MCP-сервера: {e}")
         sys.exit(1)
     finally:
-        main_logger.info("Работа сервера завершена")
+        main_logger.info("Работа MCP-сервера завершена")
 
 if __name__ == "__main__":
     asyncio.run(main())
