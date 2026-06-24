@@ -1,3 +1,7 @@
+class APIError(Exception):
+    """Базовая ошибка API."""
+    pass
+
 class LLMError(Exception):
     """Базовая ошибка LLM."""
     pass

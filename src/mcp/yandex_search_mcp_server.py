@@ -24,12 +24,12 @@ if not os.path.exists(log_dir):
 # Настройка логирования
 formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
 
-# Логгер для MainBot
-main_logger = logging.getLogger("MainBot")
+# Логгер для YandexSearch
+main_logger = logging.getLogger("YandexSearch")
 main_logger.setLevel(logging.DEBUG)
 
 main_file_handler = RotatingFileHandler(
-    filename=os.path.join(log_dir, "main_bot.log"),
+    filename=os.path.join(log_dir, "yandex_search.log"),
     maxBytes=8*1024*1024,  # 8 MB
     encoding='utf-8'
 )

@@ -52,7 +52,7 @@ class MessageProcessor:
             
             # Обновление статистики
             self.stats["total_messages"] += 1
-            self.stats["messages_by_client"][message.client_type] += 1
+            self.stats["messages_by_client"][message.client_type.value] += 1
             
             # Получение ответа
             response = await self._generate_response(message)

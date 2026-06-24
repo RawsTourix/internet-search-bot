@@ -371,7 +371,7 @@ class MCPClient:
 
     async def _connect_single_server(self, server_config: ServerConfigType) -> MCPServerRuntime:
         server_name = server_config.name or "unnamed"
-        server_alias = server_config.alias or server_name
+        server_alias = server_config.alias or ""
 
         logger.info(f"Подключение к MCP-серверу: {server_name}")
 
@@ -388,7 +388,7 @@ class MCPClient:
     
     def _register_server_tools(self, runtime: MCPServerRuntime) -> None:
         for tool in runtime.tools:
-            public_name = f"{runtime.alias}_{tool.name}"
+            public_name = f"{runtime.alias}_{tool.name}" if runtime.alias else f"{tool.name}"
 
             if public_name in self.tool_registry:
                 raise ValueError(f"Конфликт имён инструментов: {public_name}")
@@ -1687,7 +1687,7 @@ def load_config(config_path: str) -> Tuple[List[ServerConfigType], LLMConfigType
             )
 
             name = server_data.get("name") or f"server_{index + 1}"
-            alias = server_data.get("alias") or name
+            alias = server_data.get("alias") or ""
 
             executable = server_data.get("executable")
 

@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 from .config import HTTP_PROXY, HTTPS_PROXY, AGENT_CONFIG_PATH
 from ..mcp.mcp_client import MCPClient, load_config
 from ..core.models import ClientType, AgentStatus, AgentResult
+from ..core.errors import APIError
 
 # Настройка прокси
 os.environ['http_proxy'] = HTTP_PROXY
@@ -54,7 +55,7 @@ class Api:
             logger.info("Инициализация MCP-клиента")
             self.mcp_client = MCPClient(self.llm_config)
         except Exception as e:
-            logger.critical(f"Ошибка инициализации Api: {e}")
+            raise APIError(f"Ошибка инициализации Api: {repr(e)}") from e
 
     async def start(self):
         """Подключение к MCP-серверам"""
@@ -62,7 +63,7 @@ class Api:
             logger.info("Подключение к MCP-серверам")
             await self.mcp_client.connect_to_servers(self.server_configs)
         except Exception as e:
-            logger.critical(f"Ошибка подключения к MCP-серверам: {e}")
+            raise APIError(f"Ошибка подключения к MCP-серверам: {repr(e)}") from e
 
     async def call_agent(
         self, message: str,

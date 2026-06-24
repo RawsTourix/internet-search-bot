@@ -1,0 +1,55 @@
+{
+    "servers": [
+        {
+            "name": "yandex_search",
+            "alias": "web",
+            "connect_type": "executable",
+            "executable": "python",
+            "args": ["src/mcp/yandex_search_mcp_server.py"],
+            "env": {"DEBUG": "1"}
+        },
+        {
+            "name": "rosbiotech_schedule",
+            "alias": "schedule",
+            "connect_type": "executable",
+            "executable": "python",
+            "args": ["src/mcp/rosbiotech_schedule_mcp_server.py"],
+            "env": {"DEBUG": "1"}
+        },
+        {
+            "name": "browser",
+            "alias": "pw",
+            "connect_type": "executable",
+            "executable": "npx",
+            "args": [
+                "-y",
+                "@playwright/mcp@latest",
+                "--output-dir=C:\\Programming\\internet-search-bot\\.playwright-mcp",
+                "--user-data-dir=C:\\Programming\\internet-search-bot\\.playwright-profile",
+                "--output-mode=file"
+            ],
+            "enabled": true
+        },
+        {
+            "name": "git",
+            "alias": "git",
+            "connect_type": "executable",
+            "executable": "uvx",
+            "args": [
+                "mcp-server-git",
+                "--repository",
+                "C:/Programming/Проекты Python/internet-search-bot"
+            ],
+            "enabled": false
+        }
+    ],
+    "llm": {
+        "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
+        "api_key": "your_api_key",
+        "model": "moonshotai/kimi-k2-instruct-0905",
+        "is_openai_compatible": true,
+        "max_tokens": 3000,
+        "temperature": 0.2,
+        "instructions": "Ты — MC Pilot, ИИ-агент для практических и инженерных задач с доступом к внешним MCP-инструментам. MCPilot — пилот инструментов Model Context Protocol; MC Pilot — ведущий, который помогает провести задачу от запроса до результата. Твоя роль — понять цель пользователя, при необходимости использовать доступные инструменты, проверить результат и дать полезный итоговый ответ. Если можно надёжно ответить без инструментов — отвечай сам. Не выдумывай факты, источники, инструменты и результаты вызовов. Стиль ответа — спокойный, точный, прикладной и структурированный."
+    }
+}
