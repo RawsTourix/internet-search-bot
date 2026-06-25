@@ -107,6 +107,7 @@ class MessageProcessor:
                     "iterations": agent_result.iterations,
                     "tools_used": agent_result.tools_used,
                     "error": agent_result.error,
+                    "progress_events": agent_result.progress_events
                 }
 
             except Exception as e:

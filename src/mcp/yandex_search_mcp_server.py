@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import argparse
 import logging
@@ -71,38 +72,217 @@ mcp = FastMCP(name="yandex-search")
 ## ОСНОВНЫЕ ФУНКЦИИ С ИНСТРУМЕНТАМИ ##
 ######################################
 
+def _clamp_int(value: int, minimum: int, maximum: int) -> int:
+    try:
+        value = int(value)
+    except Exception:
+        value = minimum
+
+    return max(minimum, min(maximum, value))
+
+
+def _has_cyrillic(text: str) -> bool:
+    return bool(re.search(r"[А-Яа-яЁё]", text or ""))
+
+
+def _has_latin(text: str) -> bool:
+    return bool(re.search(r"[A-Za-z]", text or ""))
+
+
+def _normalize_search_type(search_type: str, query: str) -> str:
+    """
+    Yandex Search API:
+    - SEARCH_TYPE_RU  — русский поиск
+    - SEARCH_TYPE_COM — международный поиск
+    """
+    value = (search_type or "auto").strip().lower()
+
+    aliases = {
+        "ru": "SEARCH_TYPE_RU",
+        "russian": "SEARCH_TYPE_RU",
+        "русский": "SEARCH_TYPE_RU",
+        "com": "SEARCH_TYPE_COM",
+        "international": "SEARCH_TYPE_COM",
+        "global": "SEARCH_TYPE_COM",
+        "en": "SEARCH_TYPE_COM",
+        "english": "SEARCH_TYPE_COM",
+        "world": "SEARCH_TYPE_COM",
+    }
+
+    if value in aliases:
+        return aliases[value]
+
+    if value.startswith("search_type_"):
+        return value.upper()
+
+    # auto: если запрос явно английский/международный — COM, иначе RU
+    if _has_latin(query) and not _has_cyrillic(query):
+        return "SEARCH_TYPE_COM"
+
+    return "SEARCH_TYPE_RU"
+
+
+def _normalize_l10n(l10n: str, search_type: str) -> str:
+    value = (l10n or "auto").strip().lower()
+
+    aliases = {
+        "ru": "LOCALIZATION_RU",
+        "russian": "LOCALIZATION_RU",
+        "русский": "LOCALIZATION_RU",
+        "en": "LOCALIZATION_EN",
+        "english": "LOCALIZATION_EN",
+        "com": "LOCALIZATION_EN",
+        "international": "LOCALIZATION_EN",
+    }
+
+    if value in aliases:
+        return aliases[value]
+
+    if value.startswith("localization_"):
+        return value.upper()
+
+    if search_type == "SEARCH_TYPE_COM":
+        return "LOCALIZATION_EN"
+
+    return "LOCALIZATION_RU"
+
+
+def _normalize_sort_mode(sort_mode: str) -> str:
+    value = (sort_mode or "relevance").strip().lower()
+
+    aliases = {
+        "relevance": "SORT_MODE_BY_RELEVANCE",
+        "rel": "SORT_MODE_BY_RELEVANCE",
+        "по релевантности": "SORT_MODE_BY_RELEVANCE",
+        "time": "SORT_MODE_BY_TIME",
+        "date": "SORT_MODE_BY_TIME",
+        "fresh": "SORT_MODE_BY_TIME",
+        "recent": "SORT_MODE_BY_TIME",
+        "news": "SORT_MODE_BY_TIME",
+        "по времени": "SORT_MODE_BY_TIME",
+    }
+
+    if value in aliases:
+        return aliases[value]
+
+    if value.startswith("sort_mode_"):
+        return value.upper()
+
+    return "SORT_MODE_BY_RELEVANCE"
+
+
+async def _run_yandex_search(
+    query: str,
+    results: int = 5,
+    search_type: str = "auto",
+    sort_mode: str = "relevance",
+    l10n: str = "auto",
+    pages: int = 1,
+    max_passages: int = 5,
+    min_length: int = 30,
+) -> str:
+    if not query or not query.strip():
+        raise ValueError("Запрос не может быть пустым")
+
+    results = _clamp_int(results, 1, 10)
+    pages = _clamp_int(pages, 1, 3)
+    max_passages = _clamp_int(max_passages, 1, 5)
+
+    normalized_search_type = _normalize_search_type(search_type, query)
+    normalized_l10n = _normalize_l10n(l10n, normalized_search_type)
+    normalized_sort_mode = _normalize_sort_mode(sort_mode)
+
+    parsed_results = await client.search(
+        query_text=query.strip(),
+        groups_on_page=results,
+        pages_to_fetch=list(range(pages)),
+        max_passages=max_passages,
+        search_type=normalized_search_type,
+        sort_mode=normalized_sort_mode,
+        sort_order="SORT_ORDER_DESC",
+        l10n=normalized_l10n,
+    )
+
+    optimized_results = optimize_results(
+        parsed_results=parsed_results,
+        min_length=min_length,
+    )
+
+    return format_results(optimized_results, query)
+
+
 @mcp.tool()
 async def search_internet(
     query: str,
     results: int = 5,
+    search_type: str = "auto",
+    sort_mode: str = "relevance",
+    l10n: str = "auto",
+    pages: int = 1,
+    max_passages: int = 5,
 ) -> str:
-    """Найти в интернете результаты по запросу и вернуть ссылки с краткими описаниями."""
+    """Настраиваемый веб-поиск: query, results=1..10, search_type=auto|ru|com, sort_mode=relevance|time, l10n=auto|ru|en, pages=1..3, max_passages=1..5."""
     try:
-        # Предварительная проверка
-        if not query:
-            raise ValueError("Запрос не может быть пустым")
-        
-        if results > 10: results = 10
-        if results < 1: results = 1
-
-
-        # Поиск результатов
-        results = await client.search(
-            query_text=query,
-            groups_on_page=results
+        return await _run_yandex_search(
+            query=query,
+            results=results,
+            search_type=search_type,
+            sort_mode=sort_mode,
+            l10n=l10n,
+            pages=pages,
+            max_passages=max_passages,
         )
-
-        # Оптимизация данных
-        optimized_results = optimize_results(
-            parsed_results=results,
-            min_length=30
-        )
-
-        # Возврат в понятном формате
-        return format_results(optimized_results, query)
 
     except Exception as e:
         return f"Ошибка поиска: {e}"
+
+
+@mcp.tool()
+async def search_news(
+    query: str,
+    results: int = 10,
+    search_type: str = "auto",
+    l10n: str = "auto",
+    pages: int = 1,
+    max_passages: int = 5,
+) -> str:
+    """Поиск свежих новостей и текущих событий с сортировкой по времени."""
+    try:
+        return await _run_yandex_search(
+            query=query,
+            results=results,
+            search_type=search_type,
+            sort_mode="time",
+            l10n=l10n,
+            pages=pages,
+            max_passages=max_passages,
+        )
+
+    except Exception as e:
+        return f"Ошибка поиска новостей: {e}"
+    
+@mcp.tool()
+async def search_url(
+    query: str,
+    results: int = 5,
+    search_type: str = "auto",
+    l10n: str = "auto",
+) -> str:
+    """Быстрый поиск URL (официальный сайт, документация, GitHub, страница товара и т.п.)."""
+    try:
+        return await _run_yandex_search(
+            query=query,
+            results=results,
+            search_type=search_type,
+            sort_mode="relevance",
+            l10n=l10n,
+            pages=1,
+            max_passages=1,
+            min_length=0,
+        )
+
+    except Exception as e:
+        return f"Ошибка поиска URL: {e}"
 
 async def main() -> None:
     """Основная точка входа"""

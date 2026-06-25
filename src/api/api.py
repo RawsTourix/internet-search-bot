@@ -104,7 +104,8 @@ class Api:
                 session_id=session_id,
                 iterations=state.iterations if state else 0,
                 tools_used=state.tools_used if state else [],
-                error=str(e)
+                error=str(e),
+                progress_events=state.progress_events if state else []
             )
         
     async def reset(self, session_id: str):

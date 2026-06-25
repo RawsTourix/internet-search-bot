@@ -110,3 +110,4 @@ class AgentResult(BaseModel):
     iterations: int = 0
     tools_used: List[str] = []
     error: Optional[str] = None
+    progress_events: List[Dict[str, Any]] = []
