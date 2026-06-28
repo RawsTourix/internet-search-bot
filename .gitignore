@@ -22,3 +22,8 @@ test/
 
 # Файлы агента
 file/
+agent_traces/
+
+# Файлы Codex
+.agents
+.codex
