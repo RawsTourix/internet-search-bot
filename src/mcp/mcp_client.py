@@ -12,7 +12,7 @@ import locale
 import platform
 from datetime import datetime, timezone
 from uuid import uuid4
-from pydantic import BaseModel
+from pydantic import BaseModel, model_validator
 from typing import Optional, List, Dict, Any, Tuple, Callable, Awaitable
 from enum import Enum
 from dataclasses import dataclass, field
@@ -53,6 +53,52 @@ class LLMConfigType(BaseModel):
     top_p: Optional[float] = None
     final_audit: bool = False
     instructions: Optional[str] = None
+    context_window_tokens: int = 128_000
+    reserved_output_tokens: Optional[int] = None
+    context_safety_ratio: float = 0.75
+    context_compaction_target_ratio: float = 0.55
+    enable_context_compaction: bool = True
+
+    @model_validator(mode="after")
+    def validate_context_budget(self):
+        if self.max_tokens <= 0:
+            raise ValueError("max_tokens must be positive")
+
+        if self.context_window_tokens <= 0:
+            raise ValueError("context_window_tokens must be positive")
+
+        if (
+            self.reserved_output_tokens is not None
+            and self.reserved_output_tokens < 0
+        ):
+            raise ValueError("reserved_output_tokens must be non-negative")
+
+        effective_reserved = max(
+            self.reserved_output_tokens or 0,
+            self.max_tokens,
+        )
+
+        if effective_reserved >= self.context_window_tokens:
+            raise ValueError(
+                "max(max_tokens, reserved_output_tokens) must be less than "
+                "context_window_tokens"
+            )
+
+        if not 0 < self.context_safety_ratio <= 1:
+            raise ValueError("context_safety_ratio must be in (0, 1]")
+
+        if not 0 < self.context_compaction_target_ratio <= 1:
+            raise ValueError(
+                "context_compaction_target_ratio must be in (0, 1]"
+            )
+
+        if self.context_compaction_target_ratio >= self.context_safety_ratio:
+            raise ValueError(
+                "context_compaction_target_ratio should be lower than "
+                "context_safety_ratio"
+            )
+
+        return self
 
 class ServerConfigType(BaseModel):
     """Конфигурация для MCP сервера"""
@@ -87,6 +133,55 @@ class DialogTurn:
 
 
 @dataclass
+class AgentCycleSnapshot:
+    """
+    Снимок незавершённого агентного цикла.
+
+    Используется при WAITING_USER: агент приостанавливает работу,
+    но не должен терять messages_for_llm, task_trace и рабочий контекст.
+    """
+
+    cycle_id: str
+    original_user_request: str
+    messages_for_llm: List[Dict[str, Any]]
+    task_trace: List[Dict[str, Any]]
+
+    # status:
+    # - "waiting_user": агент ждёт ответ пользователя;
+    # - "running": цикл возобновлён и выполняется;
+    # - "interrupted": цикл прерван инфраструктурной ошибкой,
+    #   но может быть продолжен позже.
+    status: str = "waiting_user"
+    waiting_question: str | None = None
+    interruption_reason: str | None = None
+    interrupted_at: float | None = None
+
+    # TODO v0.4: Context compaction.
+    # Когда messages_for_llm приближается к context_window_tokens,
+    # старые подробные сообщения и большие tool results должны быть
+    # перенесены в archival_logs/task_trace, а видимый LLM-контекст
+    # должен быть заменён на компактный working_summary + working_state.
+    #
+    # working_summary — человекочитаемое краткое описание текущего цикла:
+    # цель, что уже сделано, какие решения приняты, что осталось.
+    #
+    # working_state — машинно-читаемое состояние цикла:
+    # confirmed_actions, rejected_actions, modified_files, pending_confirmation,
+    # archived_trace_refs, tool_call_ids и другие ссылки на очищенные данные.
+    #
+    # Важно: compaction не должна молча удалять смысл. Она должна сохранять
+    # восстановимое состояние работы и ссылки на полный архив.
+    working_summary: str = ""
+    working_state: Dict[str, Any] = field(default_factory=dict)
+
+    tools_used: List[str] = field(default_factory=list)
+    progress_events: List[Dict[str, Any]] = field(default_factory=list)
+
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+@dataclass
 class SessionMemory:
     """
     Долговременная память сессии.
@@ -106,6 +201,13 @@ class SessionMemory:
     # Последний подробный trace для отладки,
     # но он не отправляется в LLM автоматически.
     last_task_trace: List[Dict[str, Any]] = field(default_factory=list)
+
+    # Незавершённый цикл, если агент остановился на WAITING_USER.
+    pending_cycle: AgentCycleSnapshot | None = None
+
+    # Краткая информация о последнем ошибочном цикле.
+    # Полный trace всё равно лежит в archival_logs.
+    last_error_cycle: Dict[str, Any] | None = None
 
     last_seen: float = field(default_factory=time.time)
 
@@ -384,7 +486,6 @@ class MCPClient:
         # Память сессий
         self.sessions: Dict[str, SessionMemory] = {}
         self.session_states: Dict[str, SessionState] = {}
-        self.max_messages_chars_for_llm = 90_000
         self.archive_dir = Path("logging/agent_traces")
         self.archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -870,6 +971,177 @@ class MCPClient:
 
         return action.final_answer or ""
 
+    def _is_retryable_llm_http_error(self, error: LLMHTTPError) -> bool:
+        return error.status_code in self.llm_retryable_http_statuses
+
+    def _is_infrastructure_error(self, error: BaseException) -> bool:
+        if isinstance(error, LLMHTTPError):
+            return self._is_retryable_llm_http_error(error)
+
+        return isinstance(
+            error,
+            (
+                LLMTimeoutError,
+                LLMTransportError,
+                asyncio.TimeoutError,
+            ),
+        )
+
+    def _iteration_runtime_payload(
+        self,
+        state: SessionState,
+    ) -> Dict[str, Any]:
+        remaining = max(0, self.max_iterations - state.iterations)
+
+        return {
+            "type": "runtime_iteration_state",
+            "iteration_current": state.iterations,
+            "iteration_max": self.max_iterations,
+            "iteration_remaining": remaining,
+            "near_limit": remaining <= 3,
+            "instruction": (
+                "Если данных уже достаточно, сформируй final_answer. "
+                "Не начинай длинную новую цепочку инструментов без необходимости."
+                if remaining <= 3
+                else None
+            ),
+        }
+
+    def _with_iteration_runtime_message(
+        self,
+        messages: List[Dict[str, Any]],
+        state: SessionState,
+    ) -> List[Dict[str, Any]]:
+        return messages + [
+            {
+                "role": "user",
+                "content": dumps_json(self._iteration_runtime_payload(state)),
+            }
+        ]
+
+    def _save_interrupted_cycle(
+        self,
+        *,
+        session: SessionMemory,
+        cycle_id: str,
+        original_user_request: str,
+        messages_for_llm: List[Dict[str, Any]],
+        task_trace: List[Dict[str, Any]],
+        state: SessionState,
+        error_message: str,
+        previous_cycle_progress_events: List[Dict[str, Any]],
+        cycle_snapshot: AgentCycleSnapshot | None,
+    ) -> AgentCycleSnapshot:
+        now = time.time()
+        snapshot = AgentCycleSnapshot(
+            cycle_id=cycle_id,
+            original_user_request=original_user_request,
+            messages_for_llm=list(messages_for_llm),
+            task_trace=list(task_trace),
+            status="interrupted",
+            waiting_question=None,
+            interruption_reason=error_message,
+            interrupted_at=now,
+            working_summary=(
+                cycle_snapshot.working_summary
+                if cycle_snapshot is not None
+                else ""
+            ),
+            working_state=(
+                dict(cycle_snapshot.working_state)
+                if cycle_snapshot is not None
+                else {}
+            ),
+            tools_used=list(state.tools_used),
+            progress_events=(
+                previous_cycle_progress_events
+                + list(state.progress_events)
+            ),
+            created_at=(
+                cycle_snapshot.created_at
+                if cycle_snapshot is not None
+                else now
+            ),
+            updated_at=now,
+        )
+
+        session.pending_cycle = snapshot
+        return snapshot
+
+    def _save_last_error_cycle(
+        self,
+        *,
+        session: SessionMemory,
+        cycle_id: str,
+        original_user_request: str,
+        state: SessionState,
+        error_message: str,
+        error_kind: str,
+        can_resume: bool,
+    ) -> None:
+        session.last_error_cycle = {
+            "cycle_id": cycle_id,
+            "user_request": original_user_request,
+            "error": error_message,
+            "error_kind": error_kind,
+            "can_resume": can_resume,
+            "tools_used": list(state.tools_used),
+            "iterations": state.iterations,
+        }
+
+    async def _finalize_after_max_iterations(
+        self,
+        *,
+        messages_for_llm: List[Dict[str, Any]],
+        task_trace: List[Dict[str, Any]],
+        state: SessionState,
+        final_text: list[str],
+        cycle_id: str,
+    ) -> None:
+        self._trace_event(
+            task_trace,
+            "max_iterations_reached",
+            cycle_id=cycle_id,
+            iteration=state.iterations,
+            max_iterations=self.max_iterations,
+        )
+
+        try:
+            answer = await self._force_final_answer(
+                messages_for_llm,
+                context="Forced final answer after max_iterations",
+            )
+        except (
+            LLMHTTPError,
+            LLMTimeoutError,
+            LLMTransportError,
+            asyncio.TimeoutError,
+        ):
+            raise
+        except Exception as e:
+            error_message = (
+                f"Достигнут лимит итераций {self.max_iterations}, "
+                "и forced final answer не выполнен: "
+                f"{type(e).__name__}: {e!r}"
+            )
+            self._finish_with_error(
+                state,
+                final_text,
+                error_message,
+                log_exception=True,
+            )
+            return
+
+        final_text.clear()
+        final_text.append(answer)
+        state.status = AgentStatus.DONE
+        state.last_error = None
+        self._trace_event(
+            task_trace,
+            "max_iterations_forced_final_answer",
+            final_answer=answer,
+        )
+
     async def _audit_final_answer(
         self,
         messages: list[dict],
@@ -1143,6 +1415,11 @@ class MCPClient:
         task_trace: List[Dict[str, Any]] = []
         messages_for_llm: List[Dict[str, Any]] = []
         session: SessionMemory | None = None
+        cycle_snapshot: AgentCycleSnapshot | None = None
+        original_user_request = query
+        previous_cycle_progress_events: List[Dict[str, Any]] = []
+        preserve_context_on_error = False
+        error_kind = "logical_error"
         
         try:
             # Создание состояния сессии
@@ -1154,48 +1431,101 @@ class MCPClient:
             state.awaiting_user_input = False
             state.progress_events = []
 
-            # Составляем системное сообщение с инструкциями
-            system_message = self._create_system_message(client_type)
-
-            # Инициализируем диалог
+            # Инициализируем память сессии до построения рабочего контекста.
             session = self._get_or_create_session(session_id)
-            
-            # Добавляем сообщение пользователя
-            user_payload = {
-                "type": "user_request",
-                "user_request": query,
-                "available_servers": [
-                    {
-                        "name": item["name"],
-                        "alias": item["alias"],
-                        "connected": item["connected"],
-                        "tool_count": item["tool_count"],
-                    }
-                    for item in self.server_manager.list_servers()
-                ],
-            }
+            cycle_snapshot = session.pending_cycle
 
-            messages_for_llm = self._build_messages_for_llm(
-                session=session,
-                system_message=system_message,
-                current_user_payload=user_payload,
-                keep_last_turns=4,
-            )
+            if cycle_snapshot is not None:
+                task_id = cycle_snapshot.cycle_id
+                task_trace = cycle_snapshot.task_trace
+                messages_for_llm = cycle_snapshot.messages_for_llm
+                original_user_request = cycle_snapshot.original_user_request
+                previous_question = cycle_snapshot.waiting_question
+
+                if cycle_snapshot.status == "interrupted":
+                    messages_for_llm.append({
+                        "role": "user",
+                        "content": dumps_json({
+                            "type": "user_resume_interrupted_cycle",
+                            "reply": query,
+                            "previous_interruption": (
+                                cycle_snapshot.interruption_reason
+                            ),
+                        }),
+                    })
+                    self._trace_event(
+                        task_trace,
+                        "user_resume_interrupted_cycle",
+                        reply=query,
+                        previous_interruption=(
+                            cycle_snapshot.interruption_reason
+                        ),
+                    )
+                else:
+                    messages_for_llm.append({
+                        "role": "user",
+                        "content": dumps_json({
+                            "type": "user_reply_during_waiting_user",
+                            "reply": query,
+                            "previous_question": previous_question,
+                        }),
+                    })
+                    self._trace_event(
+                        task_trace,
+                        "user_reply_during_waiting_user",
+                        reply=query,
+                        previous_question=previous_question,
+                    )
+
+                cycle_snapshot.status = "running"
+                cycle_snapshot.updated_at = time.time()
+                state.tools_used = list(cycle_snapshot.tools_used)
+                previous_cycle_progress_events = list(
+                    cycle_snapshot.progress_events
+                )
+                state.progress_events = []
+
+            else:
+                task_id = uuid4().hex
+                original_user_request = query
+                system_message = self._create_system_message(client_type)
+
+                user_payload = {
+                    "type": "user_request",
+                    "user_request": query,
+                    "available_servers": [
+                        {
+                            "name": item["name"],
+                            "alias": item["alias"],
+                            "connected": item["connected"],
+                            "tool_count": item["tool_count"],
+                        }
+                        for item in self.server_manager.list_servers()
+                    ],
+                }
+
+                messages_for_llm = self._build_messages_for_llm(
+                    session=session,
+                    system_message=system_message,
+                    current_user_payload=user_payload,
+                    keep_last_turns=4,
+                )
+
+                self._trace_event(
+                    task_trace,
+                    "cycle_started",
+                    cycle_id=task_id,
+                    user_request=query,
+                    user_payload=user_payload,
+                )
+
             messages = messages_for_llm
             
             logger.debug(
                 "Messages for LLM prepared: "
                 f"count={len(messages_for_llm)}, "
-                f"chars={self._estimate_messages_chars(messages_for_llm)}, "
+                f"estimated_tokens={self._estimate_messages_tokens(messages_for_llm)}, "
                 f"task_id={task_id}"
-            )
-
-            self._trace_event(
-                task_trace,
-                "task_started",
-                task_id=task_id,
-                user_request=query,
-                user_payload=user_payload,
             )
             
             # Преобразуем инструменты в формат для LLM
@@ -1208,12 +1538,29 @@ class MCPClient:
                 
                 try:
                     # Вызываем LLM с таймаутом
-                    self._warn_if_messages_too_large(
+                    messages_for_llm = await self._compact_context_if_needed(
+                        messages_for_llm=messages_for_llm,
+                        cycle_snapshot=cycle_snapshot,
+                        task_trace=task_trace,
+                        cycle_id=task_id,
+                    )
+                    messages = messages_for_llm
+                    self._trace_event(
+                        task_trace,
+                        "iteration_started",
+                        iteration=state.iterations,
+                        iteration_max=self.max_iterations,
+                        iteration_remaining=max(
+                            0,
+                            self.max_iterations - state.iterations,
+                        ),
+                    )
+                    llm_messages = self._with_iteration_runtime_message(
                         messages_for_llm,
-                        task_id=task_id,
+                        state,
                     )
                     llm_response = await self._call_llm_with_retries(
-                        messages,
+                        llm_messages,
                         tools,
                         context=f"Итерация {i + 1}"
                     )
@@ -1279,6 +1626,9 @@ class MCPClient:
                                     )
 
                                 except Exception as repair_error:
+                                    if self._is_infrastructure_error(repair_error):
+                                        raise
+
                                     self._finish_with_error(
                                         state,
                                         final_text,
@@ -1514,10 +1864,13 @@ class MCPClient:
                     # Если последняя итерация и были вызовы, получаем финальный ответ
                     if i == self.max_iterations - 1 and tool_results:
                         try:
-                            self._warn_if_messages_too_large(
-                                messages_for_llm,
-                                task_id=task_id,
+                            messages_for_llm = await self._compact_context_if_needed(
+                                messages_for_llm=messages_for_llm,
+                                cycle_snapshot=cycle_snapshot,
+                                task_trace=task_trace,
+                                cycle_id=task_id,
                             )
+                            messages = messages_for_llm
                             final_response = await self._call_llm_with_retries(
                                 messages,
                                 tools,
@@ -1534,11 +1887,29 @@ class MCPClient:
                             final_tool_calls = final_response.get("tool_calls", []) or []
 
                             if final_tool_calls:
-                                self._finish_with_error(
-                                    state,
-                                    final_text,
-                                    "LLM попыталась вызвать инструмент на последней итерации."
+                                answer = await self._force_final_answer(
+                                    messages_for_llm,
+                                    context=(
+                                        "Forced final answer because LLM requested "
+                                        "tool on last iteration"
+                                    ),
                                 )
+                                final_text.clear()
+                                final_text.append(answer)
+                                state.status = AgentStatus.DONE
+                                state.last_error = None
+                                messages.append({
+                                    "role": "assistant",
+                                    "content": dumps_json({
+                                        "type": "agent_action",
+                                        "status": "done",
+                                        "action": "answer",
+                                        "agent_request": None,
+                                        "final_answer": answer,
+                                        "question_to_user": None,
+                                        "error_message": None,
+                                    }),
+                                })
                                 break
 
                             if not final_content:
@@ -1595,6 +1966,9 @@ class MCPClient:
                         except LLMTimeoutError as e:
                             error_message = f"Таймаут при получении финального ответа: {e}"
                             self._finish_with_error(state, final_text, error_message)
+                            preserve_context_on_error = True
+                            error_kind = "infrastructure_interruption"
+                            break
                         except LLMHTTPError as e:
                             if e.status_code == 429:
                                 error_message = (
@@ -1605,35 +1979,54 @@ class MCPClient:
                                 error_message = f"HTTP-ошибка LLM на итерации {i + 1}: {e}"
 
                             self._finish_with_error(state, final_text, error_message)
+                            if self._is_infrastructure_error(e):
+                                preserve_context_on_error = True
+                                error_kind = "infrastructure_interruption"
                             break
                         except LLMTransportError as e:
                             error_message = f"Сетевая ошибка при получении финального ответа: {e}"
                             self._finish_with_error(state, final_text, error_message)
+                            preserve_context_on_error = True
+                            error_kind = "infrastructure_interruption"
+                            break
                         except asyncio.TimeoutError:
                             error_message = "Общий таймаут при получении финального ответа"
                             self._finish_with_error(state, final_text, error_message)
+                            preserve_context_on_error = True
+                            error_kind = "infrastructure_interruption"
+                            break
                         except Exception as e:
                             error_message = f"Ошибка при получении финального ответа: {type(e).__name__}: {e!r}"
                             self._finish_with_error(state, final_text, error_message, log_exception=True)
+                            break
                             
                 except LLMTimeoutError as e:
                     error_message = f"Таймаут LLM на итерации {i+1}: {e}"
                     self._finish_with_error(state, final_text, error_message)
+                    preserve_context_on_error = True
+                    error_kind = "infrastructure_interruption"
                     break
 
                 except LLMHTTPError as e:
                     error_message = f"HTTP-ошибка LLM на итерации {i+1}: {e}"
                     self._finish_with_error(state, final_text, error_message)
+                    if self._is_infrastructure_error(e):
+                        preserve_context_on_error = True
+                        error_kind = "infrastructure_interruption"
                     break
 
                 except LLMTransportError as e:
                     error_message = f"Сетевая ошибка LLM на итерации {i+1}: {e}"
                     self._finish_with_error(state, final_text, error_message)
+                    preserve_context_on_error = True
+                    error_kind = "infrastructure_interruption"
                     break
 
                 except asyncio.TimeoutError:
                     error_message = f"Общий таймаут обработки LLM на итерации {i+1}"
                     self._finish_with_error(state, final_text, error_message)
+                    preserve_context_on_error = True
+                    error_kind = "infrastructure_interruption"
                     break
 
                 except Exception as e:
@@ -1641,9 +2034,18 @@ class MCPClient:
                     self._finish_with_error(state, final_text, error_message, log_exception=True)
                     break
             
-            if state.iterations >= self.max_iterations and state.status == AgentStatus.RUNNING:
-                state.status = AgentStatus.ERROR
-                state.last_error = f"Достигнут лимит итераций: {self.max_iterations}"
+            if (
+                state.iterations >= self.max_iterations
+                and state.status == AgentStatus.RUNNING
+            ):
+                error_kind = "max_iterations"
+                await self._finalize_after_max_iterations(
+                    messages_for_llm=messages_for_llm,
+                    task_trace=task_trace,
+                    state=state,
+                    final_text=final_text,
+                    cycle_id=task_id,
+                )
             
             if not final_text:
                 self._finish_with_error(
@@ -1661,10 +2063,13 @@ class MCPClient:
                 and not state.last_error
             ):
                 try:
-                    self._warn_if_messages_too_large(
-                        messages_for_llm,
-                        task_id=task_id,
+                    messages_for_llm = await self._compact_context_if_needed(
+                        messages_for_llm=messages_for_llm,
+                        cycle_snapshot=cycle_snapshot,
+                        task_trace=task_trace,
+                        cycle_id=task_id,
                     )
+                    messages = messages_for_llm
                     audited_text = await self._audit_final_answer(
                         messages_for_llm,
                         result_text,
@@ -1683,26 +2088,96 @@ class MCPClient:
 
             session.last_task_trace = task_trace[-30:]
 
-            if result_text and state.status in (
-                AgentStatus.DONE,
-                AgentStatus.WAITING_USER,
-            ):
-                self._append_dialog_turn(
-                    session,
-                    user_request=query,
-                    final_answer=result_text,
-                    state=state,
-                    keep_last_turns=8,
+            if state.status == AgentStatus.WAITING_USER:
+                session.pending_cycle = AgentCycleSnapshot(
+                    cycle_id=task_id,
+                    original_user_request=original_user_request,
+                    messages_for_llm=list(messages_for_llm),
+                    task_trace=list(task_trace),
+                    status="waiting_user",
+                    waiting_question=result_text,
+                    working_summary=(
+                        cycle_snapshot.working_summary
+                        if cycle_snapshot is not None
+                        else ""
+                    ),
+                    working_state=(
+                        dict(cycle_snapshot.working_state)
+                        if cycle_snapshot is not None
+                        else {}
+                    ),
+                    tools_used=list(state.tools_used),
+                    progress_events=(
+                        previous_cycle_progress_events
+                        + list(state.progress_events)
+                    ),
+                    created_at=(
+                        cycle_snapshot.created_at
+                        if cycle_snapshot is not None
+                        else time.time()
+                    ),
+                    updated_at=time.time(),
                 )
+                cycle_snapshot = session.pending_cycle
+
+            elif state.status == AgentStatus.DONE:
+                session.pending_cycle = None
+
+                if result_text:
+                    self._append_dialog_turn(
+                        session,
+                        user_request=original_user_request,
+                        final_answer=result_text,
+                        state=state,
+                        keep_last_turns=8,
+                    )
+
+            elif state.status == AgentStatus.ERROR:
+                error_message = state.last_error or result_text
+                self._trace_event(
+                    task_trace,
+                    "cycle_error",
+                    error=error_message,
+                    error_kind=error_kind,
+                    can_resume=preserve_context_on_error,
+                )
+                self._save_last_error_cycle(
+                    session=session,
+                    cycle_id=task_id,
+                    original_user_request=original_user_request,
+                    state=state,
+                    error_message=error_message,
+                    error_kind=error_kind,
+                    can_resume=preserve_context_on_error,
+                )
+
+                if preserve_context_on_error:
+                    cycle_snapshot = self._save_interrupted_cycle(
+                        session=session,
+                        cycle_id=task_id,
+                        original_user_request=original_user_request,
+                        messages_for_llm=messages_for_llm,
+                        task_trace=task_trace,
+                        state=state,
+                        error_message=error_message,
+                        previous_cycle_progress_events=(
+                            previous_cycle_progress_events
+                        ),
+                        cycle_snapshot=cycle_snapshot,
+                    )
+                else:
+                    session.pending_cycle = None
 
             self._archive_task_trace(
                 session_id=session_id,
                 task_id=task_id,
-                user_request=query,
+                user_request=original_user_request,
                 messages_for_llm=messages_for_llm,
                 task_trace=task_trace,
                 result_text=result_text,
                 state=state,
+                cycle_snapshot=cycle_snapshot,
+                session=session,
             )
 
             logger.info(f"Завершение обработки запроса. Результат: {result_text}")
@@ -1725,20 +2200,58 @@ class MCPClient:
             state.status = AgentStatus.ERROR
             state.last_error = error_message
 
-            try:
-                self._trace_event(
-                    task_trace,
-                    "critical_error",
-                    error=error_message,
+            if session is None:
+                session = self._get_or_create_session(session_id)
+
+            can_resume = self._is_infrastructure_error(e)
+            outer_error_kind = (
+                "infrastructure_interruption"
+                if can_resume
+                else "critical_error"
+            )
+            self._trace_event(
+                task_trace,
+                outer_error_kind,
+                error=error_message,
+            )
+            self._save_last_error_cycle(
+                session=session,
+                cycle_id=task_id,
+                original_user_request=original_user_request,
+                state=state,
+                error_message=error_message,
+                error_kind=outer_error_kind,
+                can_resume=can_resume,
+            )
+
+            if can_resume:
+                cycle_snapshot = self._save_interrupted_cycle(
+                    session=session,
+                    cycle_id=task_id,
+                    original_user_request=original_user_request,
+                    messages_for_llm=messages_for_llm,
+                    task_trace=task_trace,
+                    state=state,
+                    error_message=error_message,
+                    previous_cycle_progress_events=(
+                        previous_cycle_progress_events
+                    ),
+                    cycle_snapshot=cycle_snapshot,
                 )
+            else:
+                session.pending_cycle = None
+
+            try:
                 self._archive_task_trace(
                     session_id=session_id,
                     task_id=task_id,
-                    user_request=query,
+                    user_request=original_user_request,
                     messages_for_llm=messages_for_llm,
                     task_trace=task_trace,
                     result_text=error_message,
                     state=state,
+                    cycle_snapshot=cycle_snapshot,
+                    session=session,
                 )
             except Exception as archive_error:
                 logger.warning(
@@ -2565,25 +3078,94 @@ class MCPClient:
         task_trace: List[Dict[str, Any]],
         result_text: str,
         state: SessionState,
+        cycle_snapshot: AgentCycleSnapshot | None = None,
+        session: SessionMemory | None = None,
     ) -> None:
+        if cycle_snapshot is None:
+            archived_progress_events = list(state.progress_events)
+        elif cycle_snapshot.status in {"waiting_user", "interrupted"}:
+            archived_progress_events = list(cycle_snapshot.progress_events)
+        else:
+            archived_progress_events = (
+                list(cycle_snapshot.progress_events)
+                + list(state.progress_events)
+            )
+
+        has_current_error = (
+            state.status == AgentStatus.ERROR
+            and session is not None
+            and session.last_error_cycle is not None
+            and session.last_error_cycle.get("cycle_id") == task_id
+        )
+        cycle_status = (
+            cycle_snapshot.status
+            if (
+                cycle_snapshot is not None
+                and cycle_snapshot.status in {"waiting_user", "interrupted"}
+            )
+            else str(
+                state.status.value
+                if hasattr(state.status, "value")
+                else state.status
+            )
+        )
+
         payload = {
-            "type": "agent_task_archive",
-            "task_id": task_id,
+            "type": "agent_cycle_archive",
+            "cycle_id": task_id,
             "session_id": session_id,
             "created_at": datetime.now().isoformat(),
-            "user_request": user_request,
+            "original_user_request": user_request,
             "status": str(
                 state.status.value
                 if hasattr(state.status, "value")
                 else state.status
             ),
+            "final_answer": (
+                result_text
+                if state.status == AgentStatus.DONE
+                else None
+            ),
             "iterations": state.iterations,
             "tools_used": state.tools_used,
             "error": state.last_error,
-            "progress_events": state.progress_events,
+            "error_kind": (
+                session.last_error_cycle.get("error_kind")
+                if has_current_error
+                else None
+            ),
+            "can_resume": (
+                bool(session.last_error_cycle.get("can_resume"))
+                if has_current_error
+                else False
+            ),
+            "cycle_status": cycle_status,
+            "interruption_reason": (
+                cycle_snapshot.interruption_reason
+                if cycle_snapshot is not None
+                else None
+            ),
+            "progress_events": archived_progress_events,
             "messages_for_llm": messages_for_llm,
-            "task_trace": task_trace,
-            "result_text": result_text,
+            "cycle_trace": task_trace,
+            "working_summary": (
+                cycle_snapshot.working_summary
+                if cycle_snapshot is not None
+                else ""
+            ),
+            "working_state": (
+                cycle_snapshot.working_state
+                if cycle_snapshot is not None
+                else {}
+            ),
+            "waiting_question": (
+                cycle_snapshot.waiting_question
+                if (
+                    cycle_snapshot is not None
+                    and state.status == AgentStatus.WAITING_USER
+                )
+                else None
+            ),
         }
 
         safe_session_id = self._safe_filename_part(session_id)
@@ -2596,27 +3178,95 @@ class MCPClient:
                 encoding="utf-8",
             )
         except Exception as e:
-            logger.warning(f"Не удалось записать agent trace archive: {e!r}")
+            logger.warning(f"Не удалось записать agent cycle archive: {e!r}")
 
-    def _estimate_messages_chars(self, messages: List[Dict[str, Any]]) -> int:
-        return sum(
-            len(json.dumps(message, ensure_ascii=False))
-            for message in messages
-        )
+    def _estimate_tokens_rough(self, text: str) -> int:
+        """Грубая оценка токенов. Для русского консервативно: chars // 2."""
+        return max(1, len(text) // 2)
 
-    def _warn_if_messages_too_large(
+    def _estimate_messages_tokens(
         self,
         messages: List[Dict[str, Any]],
-        *,
-        task_id: str,
-    ) -> None:
-        chars = self._estimate_messages_chars(messages)
+    ) -> int:
+        raw = json.dumps(messages, ensure_ascii=False)
+        return self._estimate_tokens_rough(raw)
 
-        if chars > self.max_messages_chars_for_llm:
-            logger.warning(
-                f"messages_for_llm too large: {chars} chars. "
-                f"task_id={task_id}. Consider summarizing current task trace."
-            )
+    def _effective_reserved_output_tokens(self) -> int:
+        return max(
+            self.llm_config.reserved_output_tokens or 0,
+            self.llm_config.max_tokens,
+        )
+
+    def _context_usable_input_tokens(self) -> int:
+        return max(
+            1,
+            self.llm_config.context_window_tokens
+            - self._effective_reserved_output_tokens(),
+        )
+
+    def _context_trigger_tokens(self) -> int:
+        return max(
+            1,
+            int(
+                self._context_usable_input_tokens()
+                * self.llm_config.context_safety_ratio
+            ),
+        )
+
+    def _context_target_tokens(self) -> int:
+        return max(
+            1,
+            int(
+                self._context_usable_input_tokens()
+                * self.llm_config.context_compaction_target_ratio
+            ),
+        )
+
+    async def _compact_context_if_needed(
+        self,
+        *,
+        messages_for_llm: List[Dict[str, Any]],
+        cycle_snapshot: AgentCycleSnapshot | None,
+        task_trace: List[Dict[str, Any]],
+        cycle_id: str,
+    ) -> List[Dict[str, Any]]:
+        """
+        TODO v0.4: Реальная context compaction.
+
+        Сейчас:
+        - оценивает размер контекста;
+        - если лимит превышен, логирует warning;
+        - возвращает messages_for_llm без изменений.
+
+        В будущем:
+        - Level 1: сжимать большие tool_result до preview/archive_ref;
+        - Level 2: заменять старые внутренние шаги цикла на
+          compacted_cycle_segment;
+        - Level 3: вызывать LLM compact-запрос для
+          working_summary/working_state.
+        """
+
+        tokens = self._estimate_messages_tokens(messages_for_llm)
+
+        if tokens < self._context_trigger_tokens():
+            return messages_for_llm
+
+        compaction_status = (
+            "enabled_not_implemented"
+            if self.llm_config.enable_context_compaction
+            else "disabled"
+        )
+
+        logger.warning(
+            "Context compaction needed but not implemented yet: "
+            f"cycle_id={cycle_id}, "
+            f"estimated_tokens={tokens}, "
+            f"trigger_tokens={self._context_trigger_tokens()}, "
+            f"target_tokens={self._context_target_tokens()}, "
+            f"compaction_status={compaction_status}"
+        )
+
+        return messages_for_llm
 
     def _compact_large_tool_payload(
         self,
@@ -2819,7 +3469,24 @@ def load_config(config_path: str) -> Tuple[List[ServerConfigType], LLMConfigType
             temperature=llm_data.get("temperature", 0.7),
             top_p=llm_data.get("top_p", 1),
             final_audit=llm_data.get("final_audit", False),
-            instructions=llm_data.get("instructions")
+            instructions=llm_data.get("instructions"),
+            context_window_tokens=llm_data.get(
+                "context_window_tokens",
+                128_000,
+            ),
+            reserved_output_tokens=llm_data.get("reserved_output_tokens"),
+            context_safety_ratio=llm_data.get(
+                "context_safety_ratio",
+                0.75,
+            ),
+            context_compaction_target_ratio=llm_data.get(
+                "context_compaction_target_ratio",
+                0.55,
+            ),
+            enable_context_compaction=llm_data.get(
+                "enable_context_compaction",
+                True,
+            ),
         )
 
         if not llm_config.api_url:

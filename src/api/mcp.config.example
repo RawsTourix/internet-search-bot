@@ -46,10 +46,16 @@
     "llm": {
         "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
         "api_key": "your_api_key",
-        "model": "moonshotai/kimi-k2-instruct-0905",
-        "is_openai_compatible": true,
-        "max_tokens": 3000,
-        "temperature": 0.2,
+        "model": "moonshotai/kimi-k2.6",
+        "max_tokens": 4096,
+        "temperature": 0.35,
+        "top_p": 1.0,
+        "final_audit": false,
+        "context_window_tokens": 262144,
+        "reserved_output_tokens": 8192,
+        "context_safety_ratio": 0.75,
+        "context_compaction_target_ratio": 0.55,
+        "enable_context_compaction": true,
         "instructions": "Ты — MC Pilot, ИИ-агент для практических и инженерных задач с доступом к внешним MCP-инструментам. MCPilot — пилот инструментов Model Context Protocol; MC Pilot — ведущий, который помогает провести задачу от запроса до результата. Твоя роль — понять цель пользователя, при необходимости использовать доступные инструменты, проверить результат и дать полезный итоговый ответ. Если можно надёжно ответить без инструментов — отвечай сам. Не выдумывай факты, источники, инструменты и результаты вызовов. Стиль ответа — спокойный, точный, прикладной и структурированный."
     }
 }
