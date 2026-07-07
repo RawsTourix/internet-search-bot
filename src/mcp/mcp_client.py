@@ -237,6 +237,33 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "tool_done": "✅ Инструмент {tool_name} завершил работу.",
         "tool_error": "⚠️ Инструмент {tool_name} завершился с ошибкой.",
         "tool_timeout": "⚠️ Инструмент {tool_name} завершился по таймауту.",
+        "llm_http_retry": (
+            "⚠️ LLM HTTP {status_code}. Повтор через {delay:.0f} сек. "
+            "Попытка {attempt}/{max_attempts}…"
+        ),
+        "llm_http_exhausted": (
+            "⚠️ LLM HTTP {status_code}. Повторы исчерпаны. "
+            "Попытка {attempt}/{max_attempts}."
+        ),
+        "llm_transport_retry": (
+            "⚠️ LLM transport error. Повтор через {delay:.0f} сек. "
+            "Попытка {attempt}/{max_attempts}…"
+        ),
+        "llm_transport_exhausted": (
+            "⚠️ LLM transport error. Повторы исчерпаны. "
+            "Попытка {attempt}/{max_attempts}."
+        ),
+        "llm_timeout_retry": (
+            "⚠️ LLM timeout. Повтор через {delay:.0f} сек. "
+            "Попытка {attempt}/{max_attempts}…"
+        ),
+        "llm_timeout_exhausted": (
+            "⚠️ LLM timeout. Повторы исчерпаны. "
+            "Попытка {attempt}/{max_attempts}."
+        ),
+        "infrastructure_interruption": (
+            "⚠️ Инфраструктурная ошибка. Состояние задачи сохранено."
+        ),
         "waiting_user": "❓ Нужны дополнительные данные от пользователя.",
         "cycle_done": "✅ Задача завершена.",
         "cycle_error": "⚠️ Задача завершилась с ошибкой.",
@@ -255,6 +282,33 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "tool_done": "✅ Tool {tool_name} finished.",
         "tool_error": "⚠️ Tool {tool_name} failed.",
         "tool_timeout": "⚠️ Tool {tool_name} timed out.",
+        "llm_http_retry": (
+            "⚠️ LLM HTTP {status_code}. Retrying in {delay:.0f}s. "
+            "Attempt {attempt}/{max_attempts}…"
+        ),
+        "llm_http_exhausted": (
+            "⚠️ LLM HTTP {status_code}. Retries exhausted. "
+            "Attempt {attempt}/{max_attempts}."
+        ),
+        "llm_transport_retry": (
+            "⚠️ LLM transport error. Retrying in {delay:.0f}s. "
+            "Attempt {attempt}/{max_attempts}…"
+        ),
+        "llm_transport_exhausted": (
+            "⚠️ LLM transport error. Retries exhausted. "
+            "Attempt {attempt}/{max_attempts}."
+        ),
+        "llm_timeout_retry": (
+            "⚠️ LLM timeout. Retrying in {delay:.0f}s. "
+            "Attempt {attempt}/{max_attempts}…"
+        ),
+        "llm_timeout_exhausted": (
+            "⚠️ LLM timeout. Retries exhausted. "
+            "Attempt {attempt}/{max_attempts}."
+        ),
+        "infrastructure_interruption": (
+            "⚠️ Infrastructure error. Task state has been saved."
+        ),
         "waiting_user": "❓ More information is needed from the user.",
         "cycle_done": "✅ Task completed.",
         "cycle_error": "⚠️ Task failed.",
@@ -1379,6 +1433,42 @@ class MCPClient:
             data=self._safe_progress_data(data) if data else None,
         )
 
+    async def _emit_llm_retry_progress(
+        self,
+        *,
+        state: SessionState | None,
+        session_id: str | None,
+        cycle_id: str | None,
+        progress_callback,
+        cycle_trace: list[dict[str, Any]] | None,
+        context: str,
+        event_type: str,
+        message_key: str,
+        severity: str,
+        data: dict[str, Any],
+    ) -> None:
+        if state is None or session_id is None or cycle_id is None:
+            return
+
+        await self._emit_progress(
+            state,
+            self._build_progress_event(
+                event_type=event_type,
+                message=self._progress_text(
+                    message_key,
+                    locale_name=state.progress_locale,
+                    **data,
+                ),
+                state=state,
+                session_id=session_id,
+                cycle_id=cycle_id,
+                severity=severity,
+                data={"context": context, **data},
+            ),
+            progress_callback,
+            cycle_trace,
+        )
+
     def _tool_start_message(
         self,
         tool_name: str,
@@ -1807,7 +1897,12 @@ class MCPClient:
                     llm_response = await self._call_llm_with_retries(
                         llm_messages,
                         tools,
-                        context=f"Итерация {i + 1}"
+                        context=f"Итерация {i + 1}",
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
                     )
                     logger.debug(f"Получен ответ от модели: {llm_response}")
                     
@@ -2193,6 +2288,11 @@ class MCPClient:
                                 messages,
                                 tools,
                                 context="Финальный ответ после tool calls",
+                                state=state,
+                                session_id=session_id,
+                                cycle_id=cycle_id,
+                                progress_callback=progress_callback,
+                                cycle_trace=cycle_trace,
                             )
 
                             self._trace_event(
@@ -2458,6 +2558,24 @@ class MCPClient:
                     progress_callback,
                     cycle_trace,
                 )
+                if preserve_context_on_error:
+                    await self._emit_progress(
+                        state,
+                        self._build_progress_event(
+                            event_type="infrastructure_error",
+                            message=self._progress_text(
+                                "infrastructure_interruption",
+                                locale_name=state.progress_locale,
+                            ),
+                            state=state,
+                            session_id=session_id,
+                            cycle_id=cycle_id,
+                            severity="error",
+                            data={"error": state.last_error},
+                        ),
+                        progress_callback,
+                        cycle_trace,
+                    )
 
             session.last_cycle_trace = cycle_trace[-30:]
 
@@ -2562,6 +2680,10 @@ class MCPClient:
                 iterations=state.iterations,
                 tools_used=state.tools_used,
                 error=state.last_error,
+                error_kind=(
+                    error_kind if state.status == AgentStatus.ERROR else None
+                ),
+                can_resume=bool(preserve_context_on_error),
                 progress_events=state.progress_events
             )
             
@@ -2600,6 +2722,24 @@ class MCPClient:
                 if can_resume
                 else "critical_error"
             )
+            if can_resume:
+                await self._emit_progress(
+                    state,
+                    self._build_progress_event(
+                        event_type="infrastructure_error",
+                        message=self._progress_text(
+                            "infrastructure_interruption",
+                            locale_name=state.progress_locale,
+                        ),
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        severity="error",
+                        data={"error": error_message},
+                    ),
+                    progress_callback,
+                    cycle_trace,
+                )
             self._trace_event(
                 cycle_trace,
                 outer_error_kind,
@@ -2656,6 +2796,8 @@ class MCPClient:
                 iterations=state.iterations,
                 tools_used=state.tools_used,
                 error=error_message,
+                error_kind=outer_error_kind,
+                can_resume=can_resume,
                 progress_events=state.progress_events
             )
     
@@ -3084,7 +3226,12 @@ class MCPClient:
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
         *,
-        context: str = "LLM call"
+        context: str = "LLM call",
+        state: SessionState | None = None,
+        session_id: str | None = None,
+        cycle_id: str | None = None,
+        progress_callback=None,
+        cycle_trace: list[dict[str, Any]] | None = None,
     ) -> Dict[str, Any]:
         max_attempts = self.llm_max_retries + 1
 
@@ -3097,8 +3244,29 @@ class MCPClient:
 
                 if not can_retry or attempt >= max_attempts:
                     logger.error(
-                        f"{context}: LLM HTTP error без дальнейших повторов "
-                        f"(attempt {attempt}/{max_attempts}): {e}"
+                        f"{context}: LLM HTTP {e.status_code} без дальнейших "
+                        f"повторов; attempt={attempt}/{max_attempts}; "
+                        f"retry_after={e.retry_after!r}; error={e!r}"
+                    )
+                    await self._emit_llm_retry_progress(
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
+                        context=context,
+                        event_type="llm_error",
+                        message_key="llm_http_exhausted",
+                        severity="error",
+                        data={
+                            "status_code": e.status_code,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "retry_after": e.retry_after,
+                            "delay": 0,
+                            "error_type": type(e).__name__,
+                            "error_repr": repr(e),
+                        },
                     )
                     raise
 
@@ -3107,25 +3275,136 @@ class MCPClient:
                 logger.warning(
                     f"{context}: LLM HTTP {e.status_code}. "
                     f"Повтор через {delay:.1f} сек. "
-                    f"Попытка {attempt}/{max_attempts}"
+                    f"Попытка {attempt}/{max_attempts}; "
+                    f"retry_after={e.retry_after!r}; error={e!r}"
+                )
+                await self._emit_llm_retry_progress(
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                    context=context,
+                    event_type="llm_retry",
+                    message_key="llm_http_retry",
+                    severity="warning",
+                    data={
+                        "status_code": e.status_code,
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "retry_after": e.retry_after,
+                        "delay": delay,
+                        "error_type": type(e).__name__,
+                        "error_repr": repr(e),
+                    },
                 )
 
                 await asyncio.sleep(delay)
 
-            except (LLMTimeoutError, LLMTransportError) as e:
+            except LLMTimeoutError as e:
                 if attempt >= max_attempts:
                     logger.error(
-                        f"{context}: LLM transport error без дальнейших повторов "
-                        f"(attempt {attempt}/{max_attempts}): {e}"
+                        f"{context}: LLM timeout без дальнейших повторов; "
+                        f"attempt={attempt}/{max_attempts}; error={e!r}"
+                    )
+                    await self._emit_llm_retry_progress(
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
+                        context=context,
+                        event_type="llm_error",
+                        message_key="llm_timeout_exhausted",
+                        severity="error",
+                        data={
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "delay": 0,
+                            "error_type": type(e).__name__,
+                            "error_repr": repr(e),
+                        },
                     )
                     raise
 
                 delay = self._get_llm_retry_delay(None, attempt)
 
                 logger.warning(
-                    f"{context}: временная ошибка LLM: {e}. "
+                    f"{context}: LLM timeout. "
                     f"Повтор через {delay:.1f} сек. "
-                    f"Попытка {attempt}/{max_attempts}"
+                    f"Попытка {attempt}/{max_attempts}; error={e!r}"
+                )
+                await self._emit_llm_retry_progress(
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                    context=context,
+                    event_type="llm_retry",
+                    message_key="llm_timeout_retry",
+                    severity="warning",
+                    data={
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "delay": delay,
+                        "error_type": type(e).__name__,
+                        "error_repr": repr(e),
+                    },
+                )
+
+                await asyncio.sleep(delay)
+
+            except LLMTransportError as e:
+                if attempt >= max_attempts:
+                    logger.error(
+                        f"{context}: LLM transport error без дальнейших повторов; "
+                        f"attempt={attempt}/{max_attempts}; error={e!r}"
+                    )
+                    await self._emit_llm_retry_progress(
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
+                        context=context,
+                        event_type="llm_error",
+                        message_key="llm_transport_exhausted",
+                        severity="error",
+                        data={
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "delay": 0,
+                            "error_type": type(e).__name__,
+                            "error_repr": repr(e),
+                        },
+                    )
+                    raise
+
+                delay = self._get_llm_retry_delay(None, attempt)
+
+                logger.warning(
+                    f"{context}: LLM transport error. "
+                    f"Повтор через {delay:.1f} сек. "
+                    f"Попытка {attempt}/{max_attempts}; error={e!r}"
+                )
+                await self._emit_llm_retry_progress(
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                    context=context,
+                    event_type="llm_retry",
+                    message_key="llm_transport_retry",
+                    severity="warning",
+                    data={
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "delay": delay,
+                        "error_type": type(e).__name__,
+                        "error_repr": repr(e),
+                    },
                 )
 
                 await asyncio.sleep(delay)

@@ -27,6 +27,9 @@ from .config import (
     PROGRESS_EDIT_MIN_INTERVAL,
     PROGRESS_MAX_TEXT_LENGTH,
     TELEGRAM_FINAL_EDIT_MAX_LENGTH,
+    TELEGRAM_FINAL_DELIVERY_MODE,
+    TELEGRAM_FINAL_SUCCESS_STATUS_TEXT,
+    TELEGRAM_FINAL_ERROR_STATUS_TEXT,
 )
 from ...utils.telegram_formatting import markdown_to_telegram_html, split_telegram_message, split_markdown_for_telegram, markdown_to_plain_text
 
@@ -59,6 +62,37 @@ logger.addHandler(console_handler)
 # Инициализация Telegram Application
 application = Application.builder().token(BOT_TOKEN).build()
 progress_edit_state: dict[str, dict[str, Any]] = {}
+
+FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
+    "ru": {
+        "infrastructure_interruption": (
+            "⚠️ Задача прервана из-за инфраструктурной ошибки.\n\n"
+            "Тип: {error_type}\n"
+            "Итерация: {iteration}\n"
+            "Состояние задачи сохранено, её можно продолжить позже."
+        ),
+        "agent_error": (
+            "⚠️ Агент завершил задачу с ошибкой.\n\n"
+            "Тип: {error_type}\n"
+            "Итерация: {iteration}\n"
+            "Подробности: {error_message}"
+        ),
+    },
+    "en": {
+        "infrastructure_interruption": (
+            "⚠️ The task was interrupted by an infrastructure error.\n\n"
+            "Type: {error_type}\n"
+            "Iteration: {iteration}\n"
+            "The task state has been saved and can be resumed later."
+        ),
+        "agent_error": (
+            "⚠️ The agent finished with an error.\n\n"
+            "Type: {error_type}\n"
+            "Iteration: {iteration}\n"
+            "Details: {error_message}"
+        ),
+    },
+}
 
 async def send_to_gateway(payload: dict) -> tuple[bool, str, dict[str, Any]]:
     """Отправляет данные в Gateway и возвращает успех, ответ и metadata."""
@@ -110,6 +144,76 @@ def detect_progress_locale(update: Update) -> str:
     if language_code and language_code.lower().startswith("en"):
         return "en"
     return "ru"
+
+
+def normalize_locale(value: str | None) -> str:
+    value = (value or "ru").lower().strip()
+    return "en" if value.startswith("en") else "ru"
+
+
+def is_agent_error(metadata: dict[str, Any]) -> bool:
+    status_value = str(metadata.get("agent_status") or "").lower()
+    return status_value in {"error", "agentstatus.error"} or bool(
+        metadata.get("error")
+    )
+
+
+def extract_error_type_summary(error_text: str) -> str:
+    text = error_text or ""
+
+    if "ConnectError" in text:
+        return "LLMTransportError / ConnectError"
+    if "Timeout" in text or "таймаут" in text.lower():
+        return "LLMTimeoutError"
+
+    http_match = re.search(r"\bHTTP\s*(\d{3})\b", text, flags=re.IGNORECASE)
+    if not http_match:
+        http_match = re.search(
+            r"\bLLM\s+API\s*:\s*(\d{3})\b",
+            text,
+            flags=re.IGNORECASE,
+        )
+    if http_match:
+        return f"LLMHTTPError / HTTP {http_match.group(1)}"
+
+    status_match = re.search(
+        r"status[_ ]code[=:\s]+(\d{3})",
+        text,
+        flags=re.IGNORECASE,
+    )
+    if status_match:
+        return f"LLMHTTPError / HTTP {status_match.group(1)}"
+    if "LLMTransportError" in text:
+        return "LLMTransportError"
+    if "LLMHTTPError" in text:
+        return "LLMHTTPError"
+    return "RuntimeError"
+
+
+def format_agent_error_for_telegram(
+    message: str,
+    metadata: dict[str, Any],
+    *,
+    locale_name: str = "ru",
+) -> str:
+    locale_name = normalize_locale(locale_name)
+    error_message = str(metadata.get("error") or message or "")
+    iterations = metadata.get("iterations") or "?"
+    error_kind = metadata.get("error_kind")
+    error_type = extract_error_type_summary(error_message)
+    is_infra = (
+        error_kind == "infrastructure_interruption"
+        or "LLMTransportError" in error_type
+        or "LLMTimeoutError" in error_type
+        or "LLMHTTPError" in error_type
+        or "ConnectError" in error_type
+    )
+    key = "infrastructure_interruption" if is_infra else "agent_error"
+    return FINAL_ERROR_MESSAGES[locale_name][key].format(
+        error_type=error_type,
+        iteration=iterations,
+        error_message=error_message,
+    )
 
 
 async def send_initial_status_message(update: Update, text: str):
@@ -179,22 +283,47 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     success, message, metadata = await send_to_gateway(payload)
-    if success:
+    locale_name = payload.get("metadata", {}).get("progress_locale", "ru")
+    agent_failed = is_agent_error(metadata)
+
+    if success and not agent_failed:
         await finish_status_or_send_reply(
             update=update,
             status_message=status_message,
             text=message,
+            delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
+            final_status_text=TELEGRAM_FINAL_SUCCESS_STATUS_TEXT,
+            final_prefix="✅ Готово.",
         )
         logger.info(
             f"Ответ на команду [id: {payload.get('id')}] "
             f"от {payload.get('user_name') or payload.get('user_id')}: {message}"
+        )
+    elif success and agent_failed:
+        formatted_error = format_agent_error_for_telegram(
+            message,
+            metadata,
+            locale_name=locale_name,
+        )
+        await finish_status_or_send_reply(
+            update=update,
+            status_message=status_message,
+            text=formatted_error,
+            delivery_mode="send_new",
+            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
+            final_prefix="⚠️ Ошибка.",
+        )
+        logger.error(
+            f"Ошибка агента для команды [id: {payload.get('id')}]: {message}"
         )
     else:
         await finish_status_or_send_reply(
             update=update,
             status_message=status_message,
             text=f"**Произошла ошибка при обработке запроса:**\n{message}",
-            force_reply_if_long=True,
+            delivery_mode="send_new",
+            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
+            final_prefix="⚠️ Ошибка.",
         )
         logger.error(
             f"Ответ на команду [id: {payload.get('id')}] "
@@ -234,22 +363,47 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
     success, message, metadata = await send_to_gateway(payload)
-    if success:
+    locale_name = payload.get("metadata", {}).get("progress_locale", "ru")
+    agent_failed = is_agent_error(metadata)
+
+    if success and not agent_failed:
         await finish_status_or_send_reply(
             update=update,
             status_message=status_message,
             text=message,
+            delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
+            final_status_text=TELEGRAM_FINAL_SUCCESS_STATUS_TEXT,
+            final_prefix="✅ Готово.",
         )
         logger.info(
             f"Ответ на сообщение [id: {payload.get('id')}] "
             f"от {payload.get('user_name') or payload.get('user_id')}: {message}"
+        )
+    elif success and agent_failed:
+        formatted_error = format_agent_error_for_telegram(
+            message,
+            metadata,
+            locale_name=locale_name,
+        )
+        await finish_status_or_send_reply(
+            update=update,
+            status_message=status_message,
+            text=formatted_error,
+            delivery_mode="send_new",
+            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
+            final_prefix="⚠️ Ошибка.",
+        )
+        logger.error(
+            f"Ошибка агента для сообщения [id: {payload.get('id')}]: {message}"
         )
     else:
         await finish_status_or_send_reply(
             update=update,
             status_message=status_message,
             text=f"**Произошла ошибка при обработке запроса:**\n{message}",
-            force_reply_if_long=True,
+            delivery_mode="send_new",
+            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
+            final_prefix="⚠️ Ошибка.",
         )
         logger.error(
             f"Ответ на сообщение [id: {payload.get('id')}] "
@@ -422,7 +576,18 @@ async def finish_status_or_send_reply(
     status_message,
     text: str,
     force_reply_if_long: bool = False,
+    delivery_mode: str | None = None,
+    final_status_text: str = "✅ Готово. Ответ ниже.",
+    final_prefix: str = "✅ Готово.",
 ) -> None:
+    delivery_mode = (delivery_mode or TELEGRAM_FINAL_DELIVERY_MODE).lower().strip()
+    if delivery_mode not in {"send_new", "edit_status", "auto"}:
+        logger.warning(
+            "Неизвестный TELEGRAM_FINAL_DELIVERY_MODE=%r; используется send_new",
+            delivery_mode,
+        )
+        delivery_mode = "send_new"
+
     if not status_message:
         await send_telegram_markdown_reply(update, text)
         return
@@ -433,6 +598,24 @@ async def finish_status_or_send_reply(
     )
 
     raw_text = text or ""
+
+    if delivery_mode == "send_new":
+        try:
+            await edit_telegram_message_with_retries(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text=final_status_text,
+                parse_mode=None,
+                disable_web_page_preview=True,
+            )
+        except Exception as e:
+            logger.warning(
+                f"Не удалось обновить status-сообщение перед финальным ответом: {e!r}"
+            )
+
+        await send_telegram_markdown_reply(update, raw_text)
+        return
+
     markdown_chunks = split_markdown_for_telegram(raw_text)
     should_send_separately = (
         force_reply_if_long
@@ -445,7 +628,7 @@ async def finish_status_or_send_reply(
             await edit_telegram_message_with_retries(
                 chat_id=update.effective_chat.id,
                 message_id=status_message.message_id,
-                text="✅ Готово. Отправляю результат ниже.",
+                text=final_status_text,
                 parse_mode=None,
                 disable_web_page_preview=True,
             )
@@ -458,17 +641,20 @@ async def finish_status_or_send_reply(
 
     markdown_chunk = markdown_chunks[0]
     html_chunk = markdown_to_telegram_html(markdown_chunk)
+    prefixed_html = f"{html.escape(final_prefix)}\n\n{html_chunk}"
     try:
         await edit_telegram_message_with_retries(
             chat_id=update.effective_chat.id,
             message_id=status_message.message_id,
-            text=html_chunk,
+            text=prefixed_html,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
     except BadRequest as e:
         logger.warning(f"Ошибка Telegram HTML formatting при edit: {e}")
-        plain_chunk = markdown_to_plain_text(markdown_chunk)
+        plain_chunk = (
+            f"{final_prefix}\n\n{markdown_to_plain_text(markdown_chunk)}"
+        )
         try:
             await edit_telegram_message_with_retries(
                 chat_id=update.effective_chat.id,

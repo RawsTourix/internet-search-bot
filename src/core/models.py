@@ -110,4 +110,6 @@ class AgentResult(BaseModel):
     iterations: int = 0
     tools_used: List[str] = Field(default_factory=list)
     error: Optional[str] = None
+    error_kind: Optional[str] = None
+    can_resume: bool = False
     progress_events: List[Dict[str, Any]] = Field(default_factory=list)

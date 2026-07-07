@@ -122,6 +122,8 @@ class MessageProcessor:
                     "iterations": agent_result.iterations,
                     "tools_used": agent_result.tools_used,
                     "error": agent_result.error,
+                    "error_kind": agent_result.error_kind,
+                    "can_resume": agent_result.can_resume,
                     "progress_events": agent_result.progress_events
                 }
 

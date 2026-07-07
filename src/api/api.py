@@ -110,6 +110,8 @@ class Api:
                 iterations=state.iterations if state else 0,
                 tools_used=state.tools_used if state else [],
                 error=str(e),
+                error_kind="critical_error",
+                can_resume=False,
                 progress_events=state.progress_events if state else []
             )
         
