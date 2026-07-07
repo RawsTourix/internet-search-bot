@@ -220,6 +220,47 @@ class SessionState:
     last_error: Optional[str] = None
     awaiting_user_input: bool = False
     progress_events: List[Dict[str, Any]] = field(default_factory=list)
+    progress_locale: str = "ru"
+
+
+PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
+    "ru": {
+        "cycle_started": "🧭 Начинаю обработку задачи…",
+        "cycle_resumed": "▶️ Продолжаю задачу с учётом ответа…",
+        "iteration_started": "Итерация {iteration}/{max_iterations}",
+        "mcp_list_servers": "🔎 Проверяю доступные MCP-серверы…",
+        "mcp_list_tools": "🧰 Получаю список доступных инструментов…",
+        "mcp_get_tool_schema": "📋 Проверяю схему {tool_name}…",
+        "mcp_call_tool": "🔧 Запускаю {tool_name}…",
+        "mcp_get_runtime_context": "🕒 Получаю runtime-контекст агента…",
+        "tool_start": "🔧 Запускаю инструмент {tool_name}…",
+        "tool_done": "✅ Инструмент {tool_name} завершил работу.",
+        "tool_error": "⚠️ Инструмент {tool_name} завершился с ошибкой.",
+        "tool_timeout": "⚠️ Инструмент {tool_name} завершился по таймауту.",
+        "waiting_user": "❓ Нужны дополнительные данные от пользователя.",
+        "cycle_done": "✅ Задача завершена.",
+        "cycle_error": "⚠️ Задача завершилась с ошибкой.",
+        "context_warning": "⚠️ Контекст задачи стал большим.",
+    },
+    "en": {
+        "cycle_started": "🧭 Starting task processing…",
+        "cycle_resumed": "▶️ Continuing the task with the new reply…",
+        "iteration_started": "Iteration {iteration}/{max_iterations}",
+        "mcp_list_servers": "🔎 Checking available MCP servers…",
+        "mcp_list_tools": "🧰 Getting available tools…",
+        "mcp_get_tool_schema": "📋 Checking schema for {tool_name}…",
+        "mcp_call_tool": "🔧 Running {tool_name}…",
+        "mcp_get_runtime_context": "🕒 Getting agent runtime context…",
+        "tool_start": "🔧 Running tool {tool_name}…",
+        "tool_done": "✅ Tool {tool_name} finished.",
+        "tool_error": "⚠️ Tool {tool_name} failed.",
+        "tool_timeout": "⚠️ Tool {tool_name} timed out.",
+        "waiting_user": "❓ More information is needed from the user.",
+        "cycle_done": "✅ Task completed.",
+        "cycle_error": "⚠️ Task failed.",
+        "context_warning": "⚠️ Task context is getting large.",
+    },
+}
 
 @dataclass
 class MCPServerRuntime:
@@ -428,6 +469,11 @@ class MCPClient:
         ... )
         >>> client = MCPClient(llm_config)
     """
+    SENSITIVE_PROGRESS_KEYS = {
+        "api_key", "apikey", "token", "password", "secret",
+        "authorization", "cookie", "set-cookie",
+    }
+
     def __init__(self, llm_config: LLMConfigType):
         """
         Description:
@@ -1219,19 +1265,144 @@ class MCPClient:
         state: SessionState,
         event: ProgressEvent,
         progress_callback=None,
+        cycle_trace: list[dict[str, Any]] | None = None,
     ) -> None:
         payload = event.model_dump()
         state.progress_events.append(payload)
 
+        if cycle_trace is not None:
+            self._trace_event(
+                cycle_trace,
+                "progress_event",
+                progress_event=payload,
+            )
+
         logger.info(f"Progress event: {payload}")
 
         if progress_callback is not None:
-            result = progress_callback(payload)
-            if inspect.isawaitable(result):
-                await result
+            try:
+                result = progress_callback(payload)
+                if inspect.isawaitable(result):
+                    await result
+            except Exception as e:
+                logger.warning("Progress callback failed: %r", e)
 
+    def _normalize_progress_locale(self, value: str | None) -> str:
+        value = (value or "ru").lower().strip()
+        return "en" if value.startswith("en") else "ru"
 
-    def _tool_start_message(self, tool_name: str, arguments: dict[str, Any]) -> str:
+    def _progress_text(
+        self,
+        key: str,
+        *,
+        locale_name: str | None = None,
+        **kwargs: Any,
+    ) -> str:
+        locale_name = self._normalize_progress_locale(locale_name)
+        messages = PROGRESS_MESSAGES.get(locale_name) or PROGRESS_MESSAGES["ru"]
+        template = messages.get(key) or PROGRESS_MESSAGES["ru"].get(key) or key
+        try:
+            return template.format(**kwargs)
+        except Exception:
+            return template
+
+    def _safe_progress_data(
+        self,
+        data: dict[str, Any],
+        *,
+        max_string_chars: int = 500,
+        max_list_items: int = 20,
+    ) -> dict[str, Any]:
+        def sanitize(value: Any, key: str | None = None) -> Any:
+            if key and key.lower() in self.SENSITIVE_PROGRESS_KEYS:
+                return "[REDACTED]"
+            if isinstance(value, str):
+                if len(value) > max_string_chars:
+                    return value[:max_string_chars] + "…[truncated]"
+                return value
+            if isinstance(value, dict):
+                return {str(k): sanitize(v, str(k)) for k, v in value.items()}
+            if isinstance(value, list):
+                result = [sanitize(v) for v in value[:max_list_items]]
+                if len(value) > max_list_items:
+                    result.append(f"…[truncated {len(value) - max_list_items} items]")
+                return result
+            return value
+
+        return sanitize(data)
+
+    def _resolve_progress_tool_names(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+    ) -> tuple[str, str | None]:
+        if tool_name == "mcp_call_tool":
+            target_tool_name = arguments.get("tool_name")
+            return tool_name, str(target_tool_name) if target_tool_name else None
+        return tool_name, None
+
+    def _resolve_progress_server_name(
+        self,
+        target_tool_name: str | None,
+    ) -> str | None:
+        if not target_tool_name:
+            return None
+        binding = self.tool_registry.get(target_tool_name)
+        return binding.server_name if binding is not None else None
+
+    def _build_progress_event(
+        self,
+        *,
+        event_type: str,
+        message: str,
+        state: SessionState,
+        session_id: str,
+        cycle_id: str,
+        tool_name: str | None = None,
+        target_tool_name: str | None = None,
+        server_name: str | None = None,
+        severity: str = "info",
+        visibility: str = "user",
+        data: dict[str, Any] | None = None,
+    ) -> ProgressEvent:
+        return ProgressEvent(
+            type=event_type,
+            message=message,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            iteration=state.iterations or None,
+            tool_name=tool_name,
+            target_tool_name=target_tool_name,
+            server_name=server_name,
+            severity=severity,
+            visibility=visibility,
+            data=self._safe_progress_data(data) if data else None,
+        )
+
+    def _tool_start_message(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        *,
+        progress_locale: str = "ru",
+    ) -> str:
+        if tool_name == "mcp_get_tool_schema":
+            return self._progress_text(
+                "mcp_get_tool_schema",
+                locale_name=progress_locale,
+                tool_name=arguments.get("tool_name", "инструмента"),
+            )
+        if tool_name == "mcp_call_tool":
+            return self._progress_text(
+                "mcp_call_tool",
+                locale_name=progress_locale,
+                tool_name=arguments.get("tool_name", "инструмент"),
+            )
+        if tool_name in {
+            "mcp_list_servers", "mcp_list_tools", "mcp_get_runtime_context",
+        }:
+            return self._progress_text(tool_name, locale_name=progress_locale)
+
         spec = self.manager_tools.get(tool_name)
 
         if spec is not None:
@@ -1242,7 +1413,36 @@ class MCPClient:
 
             return message
 
-        return f"🔧 Запускаю инструмент {tool_name}…"
+        return self._progress_text(
+            "tool_start",
+            locale_name=progress_locale,
+            tool_name=tool_name,
+        )
+
+    def _tool_done_message(
+        self,
+        tool_name: str,
+        *,
+        progress_locale: str = "ru",
+    ) -> str:
+        return self._progress_text(
+            "tool_done",
+            locale_name=progress_locale,
+            tool_name=tool_name,
+        )
+
+    def _tool_error_message(
+        self,
+        tool_name: str,
+        *,
+        progress_locale: str = "ru",
+        timeout: bool = False,
+    ) -> str:
+        return self._progress_text(
+            "tool_timeout" if timeout else "tool_error",
+            locale_name=progress_locale,
+            tool_name=tool_name,
+        )
     
     async def _parse_or_repair_agent_action(
         self,
@@ -1387,10 +1587,12 @@ class MCPClient:
         return calls
 
     async def process_query(
-        self, query: str,
+        self,
+        query: str,
         session_id: str = "default",
         client_type: ClientType | None = None,
-        progress_callback=None
+        progress_callback=None,
+        progress_locale: str = "ru",
     ) -> AgentResult:
         """
         Description:
@@ -1430,6 +1632,7 @@ class MCPClient:
             state.last_error = None
             state.awaiting_user_input = False
             state.progress_events = []
+            state.progress_locale = self._normalize_progress_locale(progress_locale)
 
             # Инициализируем память сессии до построения рабочего контекста.
             session = self._get_or_create_session(session_id)
@@ -1485,6 +1688,22 @@ class MCPClient:
                 )
                 state.progress_events = []
 
+                await self._emit_progress(
+                    state,
+                    self._build_progress_event(
+                        event_type="cycle_resumed",
+                        message=self._progress_text(
+                            "cycle_resumed",
+                            locale_name=state.progress_locale,
+                        ),
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                    ),
+                    progress_callback,
+                    cycle_trace,
+                )
+
             else:
                 cycle_id = uuid4().hex
                 original_user_request = query
@@ -1493,15 +1712,6 @@ class MCPClient:
                 user_payload = {
                     "type": "user_request",
                     "user_request": query,
-                    "available_servers": [
-                        {
-                            "name": item["name"],
-                            "alias": item["alias"],
-                            "connected": item["connected"],
-                            "tool_count": item["tool_count"],
-                        }
-                        for item in self.server_manager.list_servers()
-                    ],
                 }
 
                 messages_for_llm = self._build_messages_for_llm(
@@ -1517,6 +1727,22 @@ class MCPClient:
                     cycle_id=cycle_id,
                     user_request=query,
                     user_payload=user_payload,
+                )
+
+                await self._emit_progress(
+                    state,
+                    self._build_progress_event(
+                        event_type="cycle_started",
+                        message=self._progress_text(
+                            "cycle_started",
+                            locale_name=state.progress_locale,
+                        ),
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                    ),
+                    progress_callback,
+                    cycle_trace,
                 )
 
             messages = messages_for_llm
@@ -1535,6 +1761,25 @@ class MCPClient:
             for i in range(self.max_iterations):
                 state.iterations = i + 1
                 logger.info(f"Итерация {state.iterations}/{self.max_iterations}")
+
+                await self._emit_progress(
+                    state,
+                    self._build_progress_event(
+                        event_type="iteration_started",
+                        message=self._progress_text(
+                            "iteration_started",
+                            locale_name=state.progress_locale,
+                            iteration=state.iterations,
+                            max_iterations=self.max_iterations,
+                        ),
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        visibility="debug",
+                    ),
+                    progress_callback,
+                    cycle_trace,
+                )
                 
                 try:
                     # Вызываем LLM с таймаутом
@@ -1641,11 +1886,15 @@ class MCPClient:
                             if action.agent_request:
                                 await self._emit_progress(
                                     state,
-                                    ProgressEvent(
-                                        type="agent_message",
+                                    self._build_progress_event(
+                                        event_type="agent_message",
                                         message=action.agent_request,
+                                        state=state,
+                                        session_id=session_id,
+                                        cycle_id=cycle_id,
                                     ),
                                     progress_callback,
+                                    cycle_trace,
                                 )
 
                             if action.status == "done" and action.action == "answer":
@@ -1665,6 +1914,21 @@ class MCPClient:
                                     "role": "assistant",
                                     "content": action.model_dump_json(),
                                 })
+                                await self._emit_progress(
+                                    state,
+                                    self._build_progress_event(
+                                        event_type="waiting_user",
+                                        message=self._progress_text(
+                                            "waiting_user",
+                                            locale_name=state.progress_locale,
+                                        ),
+                                        state=state,
+                                        session_id=session_id,
+                                        cycle_id=cycle_id,
+                                    ),
+                                    progress_callback,
+                                    cycle_trace,
+                                )
                                 break
 
                             if action.status == "error":
@@ -1706,12 +1970,17 @@ class MCPClient:
                         function = tool_call.get("function", {})
                         tool_name = function.get("name", "")
                         tool_call_id = tool_call.get("id", "")
+                        manager_tool_name = tool_name
+                        target_tool_name = None
                         
                         logger.info(f"Вызов инструмента: {tool_name}")
                         
                         try:
                             # Парсим аргументы
                             arguments = json.loads(function.get("arguments", "{}"))
+                            manager_tool_name, target_tool_name = (
+                                self._resolve_progress_tool_names(tool_name, arguments)
+                            )
                             self._record_tool_used(state, tool_name, arguments)
                             self._trace_event(
                                 cycle_trace,
@@ -1725,13 +1994,25 @@ class MCPClient:
                             # Отслеживание прогресса
                             await self._emit_progress(
                                 state,
-                                ProgressEvent(
-                                    type="tool_start",
-                                    tool_name=tool_name,
-                                    message=self._tool_start_message(tool_name, arguments),
+                                self._build_progress_event(
+                                    event_type="tool_start",
+                                    message=self._tool_start_message(
+                                        tool_name,
+                                        arguments,
+                                        progress_locale=state.progress_locale,
+                                    ),
+                                    state=state,
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    tool_name=manager_tool_name,
+                                    target_tool_name=target_tool_name,
+                                    server_name=self._resolve_progress_server_name(
+                                        target_tool_name
+                                    ),
                                     data={"arguments": arguments},
                                 ),
                                 progress_callback,
+                                cycle_trace,
                             )
                             
                             # Вызываем инструмент через соответствующий клиент с таймаутом
@@ -1774,12 +2055,24 @@ class MCPClient:
                             # Отслеживание прогресса
                             await self._emit_progress(
                                 state,
-                                ProgressEvent(
-                                    type="tool_done",
-                                    tool_name=tool_name,
-                                    message=f"✅ Инструмент {tool_name} завершил работу.",
+                                self._build_progress_event(
+                                    event_type="tool_done",
+                                    message=self._tool_done_message(
+                                        target_tool_name or tool_name,
+                                        progress_locale=state.progress_locale,
+                                    ),
+                                    state=state,
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    tool_name=manager_tool_name,
+                                    target_tool_name=target_tool_name,
+                                    server_name=self._resolve_progress_server_name(
+                                        target_tool_name
+                                    ),
+                                    severity="success",
                                 ),
                                 progress_callback,
+                                cycle_trace,
                             )
                             
                         except asyncio.TimeoutError:  # Обработка таймаута
@@ -1810,13 +2103,26 @@ class MCPClient:
 
                             await self._emit_progress(
                                 state,
-                                ProgressEvent(
-                                    type="tool_error",
-                                    tool_name=tool_name,
-                                    message=f"⚠️ Инструмент {tool_name} завершился по таймауту.",
+                                self._build_progress_event(
+                                    event_type="tool_error",
+                                    message=self._tool_error_message(
+                                        target_tool_name or tool_name,
+                                        progress_locale=state.progress_locale,
+                                        timeout=True,
+                                    ),
+                                    state=state,
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    tool_name=manager_tool_name,
+                                    target_tool_name=target_tool_name,
+                                    server_name=self._resolve_progress_server_name(
+                                        target_tool_name
+                                    ),
+                                    severity="warning",
                                     data={"error": error_message},
                                 ),
-                                progress_callback
+                                progress_callback,
+                                cycle_trace,
                             )
                             
                         except Exception as e:
@@ -1852,13 +2158,25 @@ class MCPClient:
                         
                             await self._emit_progress(
                                 state,
-                                ProgressEvent(
-                                    type="tool_error",
-                                    tool_name=tool_name,
-                                    message=f"⚠️ Инструмент {tool_name} завершился с ошибкой.",
+                                self._build_progress_event(
+                                    event_type="tool_error",
+                                    message=self._tool_error_message(
+                                        target_tool_name or tool_name,
+                                        progress_locale=state.progress_locale,
+                                    ),
+                                    state=state,
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    tool_name=manager_tool_name,
+                                    target_tool_name=target_tool_name,
+                                    server_name=self._resolve_progress_server_name(
+                                        target_tool_name
+                                    ),
+                                    severity="error",
                                     data={"error": error_message},
                                 ),
-                                progress_callback
+                                progress_callback,
+                                cycle_trace,
                             )
                                                 
                     # Если последняя итерация и были вызовы, получаем финальный ответ
@@ -1928,11 +2246,15 @@ class MCPClient:
                             if action.agent_request:
                                 await self._emit_progress(
                                     state,
-                                    ProgressEvent(
-                                        type="agent_message",
+                                    self._build_progress_event(
+                                        event_type="agent_message",
                                         message=action.agent_request,
+                                        state=state,
+                                        session_id=session_id,
+                                        cycle_id=cycle_id,
                                     ),
                                     progress_callback,
+                                    cycle_trace,
                                 )
 
                             if action.status == "done" and action.action == "answer":
@@ -1954,6 +2276,21 @@ class MCPClient:
                                     "role": "assistant",
                                     "content": action.model_dump_json(),
                                 })
+                                await self._emit_progress(
+                                    state,
+                                    self._build_progress_event(
+                                        event_type="waiting_user",
+                                        message=self._progress_text(
+                                            "waiting_user",
+                                            locale_name=state.progress_locale,
+                                        ),
+                                        state=state,
+                                        session_id=session_id,
+                                        cycle_id=cycle_id,
+                                    ),
+                                    progress_callback,
+                                    cycle_trace,
+                                )
                                 break
 
                             self._finish_with_error(
@@ -2086,6 +2423,42 @@ class MCPClient:
             if state.status == AgentStatus.RUNNING:
                 state.status = AgentStatus.DONE
 
+            if state.status == AgentStatus.DONE:
+                await self._emit_progress(
+                    state,
+                    self._build_progress_event(
+                        event_type="cycle_done",
+                        message=self._progress_text(
+                            "cycle_done",
+                            locale_name=state.progress_locale,
+                        ),
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        severity="success",
+                    ),
+                    progress_callback,
+                    cycle_trace,
+                )
+            elif state.status == AgentStatus.ERROR:
+                await self._emit_progress(
+                    state,
+                    self._build_progress_event(
+                        event_type="cycle_error",
+                        message=self._progress_text(
+                            "cycle_error",
+                            locale_name=state.progress_locale,
+                        ),
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        severity="error",
+                        data={"error": state.last_error},
+                    ),
+                    progress_callback,
+                    cycle_trace,
+                )
+
             session.last_cycle_trace = cycle_trace[-30:]
 
             if state.status == AgentStatus.WAITING_USER:
@@ -2199,6 +2572,24 @@ class MCPClient:
             state = self._get_or_create_state(session_id)
             state.status = AgentStatus.ERROR
             state.last_error = error_message
+
+            await self._emit_progress(
+                state,
+                self._build_progress_event(
+                    event_type="cycle_error",
+                    message=self._progress_text(
+                        "cycle_error",
+                        locale_name=state.progress_locale,
+                    ),
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    severity="error",
+                    data={"error": error_message},
+                ),
+                progress_callback,
+                cycle_trace,
+            )
 
             if session is None:
                 session = self._get_or_create_session(session_id)
@@ -3264,6 +3655,16 @@ class MCPClient:
             f"trigger_tokens={self._context_trigger_tokens()}, "
             f"target_tokens={self._context_target_tokens()}, "
             f"compaction_status={compaction_status}"
+        )
+
+        self._trace_event(
+            cycle_trace,
+            "context_warning",
+            cycle_id=cycle_id,
+            estimated_tokens=tokens,
+            trigger_tokens=self._context_trigger_tokens(),
+            target_tokens=self._context_target_tokens(),
+            compaction_status=compaction_status,
         )
 
         return messages_for_llm

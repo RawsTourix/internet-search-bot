@@ -1,4 +1,4 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from enum import Enum
 from typing import Dict, Any, Optional, List
 from datetime import datetime
@@ -27,7 +27,7 @@ class UnifiedMessage(BaseModel):
     user_id: str
     user_name: Optional[str] = None
     timestamp: datetime
-    metadata: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = Field(default_factory=dict)
 
     # Поля специфичные для команд
     command: Optional[str] = None
@@ -39,14 +39,14 @@ class UnifiedResponse(BaseModel):
     client_type: ClientType
     content: str
     response_type: MessageType = MessageType.TEXT
-    metadata: Dict[str, Any] = {}
+    metadata: Dict[str, Any] = Field(default_factory=dict)
     
 class CommandRequest(BaseModel):
     """Модель CLI команды"""
     command: str
-    args: List[str] = []
+    args: List[str] = Field(default_factory=list)
     user_id: str
-    options: Dict[str, Any] = {}
+    options: Dict[str, Any] = Field(default_factory=dict)
     
 class WebMessage(BaseModel):
     """Модель веб-сообщения"""
@@ -108,6 +108,6 @@ class AgentResult(BaseModel):
     status: AgentStatus
     session_id: Optional[str] = None
     iterations: int = 0
-    tools_used: List[str] = []
+    tools_used: List[str] = Field(default_factory=list)
     error: Optional[str] = None
-    progress_events: List[Dict[str, Any]] = []
+    progress_events: List[Dict[str, Any]] = Field(default_factory=list)

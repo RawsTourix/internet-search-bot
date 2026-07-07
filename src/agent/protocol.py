@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import json
+import time
 from typing import Any, Literal
+from uuid import uuid4
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -65,20 +67,43 @@ class AgentAction(BaseModel):
 
 
 class ProgressEvent(BaseModel):
-    """Событие прогресса для UI/Telegram/Web."""
+    """Событие прогресса для UI/Telegram/Web и trace."""
 
     model_config = ConfigDict(extra="forbid")
 
     type: Literal[
+        "cycle_started",
+        "cycle_resumed",
+        "iteration_started",
         "agent_message",
         "tool_start",
         "tool_done",
         "tool_error",
+        "context_warning",
+        "context_compaction_started",
+        "context_compaction_done",
+        "large_result_saved",
+        "waiting_user",
+        "cycle_done",
+        "cycle_error",
     ]
 
     message: str
+
+    event_id: str = Field(default_factory=lambda: uuid4().hex)
+    created_at: float = Field(default_factory=time.time)
+
+    session_id: str | None = None
+    cycle_id: str | None = None
+    iteration: int | None = None
+
     tool_name: str | None = None
+    target_tool_name: str | None = None
     server_name: str | None = None
+
+    severity: Literal["info", "success", "warning", "error"] = "info"
+    visibility: Literal["user", "debug", "internal"] = "user"
+
     data: dict[str, Any] | None = None
 
 

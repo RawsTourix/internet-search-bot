@@ -2,6 +2,10 @@ import os
 import uuid
 import logging
 import asyncio
+from typing import Any
+from urllib.parse import urlparse
+
+import httpx
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status, Depends
 from fastapi.responses import JSONResponse
@@ -68,6 +72,108 @@ def get_api_keys():
 
 # Инициализация API ключей при старте приложения
 VALID_API_KEYS = get_api_keys()
+
+PROGRESS_CALLBACK_ALLOWED_PREFIXES = [
+    value.strip()
+    for value in os.getenv(
+        "PROGRESS_CALLBACK_ALLOWED_PREFIXES",
+        "http://127.0.0.1,http://localhost",
+    ).split(",")
+    if value.strip()
+]
+
+
+def is_allowed_progress_callback_url(url: str) -> bool:
+    """Проверяет callback URL по явно разрешённым origin/path-prefix."""
+    if not url:
+        return False
+
+    try:
+        candidate = urlparse(url.strip())
+        candidate_port = candidate.port
+    except ValueError:
+        return False
+
+    if (
+        candidate.scheme not in {"http", "https"}
+        or not candidate.hostname
+        or candidate.username is not None
+        or candidate.password is not None
+    ):
+        return False
+
+    for prefix in PROGRESS_CALLBACK_ALLOWED_PREFIXES:
+        try:
+            allowed = urlparse(prefix)
+            allowed_port = allowed.port
+        except ValueError:
+            continue
+
+        if (
+            candidate.scheme == allowed.scheme
+            and candidate.hostname == allowed.hostname
+            and (allowed_port is None or candidate_port == allowed_port)
+            and candidate.path.startswith(allowed.path or "/")
+        ):
+            return True
+
+    return False
+
+
+def make_http_progress_callback(message: UnifiedMessage):
+    metadata = message.metadata or {}
+    callback_url = metadata.get("progress_callback_url")
+
+    if not callback_url:
+        return None
+
+    if not is_allowed_progress_callback_url(callback_url):
+        logger.warning("Progress callback URL rejected by allowlist: %s", callback_url)
+        return None
+
+    progress_target = metadata.get("progress_target") or {
+        "chat_id": metadata.get("chat_id"),
+        "message_id": metadata.get("status_message_id"),
+    }
+    request_id = metadata.get("progress_request_id") or message.id
+    callback_token = metadata.get("progress_callback_token")
+
+    logger.debug(
+        "Progress callback enabled: request_id=%s target=%s url=%s",
+        request_id,
+        progress_target,
+        callback_url,
+    )
+
+    async def send_progress_event(event: dict[str, Any]):
+        payload = {
+            "type": "progress_event",
+            "request_id": request_id,
+            "client_type": message.client_type.value,
+            "target": progress_target,
+            "event": event,
+        }
+        headers = {}
+        if callback_token:
+            headers["X-Progress-Token"] = str(callback_token)
+
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    callback_url,
+                    json=payload,
+                    headers=headers,
+                )
+                response.raise_for_status()
+                logger.debug(
+                    "Progress callback delivered: request_id=%s event_type=%s",
+                    request_id,
+                    event.get("type"),
+                )
+        except Exception as e:
+            logger.warning("Failed to send progress callback: %r", e)
+
+    return send_progress_event
 
 # Функция для проверки аутентификации
 async def api_key_auth(api_key: str = Depends(API_KEY_HEADER)):
@@ -139,7 +245,11 @@ async def unified_message_handler(message: UnifiedMessage):
             ClientType.WEB: web_adapter.handle_unified_message,
         }[message.client_type]
         
-        response = await processor(message)
+        progress_callback = make_http_progress_callback(message)
+        response = await processor(
+            message,
+            progress_callback=progress_callback,
+        )
         return {"status": "ok",
                 "response": response.content,
                 "metadata": response.metadata}

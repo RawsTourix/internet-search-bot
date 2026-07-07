@@ -45,7 +45,11 @@ class MessageProcessor:
         }
         self.active_sessions = {}
         
-    async def process_message(self, message: UnifiedMessage) -> UnifiedResponse:
+    async def process_message(
+        self,
+        message: UnifiedMessage,
+        progress_callback=None,
+    ) -> UnifiedResponse:
         """Обработка унифицированного сообщения"""
         try:
             logger.info(f"Обработка сообщения от {message.client_type}: {message.content}")
@@ -55,7 +59,10 @@ class MessageProcessor:
             self.stats["messages_by_client"][message.client_type.value] += 1
             
             # Получение ответа
-            response = await self._generate_response(message)
+            response = await self._generate_response(
+                message,
+                progress_callback=progress_callback,
+            )
             
             return response
             
@@ -84,7 +91,11 @@ class MessageProcessor:
 
         return f"{message.client_type.value}:user:{message.user_id}"
     
-    async def _generate_response(self, message: UnifiedMessage) -> str:
+    async def _generate_response(
+        self,
+        message: UnifiedMessage,
+        progress_callback=None,
+    ) -> UnifiedResponse:
         """Обработка запроса"""
         response_content = ""
         response_metadata = {}
@@ -95,10 +106,14 @@ class MessageProcessor:
             try:
                 session_id = self._build_session_id(message)
                 client_type = message.client_type
+                metadata = message.metadata or {}
+                progress_locale = metadata.get("progress_locale", "ru")
                 agent_result  = await API.call_agent(
                     message.content,
                     session_id=session_id,
-                    client_type=client_type
+                    client_type=client_type,
+                    progress_callback=progress_callback,
+                    progress_locale=progress_locale,
                 )
                 response_content = agent_result.content
                 response_metadata = {

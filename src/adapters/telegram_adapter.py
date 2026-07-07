@@ -55,7 +55,11 @@ class TelegramAdapter:
         logger.info("Telegram адаптер остановлен")
     
     # Основная логика формирования ответа
-    async def handle_unified_message(self, message: UnifiedMessage) -> UnifiedResponse:
+    async def handle_unified_message(
+        self,
+        message: UnifiedMessage,
+        progress_callback=None,
+    ) -> UnifiedResponse:
         """Обработка унифицированного сообщения от Telegram-сервера"""
         try:
             if not self.status.is_healthy:
@@ -68,7 +72,10 @@ class TelegramAdapter:
                 )
             
             # Обработка через центральный процессор
-            response = await self.message_processor.process_message(message)
+            response = await self.message_processor.process_message(
+                message,
+                progress_callback=progress_callback,
+            )
             
             self.status.last_activity = datetime.now()
             self.status.message_count += 1

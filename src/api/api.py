@@ -66,9 +66,12 @@ class Api:
             raise APIError(f"Ошибка подключения к MCP-серверам: {repr(e)}") from e
 
     async def call_agent(
-        self, message: str,
+        self,
+        message: str,
         session_id: str = "default",
-        client_type: ClientType | None = None
+        client_type: ClientType | None = None,
+        progress_callback=None,
+        progress_locale: str = "ru",
     ) -> AgentResult:
         """Обращение к MCP-клиенту"""
         try:
@@ -83,7 +86,9 @@ class Api:
             agent_result = await self.mcp_client.process_query(
                 message,
                 session_id=session_id,
-                client_type=client_type
+                client_type=client_type,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
             )
             logger.info("Ответ получен")
             return agent_result
