@@ -336,7 +336,7 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(summary, "LLMHTTPError / HTTP 429")
 
-    async def test_send_new_edits_status_and_sends_final_message(self):
+    async def test_send_new_preserves_status_and_sends_final_message(self):
         update = SimpleNamespace(effective_chat=SimpleNamespace(id=10))
         status_message = SimpleNamespace(message_id=20)
 
@@ -357,13 +357,11 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
                 status_message=status_message,
                 text="Final answer",
                 delivery_mode="send_new",
-                final_status_text="✅ Готово. Ответ ниже.",
             )
 
-        self.assertEqual(edit.await_args.kwargs["text"], "✅ Готово. Ответ ниже.")
+        edit.assert_not_awaited()
         send.assert_awaited_once_with(update, "Final answer")
 
 
 if __name__ == "__main__":
     unittest.main()
-

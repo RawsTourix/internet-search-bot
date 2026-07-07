@@ -3,7 +3,6 @@ import re
 import httpx
 import asyncio
 import uuid
-import html
 import logging
 from typing import Any
 from contextlib import asynccontextmanager
@@ -28,8 +27,6 @@ from .config import (
     PROGRESS_MAX_TEXT_LENGTH,
     TELEGRAM_FINAL_EDIT_MAX_LENGTH,
     TELEGRAM_FINAL_DELIVERY_MODE,
-    TELEGRAM_FINAL_SUCCESS_STATUS_TEXT,
-    TELEGRAM_FINAL_ERROR_STATUS_TEXT,
 )
 from ...utils.telegram_formatting import markdown_to_telegram_html, split_telegram_message, split_markdown_for_telegram, markdown_to_plain_text
 
@@ -292,8 +289,6 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_message=status_message,
             text=message,
             delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
-            final_status_text=TELEGRAM_FINAL_SUCCESS_STATUS_TEXT,
-            final_prefix="✅ Готово.",
         )
         logger.info(
             f"Ответ на команду [id: {payload.get('id')}] "
@@ -310,8 +305,6 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_message=status_message,
             text=formatted_error,
             delivery_mode="send_new",
-            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
-            final_prefix="⚠️ Ошибка.",
         )
         logger.error(
             f"Ошибка агента для команды [id: {payload.get('id')}]: {message}"
@@ -322,8 +315,6 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_message=status_message,
             text=f"**Произошла ошибка при обработке запроса:**\n{message}",
             delivery_mode="send_new",
-            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
-            final_prefix="⚠️ Ошибка.",
         )
         logger.error(
             f"Ответ на команду [id: {payload.get('id')}] "
@@ -372,8 +363,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_message=status_message,
             text=message,
             delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
-            final_status_text=TELEGRAM_FINAL_SUCCESS_STATUS_TEXT,
-            final_prefix="✅ Готово.",
         )
         logger.info(
             f"Ответ на сообщение [id: {payload.get('id')}] "
@@ -390,8 +379,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_message=status_message,
             text=formatted_error,
             delivery_mode="send_new",
-            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
-            final_prefix="⚠️ Ошибка.",
         )
         logger.error(
             f"Ошибка агента для сообщения [id: {payload.get('id')}]: {message}"
@@ -402,8 +389,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             status_message=status_message,
             text=f"**Произошла ошибка при обработке запроса:**\n{message}",
             delivery_mode="send_new",
-            final_status_text=TELEGRAM_FINAL_ERROR_STATUS_TEXT,
-            final_prefix="⚠️ Ошибка.",
         )
         logger.error(
             f"Ответ на сообщение [id: {payload.get('id')}] "
@@ -577,8 +562,6 @@ async def finish_status_or_send_reply(
     text: str,
     force_reply_if_long: bool = False,
     delivery_mode: str | None = None,
-    final_status_text: str = "✅ Готово. Ответ ниже.",
-    final_prefix: str = "✅ Готово.",
 ) -> None:
     delivery_mode = (delivery_mode or TELEGRAM_FINAL_DELIVERY_MODE).lower().strip()
     if delivery_mode not in {"send_new", "edit_status", "auto"}:
@@ -600,19 +583,6 @@ async def finish_status_or_send_reply(
     raw_text = text or ""
 
     if delivery_mode == "send_new":
-        try:
-            await edit_telegram_message_with_retries(
-                chat_id=update.effective_chat.id,
-                message_id=status_message.message_id,
-                text=final_status_text,
-                parse_mode=None,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Не удалось обновить status-сообщение перед финальным ответом: {e!r}"
-            )
-
         await send_telegram_markdown_reply(update, raw_text)
         return
 
@@ -624,37 +594,22 @@ async def finish_status_or_send_reply(
     )
 
     if should_send_separately:
-        try:
-            await edit_telegram_message_with_retries(
-                chat_id=update.effective_chat.id,
-                message_id=status_message.message_id,
-                text=final_status_text,
-                parse_mode=None,
-                disable_web_page_preview=True,
-            )
-        except Exception as e:
-            logger.warning(
-                f"Не удалось обновить status-сообщение перед ответом: {e!r}"
-            )
         await send_telegram_markdown_reply(update, raw_text)
         return
 
     markdown_chunk = markdown_chunks[0]
     html_chunk = markdown_to_telegram_html(markdown_chunk)
-    prefixed_html = f"{html.escape(final_prefix)}\n\n{html_chunk}"
     try:
         await edit_telegram_message_with_retries(
             chat_id=update.effective_chat.id,
             message_id=status_message.message_id,
-            text=prefixed_html,
+            text=html_chunk,
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
     except BadRequest as e:
         logger.warning(f"Ошибка Telegram HTML formatting при edit: {e}")
-        plain_chunk = (
-            f"{final_prefix}\n\n{markdown_to_plain_text(markdown_chunk)}"
-        )
+        plain_chunk = markdown_to_plain_text(markdown_chunk)
         try:
             await edit_telegram_message_with_retries(
                 chat_id=update.effective_chat.id,
