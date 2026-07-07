@@ -138,13 +138,13 @@ class AgentCycleSnapshot:
     Снимок незавершённого агентного цикла.
 
     Используется при WAITING_USER: агент приостанавливает работу,
-    но не должен терять messages_for_llm, task_trace и рабочий контекст.
+    но не должен терять messages_for_llm, cycle_trace и рабочий контекст.
     """
 
     cycle_id: str
     original_user_request: str
     messages_for_llm: List[Dict[str, Any]]
-    task_trace: List[Dict[str, Any]]
+    cycle_trace: List[Dict[str, Any]]
 
     # status:
     # - "waiting_user": агент ждёт ответ пользователя;
@@ -159,7 +159,7 @@ class AgentCycleSnapshot:
     # TODO v0.4: Context compaction.
     # Когда messages_for_llm приближается к context_window_tokens,
     # старые подробные сообщения и большие tool results должны быть
-    # перенесены в archival_logs/task_trace, а видимый LLM-контекст
+    # перенесены в archival_logs/cycle_trace, а видимый LLM-контекст
     # должен быть заменён на компактный working_summary + working_state.
     #
     # working_summary — человекочитаемое краткое описание текущего цикла:
@@ -200,7 +200,7 @@ class SessionMemory:
 
     # Последний подробный trace для отладки,
     # но он не отправляется в LLM автоматически.
-    last_task_trace: List[Dict[str, Any]] = field(default_factory=list)
+    last_cycle_trace: List[Dict[str, Any]] = field(default_factory=list)
 
     # Незавершённый цикл, если агент остановился на WAITING_USER.
     pending_cycle: AgentCycleSnapshot | None = None
@@ -1026,7 +1026,7 @@ class MCPClient:
         cycle_id: str,
         original_user_request: str,
         messages_for_llm: List[Dict[str, Any]],
-        task_trace: List[Dict[str, Any]],
+        cycle_trace: List[Dict[str, Any]],
         state: SessionState,
         error_message: str,
         previous_cycle_progress_events: List[Dict[str, Any]],
@@ -1037,7 +1037,7 @@ class MCPClient:
             cycle_id=cycle_id,
             original_user_request=original_user_request,
             messages_for_llm=list(messages_for_llm),
-            task_trace=list(task_trace),
+            cycle_trace=list(cycle_trace),
             status="interrupted",
             waiting_question=None,
             interruption_reason=error_message,
@@ -1093,13 +1093,13 @@ class MCPClient:
         self,
         *,
         messages_for_llm: List[Dict[str, Any]],
-        task_trace: List[Dict[str, Any]],
+        cycle_trace: List[Dict[str, Any]],
         state: SessionState,
         final_text: list[str],
         cycle_id: str,
     ) -> None:
         self._trace_event(
-            task_trace,
+            cycle_trace,
             "max_iterations_reached",
             cycle_id=cycle_id,
             iteration=state.iterations,
@@ -1137,7 +1137,7 @@ class MCPClient:
         state.status = AgentStatus.DONE
         state.last_error = None
         self._trace_event(
-            task_trace,
+            cycle_trace,
             "max_iterations_forced_final_answer",
             final_answer=answer,
         )
@@ -1411,8 +1411,8 @@ class MCPClient:
         """
         logger.info(f"Начало обработки запроса: '{query}'")
         final_text = []
-        task_id = uuid4().hex
-        task_trace: List[Dict[str, Any]] = []
+        cycle_id = uuid4().hex
+        cycle_trace: List[Dict[str, Any]] = []
         messages_for_llm: List[Dict[str, Any]] = []
         session: SessionMemory | None = None
         cycle_snapshot: AgentCycleSnapshot | None = None
@@ -1436,8 +1436,8 @@ class MCPClient:
             cycle_snapshot = session.pending_cycle
 
             if cycle_snapshot is not None:
-                task_id = cycle_snapshot.cycle_id
-                task_trace = cycle_snapshot.task_trace
+                cycle_id = cycle_snapshot.cycle_id
+                cycle_trace = cycle_snapshot.cycle_trace
                 messages_for_llm = cycle_snapshot.messages_for_llm
                 original_user_request = cycle_snapshot.original_user_request
                 previous_question = cycle_snapshot.waiting_question
@@ -1454,7 +1454,7 @@ class MCPClient:
                         }),
                     })
                     self._trace_event(
-                        task_trace,
+                        cycle_trace,
                         "user_resume_interrupted_cycle",
                         reply=query,
                         previous_interruption=(
@@ -1471,7 +1471,7 @@ class MCPClient:
                         }),
                     })
                     self._trace_event(
-                        task_trace,
+                        cycle_trace,
                         "user_reply_during_waiting_user",
                         reply=query,
                         previous_question=previous_question,
@@ -1486,7 +1486,7 @@ class MCPClient:
                 state.progress_events = []
 
             else:
-                task_id = uuid4().hex
+                cycle_id = uuid4().hex
                 original_user_request = query
                 system_message = self._create_system_message(client_type)
 
@@ -1512,9 +1512,9 @@ class MCPClient:
                 )
 
                 self._trace_event(
-                    task_trace,
+                    cycle_trace,
                     "cycle_started",
-                    cycle_id=task_id,
+                    cycle_id=cycle_id,
                     user_request=query,
                     user_payload=user_payload,
                 )
@@ -1525,7 +1525,7 @@ class MCPClient:
                 "Messages for LLM prepared: "
                 f"count={len(messages_for_llm)}, "
                 f"estimated_tokens={self._estimate_messages_tokens(messages_for_llm)}, "
-                f"task_id={task_id}"
+                f"cycle_id={cycle_id}"
             )
             
             # Преобразуем инструменты в формат для LLM
@@ -1541,12 +1541,12 @@ class MCPClient:
                     messages_for_llm = await self._compact_context_if_needed(
                         messages_for_llm=messages_for_llm,
                         cycle_snapshot=cycle_snapshot,
-                        task_trace=task_trace,
-                        cycle_id=task_id,
+                        cycle_trace=cycle_trace,
+                        cycle_id=cycle_id,
                     )
                     messages = messages_for_llm
                     self._trace_event(
-                        task_trace,
+                        cycle_trace,
                         "iteration_started",
                         iteration=state.iterations,
                         iteration_max=self.max_iterations,
@@ -1568,7 +1568,7 @@ class MCPClient:
                     
                     # Проверяем наличие вызовов инструментов
                     self._trace_event(
-                        task_trace,
+                        cycle_trace,
                         "llm_response",
                         iteration=state.iterations,
                         response=llm_response,
@@ -1607,7 +1607,7 @@ class MCPClient:
                                 )
 
                                 self._trace_event(
-                                    task_trace,
+                                    cycle_trace,
                                     "textual_tool_call_recovered",
                                     iteration=state.iterations,
                                     error=repr(parse_error),
@@ -1695,7 +1695,7 @@ class MCPClient:
                     }
                     messages.append(assistant_message)
                     self._trace_event(
-                        task_trace,
+                        cycle_trace,
                         "assistant_tool_calls",
                         iteration=state.iterations,
                         message=assistant_message,
@@ -1714,7 +1714,7 @@ class MCPClient:
                             arguments = json.loads(function.get("arguments", "{}"))
                             self._record_tool_used(state, tool_name, arguments)
                             self._trace_event(
-                                task_trace,
+                                cycle_trace,
                                 "tool_call",
                                 tool_name=tool_name,
                                 tool_call_id=tool_call_id,
@@ -1755,7 +1755,7 @@ class MCPClient:
                             # Добавляем результат в сообщения
                             tool_payload = self._tool_result_payload(tool_name, tool_result)
                             self._trace_event(
-                                task_trace,
+                                cycle_trace,
                                 "tool_result_full",
                                 tool_name=tool_name,
                                 tool_call_id=tool_call_id,
@@ -1795,7 +1795,7 @@ class MCPClient:
                                 "error": error_message,
                             }
                             self._trace_event(
-                                task_trace,
+                                cycle_trace,
                                 "tool_error",
                                 tool_name=tool_name,
                                 tool_call_id=tool_call_id,
@@ -1837,7 +1837,7 @@ class MCPClient:
                                 ),
                             }
                             self._trace_event(
-                                task_trace,
+                                cycle_trace,
                                 "tool_error",
                                 tool_name=tool_name,
                                 tool_call_id=tool_call_id,
@@ -1867,8 +1867,8 @@ class MCPClient:
                             messages_for_llm = await self._compact_context_if_needed(
                                 messages_for_llm=messages_for_llm,
                                 cycle_snapshot=cycle_snapshot,
-                                task_trace=task_trace,
-                                cycle_id=task_id,
+                                cycle_trace=cycle_trace,
+                                cycle_id=cycle_id,
                             )
                             messages = messages_for_llm
                             final_response = await self._call_llm_with_retries(
@@ -1878,7 +1878,7 @@ class MCPClient:
                             )
 
                             self._trace_event(
-                                task_trace,
+                                cycle_trace,
                                 "llm_final_response",
                                 iteration=state.iterations,
                                 response=final_response,
@@ -2041,10 +2041,10 @@ class MCPClient:
                 error_kind = "max_iterations"
                 await self._finalize_after_max_iterations(
                     messages_for_llm=messages_for_llm,
-                    task_trace=task_trace,
+                    cycle_trace=cycle_trace,
                     state=state,
                     final_text=final_text,
-                    cycle_id=task_id,
+                    cycle_id=cycle_id,
                 )
             
             if not final_text:
@@ -2066,8 +2066,8 @@ class MCPClient:
                     messages_for_llm = await self._compact_context_if_needed(
                         messages_for_llm=messages_for_llm,
                         cycle_snapshot=cycle_snapshot,
-                        task_trace=task_trace,
-                        cycle_id=task_id,
+                        cycle_trace=cycle_trace,
+                        cycle_id=cycle_id,
                     )
                     messages = messages_for_llm
                     audited_text = await self._audit_final_answer(
@@ -2086,14 +2086,14 @@ class MCPClient:
             if state.status == AgentStatus.RUNNING:
                 state.status = AgentStatus.DONE
 
-            session.last_task_trace = task_trace[-30:]
+            session.last_cycle_trace = cycle_trace[-30:]
 
             if state.status == AgentStatus.WAITING_USER:
                 session.pending_cycle = AgentCycleSnapshot(
-                    cycle_id=task_id,
+                    cycle_id=cycle_id,
                     original_user_request=original_user_request,
                     messages_for_llm=list(messages_for_llm),
-                    task_trace=list(task_trace),
+                    cycle_trace=list(cycle_trace),
                     status="waiting_user",
                     waiting_question=result_text,
                     working_summary=(
@@ -2135,7 +2135,7 @@ class MCPClient:
             elif state.status == AgentStatus.ERROR:
                 error_message = state.last_error or result_text
                 self._trace_event(
-                    task_trace,
+                    cycle_trace,
                     "cycle_error",
                     error=error_message,
                     error_kind=error_kind,
@@ -2143,7 +2143,7 @@ class MCPClient:
                 )
                 self._save_last_error_cycle(
                     session=session,
-                    cycle_id=task_id,
+                    cycle_id=cycle_id,
                     original_user_request=original_user_request,
                     state=state,
                     error_message=error_message,
@@ -2154,10 +2154,10 @@ class MCPClient:
                 if preserve_context_on_error:
                     cycle_snapshot = self._save_interrupted_cycle(
                         session=session,
-                        cycle_id=task_id,
+                        cycle_id=cycle_id,
                         original_user_request=original_user_request,
                         messages_for_llm=messages_for_llm,
-                        task_trace=task_trace,
+                        cycle_trace=cycle_trace,
                         state=state,
                         error_message=error_message,
                         previous_cycle_progress_events=(
@@ -2168,12 +2168,12 @@ class MCPClient:
                 else:
                     session.pending_cycle = None
 
-            self._archive_task_trace(
+            self._archive_agent_cycle(
                 session_id=session_id,
-                task_id=task_id,
+                cycle_id=cycle_id,
                 user_request=original_user_request,
                 messages_for_llm=messages_for_llm,
-                task_trace=task_trace,
+                cycle_trace=cycle_trace,
                 result_text=result_text,
                 state=state,
                 cycle_snapshot=cycle_snapshot,
@@ -2210,13 +2210,13 @@ class MCPClient:
                 else "critical_error"
             )
             self._trace_event(
-                task_trace,
+                cycle_trace,
                 outer_error_kind,
                 error=error_message,
             )
             self._save_last_error_cycle(
                 session=session,
-                cycle_id=task_id,
+                cycle_id=cycle_id,
                 original_user_request=original_user_request,
                 state=state,
                 error_message=error_message,
@@ -2227,10 +2227,10 @@ class MCPClient:
             if can_resume:
                 cycle_snapshot = self._save_interrupted_cycle(
                     session=session,
-                    cycle_id=task_id,
+                    cycle_id=cycle_id,
                     original_user_request=original_user_request,
                     messages_for_llm=messages_for_llm,
-                    task_trace=task_trace,
+                    cycle_trace=cycle_trace,
                     state=state,
                     error_message=error_message,
                     previous_cycle_progress_events=(
@@ -2242,12 +2242,12 @@ class MCPClient:
                 session.pending_cycle = None
 
             try:
-                self._archive_task_trace(
+                self._archive_agent_cycle(
                     session_id=session_id,
-                    task_id=task_id,
+                    cycle_id=cycle_id,
                     user_request=original_user_request,
                     messages_for_llm=messages_for_llm,
-                    task_trace=task_trace,
+                    cycle_trace=cycle_trace,
                     result_text=error_message,
                     state=state,
                     cycle_snapshot=cycle_snapshot,
@@ -3028,11 +3028,11 @@ class MCPClient:
 
     def _trace_event(
         self,
-        task_trace: List[Dict[str, Any]],
+        cycle_trace: List[Dict[str, Any]],
         event_type: str,
         **payload: Any,
     ) -> None:
-        task_trace.append({
+        cycle_trace.append({
             "ts": time.time(),
             "type": event_type,
             **payload,
@@ -3068,14 +3068,14 @@ class MCPClient:
         value = re.sub(r"[^a-zA-Z0-9_.-]+", "_", value)
         return value[:80] or "session"
 
-    def _archive_task_trace(
+    def _archive_agent_cycle(
         self,
         *,
         session_id: str,
-        task_id: str,
+        cycle_id: str,
         user_request: str,
         messages_for_llm: List[Dict[str, Any]],
-        task_trace: List[Dict[str, Any]],
+        cycle_trace: List[Dict[str, Any]],
         result_text: str,
         state: SessionState,
         cycle_snapshot: AgentCycleSnapshot | None = None,
@@ -3095,7 +3095,7 @@ class MCPClient:
             state.status == AgentStatus.ERROR
             and session is not None
             and session.last_error_cycle is not None
-            and session.last_error_cycle.get("cycle_id") == task_id
+            and session.last_error_cycle.get("cycle_id") == cycle_id
         )
         cycle_status = (
             cycle_snapshot.status
@@ -3112,7 +3112,7 @@ class MCPClient:
 
         payload = {
             "type": "agent_cycle_archive",
-            "cycle_id": task_id,
+            "cycle_id": cycle_id,
             "session_id": session_id,
             "created_at": datetime.now().isoformat(),
             "original_user_request": user_request,
@@ -3147,7 +3147,7 @@ class MCPClient:
             ),
             "progress_events": archived_progress_events,
             "messages_for_llm": messages_for_llm,
-            "cycle_trace": task_trace,
+            "cycle_trace": cycle_trace,
             "working_summary": (
                 cycle_snapshot.working_summary
                 if cycle_snapshot is not None
@@ -3169,8 +3169,8 @@ class MCPClient:
         }
 
         safe_session_id = self._safe_filename_part(session_id)
-        safe_task_id = self._safe_filename_part(task_id)
-        path = self.archive_dir / f"{safe_session_id}_{safe_task_id}.json"
+        safe_cycle_id = self._safe_filename_part(cycle_id)
+        path = self.archive_dir / f"{safe_session_id}_{safe_cycle_id}.json"
 
         try:
             path.write_text(
@@ -3227,7 +3227,7 @@ class MCPClient:
         *,
         messages_for_llm: List[Dict[str, Any]],
         cycle_snapshot: AgentCycleSnapshot | None,
-        task_trace: List[Dict[str, Any]],
+        cycle_trace: List[Dict[str, Any]],
         cycle_id: str,
     ) -> List[Dict[str, Any]]:
         """
@@ -3289,7 +3289,7 @@ class MCPClient:
         compact["content_full_chars"] = len(content)
         compact["content"] = (
             content[:max_content_chars]
-            + "\n\n[TRUNCATED: полный результат сохранён в archival_logs/task_trace]"
+            + "\n\n[TRUNCATED: полный результат сохранён в archival_logs/cycle_trace]"
         )
 
         return compact
