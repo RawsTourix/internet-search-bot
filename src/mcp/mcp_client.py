@@ -325,6 +325,11 @@ class MCPServerRuntime:
     http_client: Any = None
     exit_stack: Optional[AsyncExitStack] = None
     tools: List[Any] = field(default_factory=list)
+    healthy: bool = True
+    reconnecting: bool = False
+    last_error: str | None = None
+    connected_at: float = field(default_factory=time.time)
+    generation: int = 0
 
 @dataclass
 class MCPToolBinding:
@@ -574,6 +579,10 @@ class MCPClient:
         
         # Настройки таймаутов
         self.tool_call_timeout = 240.0  # Таймаут для вызова инструментов
+        self.mcp_transport_call_timeout = 45.0
+        self.mcp_reconnect_timeout = 20.0
+        self.mcp_call_retries_after_recovery = 1
+        self.server_reconnect_locks: Dict[str, asyncio.Lock] = {}
         self.llm_call_timeout = 120.0   # Таймаут для вызова LLM
 
         # Настройка повторных запросов
@@ -988,34 +997,10 @@ class MCPClient:
     ):
         if self._is_manager_tool(public_tool_name):
             return await self._call_manager_tool(public_tool_name, arguments)
-    
-        binding = self.tool_registry.get(public_tool_name)
 
-        if binding is None:
-            raise ValueError(f"Неизвестный инструмент: {public_tool_name}")
-
-        runtime = self.server_runtimes.get(binding.server_name)
-
-        if runtime is None:
-            raise RuntimeError(
-                f"Сервер для инструмента {public_tool_name} не подключён: "
-                f"{binding.server_name}"
-            )
-
-        if runtime.session is not None:
-            return await runtime.session.call_tool(
-                binding.remote_name,
-                arguments
-            )
-
-        if runtime.http_client is not None:
-            return await runtime.http_client.call_tool(
-                binding.remote_name,
-                arguments
-            )
-
-        raise RuntimeError(
-            f"У сервера {binding.server_name} нет активного клиента"
+        return await self.server_manager.call_tool(
+            public_tool_name,
+            arguments,
         )
     
     async def _force_final_answer(
@@ -3554,10 +3539,19 @@ class MCPClient:
 
             logger.info(f"MCP-сервер {runtime.name} отключён")
 
+        except Exception as e:
+            logger.warning(
+                "Ошибка при закрытии MCP runtime %s: %r",
+                runtime.name,
+                e,
+            )
+
         finally:
             runtime.session = None
             runtime.http_client = None
             runtime.exit_stack = None
+            runtime.healthy = False
+            runtime.reconnecting = False
 
 
     def _unregister_server_tools(self, server_name: str) -> None:
@@ -3616,6 +3610,7 @@ class MCPClient:
         self.server_runtimes.clear()
         self.tool_registry.clear()
         self.available_tools.clear()
+        self.server_reconnect_locks.clear()
 
         # Закрытие HTTP-клиента LLM
         try:
