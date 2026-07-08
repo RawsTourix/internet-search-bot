@@ -157,6 +157,35 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LLM HTTP 429", events[0]["message"])
         self.assertIn("Повторы исчерпаны", events[0]["message"])
 
+    async def test_llm_http_404_non_retryable_emits_no_retry_error(self):
+        self.client.llm_max_retries = 4
+        self.client.llm_retryable_http_statuses = {429, 500, 502, 503, 504}
+        self.client._call_llm = AsyncMock(
+            side_effect=LLMHTTPError(404, "not found")
+        )
+        state = SessionState(progress_locale="ru")
+        events = []
+
+        with self.assertRaises(LLMHTTPError):
+            await self.client._call_llm_with_retries(
+                [],
+                [],
+                context="Итерация 1",
+                state=state,
+                session_id="session-1",
+                cycle_id="cycle-1",
+                progress_callback=events.append,
+                cycle_trace=[],
+            )
+
+        self.client._call_llm.assert_awaited_once()
+        self.assertEqual(events[0]["type"], "llm_error")
+        self.assertIn("LLM HTTP 404", events[0]["message"])
+        self.assertIn("Повтор не выполняется", events[0]["message"])
+        self.assertNotIn("Повторы исчерпаны", events[0]["message"])
+        self.assertEqual(events[0]["data"]["attempt"], 1)
+        self.assertEqual(events[0]["data"]["max_attempts"], 5)
+
     async def test_llm_timeout_retry_emits_progress(self):
         self.client.llm_max_retries = 1
         self.client._call_llm = AsyncMock(side_effect=[
@@ -335,6 +364,25 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
             "HTTP-ошибка LLM: Ошибка LLM API: 429 - rate limited"
         )
         self.assertEqual(summary, "LLMHTTPError / HTTP 429")
+
+    def test_llm_http_404_is_rendered_as_configuration_error(self):
+        text = telegram_server.format_agent_error_for_telegram(
+            "request failed",
+            {
+                "agent_status": "error",
+                "error": "HTTP-ошибка LLM на итерации 1: LLM API: 404 - not found",
+                "error_kind": "llm_configuration_error",
+                "iterations": 1,
+                "can_resume": False,
+            },
+            locale_name="ru",
+        )
+
+        self.assertIn("ошибки конфигурации LLM", text)
+        self.assertIn("LLMHTTPError / HTTP 404", text)
+        self.assertIn("Итерация: 1", text)
+        self.assertIn("Проверь API URL", text)
+        self.assertNotIn("можно продолжить позже", text)
 
     async def test_send_new_preserves_status_and_sends_final_message(self):
         update = SimpleNamespace(effective_chat=SimpleNamespace(id=10))

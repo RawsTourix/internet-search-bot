@@ -68,6 +68,12 @@ FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
             "Итерация: {iteration}\n"
             "Состояние задачи сохранено, её можно продолжить позже."
         ),
+        "llm_configuration_error": (
+            "⚠️ Задача остановлена из-за ошибки конфигурации LLM.\n\n"
+            "Тип: {error_type}\n"
+            "Итерация: {iteration}\n"
+            "Проверь API URL, endpoint, model name или настройки провайдера."
+        ),
         "agent_error": (
             "⚠️ Агент завершил задачу с ошибкой.\n\n"
             "Тип: {error_type}\n"
@@ -81,6 +87,12 @@ FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
             "Type: {error_type}\n"
             "Iteration: {iteration}\n"
             "The task state has been saved and can be resumed later."
+        ),
+        "llm_configuration_error": (
+            "⚠️ The task stopped because of an LLM configuration error.\n\n"
+            "Type: {error_type}\n"
+            "Iteration: {iteration}\n"
+            "Check the API URL, endpoint, model name, or provider settings."
         ),
         "agent_error": (
             "⚠️ The agent finished with an error.\n\n"
@@ -187,6 +199,14 @@ def extract_error_type_summary(error_text: str) -> str:
     return "RuntimeError"
 
 
+def extract_llm_http_status(error_type: str) -> int | None:
+    match = re.search(r"\bHTTP\s+(\d{3})\b", error_type, flags=re.IGNORECASE)
+    if not match:
+        return None
+
+    return int(match.group(1))
+
+
 def format_agent_error_for_telegram(
     message: str,
     metadata: dict[str, Any],
@@ -198,14 +218,25 @@ def format_agent_error_for_telegram(
     iterations = metadata.get("iterations") or "?"
     error_kind = metadata.get("error_kind")
     error_type = extract_error_type_summary(error_message)
-    is_infra = (
-        error_kind == "infrastructure_interruption"
-        or "LLMTransportError" in error_type
-        or "LLMTimeoutError" in error_type
-        or "LLMHTTPError" in error_type
-        or "ConnectError" in error_type
-    )
-    key = "infrastructure_interruption" if is_infra else "agent_error"
+    llm_http_status = extract_llm_http_status(error_type)
+
+    if error_kind == "llm_configuration_error":
+        key = "llm_configuration_error"
+    elif (
+        error_kind != "infrastructure_interruption"
+        and llm_http_status in {400, 401, 403, 404, 422}
+    ):
+        key = "llm_configuration_error"
+    else:
+        is_infra = (
+            error_kind == "infrastructure_interruption"
+            or "LLMTransportError" in error_type
+            or "LLMTimeoutError" in error_type
+            or "ConnectError" in error_type
+            or llm_http_status in {429, 500, 502, 503, 504}
+        )
+        key = "infrastructure_interruption" if is_infra else "agent_error"
+
     return FINAL_ERROR_MESSAGES[locale_name][key].format(
         error_type=error_type,
         iteration=iterations,

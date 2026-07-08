@@ -245,6 +245,9 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ LLM HTTP {status_code}. Повторы исчерпаны. "
             "Попытка {attempt}/{max_attempts}."
         ),
+        "llm_http_non_retryable": (
+            "⚠️ LLM HTTP {status_code}. Повтор не выполняется."
+        ),
         "llm_transport_retry": (
             "⚠️ LLM transport error. Повтор через {delay:.0f} сек. "
             "Попытка {attempt}/{max_attempts}…"
@@ -289,6 +292,9 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "llm_http_exhausted": (
             "⚠️ LLM HTTP {status_code}. Retries exhausted. "
             "Attempt {attempt}/{max_attempts}."
+        ),
+        "llm_http_non_retryable": (
+            "⚠️ LLM HTTP {status_code}. Retry is not allowed."
         ),
         "llm_transport_retry": (
             "⚠️ LLM transport error. Retrying in {delay:.0f}s. "
@@ -1059,9 +1065,19 @@ class MCPClient:
     def _is_retryable_llm_http_error(self, error: LLMHTTPError) -> bool:
         return error.status_code in self.llm_retryable_http_statuses
 
+    def _classify_llm_http_error(self, error: LLMHTTPError) -> tuple[str, bool]:
+        if self._is_retryable_llm_http_error(error):
+            return "infrastructure_interruption", True
+
+        if error.status_code in {400, 401, 403, 404, 422}:
+            return "llm_configuration_error", False
+
+        return "llm_http_error", False
+
     def _is_infrastructure_error(self, error: BaseException) -> bool:
         if isinstance(error, LLMHTTPError):
-            return self._is_retryable_llm_http_error(error)
+            _, can_resume = self._classify_llm_http_error(error)
+            return can_resume
 
         return isinstance(
             error,
@@ -2401,9 +2417,9 @@ class MCPClient:
                                 error_message = f"HTTP-ошибка LLM на итерации {i + 1}: {e}"
 
                             self._finish_with_error(state, final_text, error_message)
-                            if self._is_infrastructure_error(e):
-                                preserve_context_on_error = True
-                                error_kind = "infrastructure_interruption"
+                            error_kind, preserve_context_on_error = (
+                                self._classify_llm_http_error(e)
+                            )
                             break
                         except LLMTransportError as e:
                             error_message = f"Сетевая ошибка при получении финального ответа: {e}"
@@ -2432,9 +2448,9 @@ class MCPClient:
                 except LLMHTTPError as e:
                     error_message = f"HTTP-ошибка LLM на итерации {i+1}: {e}"
                     self._finish_with_error(state, final_text, error_message)
-                    if self._is_infrastructure_error(e):
-                        preserve_context_on_error = True
-                        error_kind = "infrastructure_interruption"
+                    error_kind, preserve_context_on_error = (
+                        self._classify_llm_http_error(e)
+                    )
                     break
 
                 except LLMTransportError as e:
@@ -2701,12 +2717,15 @@ class MCPClient:
             if session is None:
                 session = self._get_or_create_session(session_id)
 
-            can_resume = self._is_infrastructure_error(e)
-            outer_error_kind = (
-                "infrastructure_interruption"
-                if can_resume
-                else "critical_error"
-            )
+            if isinstance(e, LLMHTTPError):
+                outer_error_kind, can_resume = self._classify_llm_http_error(e)
+            else:
+                can_resume = self._is_infrastructure_error(e)
+                outer_error_kind = (
+                    "infrastructure_interruption"
+                    if can_resume
+                    else "critical_error"
+                )
             if can_resume:
                 await self._emit_progress(
                     state,
@@ -3227,7 +3246,35 @@ class MCPClient:
             except LLMHTTPError as e:
                 can_retry = e.status_code in self.llm_retryable_http_statuses
 
-                if not can_retry or attempt >= max_attempts:
+                if not can_retry:
+                    logger.error(
+                        f"{context}: LLM HTTP {e.status_code} не подходит "
+                        f"для retry; attempt={attempt}/{max_attempts}; "
+                        f"retry_after={e.retry_after!r}; error={e!r}"
+                    )
+                    await self._emit_llm_retry_progress(
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
+                        context=context,
+                        event_type="llm_error",
+                        message_key="llm_http_non_retryable",
+                        severity="error",
+                        data={
+                            "status_code": e.status_code,
+                            "attempt": attempt,
+                            "max_attempts": max_attempts,
+                            "retry_after": e.retry_after,
+                            "delay": 0,
+                            "error_type": type(e).__name__,
+                            "error_repr": repr(e),
+                        },
+                    )
+                    raise
+
+                if attempt >= max_attempts:
                     logger.error(
                         f"{context}: LLM HTTP {e.status_code} без дальнейших "
                         f"повторов; attempt={attempt}/{max_attempts}; "
