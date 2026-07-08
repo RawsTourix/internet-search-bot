@@ -30,6 +30,7 @@ from mcp.types import TextContent
 from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import LLMError, LLMHTTPError, LLMTimeoutError, LLMTransportError
 from ..agent.prompts import AGENT_SYSTEM_PROTOCOL
+from ..agent.progress_messages import normalize_progress_locale, progress_text
 from .server_manager import MCPServerManager
 from ..agent.protocol import AgentAction, ProgressEvent, dumps_json
 
@@ -223,105 +224,6 @@ class SessionState:
     progress_locale: str = "ru"
 
 
-PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
-    "ru": {
-        "cycle_started": "🧭 Начинаю обработку задачи…",
-        "cycle_resumed": "▶️ Продолжаю задачу с учётом ответа…",
-        "iteration_started": "Итерация {iteration}/{max_iterations}",
-        "mcp_list_servers": "🔎 Проверяю доступные MCP-серверы…",
-        "mcp_list_tools": "🧰 Получаю список доступных инструментов…",
-        "mcp_get_tool_schema": "📋 Проверяю схему {tool_name}…",
-        "mcp_call_tool": "🔧 Запускаю {tool_name}…",
-        "mcp_get_runtime_context": "🕒 Получаю runtime-контекст агента…",
-        "tool_start": "🔧 Запускаю инструмент {tool_name}…",
-        "tool_done": "✅ Инструмент {tool_name} завершил работу.",
-        "tool_error": "⚠️ Инструмент {tool_name} завершился с ошибкой.",
-        "tool_timeout": "⚠️ Инструмент {tool_name} завершился по таймауту.",
-        "llm_http_retry": (
-            "⚠️ LLM HTTP {status_code}. Повтор через {delay:.0f} сек. "
-            "Попытка {attempt}/{max_attempts}…"
-        ),
-        "llm_http_exhausted": (
-            "⚠️ LLM HTTP {status_code}. Повторы исчерпаны. "
-            "Попытка {attempt}/{max_attempts}."
-        ),
-        "llm_http_non_retryable": (
-            "⚠️ LLM HTTP {status_code}. Повтор не выполняется."
-        ),
-        "llm_transport_retry": (
-            "⚠️ LLM transport error. Повтор через {delay:.0f} сек. "
-            "Попытка {attempt}/{max_attempts}…"
-        ),
-        "llm_transport_exhausted": (
-            "⚠️ LLM transport error. Повторы исчерпаны. "
-            "Попытка {attempt}/{max_attempts}."
-        ),
-        "llm_timeout_retry": (
-            "⚠️ LLM timeout. Повтор через {delay:.0f} сек. "
-            "Попытка {attempt}/{max_attempts}…"
-        ),
-        "llm_timeout_exhausted": (
-            "⚠️ LLM timeout. Повторы исчерпаны. "
-            "Попытка {attempt}/{max_attempts}."
-        ),
-        "infrastructure_interruption": (
-            "⚠️ Инфраструктурная ошибка. Состояние задачи сохранено."
-        ),
-        "waiting_user": "❓ Нужны дополнительные данные от пользователя.",
-        "cycle_done": "✅ Задача завершена.",
-        "cycle_error": "⚠️ Задача завершилась с ошибкой.",
-        "context_warning": "⚠️ Контекст задачи стал большим.",
-    },
-    "en": {
-        "cycle_started": "🧭 Starting task processing…",
-        "cycle_resumed": "▶️ Continuing the task with the new reply…",
-        "iteration_started": "Iteration {iteration}/{max_iterations}",
-        "mcp_list_servers": "🔎 Checking available MCP servers…",
-        "mcp_list_tools": "🧰 Getting available tools…",
-        "mcp_get_tool_schema": "📋 Checking schema for {tool_name}…",
-        "mcp_call_tool": "🔧 Running {tool_name}…",
-        "mcp_get_runtime_context": "🕒 Getting agent runtime context…",
-        "tool_start": "🔧 Running tool {tool_name}…",
-        "tool_done": "✅ Tool {tool_name} finished.",
-        "tool_error": "⚠️ Tool {tool_name} failed.",
-        "tool_timeout": "⚠️ Tool {tool_name} timed out.",
-        "llm_http_retry": (
-            "⚠️ LLM HTTP {status_code}. Retrying in {delay:.0f}s. "
-            "Attempt {attempt}/{max_attempts}…"
-        ),
-        "llm_http_exhausted": (
-            "⚠️ LLM HTTP {status_code}. Retries exhausted. "
-            "Attempt {attempt}/{max_attempts}."
-        ),
-        "llm_http_non_retryable": (
-            "⚠️ LLM HTTP {status_code}. Retry is not allowed."
-        ),
-        "llm_transport_retry": (
-            "⚠️ LLM transport error. Retrying in {delay:.0f}s. "
-            "Attempt {attempt}/{max_attempts}…"
-        ),
-        "llm_transport_exhausted": (
-            "⚠️ LLM transport error. Retries exhausted. "
-            "Attempt {attempt}/{max_attempts}."
-        ),
-        "llm_timeout_retry": (
-            "⚠️ LLM timeout. Retrying in {delay:.0f}s. "
-            "Attempt {attempt}/{max_attempts}…"
-        ),
-        "llm_timeout_exhausted": (
-            "⚠️ LLM timeout. Retries exhausted. "
-            "Attempt {attempt}/{max_attempts}."
-        ),
-        "infrastructure_interruption": (
-            "⚠️ Infrastructure error. Task state has been saved."
-        ),
-        "waiting_user": "❓ More information is needed from the user.",
-        "cycle_done": "✅ Task completed.",
-        "cycle_error": "⚠️ Task failed.",
-        "context_warning": "⚠️ Task context is getting large.",
-    },
-}
-
 @dataclass
 class MCPServerRuntime:
     name: str
@@ -360,7 +262,7 @@ class ManagerToolSpec:
     description: str
     parameters: Dict[str, Any]
     handler: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
-    progress_message: str | Callable[[Dict[str, Any]], str]
+    progress_key: str
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -617,7 +519,7 @@ class MCPClient:
                     "additionalProperties": False,
                 },
                 handler=self._manager_list_servers,
-                progress_message="🔎 Проверяю доступные MCP-серверы…",
+                progress_key="mcp_list_servers",
             ),
             "mcp_list_tools": ManagerToolSpec(
                 name="mcp_list_tools",
@@ -650,9 +552,7 @@ class MCPClient:
                     "additionalProperties": False,
                 },
                 handler=self._manager_list_tools,
-                progress_message=(
-                    "🧰 Получаю список доступных инструментов…"
-                ),
+                progress_key="mcp_list_tools",
             ),
             "mcp_get_tool_schema": ManagerToolSpec(
                 name="mcp_get_tool_schema",
@@ -673,10 +573,7 @@ class MCPClient:
                     "additionalProperties": False,
                 },
                 handler=self._manager_get_tool_schema,
-                progress_message=lambda arguments: (
-                    "📋 Проверяю схему "
-                    f"{arguments.get('tool_name', 'инструмента')}…"
-                ),
+                progress_key="mcp_get_tool_schema",
             ),
             "mcp_call_tool": ManagerToolSpec(
                 name="mcp_call_tool",
@@ -706,9 +603,7 @@ class MCPClient:
                     "additionalProperties": False,
                 },
                 handler=self._manager_call_tool,
-                progress_message=lambda arguments: (
-                    f"🔧 Запускаю {arguments.get('tool_name', 'инструмент')}…"
-                ),
+                progress_key="mcp_call_tool",
             ),
             "mcp_get_runtime_context": ManagerToolSpec(
                 name="mcp_get_runtime_context",
@@ -725,9 +620,7 @@ class MCPClient:
                     "additionalProperties": False,
                 },
                 handler=self._manager_get_runtime_context,
-                progress_message=(
-                    "🕒 Получаю runtime-контекст агента…"
-                ),
+                progress_key="mcp_get_runtime_context",
             ),
         }
 
@@ -1394,8 +1287,7 @@ class MCPClient:
                 logger.warning("Progress callback failed: %r", e)
 
     def _normalize_progress_locale(self, value: str | None) -> str:
-        value = (value or "ru").lower().strip()
-        return "en" if value.startswith("en") else "ru"
+        return normalize_progress_locale(value)
 
     def _progress_text(
         self,
@@ -1404,13 +1296,7 @@ class MCPClient:
         locale_name: str | None = None,
         **kwargs: Any,
     ) -> str:
-        locale_name = self._normalize_progress_locale(locale_name)
-        messages = PROGRESS_MESSAGES.get(locale_name) or PROGRESS_MESSAGES["ru"]
-        template = messages.get(key) or PROGRESS_MESSAGES["ru"].get(key) or key
-        try:
-            return template.format(**kwargs)
-        except Exception:
-            return template
+        return progress_text(key, locale_name=locale_name, **kwargs)
 
     def _safe_progress_data(
         self,
@@ -1540,20 +1426,13 @@ class MCPClient:
                 locale_name=progress_locale,
                 tool_name=arguments.get("tool_name", "инструмент"),
             )
-        if tool_name in {
-            "mcp_list_servers", "mcp_list_tools", "mcp_get_runtime_context",
-        }:
-            return self._progress_text(tool_name, locale_name=progress_locale)
-
         spec = self.manager_tools.get(tool_name)
 
         if spec is not None:
-            message = spec.progress_message
-
-            if callable(message):
-                return message(arguments)
-
-            return message
+            return self._progress_text(
+                spec.progress_key,
+                locale_name=progress_locale,
+            )
 
         return self._progress_text(
             "tool_start",
