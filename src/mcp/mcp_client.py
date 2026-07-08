@@ -579,8 +579,8 @@ class MCPClient:
         
         # Настройки таймаутов
         self.tool_call_timeout = 240.0  # Таймаут для вызова инструментов
-        self.mcp_transport_call_timeout = 45.0
-        self.mcp_reconnect_timeout = 20.0
+        self.mcp_transport_call_timeout = 15.0
+        self.mcp_reconnect_timeout = 10.0
         self.mcp_call_retries_after_recovery = 1
         self.server_reconnect_locks: Dict[str, asyncio.Lock] = {}
         self.llm_call_timeout = 120.0   # Таймаут для вызова LLM

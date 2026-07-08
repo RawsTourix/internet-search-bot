@@ -173,6 +173,7 @@ class MCPServerManager:
         name = type(error).__name__
         text = f"{name}: {error!r}".lower()
         lifecycle_error_names = {
+            "TimeoutError",
             "ReadError",
             "WriteError",
             "ConnectError",
@@ -191,6 +192,8 @@ class MCPServerManager:
 
         if isinstance(error, MCPTransportLifecycleError):
             return True
+        if self.is_mcp_transport_cancellation(error):
+            return True
         if name in lifecycle_error_names:
             return True
         if isinstance(error, (asyncio.TimeoutError, httpx.HTTPError)):
@@ -199,11 +202,30 @@ class MCPServerManager:
             return True
         if "broken pipe" in text or "connection reset" in text:
             return True
+        if "session terminated" in text:
+            return True
+        if "session closed" in text:
+            return True
+        if "session is closed" in text:
+            return True
         if "session termination failed" in text:
+            return True
+        if "connection attempts failed" in text:
             return True
         if "attempted to exit cancel scope" in text:
             return True
         return False
+
+    def is_mcp_transport_cancellation(self, error: BaseException) -> bool:
+        if not isinstance(error, asyncio.CancelledError):
+            return False
+
+        # asyncio.CancelledError не является Exception в Python 3.11+.
+        # Внутри MCP streamable HTTP он может означать не отмену HTTP-запроса
+        # Gateway, а внутренний shutdown/cancel transport-а при initialize,
+        # reconnect или call_tool. На этой lifecycle-boundary превращаем его
+        # в управляемую MCP recovery/tool error вместо проброса наружу.
+        return True
 
     def supports_recovery(self, runtime) -> bool:
         return runtime.connect_type.value in {
@@ -267,7 +289,9 @@ class MCPServerManager:
                     new_runtime.generation,
                 )
                 return new_runtime
-            except Exception as e:
+            except BaseException as e:
+                if not self.is_transport_lifecycle_error(e):
+                    raise
                 if current is not None:
                     self.mark_unhealthy(current, e)
                     current.reconnecting = False
@@ -318,7 +342,12 @@ class MCPServerManager:
                     )
                 try:
                     runtime = await self.recover_runtime(binding.server_name)
-                except Exception as recovery_error:
+                except BaseException as recovery_error:
+                    if not (
+                        isinstance(recovery_error, MCPServerManagerError)
+                        or self.is_transport_lifecycle_error(recovery_error)
+                    ):
+                        raise
                     last_error = recovery_error
                     break
 
@@ -331,7 +360,7 @@ class MCPServerManager:
                     ),
                     timeout=self.owner.mcp_transport_call_timeout,
                 )
-            except Exception as e:
+            except BaseException as e:
                 last_error = e
 
                 if not self.is_transport_lifecycle_error(e):
@@ -358,7 +387,12 @@ class MCPServerManager:
 
                 try:
                     await self.recover_runtime(binding.server_name)
-                except Exception as recovery_error:
+                except BaseException as recovery_error:
+                    if not (
+                        isinstance(recovery_error, MCPServerManagerError)
+                        or self.is_transport_lifecycle_error(recovery_error)
+                    ):
+                        raise
                     last_error = recovery_error
                     logger.warning(
                         "MCP runtime recovery failed: server=%s error=%s: %r",

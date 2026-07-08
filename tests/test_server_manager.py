@@ -101,6 +101,69 @@ class MCPServerManagerTests(unittest.IsolatedAsyncioTestCase):
         owner._close_runtime.assert_awaited_once_with(old_runtime)
         new_session.call_tool.assert_awaited_once()
 
+    async def test_session_terminated_text_recovers_and_retries_once(self):
+        stale_session = SimpleNamespace(
+            call_tool=AsyncMock(side_effect=RuntimeError("Session terminated"))
+        )
+        old_runtime = make_runtime(session=stale_session)
+        owner, _ = make_owner(old_runtime)
+
+        expected = SimpleNamespace(content=[])
+        new_session = SimpleNamespace(call_tool=AsyncMock(return_value=expected))
+        new_runtime = make_runtime(session=new_session)
+        owner._connect_single_server.return_value = new_runtime
+        manager = MCPServerManager(owner)
+
+        result = await manager.call_tool("search", {})
+
+        self.assertIs(result, expected)
+        self.assertFalse(old_runtime.healthy)
+        self.assertEqual(new_runtime.generation, 1)
+        owner._connect_single_server.assert_awaited_once()
+        new_session.call_tool.assert_awaited_once()
+
+    async def test_cancelled_tool_call_is_lifecycle_error_not_task_escape(self):
+        async def raise_cancelled(*_args, **_kwargs):
+            raise asyncio.CancelledError("session cancelled")
+
+        stale_session = SimpleNamespace(call_tool=raise_cancelled)
+        old_runtime = make_runtime(session=stale_session)
+        owner, _ = make_owner(old_runtime)
+
+        expected = SimpleNamespace(content=[])
+        new_session = SimpleNamespace(call_tool=AsyncMock(return_value=expected))
+        new_runtime = make_runtime(session=new_session)
+        owner._connect_single_server.return_value = new_runtime
+        manager = MCPServerManager(owner)
+
+        result = await manager.call_tool("search", {})
+
+        self.assertIs(result, expected)
+        self.assertFalse(old_runtime.healthy)
+        self.assertEqual(new_runtime.generation, 1)
+        new_session.call_tool.assert_awaited_once()
+
+    async def test_cancelled_recovery_becomes_tool_call_failure(self):
+        stale_session = SimpleNamespace(
+            call_tool=AsyncMock(side_effect=httpx.ReadError("stale session"))
+        )
+        runtime = make_runtime(session=stale_session)
+        owner, _ = make_owner(runtime)
+
+        async def raise_cancelled(_config):
+            raise asyncio.CancelledError("session initialize cancelled")
+
+        owner._connect_single_server.side_effect = raise_cancelled
+        manager = MCPServerManager(owner)
+
+        with self.assertRaises(MCPToolCallFailedError) as raised:
+            await manager.call_tool("search", {})
+
+        self.assertIn("tool=search", str(raised.exception))
+        self.assertIn("MCPServerRecoveryError", str(raised.exception))
+        self.assertFalse(runtime.healthy)
+        self.assertFalse(runtime.reconnecting)
+
     async def test_application_error_does_not_reconnect_or_mark_unhealthy(self):
         session = SimpleNamespace(
             call_tool=AsyncMock(side_effect=ValueError("invalid arguments"))
