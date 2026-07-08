@@ -3,6 +3,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
+from src.agent.progress_messages import progress_text
 from src.agent.protocol import ProgressEvent
 from src.core.models import ClientType, UnifiedMessage
 from src.gateway import (
@@ -18,6 +19,35 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.client = object.__new__(MCPClient)
         self.client.tool_registry = {}
+        self.client.manager_tools = self.client._build_manager_tools()
+
+    def test_progress_text_uses_localized_default_for_empty_tool_name(self):
+        self.assertEqual(
+            progress_text("mcp_get_tool_schema", locale_name="ru", tool_name=None),
+            "📋 Проверяю схему инструмента…",
+        )
+        self.assertEqual(
+            progress_text("mcp_call_tool", locale_name="en", tool_name=""),
+            "🔧 Running tool…",
+        )
+
+    def test_manager_tool_progress_arguments_are_mapped_declaratively(self):
+        self.assertEqual(
+            self.client._tool_start_message(
+                "mcp_get_tool_schema",
+                {"tool_name": "events"},
+                progress_locale="en",
+            ),
+            "📋 Checking schema for events…",
+        )
+        self.assertEqual(
+            self.client._tool_start_message(
+                "mcp_call_tool",
+                {"tool_name": None},
+                progress_locale="ru",
+            ),
+            "🔧 Запускаю инструмент…",
+        )
 
     def test_progress_event_has_trace_fields(self):
         event = ProgressEvent(type="cycle_started", message="Starting")

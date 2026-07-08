@@ -263,6 +263,7 @@ class ManagerToolSpec:
     parameters: Dict[str, Any]
     handler: Callable[[Dict[str, Any]], Awaitable[Dict[str, Any]]]
     progress_key: str
+    progress_arg_map: Dict[str, str] = field(default_factory=dict)
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -574,6 +575,7 @@ class MCPClient:
                 },
                 handler=self._manager_get_tool_schema,
                 progress_key="mcp_get_tool_schema",
+                progress_arg_map={"tool_name": "tool_name"},
             ),
             "mcp_call_tool": ManagerToolSpec(
                 name="mcp_call_tool",
@@ -604,6 +606,7 @@ class MCPClient:
                 },
                 handler=self._manager_call_tool,
                 progress_key="mcp_call_tool",
+                progress_arg_map={"tool_name": "tool_name"},
             ),
             "mcp_get_runtime_context": ManagerToolSpec(
                 name="mcp_get_runtime_context",
@@ -1414,24 +1417,18 @@ class MCPClient:
         *,
         progress_locale: str = "ru",
     ) -> str:
-        if tool_name == "mcp_get_tool_schema":
-            return self._progress_text(
-                "mcp_get_tool_schema",
-                locale_name=progress_locale,
-                tool_name=arguments.get("tool_name", "инструмента"),
-            )
-        if tool_name == "mcp_call_tool":
-            return self._progress_text(
-                "mcp_call_tool",
-                locale_name=progress_locale,
-                tool_name=arguments.get("tool_name", "инструмент"),
-            )
         spec = self.manager_tools.get(tool_name)
 
         if spec is not None:
+            kwargs = {
+                placeholder: arguments.get(argument_name)
+                for placeholder, argument_name in spec.progress_arg_map.items()
+            }
+
             return self._progress_text(
                 spec.progress_key,
                 locale_name=progress_locale,
+                **kwargs,
             )
 
         return self._progress_text(

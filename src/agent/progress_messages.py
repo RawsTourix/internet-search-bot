@@ -101,9 +101,79 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
 }
 
 
+PROGRESS_MESSAGE_DEFAULT_KWARGS: dict[str, dict[str, dict[str, str]]] = {
+    "mcp_get_tool_schema": {
+        "tool_name": {
+            "ru": "инструмента",
+            "en": "tool",
+        },
+    },
+    "mcp_call_tool": {
+        "tool_name": {
+            "ru": "инструмент",
+            "en": "tool",
+        },
+    },
+    "tool_start": {
+        "tool_name": {
+            "ru": "инструмент",
+            "en": "tool",
+        },
+    },
+    "tool_done": {
+        "tool_name": {
+            "ru": "инструмент",
+            "en": "tool",
+        },
+    },
+    "tool_error": {
+        "tool_name": {
+            "ru": "инструмент",
+            "en": "tool",
+        },
+    },
+    "tool_timeout": {
+        "tool_name": {
+            "ru": "инструмент",
+            "en": "tool",
+        },
+    },
+}
+
+
 def normalize_progress_locale(value: str | None) -> str:
     value = (value or "ru").lower().strip()
     return "en" if value.startswith("en") else "ru"
+
+
+def _localized_default(
+    key: str,
+    arg_name: str,
+    locale_name: str,
+) -> str | None:
+    key_defaults = PROGRESS_MESSAGE_DEFAULT_KWARGS.get(key) or {}
+    arg_defaults = key_defaults.get(arg_name) or {}
+
+    return arg_defaults.get(locale_name) or arg_defaults.get("ru")
+
+
+def _merge_default_kwargs(
+    key: str,
+    locale_name: str,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    key_defaults = PROGRESS_MESSAGE_DEFAULT_KWARGS.get(key) or {}
+    result = dict(kwargs)
+
+    for arg_name in key_defaults:
+        if result.get(arg_name) not in (None, ""):
+            continue
+
+        default_value = _localized_default(key, arg_name, locale_name)
+        if default_value is not None:
+            result[arg_name] = default_value
+
+    return result
 
 
 def progress_text(
@@ -115,6 +185,8 @@ def progress_text(
     locale_name = normalize_progress_locale(locale_name)
     messages = PROGRESS_MESSAGES.get(locale_name) or PROGRESS_MESSAGES["ru"]
     template = messages.get(key) or PROGRESS_MESSAGES["ru"].get(key) or key
+    kwargs = _merge_default_kwargs(key, locale_name, kwargs)
+
     try:
         return template.format(**kwargs)
     except Exception:
