@@ -45,6 +45,14 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "infrastructure_interruption": (
             "⚠️ Инфраструктурная ошибка. Состояние задачи сохранено."
         ),
+        "final_processing_started": "✍️ Готовлю финальный ответ…",
+        "final_processing_format_only": "🪄 Оформляю финальный ответ…",
+        "final_processing_grounded": (
+            "🔎 Проверяю финальный ответ по собранным данным…"
+        ),
+        "final_processing_strict_grounded": (
+            "🧩 Сверяю детали перед финальным ответом…"
+        ),
         "waiting_user": "❓ Нужны дополнительные данные от пользователя.",
         "cycle_done": "✅ Задача завершена.",
         "cycle_error": "⚠️ Задача завершилась с ошибкой.",
@@ -92,6 +100,14 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         ),
         "infrastructure_interruption": (
             "⚠️ Infrastructure error. Task state has been saved."
+        ),
+        "final_processing_started": "✍️ Preparing the final answer…",
+        "final_processing_format_only": "🪄 Polishing the final answer…",
+        "final_processing_grounded": (
+            "🔎 Checking the final answer against the collected data…"
+        ),
+        "final_processing_strict_grounded": (
+            "🧩 Checking the details before the final answer…"
         ),
         "waiting_user": "❓ More information is needed from the user.",
         "cycle_done": "✅ Task completed.",

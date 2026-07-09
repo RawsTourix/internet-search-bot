@@ -86,6 +86,7 @@ class ProgressEvent(BaseModel):
         "context_compaction_started",
         "context_compaction_done",
         "large_result_saved",
+        "final_processing_started",
         "waiting_user",
         "cycle_done",
         "cycle_error",

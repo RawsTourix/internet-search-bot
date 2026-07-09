@@ -76,6 +76,14 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(event.visibility, "user")
         self.assertEqual(event.severity, "info")
 
+    def test_final_processing_progress_event_type_is_allowed(self):
+        event = ProgressEvent(
+            type="final_processing_started",
+            message="Preparing final answer",
+        )
+
+        self.assertEqual(event.type, "final_processing_started")
+
     def test_progress_data_is_sanitized_and_truncated(self):
         result = self.client._safe_progress_data({
             "token": "secret-token",
@@ -150,6 +158,30 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(decision.mode, FinalProcessingMode.STRICT_GROUNDED)
         self.assertEqual(decision.reason, "risky_tool_workflow")
 
+    def test_final_processing_progress_key_uses_user_friendly_messages(self):
+        self.assertIsNone(
+            self.client._final_processing_progress_key(
+                FinalProcessingDecision(FinalProcessingMode.SKIP, "short_no_tools")
+            )
+        )
+        self.assertEqual(
+            self.client._final_processing_progress_key(
+                FinalProcessingDecision(
+                    FinalProcessingMode.FORMAT_ONLY,
+                    "no_tools_format_only",
+                )
+            ),
+            "final_processing_format_only",
+        )
+        self.assertEqual(
+            progress_text("final_processing_grounded", locale_name="ru"),
+            "🔎 Проверяю финальный ответ по собранным данным…",
+        )
+        self.assertEqual(
+            progress_text("final_processing_strict_grounded", locale_name="en"),
+            "🧩 Checking the details before the final answer…",
+        )
+
     def test_final_evidence_pack_preserves_full_tool_result(self):
         state = SessionState(tools_used=["search"])
         tool_result = {
@@ -211,6 +243,46 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.client._format_final_answer.await_args.kwargs["draft_answer"],
             "grounded",
         )
+
+    async def test_emit_final_processing_progress_event_is_persistent(self):
+        state = SessionState(progress_locale="ru")
+        events = []
+        cycle_trace = [
+            {
+                "type": "final_processing_decision",
+                "mode": "grounded",
+                "reason": "tools_used",
+                "final_audit_enabled": True,
+            },
+        ]
+
+        await self.client._emit_progress_event(
+            state=state,
+            session_id="session-1",
+            cycle_id="cycle-1",
+            progress_callback=events.append,
+            cycle_trace=cycle_trace,
+            event_type="final_processing_started",
+            message_key="final_processing_grounded",
+            data={
+                "mode": "grounded",
+                "reason": "tools_used",
+                "final_audit_enabled": True,
+            },
+        )
+
+        self.assertEqual(events, state.progress_events)
+        self.assertEqual(events[0]["type"], "final_processing_started")
+        self.assertEqual(
+            events[0]["message"],
+            "🔎 Проверяю финальный ответ по собранным данным…",
+        )
+        self.assertEqual(events[0]["severity"], "info")
+        self.assertEqual(events[0]["visibility"], "user")
+        self.assertEqual(events[0]["data"]["mode"], "grounded")
+        self.assertEqual(cycle_trace[0]["type"], "final_processing_decision")
+        self.assertEqual(cycle_trace[1]["type"], "progress_event")
+        self.assertEqual(cycle_trace[1]["progress_event"], events[0])
 
     async def test_callback_failure_does_not_break_runtime(self):
         state = SessionState()

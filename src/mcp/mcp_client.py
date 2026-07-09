@@ -985,6 +985,24 @@ class MCPClient:
     ) -> bool:
         return any(event.get("type") == "tool_error" for event in cycle_trace)
 
+    def _final_processing_progress_key(
+        self,
+        decision: FinalProcessingDecision,
+    ) -> str | None:
+        if decision.mode == FinalProcessingMode.SKIP:
+            return None
+
+        if decision.mode == FinalProcessingMode.FORMAT_ONLY:
+            return "final_processing_format_only"
+
+        if decision.mode == FinalProcessingMode.GROUNDED:
+            return "final_processing_grounded"
+
+        if decision.mode == FinalProcessingMode.STRICT_GROUNDED:
+            return "final_processing_strict_grounded"
+
+        return "final_processing_started"
+
     def _trace_has_empty_tool_results(
         self,
         cycle_trace: list[dict[str, Any]],
@@ -2765,6 +2783,39 @@ class MCPClient:
                     final_audit_enabled=self.llm_config.final_audit,
                 )
 
+                logger.info(
+                    "Final processing: mode=%s reason=%s final_audit=%s "
+                    "iterations=%s tools=%s chars=%s",
+                    decision.mode.value,
+                    decision.reason,
+                    self.llm_config.final_audit,
+                    state.iterations,
+                    len(state.tools_used),
+                    len(result_text),
+                )
+
+                final_processing_progress_key = (
+                    self._final_processing_progress_key(decision)
+                )
+
+                if final_processing_progress_key is not None:
+                    await self._emit_progress_event(
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
+                        event_type="final_processing_started",
+                        message_key=final_processing_progress_key,
+                        severity="info",
+                        visibility="user",
+                        data={
+                            "mode": decision.mode.value,
+                            "reason": decision.reason,
+                            "final_audit_enabled": self.llm_config.final_audit,
+                        },
+                    )
+
                 if decision.mode != FinalProcessingMode.SKIP:
                     try:
                         evidence_pack = None
@@ -2802,6 +2853,14 @@ class MCPClient:
                                 reason=decision.reason,
                                 before_chars=len(old_result_text),
                                 after_chars=len(processed_text),
+                            )
+
+                            logger.info(
+                                "Final processing done: mode=%s reason=%s before_chars=%s after_chars=%s",
+                                decision.mode.value,
+                                decision.reason,
+                                len(old_result_text),
+                                len(processed_text),
                             )
 
                     except Exception as e:
