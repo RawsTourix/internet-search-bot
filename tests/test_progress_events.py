@@ -3,7 +3,11 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from src.agent.progress_messages import progress_text
+from src.agent.progress_messages import (
+    PROGRESS_MESSAGES,
+    normalize_progress_locale,
+    progress_text,
+)
 from src.agent.protocol import ProgressEvent
 from src.core.models import ClientType, UnifiedMessage
 from src.gateway import (
@@ -30,6 +34,15 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
             progress_text("mcp_call_tool", locale_name="en", tool_name=""),
             "🔧 Running tool…",
         )
+
+    def test_progress_locale_normalization_uses_available_catalogs(self):
+        self.assertEqual(normalize_progress_locale(None), "ru")
+        self.assertEqual(normalize_progress_locale("ru-RU"), "ru")
+        self.assertEqual(normalize_progress_locale("en_GB"), "en")
+        self.assertEqual(normalize_progress_locale("unknown"), "ru")
+
+        with patch.dict(PROGRESS_MESSAGES, {"de": {}}, clear=False):
+            self.assertEqual(normalize_progress_locale("de-DE"), "de")
 
     def test_manager_tool_progress_arguments_are_mapped_declaratively(self):
         self.assertEqual(
@@ -105,6 +118,31 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(len(state.progress_events), 1)
+
+    async def test_emit_progress_event_preserves_callback_and_trace_payload(self):
+        state = SessionState(progress_locale="en", iterations=2)
+        events = []
+        cycle_trace = []
+
+        await self.client._emit_progress_event(
+            state=state,
+            session_id="session-1",
+            cycle_id="cycle-1",
+            progress_callback=events.append,
+            cycle_trace=cycle_trace,
+            event_type="iteration_started",
+            visibility="debug",
+            message_kwargs={"iteration": 2, "max_iterations": 8},
+        )
+
+        self.assertEqual(events, state.progress_events)
+        self.assertEqual(events[0]["type"], "iteration_started")
+        self.assertEqual(events[0]["message"], "Iteration 2/8")
+        self.assertEqual(events[0]["visibility"], "debug")
+        self.assertEqual(events[0]["session_id"], "session-1")
+        self.assertEqual(events[0]["cycle_id"], "cycle-1")
+        self.assertEqual(cycle_trace[0]["type"], "progress_event")
+        self.assertEqual(cycle_trace[0]["progress_event"], events[0])
 
     async def test_llm_http_429_emits_retry_then_succeeds(self):
         self.client.llm_max_retries = 1

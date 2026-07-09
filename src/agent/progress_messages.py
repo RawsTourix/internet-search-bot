@@ -141,9 +141,24 @@ PROGRESS_MESSAGE_DEFAULT_KWARGS: dict[str, dict[str, dict[str, str]]] = {
 }
 
 
+DEFAULT_PROGRESS_LOCALE = "ru"
+
+
 def normalize_progress_locale(value: str | None) -> str:
-    value = (value or "ru").lower().strip()
-    return "en" if value.startswith("en") else "ru"
+    if not value:
+        return DEFAULT_PROGRESS_LOCALE
+
+    value = value.lower().strip().replace("_", "-")
+
+    if value in PROGRESS_MESSAGES:
+        return value
+
+    language = value.split("-", 1)[0]
+
+    if language in PROGRESS_MESSAGES:
+        return language
+
+    return DEFAULT_PROGRESS_LOCALE
 
 
 def _localized_default(
