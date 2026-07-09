@@ -8,14 +8,20 @@ from src.agent.progress_messages import (
     normalize_progress_locale,
     progress_text,
 )
-from src.agent.protocol import ProgressEvent
+from src.agent.protocol import ProgressEvent, dumps_json
 from src.core.models import ClientType, UnifiedMessage
 from src.gateway import (
     is_allowed_progress_callback_url,
     make_http_progress_callback,
 )
 from src.core.errors import LLMHTTPError, LLMTimeoutError, LLMTransportError
-from src.mcp.mcp_client import MCPClient, MCPToolBinding, SessionState
+from src.mcp.mcp_client import (
+    FinalProcessingDecision,
+    FinalProcessingMode,
+    MCPClient,
+    MCPToolBinding,
+    SessionState,
+)
 from src.servers.telegram import telegram_server
 
 
@@ -103,6 +109,107 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             self.client._resolve_progress_server_name(target),
             "kudago_nominatim",
+        )
+
+    def test_final_processing_mode_skips_short_answers_without_tools(self):
+        self.client.llm_config = SimpleNamespace(final_audit=True)
+        state = SessionState(iterations=1)
+
+        decision = self.client._select_final_processing_mode(
+            result_text="Привет! Чем могу помочь?",
+            state=state,
+            cycle_trace=[],
+        )
+
+        self.assertEqual(decision.mode, FinalProcessingMode.SKIP)
+        self.assertEqual(decision.reason, "short_no_tools")
+
+    def test_final_processing_mode_uses_structural_risk_signals(self):
+        self.client.llm_config = SimpleNamespace(final_audit=True)
+        state = SessionState(iterations=2, tools_used=["search"])
+        cycle_trace = [
+            {
+                "type": "tool_result_full",
+                "result": {
+                    "content": dumps_json({
+                        "data": {
+                            "count": 0,
+                            "items": [],
+                        },
+                    }),
+                },
+            },
+        ]
+
+        decision = self.client._select_final_processing_mode(
+            result_text="Ничего не найдено.",
+            state=state,
+            cycle_trace=cycle_trace,
+        )
+
+        self.assertEqual(decision.mode, FinalProcessingMode.STRICT_GROUNDED)
+        self.assertEqual(decision.reason, "risky_tool_workflow")
+
+    def test_final_evidence_pack_preserves_full_tool_result(self):
+        state = SessionState(tools_used=["search"])
+        tool_result = {
+            "content": dumps_json({
+                "data": {
+                    "id": 1,
+                    "title": "A",
+                    "custom_payload": {"nested": True},
+                },
+            }),
+        }
+        cycle_trace = [
+            {
+                "type": "tool_result_full",
+                "tool_name": "search",
+                "tool_call_id": "call-1",
+                "result": tool_result,
+            },
+            {
+                "type": "tool_error",
+                "tool_name": "details",
+                "error": "timeout",
+            },
+        ]
+
+        evidence = self.client._build_final_evidence_pack(
+            original_user_request="find places",
+            state=state,
+            cycle_trace=cycle_trace,
+        )
+
+        self.assertEqual(evidence["tool_results"][0]["result"], tool_result)
+        self.assertEqual(evidence["tool_errors"][0]["error"], "timeout")
+        self.assertEqual(evidence["limitations"][0]["type"], "tool_errors_present")
+
+    async def test_process_final_answer_runs_grounding_before_formatting(self):
+        self.client._ground_final_answer = AsyncMock(return_value="grounded")
+        self.client._format_final_answer = AsyncMock(return_value="formatted")
+        evidence_pack = {"type": "final_evidence_pack"}
+
+        result = await self.client._process_final_answer(
+            draft_answer="draft",
+            client_type=ClientType.WEB,
+            decision=FinalProcessingDecision(
+                FinalProcessingMode.GROUNDED,
+                "tools_used",
+            ),
+            evidence_pack=evidence_pack,
+        )
+
+        self.assertEqual(result, "formatted")
+        self.client._ground_final_answer.assert_awaited_once()
+        self.client._format_final_answer.assert_awaited_once()
+        self.assertEqual(
+            self.client._ground_final_answer.await_args.kwargs["evidence_pack"],
+            evidence_pack,
+        )
+        self.assertEqual(
+            self.client._format_final_answer.await_args.kwargs["draft_answer"],
+            "grounded",
         )
 
     async def test_callback_failure_does_not_break_runtime(self):

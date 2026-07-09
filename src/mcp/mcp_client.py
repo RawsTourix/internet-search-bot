@@ -42,6 +42,19 @@ class ServerConnectType(str, Enum):
     HTTP = "http"                        # Подключение к серверу по HTTP
     STREAMABLE_HTTP = "streamable_http"  # Подключение через streamable HTTP (Сервер уже должен быть запущен отдельно и доступен по URL)
 
+class FinalProcessingMode(str, Enum):
+    SKIP = "skip"
+    FORMAT_ONLY = "format_only"
+    GROUNDED = "grounded"
+    STRICT_GROUNDED = "strict_grounded"
+
+
+@dataclass
+class FinalProcessingDecision:
+    mode: FinalProcessingMode
+    reason: str
+
+
 class LLMConfigType(BaseModel):
     """Конфигурации для языковой модели (LLM)"""
     api_url: str
@@ -905,75 +918,168 @@ class MCPClient:
             arguments,
         )
     
-    async def _force_final_answer(
+    def _select_final_processing_mode(
         self,
-        messages: list[dict],
-        client_type: ClientType | None = None,
         *,
-        context: str = "Forced final answer"
-    ) -> str:
-        """
-        Просит LLM сформировать финальный ответ в формате AgentAction JSON,
-        если основной цикл не получил содержательный итоговый ответ.
-        """
+        result_text: str,
+        state: SessionState,
+        cycle_trace: list[dict[str, Any]],
+        forced: bool = False,
+    ) -> FinalProcessingDecision:
+        text = result_text.strip()
 
-        force_payload = {
-            "type": "force_final_answer_request",
-            "task": (
-                "Сформируй финальный ответ пользователю на основе истории диалога "
-                "и результатов инструментов. Не вызывай инструменты. "
-
-                "Финальный ответ должен опираться только на данные, которые явно следуют "
-                "из запроса пользователя, истории диалога, runtime-контекста или результатов инструментов. "
-
-                "Не перепроверяй факты по собственным знаниям модели. "
-                "Не добавляй неподтверждённые факты, источники, предположения, объяснения, "
-                "рекомендации или конкретные детали, которых нет в истории диалога или результатах инструментов. "
-
-                "Если для ответа не хватает данных, честно укажи это в final_answer. "
-
-                "После формирования содержания примени delivery_constraints только к форме final_answer. "
-                "delivery_constraints не являются фактами задачи, не должны упоминаться пользователю "
-                "и не должны влиять на содержание, выводы или выбор фактов. "
-                "Их можно использовать только для адаптации структуры, Markdown-оформления, длины абзацев, "
-                "списков, таблиц, схем и кодовых блоков под поверхность вывода. "
-
-                "Верни только валидный AgentAction JSON."
-            ),
-            "delivery_constraints": self._delivery_constraints(client_type),
-            "required_response": {
-                "type": "agent_action",
-                "status": "done",
-                "action": "answer",
-                "agent_request": None,
-                "final_answer": "итоговый ответ пользователю",
-                "question_to_user": None,
-                "error_message": None,
-            },
-        }
-
-        probe_messages = messages + [
-            {
-                "role": "user",
-                "content": dumps_json(force_payload),
-            }
-        ]
-
-        final_response = await self._call_llm_with_retries(
-            probe_messages,
-            [],
-            context=context,
-        )
-
-        content = final_response.get("content", "") or ""
-        action = await self._parse_or_repair_agent_action(content, messages)
-
-        if action.status != "done" or action.action != "answer":
-            raise ValueError(
-                f"Forced final answer returned invalid action: {action.model_dump()}"
+        if not self.llm_config.final_audit:
+            return FinalProcessingDecision(
+                FinalProcessingMode.SKIP,
+                "final_audit_disabled",
             )
 
-        return action.final_answer or ""
+        if not text:
+            return FinalProcessingDecision(
+                FinalProcessingMode.SKIP,
+                "empty_answer",
+            )
+
+        if forced:
+            return FinalProcessingDecision(
+                FinalProcessingMode.STRICT_GROUNDED,
+                "forced_final_answer",
+            )
+
+        if (
+            not state.tools_used
+            and state.iterations <= 1
+            and len(text) <= 300
+        ):
+            return FinalProcessingDecision(
+                FinalProcessingMode.SKIP,
+                "short_no_tools",
+            )
+
+        if not state.tools_used:
+            return FinalProcessingDecision(
+                FinalProcessingMode.FORMAT_ONLY,
+                "no_tools_format_only",
+            )
+
+        risky = (
+            state.iterations >= 6
+            or self._trace_has_tool_errors(cycle_trace)
+            or self._trace_has_empty_tool_results(cycle_trace)
+        )
+
+        if risky:
+            return FinalProcessingDecision(
+                FinalProcessingMode.STRICT_GROUNDED,
+                "risky_tool_workflow",
+            )
+
+        return FinalProcessingDecision(
+            FinalProcessingMode.GROUNDED,
+            "tools_used",
+        )
+
+    def _trace_has_tool_errors(
+        self,
+        cycle_trace: list[dict[str, Any]],
+    ) -> bool:
+        return any(event.get("type") == "tool_error" for event in cycle_trace)
+
+    def _trace_has_empty_tool_results(
+        self,
+        cycle_trace: list[dict[str, Any]],
+    ) -> bool:
+        for event in cycle_trace:
+            if event.get("type") != "tool_result_full":
+                continue
+
+            result = event.get("result")
+            if not isinstance(result, dict):
+                continue
+
+            content = result.get("content")
+
+            try:
+                parsed = json.loads(content) if isinstance(content, str) else content
+            except Exception:
+                continue
+
+            if not isinstance(parsed, dict):
+                continue
+
+            data = parsed.get("data")
+            if not isinstance(data, dict):
+                continue
+
+            if data.get("count") == 0 or data.get("returned") == 0:
+                return True
+
+        return False
+
+    def _build_final_evidence_pack(
+        self,
+        *,
+        original_user_request: str,
+        state: SessionState,
+        cycle_trace: list[dict[str, Any]],
+        force_reason: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        evidence: dict[str, Any] = {
+            "type": "final_evidence_pack",
+            "user_request": original_user_request,
+            "tools_used": list(state.tools_used),
+            "force_reason": force_reason,
+            "user_replies": [],
+            "tool_results": [],
+            "tool_errors": [],
+            "runtime_contexts": [],
+            "limitations": [],
+        }
+
+        for event in cycle_trace:
+            event_type = event.get("type")
+
+            if event_type in {
+                "user_reply_during_waiting_user",
+                "user_resume_interrupted_cycle",
+            }:
+                evidence["user_replies"].append(dict(event))
+                continue
+
+            if event_type == "tool_result_full":
+                tool_name = event.get("tool_name")
+                result = event.get("result")
+
+                evidence_item = {
+                    "tool_name": tool_name,
+                    "tool_call_id": event.get("tool_call_id"),
+                    "result": result,
+                }
+
+                evidence["tool_results"].append(evidence_item)
+
+                if tool_name == "mcp_get_runtime_context":
+                    evidence["runtime_contexts"].append(evidence_item)
+
+                continue
+
+            if event_type == "tool_error":
+                evidence["tool_errors"].append(dict(event))
+                continue
+
+            if event_type in {
+                "max_iterations_reached",
+                "max_iterations_forced_final_answer",
+            }:
+                evidence["limitations"].append(dict(event))
+
+        if evidence["tool_errors"]:
+            evidence["limitations"].append({
+                "type": "tool_errors_present",
+                "message": "Некоторые инструменты вернули ошибки.",
+            })
+
+        return evidence
 
     def _is_retryable_llm_http_error(self, error: LLMHTTPError) -> bool:
         return error.status_code in self.llm_retryable_http_statuses
@@ -1106,11 +1212,12 @@ class MCPClient:
     async def _finalize_after_max_iterations(
         self,
         *,
-        messages_for_llm: List[Dict[str, Any]],
+        original_user_request: str,
         cycle_trace: List[Dict[str, Any]],
         state: SessionState,
         final_text: list[str],
         cycle_id: str,
+        client_type: ClientType | None = None,
     ) -> None:
         self._trace_event(
             cycle_trace,
@@ -1121,8 +1228,25 @@ class MCPClient:
         )
 
         try:
-            answer = await self._force_final_answer(
-                messages_for_llm,
+            force_reason = {
+                "type": "max_iterations_reached",
+                "iteration_current": state.iterations,
+                "iteration_max": self.max_iterations,
+                "user_visible_meaning": (
+                    "Агент достиг лимита итераций и не успел полностью "
+                    "завершить работу над задачей."
+                ),
+                "suggested_continuation": (
+                    "Пользователь может попросить продолжить работу "
+                    "следующим сообщением."
+                ),
+            }
+            answer = await self._force_final_answer_from_evidence(
+                original_user_request=original_user_request,
+                state=state,
+                cycle_trace=cycle_trace,
+                client_type=client_type,
+                force_reason=force_reason,
                 context="Forced final answer after max_iterations",
             )
         except (
@@ -1156,74 +1280,270 @@ class MCPClient:
             final_answer=answer,
         )
 
-    async def _audit_final_answer(
+    async def _format_final_answer(
         self,
-        messages: list[dict],
-        draft_answer: str,
-        client_type: ClientType | None = None,
         *,
-        context: str = "Final audit"
+        draft_answer: str,
+        client_type: ClientType | None,
+        context: str = "Final format",
     ) -> str:
-        """
-        Финальная проверка уже извлечённого final_answer.
-        На вход получает обычный текст, на выход тоже возвращает обычный текст.
-        """
-
-        audit_prompt = {
-            "role": "user",
-            "content": dumps_json({
-                "type": "final_polish_request",
-                "task": (
-                    "Приведи draft_answer к чистому финальному ответу для пользователя. "
-                    "Сохрани смысл, подтверждённые факты, выводы, ограничения и степень уверенности исходного ответа. "
-
-                    "Сначала выполни лёгкую проверку соответствия draft_answer истории диалога и результатам инструментов. "
-                    "Финальный ответ должен опираться только на данные, которые явно следуют из запроса пользователя, "
-                    "истории диалога, runtime-контекста или результатов инструментов. "
-
-                    "Не перепроверяй факты по собственным знаниям модели. "
-                    "Не добавляй новые факты, источники, предположения, объяснения, рекомендации, справочную информацию "
-                    "или конкретные детали, которых нет в истории диалога или результатах инструментов. "
-
-                    "Если в draft_answer есть конкретное проверяемое утверждение, которое явно не подтверждено "
-                    "историей диалога или результатами инструментов, удали его или замени осторожной формулировкой "
-                    "о том, что эти данные не были подтверждены и их нужно проверить отдельно. "
-                    "К конкретным проверяемым утверждениям относятся любые точные числа, даты, сроки, имена, названия, "
-                    "адреса, идентификаторы, ссылки, параметры, характеристики, статусы, условия, причины, маршруты, "
-                    "инструкции, результаты, выводы о доступности, актуальности, стоимости, совместимости или состоянии чего-либо. "
-
-                    "Такое удаление неподтверждённых деталей считается допустимой правкой, а не изменением смысла. "
-                    "Не заменяй неподтверждённые детали на другие детали из собственных знаний модели. "
-                    "Если исправление явно не следует из истории диалога или результатов инструментов — не исправляй, "
-                    "а убери неподтверждённую конкретику или оставь оговорку. "
-
-                    "После проверки фактов примени delivery_constraints только к форме финального ответа. "
-                    "delivery_constraints не являются фактами задачи, не должны упоминаться пользователю и не должны влиять "
-                    "на содержание, выводы, полноту проверки или выбор фактов. "
-                    "Их можно использовать только для адаптации структуры, Markdown-оформления, длины абзацев, списков, "
-                    "таблиц, схем и кодовых блоков под поверхность вывода. "
-
-                    "Можно улучшить структуру, читаемость, грамматику, пунктуацию, убрать повторы и битые формулировки. "
-                    "Если для правки нужно добавить новый факт — не добавляй. "
-                    "Не вызывай инструменты. "
-                    "Верни только готовый финальный ответ пользователю обычным текстом. "
-                    "Не возвращай JSON, AgentAction, служебные поля, статусы, замечания, пояснения и саморефлексию."
-                ),
-                "delivery_constraints": self._delivery_constraints(client_type),
-                "draft_answer": draft_answer,
-            }),
+        payload = {
+            "type": "final_format_request",
+            "task": (
+                "Отредактируй только форму draft_answer для пользователя. "
+                "Не меняй смысл, факты, выводы, ограничения, числа, названия, "
+                "адреса, ссылки, id, код и данные. "
+                "Не добавляй новые факты, источники, предположения, "
+                "рекомендации или справочную информацию. "
+                "Примени delivery_constraints только к форме ответа: "
+                "структуре, Markdown-оформлению, абзацам, спискам, "
+                "таблицам, схемам и кодовым блокам. "
+                "Не оборачивай весь ответ в служебный JSON, AgentAction "
+                "или другую служебную структуру. "
+                "Если draft_answer содержит JSON, код, логи или "
+                "структурированные данные как часть пользовательского ответа, "
+                "сохрани их как обычную часть ответа и не удаляй только "
+                "из-за формата. "
+                "Верни только готовый пользовательский ответ."
+            ),
+            "delivery_constraints": self._delivery_constraints(client_type),
+            "draft_answer": draft_answer,
         }
 
-        probe_messages = messages + [audit_prompt]
-
-        audit_response = await self._call_llm_with_retries(
-            probe_messages,
+        response = await self._call_llm_with_retries(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты редактор формы финального ответа. "
+                        "Ты не проверяешь факты и не меняешь содержание."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": dumps_json(payload),
+                },
+            ],
             [],
             context=context,
         )
 
-        content = audit_response.get("content", "") or ""
-        return content.strip()
+        return (response.get("content") or "").strip()
+
+    async def _ground_final_answer(
+        self,
+        *,
+        draft_answer: str,
+        evidence_pack: dict[str, Any],
+        strict: bool,
+        force_reason: dict[str, Any] | None = None,
+        context: str = "Final grounding",
+    ) -> str:
+        task = (
+            "Очисти draft_answer от неподтверждённых утверждений. "
+            "draft_answer является недоверенным черновиком и может содержать "
+            "неподтверждённые, устаревшие, неточные или выдуманные сведения. "
+            "Используй только evidence_pack и force_reason как источники фактов. "
+            "Собственные знания модели не являются источником фактов. "
+            "Не перепроверяй факты по собственным знаниям модели. "
+            "Не добавляй новые факты, источники, предположения, рекомендации "
+            "или справочную информацию. "
+            "Если утверждение из draft_answer явно не подтверждено evidence_pack "
+            "или force_reason, удали его или замени осторожной формулировкой "
+            "о том, что эти данные не были подтверждены и их нужно проверить отдельно. "
+            "Не заменяй неподтверждённую конкретику другой конкретикой "
+            "из собственных знаний. "
+            "Если данных не хватает, честно укажи ограничение. "
+            "Не занимайся специальным оформлением под Telegram/Web: "
+            "сохрани простой читаемый текст. "
+            "Не оборачивай весь ответ в служебный JSON, AgentAction "
+            "или другую служебную структуру. "
+            "Если draft_answer содержит JSON, код, логи или структурированные "
+            "данные как часть пользовательского ответа, сохрани их только "
+            "в той мере, в какой они подтверждены evidence_pack. "
+            "Верни только очищенный пользовательский ответ."
+        )
+
+        payload: dict[str, Any] = {
+            "type": "final_grounding_request",
+            "mode": "strict" if strict else "normal",
+            "task": task,
+            "force_reason": force_reason,
+            "evidence_pack": evidence_pack,
+            "draft_answer": draft_answer,
+        }
+
+        if strict:
+            payload["strict_rules"] = [
+                (
+                    "Если есть сомнение, лучше убрать конкретное утверждение "
+                    "или заменить его оговоркой."
+                ),
+                "Не достраивай отсутствующие поля результата инструмента.",
+                (
+                    "Не утверждай, что что-либо проверено, доступно, "
+                    "актуально, работает, подходит, совместимо или завершено, "
+                    "если это явно не следует из evidence_pack."
+                ),
+                (
+                    "Если агент был остановлен принудительно, явно сохрани "
+                    "ограничение остановки в ответе."
+                ),
+            ]
+
+        response = await self._call_llm_with_retries(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты фактологический фильтр финального ответа. "
+                        "Твоя задача — удалить неподтверждённую конкретику. "
+                        "Ты не должен делать ответ красивее, если это требует "
+                        "добавления содержания."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": dumps_json(payload),
+                },
+            ],
+            [],
+            context=context,
+        )
+
+        return (response.get("content") or "").strip()
+
+    async def _process_final_answer(
+        self,
+        *,
+        draft_answer: str,
+        client_type: ClientType | None,
+        decision: FinalProcessingDecision,
+        evidence_pack: dict[str, Any] | None = None,
+        force_reason: dict[str, Any] | None = None,
+        context: str = "Final processing",
+    ) -> str:
+        if decision.mode == FinalProcessingMode.SKIP:
+            return draft_answer.strip()
+
+        if decision.mode == FinalProcessingMode.FORMAT_ONLY:
+            formatted = await self._format_final_answer(
+                draft_answer=draft_answer,
+                client_type=client_type,
+                context=f"{context}: format_only",
+            )
+            return formatted or draft_answer.strip()
+
+        grounded = await self._ground_final_answer(
+            draft_answer=draft_answer,
+            evidence_pack=evidence_pack or {},
+            strict=decision.mode == FinalProcessingMode.STRICT_GROUNDED,
+            force_reason=force_reason,
+            context=f"{context}: {decision.mode.value}",
+        )
+
+        grounded = grounded or draft_answer.strip()
+
+        formatted = await self._format_final_answer(
+            draft_answer=grounded,
+            client_type=client_type,
+            context=f"{context}: final_format",
+        )
+
+        return formatted or grounded
+
+    async def _force_final_answer_from_evidence(
+        self,
+        *,
+        original_user_request: str,
+        state: SessionState,
+        cycle_trace: list[dict[str, Any]],
+        client_type: ClientType | None,
+        force_reason: dict[str, Any],
+        context: str = "Forced final answer",
+    ) -> str:
+        evidence_pack = self._build_final_evidence_pack(
+            original_user_request=original_user_request,
+            state=state,
+            cycle_trace=cycle_trace,
+            force_reason=force_reason,
+        )
+
+        payload = {
+            "type": "force_final_answer_request",
+            "task": (
+                "Сформируй полезный черновик финального ответа пользователю "
+                "по evidence_pack. "
+                "Агент был вынужденно остановлен до полного завершения задачи. "
+                "Честно укажи, что удалось сделать, что не удалось завершить "
+                "и почему. "
+                "Предложи безопасные варианты продолжения. "
+                "Не добавляй факты, которых нет в evidence_pack или force_reason. "
+                "Не оборачивай весь ответ в служебный JSON, AgentAction "
+                "или другую служебную структуру. "
+                "Если в ответе нужны JSON, код или структурированные данные "
+                "как часть пользовательского ответа, они допустимы как обычная "
+                "часть текста. "
+                "Верни только черновик пользовательского ответа."
+            ),
+            "force_reason": force_reason,
+            "evidence_pack": evidence_pack,
+        }
+
+        response = await self._call_llm_with_retries(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Ты формируешь аварийный черновик ответа, когда агент "
+                        "не успел завершить работу. "
+                        "Будь честен об ограничениях и не добавляй "
+                        "неподтверждённых фактов."
+                    ),
+                },
+                {
+                    "role": "user",
+                    "content": dumps_json(payload),
+                },
+            ],
+            [],
+            context=context,
+        )
+
+        draft = (response.get("content") or "").strip()
+        decision = FinalProcessingDecision(
+            FinalProcessingMode.STRICT_GROUNDED,
+            "forced_final_answer",
+        )
+
+        return await self._process_final_answer(
+            draft_answer=draft,
+            client_type=client_type,
+            decision=decision,
+            evidence_pack=evidence_pack,
+            force_reason=force_reason,
+            context=f"{context}: strict_grounded_and_format",
+        )
+
+    async def _audit_final_answer(
+        self,
+        *,
+        draft_answer: str,
+        client_type: ClientType | None = None,
+        decision: FinalProcessingDecision | None = None,
+        evidence_pack: dict[str, Any] | None = None,
+        context: str = "Final audit",
+    ) -> str:
+        return await self._process_final_answer(
+            draft_answer=draft_answer,
+            client_type=client_type,
+            decision=decision or FinalProcessingDecision(
+                FinalProcessingMode.GROUNDED,
+                "compat_default",
+            ),
+            evidence_pack=evidence_pack,
+            context=context,
+        )
     
     def _delivery_constraints(self, client_type: ClientType | None) -> dict:
         if client_type == ClientType.TELEGRAM:
@@ -2228,8 +2548,27 @@ class MCPClient:
                             final_tool_calls = final_response.get("tool_calls", []) or []
 
                             if final_tool_calls:
-                                answer = await self._force_final_answer(
-                                    messages_for_llm,
+                                force_reason = {
+                                    "type": "tool_requested_on_last_iteration",
+                                    "iteration_current": state.iterations,
+                                    "iteration_max": self.max_iterations,
+                                    "user_visible_meaning": (
+                                        "Модель запросила дополнительный "
+                                        "инструмент на последней доступной "
+                                        "итерации, поэтому агент был вынужден "
+                                        "завершить ответ по уже собранным данным."
+                                    ),
+                                    "suggested_continuation": (
+                                        "Пользователь может попросить продолжить "
+                                        "работу следующим сообщением."
+                                    ),
+                                }
+                                answer = await self._force_final_answer_from_evidence(
+                                    original_user_request=original_user_request,
+                                    state=state,
+                                    cycle_trace=cycle_trace,
+                                    client_type=client_type,
+                                    force_reason=force_reason,
                                     context=(
                                         "Forced final answer because LLM requested "
                                         "tool on last iteration"
@@ -2390,11 +2729,12 @@ class MCPClient:
             ):
                 error_kind = "max_iterations"
                 await self._finalize_after_max_iterations(
-                    messages_for_llm=messages_for_llm,
+                    original_user_request=original_user_request,
                     cycle_trace=cycle_trace,
                     state=state,
                     final_text=final_text,
                     cycle_id=cycle_id,
+                    client_type=client_type,
                 )
             
             if not final_text:
@@ -2407,32 +2747,75 @@ class MCPClient:
             result_text = final_text[-1]
 
             if (
-                self.llm_config.final_audit
-                and state.status in (AgentStatus.DONE, AgentStatus.RUNNING)
+                state.status in (AgentStatus.DONE, AgentStatus.RUNNING)
                 and result_text
                 and not state.last_error
             ):
-                try:
-                    messages_for_llm = await self._compact_context_if_needed(
-                        messages_for_llm=messages_for_llm,
-                        cycle_snapshot=cycle_snapshot,
-                        cycle_trace=cycle_trace,
-                        cycle_id=cycle_id,
-                    )
-                    messages = messages_for_llm
-                    audited_text = await self._audit_final_answer(
-                        messages_for_llm,
-                        result_text,
-                        client_type,
-                        context="Final audit before AgentResult"
-                    )
+                decision = self._select_final_processing_mode(
+                    result_text=result_text,
+                    state=state,
+                    cycle_trace=cycle_trace,
+                )
 
-                    if audited_text:
-                        result_text = audited_text
-                        final_text[-1] = audited_text
+                self._trace_event(
+                    cycle_trace,
+                    "final_processing_decision",
+                    mode=decision.mode.value,
+                    reason=decision.reason,
+                    final_audit_enabled=self.llm_config.final_audit,
+                )
 
-                except Exception as e:
-                    logger.warning(f"Final audit не выполнен: {type(e).__name__}: {e!r}")
+                if decision.mode != FinalProcessingMode.SKIP:
+                    try:
+                        evidence_pack = None
+
+                        if decision.mode in {
+                            FinalProcessingMode.GROUNDED,
+                            FinalProcessingMode.STRICT_GROUNDED,
+                        }:
+                            evidence_pack = self._build_final_evidence_pack(
+                                original_user_request=original_user_request,
+                                state=state,
+                                cycle_trace=cycle_trace,
+                            )
+
+                        processed_text = await self._process_final_answer(
+                            draft_answer=result_text,
+                            client_type=client_type,
+                            decision=decision,
+                            evidence_pack=evidence_pack,
+                            context=(
+                                "Final processing before AgentResult: "
+                                f"{decision.mode.value}"
+                            ),
+                        )
+
+                        if processed_text:
+                            old_result_text = result_text
+                            result_text = processed_text
+                            final_text[-1] = processed_text
+
+                            self._trace_event(
+                                cycle_trace,
+                                "final_processing_done",
+                                mode=decision.mode.value,
+                                reason=decision.reason,
+                                before_chars=len(old_result_text),
+                                after_chars=len(processed_text),
+                            )
+
+                    except Exception as e:
+                        logger.warning(
+                            "Final processing не выполнен: "
+                            f"{type(e).__name__}: {e!r}"
+                        )
+                        self._trace_event(
+                            cycle_trace,
+                            "final_processing_failed",
+                            mode=decision.mode.value,
+                            reason=decision.reason,
+                            error=f"{type(e).__name__}: {e!r}",
+                        )
 
             if state.status == AgentStatus.RUNNING:
                 state.status = AgentStatus.DONE
