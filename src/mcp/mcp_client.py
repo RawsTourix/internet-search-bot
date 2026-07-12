@@ -12,7 +12,7 @@ import locale
 import platform
 from datetime import datetime, timezone
 from uuid import uuid4
-from pydantic import BaseModel, model_validator
+from pydantic import BaseModel, ValidationError, model_validator
 from typing import Optional, List, Dict, Any, Tuple, Callable, Awaitable
 from enum import Enum
 from dataclasses import dataclass, field
@@ -33,6 +33,7 @@ from ..agent.prompts import AGENT_SYSTEM_PROTOCOL
 from ..agent.progress_messages import normalize_progress_locale, progress_text
 from .server_manager import MCPServerManager
 from ..agent.protocol import AgentAction, ProgressEvent, dumps_json
+from ..storage import StorageConfigType, StorageServices, StorageValidationError
 
 # Модели
 class ServerConnectType(str, Enum):
@@ -455,7 +456,12 @@ class MCPClient:
         "authorization", "cookie", "set-cookie",
     }
 
-    def __init__(self, llm_config: LLMConfigType):
+    def __init__(
+        self,
+        llm_config: LLMConfigType,
+        *,
+        storage_services: StorageServices | None = None,
+    ):
         """
         Description:
         ---------------
@@ -464,6 +470,7 @@ class MCPClient:
         Args:
         ---------------
             llm_config: Конфигурация для LLM
+            storage_services: Внедрённые storage interfaces; временно optional
         """
         self.session = None
         self.exit_stack = AsyncExitStack()
@@ -472,6 +479,20 @@ class MCPClient:
         
         # Настройка для LLM
         self.llm_config = llm_config
+
+        self.storage_services = storage_services
+        self.content_store = (
+            storage_services.content_store
+            if storage_services is not None
+            else None
+        )
+        self.artifact_store = (
+            storage_services.artifact_store
+            if storage_services is not None
+            else None
+        )
+        # TODO v0.4-result-compaction:
+        # content_store becomes required for raw tool result persistence.
 
         headers = dict(llm_config.headers or {})
 
@@ -517,6 +538,9 @@ class MCPClient:
         # Память сессий
         self.sessions: Dict[str, SessionMemory] = {}
         self.session_states: Dict[str, SessionState] = {}
+        # TODO v0.4-cycle-compaction:
+        # migrate cycle archive/events/working memory to a dedicated CycleStore
+        # built on the storage foundation.
         self.archive_dir = Path("logging/agent_traces")
         self.archive_dir.mkdir(parents=True, exist_ok=True)
 
@@ -4401,7 +4425,9 @@ class MCPClient:
         final_text.append(message)
 
 
-def load_config(config_path: str) -> Tuple[List[ServerConfigType], LLMConfigType]:
+def load_config(
+    config_path: str,
+) -> Tuple[List[ServerConfigType], LLMConfigType, StorageConfigType]:
     """
     Description:
     ---------------
@@ -4413,7 +4439,8 @@ def load_config(config_path: str) -> Tuple[List[ServerConfigType], LLMConfigType
         
     Returns:
     ---------------
-        Tuple[List[ServerConfigType], LLMConfigType]: Конфигурации серверов и LLM
+        Tuple[List[ServerConfigType], LLMConfigType, StorageConfigType]:
+        Конфигурации серверов, LLM и storage
         
     Raises:
         ImportError: Если требуется YAML, но библиотека не установлена
@@ -4421,7 +4448,7 @@ def load_config(config_path: str) -> Tuple[List[ServerConfigType], LLMConfigType
         Exception: При ошибке загрузки конфигурации
         
     Examples:
-        >>> server_configs, llm_config = load_config("config.json")
+        >>> server_configs, llm_config, storage_config = load_config("config.json")
     """
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -4534,7 +4561,13 @@ def load_config(config_path: str) -> Tuple[List[ServerConfigType], LLMConfigType
         if not llm_config.api_url:
             raise ValueError("В конфиге LLM не указан api_url")
 
-        return server_configs, llm_config
+        storage_data = config.get("storage", {})
+        try:
+            storage_config = StorageConfigType.model_validate(storage_data)
+        except ValidationError as error:
+            raise StorageValidationError("Invalid storage configuration") from error
+
+        return server_configs, llm_config, storage_config
 
     except Exception as e:
         logger.error(f"Ошибка при загрузке конфигурации: {type(e).__name__}: {e!r}")

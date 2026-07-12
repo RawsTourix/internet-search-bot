@@ -24,6 +24,9 @@ test/
 file/
 agent_traces/
 
+# Runtime storage (the source package lives under src/storage)
+/storage/
+
 # Файлы Codex
 .agents
 .codex

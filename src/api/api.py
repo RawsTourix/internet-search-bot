@@ -1,12 +1,14 @@
 import os
 import logging
 from logging.handlers import RotatingFileHandler
+from pathlib import Path
 
 # Импорт модулей
 from .config import HTTP_PROXY, HTTPS_PROXY, AGENT_CONFIG_PATH
 from ..mcp.mcp_client import MCPClient, load_config
 from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import APIError
+from ..storage import create_storage_services
 
 # Настройка прокси
 os.environ['http_proxy'] = HTTP_PROXY
@@ -44,16 +46,38 @@ class Api:
         """Инициализация Api"""
         try:
             # Загрузка конфигурации
-            logger.info("Загрузка конфигурации MCP-серверов и LLM")
-            self.server_configs, self.llm_config = load_config(config_path)
+            logger.info("Загрузка конфигурации MCP-серверов, LLM и storage")
+            (
+                self.server_configs,
+                self.llm_config,
+                self.storage_config,
+            ) = load_config(config_path)
 
             # Логирование конфигурации
             logger.debug(f"server_configs: {self.server_configs}")
             logger.debug(f"llm_config: {self.llm_config}")
 
+            storage_root = Path(self.storage_config.root_dir).expanduser()
+            if not storage_root.is_absolute():
+                storage_root = Path.cwd() / storage_root
+            logger.info(
+                "Storage: backend=%s root=%s atomic_writes=%s "
+                "verify_content_hash=%s max_in_memory_content_bytes=%s",
+                self.storage_config.backend,
+                storage_root.resolve(strict=False),
+                self.storage_config.atomic_writes,
+                self.storage_config.verify_content_hash,
+                self.storage_config.max_in_memory_content_bytes,
+            )
+
+            self.storage_services = create_storage_services(self.storage_config)
+
             # Создание и запуск клиента
             logger.info("Инициализация MCP-клиента")
-            self.mcp_client = MCPClient(self.llm_config)
+            self.mcp_client = MCPClient(
+                self.llm_config,
+                storage_services=self.storage_services,
+            )
         except Exception as e:
             raise APIError(f"Ошибка инициализации Api: {repr(e)}") from e
 
