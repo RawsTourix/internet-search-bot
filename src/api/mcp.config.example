@@ -6,7 +6,8 @@
             "connect_type": "executable",
             "executable": "python",
             "args": ["src/mcp/yandex_search_mcp_server.py"],
-            "env": {"DEBUG": "1"}
+            "env": {"DEBUG": "1"},
+            "startup_required": false
         },
         {
             "name": "rosbiotech_schedule",
@@ -14,7 +15,8 @@
             "connect_type": "executable",
             "executable": "python",
             "args": ["src/mcp/rosbiotech_schedule_mcp_server.py"],
-            "env": {"DEBUG": "1"}
+            "env": {"DEBUG": "1"},
+            "startup_required": false
         },
         {
             "name": "browser",
@@ -28,7 +30,8 @@
                 "--user-data-dir=C:\\Programming\\internet-search-bot\\.playwright-profile",
                 "--output-mode=file"
             ],
-            "enabled": true
+            "enabled": true,
+            "startup_required": false
         },
         {
             "name": "git",
@@ -40,7 +43,8 @@
                 "--repository",
                 "C:/Programming/Проекты Python/internet-search-bot"
             ],
-            "enabled": false
+            "enabled": false,
+            "startup_required": false
         }
     ],
     "llm": {

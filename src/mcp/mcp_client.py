@@ -31,7 +31,7 @@ from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import LLMError, LLMHTTPError, LLMTimeoutError, LLMTransportError
 from ..agent.prompts import AGENT_SYSTEM_PROTOCOL
 from ..agent.progress_messages import normalize_progress_locale, progress_text
-from .server_manager import MCPServerManager
+from .server_manager import MCPServerConnectionError, MCPServerManager
 from ..agent.protocol import AgentAction, ProgressEvent, dumps_json
 from ..storage import StorageConfigType, StorageServices, StorageValidationError
 
@@ -137,6 +137,7 @@ class ServerConfigType(BaseModel):
     path: Optional[str] = None
 
     enabled: bool = True
+    startup_required: bool = True
 
 @dataclass
 class DialogTurn:
@@ -512,6 +513,7 @@ class MCPClient:
             or "Ты ассистент, задача которого — помогать пользователю решать его задачи."
         )
         self.server_runtimes: Dict[str, MCPServerRuntime] = {}
+        self.server_startup_errors: Dict[str, str] = {}
         self.tool_registry: Dict[str, MCPToolBinding] = {}
         self.available_tools: List[MCPToolBinding] = []
 
@@ -741,25 +743,48 @@ class MCPClient:
 
         exit_stack = AsyncExitStack()
 
-        http_transport = await exit_stack.enter_async_context(
-            self._open_streamable_http_transport(
-                url=url,
-                headers=headers,
+        try:
+            http_transport = await exit_stack.enter_async_context(
+                self._open_streamable_http_transport(
+                    url=url,
+                    headers=headers,
+                )
             )
-        )
 
-        # В актуальном SDK transport обычно возвращает:
-        # read_stream, write_stream, get_session_id
-        read_stream, write_stream, *_ = http_transport
+            # В актуальном SDK transport обычно возвращает:
+            # read_stream, write_stream, get_session_id
+            read_stream, write_stream, *_ = http_transport
 
-        session = await exit_stack.enter_async_context(
-            ClientSession(read_stream, write_stream)
-        )
+            session = await exit_stack.enter_async_context(
+                ClientSession(read_stream, write_stream)
+            )
 
-        await session.initialize()
+            await session.initialize()
 
-        response = await session.list_tools()
-        tools = response.tools
+            response = await session.list_tools()
+            tools = response.tools
+        except asyncio.CancelledError as error:
+            cleanup_error = await self._close_failed_connection_stack(
+                exit_stack,
+                server_name,
+            )
+            externally_cancelled = self._startup_cancellation_is_external(
+                cleanup_error
+            )
+            if externally_cancelled:
+                raise
+            cause = self._representative_connection_cause(
+                cleanup_error or error
+            )
+            raise MCPServerConnectionError(server_name, cause) from error
+        except Exception as error:
+            await self._close_failed_connection_stack(exit_stack, server_name)
+            if isinstance(error, MCPServerConnectionError):
+                raise
+            raise MCPServerConnectionError(server_name, error) from error
+        except BaseException:
+            await self._close_failed_connection_stack(exit_stack, server_name)
+            raise
 
         logger.info(
             f"HTTP MCP-сервер {server_name} подключён: {url}. "
@@ -781,46 +806,70 @@ class MCPClient:
         server_name: str,
         server_alias: str
     ) -> MCPServerRuntime:
-        executable = server_config.executable
-
-        if not executable:
-            executable = find_python_executable()
-
-        executable_path = shutil.which(executable)
-        if not executable_path:
-            raise FileNotFoundError(f"Исполняемый файл не найден: {executable}")
-
-        env = server_config.env or {}
-        env.update({
-            "PYTHONIOENCODING": "utf-8",
-            "PYTHONUTF8": "1",
-            "PYTHONLEGACYWINDOWSSTDIO": "0",
-            "LC_ALL": "C.UTF-8",
-            "LANG": "C.UTF-8",
-        })
-
-        server_params = StdioServerParameters(
-            command=executable_path,
-            args=server_config.args or [],
-            env=env
-        )
-
         exit_stack = AsyncExitStack()
+        try:
+            executable = server_config.executable
 
-        stdio_transport = await exit_stack.enter_async_context(
-            stdio_client(server_params)
-        )
+            if not executable:
+                executable = find_python_executable()
 
-        stdio, write = stdio_transport
+            executable_path = shutil.which(executable)
+            if not executable_path:
+                raise FileNotFoundError(
+                    f"Исполняемый файл не найден: {executable}"
+                )
 
-        session = await exit_stack.enter_async_context(
-            ClientSession(stdio, write)
-        )
+            env = dict(server_config.env or {})
+            env.update({
+                "PYTHONIOENCODING": "utf-8",
+                "PYTHONUTF8": "1",
+                "PYTHONLEGACYWINDOWSSTDIO": "0",
+                "LC_ALL": "C.UTF-8",
+                "LANG": "C.UTF-8",
+            })
 
-        await session.initialize()
+            server_params = StdioServerParameters(
+                command=executable_path,
+                args=server_config.args or [],
+                env=env,
+            )
 
-        response = await session.list_tools()
-        tools = response.tools
+            stdio_transport = await exit_stack.enter_async_context(
+                stdio_client(server_params)
+            )
+
+            stdio, write = stdio_transport
+
+            session = await exit_stack.enter_async_context(
+                ClientSession(stdio, write)
+            )
+
+            await session.initialize()
+
+            response = await session.list_tools()
+            tools = response.tools
+        except asyncio.CancelledError as error:
+            cleanup_error = await self._close_failed_connection_stack(
+                exit_stack,
+                server_name,
+            )
+            externally_cancelled = self._startup_cancellation_is_external(
+                cleanup_error
+            )
+            if externally_cancelled:
+                raise
+            cause = self._representative_connection_cause(
+                cleanup_error or error
+            )
+            raise MCPServerConnectionError(server_name, cause) from error
+        except Exception as error:
+            await self._close_failed_connection_stack(exit_stack, server_name)
+            if isinstance(error, MCPServerConnectionError):
+                raise
+            raise MCPServerConnectionError(server_name, error) from error
+        except BaseException:
+            await self._close_failed_connection_stack(exit_stack, server_name)
+            raise
 
         logger.info(
             f"MCP-сервер {server_name} подключён. "
@@ -835,6 +884,67 @@ class MCPClient:
             exit_stack=exit_stack,
             tools=tools
         )
+
+    @staticmethod
+    def _startup_cancellation_is_external(
+        cleanup_error: BaseException | None,
+    ) -> bool:
+        """Separate a failed transport shutdown from application cancellation."""
+        task = asyncio.current_task()
+        if task is None:
+            return False
+
+        representative = (
+            MCPClient._representative_connection_cause(cleanup_error)
+            if cleanup_error is not None
+            else None
+        )
+        transport_failed = (
+            representative is not None
+            and not isinstance(representative, asyncio.CancelledError)
+        )
+        if transport_failed and task.cancelling():
+            # AnyIO cancelled the host task because its transport task failed.
+            # Consume only that request; an additional app cancellation remains.
+            task.uncancel()
+
+        return bool(task.cancelling())
+
+    @staticmethod
+    def _representative_connection_cause(error: BaseException) -> BaseException:
+        """Return the first concrete leaf from an ExceptionGroup-like error."""
+        nested = getattr(error, "exceptions", None)
+        if isinstance(nested, tuple) and nested:
+            return MCPClient._representative_connection_cause(nested[0])
+        return error
+
+    @staticmethod
+    async def _close_failed_connection_stack(
+        exit_stack: AsyncExitStack,
+        server_name: str,
+    ) -> BaseException | None:
+        """Close a partial transport in the task that entered its contexts."""
+        try:
+            await exit_stack.aclose()
+        except asyncio.CancelledError as cleanup_error:
+            logger.warning(
+                "Partial MCP transport cleanup was cancelled: server=%s error=%r",
+                server_name,
+                cleanup_error,
+            )
+            return cleanup_error
+        except Exception as cleanup_error:
+            representative = MCPClient._representative_connection_cause(
+                cleanup_error
+            )
+            logger.warning(
+                "MCP transport shutdown surfaced a startup error: "
+                "server=%s cause=%s",
+                server_name,
+                type(representative).__name__,
+            )
+            return cleanup_error
+        return None
 
     async def _connect_single_server(self, server_config: ServerConfigType) -> MCPServerRuntime:
         server_name = server_config.name or "unnamed"
@@ -900,15 +1010,52 @@ class MCPClient:
             (config.name or "unnamed"): config
             for config in server_configs
         }
+        self.server_startup_errors.clear()
         
         for server_config in server_configs:
             if not server_config.enabled:
                 logger.info(f"Сервер {server_config.name} отключён, пропускаю")
                 continue
 
-            runtime = await self._connect_single_server(server_config)
-            self.server_runtimes[runtime.name] = runtime
-            self._register_server_tools(runtime)
+            runtime: MCPServerRuntime | None = None
+            server_name = server_config.name or "unnamed"
+            try:
+                runtime = await self._connect_single_server(server_config)
+                self._register_server_tools(runtime)
+                self.server_runtimes[runtime.name] = runtime
+                self.server_startup_errors.pop(server_name, None)
+            except asyncio.CancelledError:
+                # Application/task cancellation is never an optional-server error.
+                raise
+            except Exception as error:
+                if runtime is not None:
+                    self._unregister_server_tools(runtime.name)
+                    await self._close_runtime(runtime)
+
+                connection_error = (
+                    error
+                    if isinstance(error, MCPServerConnectionError)
+                    else MCPServerConnectionError(server_name, error)
+                )
+                self.server_startup_errors[server_name] = str(connection_error)
+
+                if server_config.startup_required:
+                    logger.error(
+                        "Required MCP server failed during startup: server=%s "
+                        "error=%r",
+                        server_name,
+                        connection_error,
+                    )
+                    if connection_error is error:
+                        raise
+                    raise connection_error from error
+
+                logger.warning(
+                    "Optional MCP server unavailable during startup; continuing: "
+                    "server=%s error=%r",
+                    server_name,
+                    connection_error,
+                )
 
         logger.info(
             f"Подключено MCP-серверов: {list(self.server_runtimes.keys())}"
@@ -4502,6 +4649,7 @@ def load_config(
                 port=server_data.get("port"),
                 path=server_data.get("path"),
                 enabled=server_data.get("enabled", True),
+                startup_required=server_data.get("startup_required", True),
             )
 
             server_configs.append(server_config)

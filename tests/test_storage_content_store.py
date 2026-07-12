@@ -53,7 +53,7 @@ class ContentStoreTests(unittest.IsolatedAsyncioTestCase):
             ref.content_hash,
             "sha256:" + hashlib.sha256(text.encode()).hexdigest(),
         )
-        self.assertFalse(any("path" in key for key in ref.model_fields))
+        self.assertFalse(any("path" in key for key in type(ref).model_fields))
 
     async def test_binary_round_trip_and_missing_encoding(self):
         content = b"\x00\xffbinary"

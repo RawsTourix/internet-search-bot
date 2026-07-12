@@ -1,7 +1,7 @@
 import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -9,10 +9,12 @@ from src.mcp.mcp_client import (
     MCPClient,
     MCPServerRuntime,
     MCPToolBinding,
+    ServerConfigType,
     ServerConnectType,
 )
 from src.mcp.server_manager import (
     MCPServerManager,
+    MCPServerConnectionError,
     MCPToolCallFailedError,
     MCPToolNotFoundError,
 )
@@ -61,7 +63,191 @@ def make_owner(runtime):
     return owner, binding
 
 
+def make_startup_client():
+    client = object.__new__(MCPClient)
+    client.server_runtimes = {}
+    client.server_startup_errors = {}
+    client.server_configs_by_name = {}
+    client.tool_registry = {}
+    client.available_tools = []
+    client._connect_single_server = AsyncMock()
+    client._register_server_tools = Mock()
+    client._unregister_server_tools = Mock()
+    client._close_runtime = AsyncMock()
+    return client
+
+
+class AsyncContextProbe:
+    def __init__(self, value):
+        self.value = value
+        self.enter_task = None
+        self.exit_task = None
+        self.exited = False
+
+    async def __aenter__(self):
+        self.enter_task = asyncio.current_task()
+        return self.value
+
+    async def __aexit__(self, exc_type, exc, traceback):
+        self.exit_task = asyncio.current_task()
+        self.exited = True
+        return False
+
+
 class MCPServerManagerTests(unittest.IsolatedAsyncioTestCase):
+    async def test_optional_startup_failure_does_not_block_next_server(self):
+        client = make_startup_client()
+        optional = ServerConfigType(
+            name="optional",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+            startup_required=False,
+        )
+        available = ServerConfigType(
+            name="available",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8012/mcp/",
+            startup_required=False,
+        )
+        runtime = MCPServerRuntime(
+            name="available",
+            alias="",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+        )
+        client._connect_single_server.side_effect = [
+            MCPServerConnectionError(
+                "optional",
+                ConnectionRefusedError("offline"),
+            ),
+            runtime,
+        ]
+
+        await client.connect_to_servers([optional, available])
+
+        self.assertEqual(client.server_runtimes, {"available": runtime})
+        self.assertIn("optional", client.server_startup_errors)
+        client._register_server_tools.assert_called_once_with(runtime)
+
+        servers = MCPServerManager(client).list_servers()
+        optional_status = next(
+            item for item in servers if item["name"] == "optional"
+        )
+        self.assertFalse(optional_status["connected"])
+        self.assertFalse(optional_status["healthy"])
+        self.assertFalse(optional_status["startup_required"])
+        self.assertIn("ConnectionRefusedError", optional_status["last_error"])
+
+    async def test_required_startup_failure_remains_fail_fast(self):
+        client = make_startup_client()
+        required = ServerConfigType(
+            name="required",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+            startup_required=True,
+        )
+        failure = MCPServerConnectionError(
+            "required",
+            ConnectionRefusedError("offline"),
+        )
+        client._connect_single_server.side_effect = failure
+
+        with self.assertRaises(MCPServerConnectionError) as raised:
+            await client.connect_to_servers([required])
+
+        self.assertIs(raised.exception, failure)
+        self.assertIn("required", client.server_startup_errors)
+
+    async def test_internal_transport_cancellation_is_managed_and_closed_in_task(self):
+        client = object.__new__(MCPClient)
+        session = SimpleNamespace(
+            initialize=AsyncMock(
+                side_effect=asyncio.CancelledError(
+                    "Cancelled by cancel scope test"
+                )
+            ),
+            list_tools=AsyncMock(),
+        )
+        transport_context = AsyncContextProbe((object(), object(), None))
+        session_context = AsyncContextProbe(session)
+        client._open_streamable_http_transport = Mock(
+            return_value=transport_context
+        )
+        config = ServerConfigType(
+            name="optional",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+            startup_required=False,
+        )
+
+        with patch(
+            "src.mcp.mcp_client.ClientSession",
+            return_value=session_context,
+        ):
+            with self.assertRaises(MCPServerConnectionError) as raised:
+                await client._connect_streamable_http_server(
+                    config,
+                    "optional",
+                    "",
+                )
+
+        self.assertEqual(raised.exception.cause_type, "CancelledError")
+        self.assertTrue(session_context.exited)
+        self.assertTrue(transport_context.exited)
+        self.assertIs(session_context.enter_task, session_context.exit_task)
+        self.assertIs(transport_context.enter_task, transport_context.exit_task)
+
+    async def test_external_startup_cancellation_is_not_suppressed(self):
+        client = object.__new__(MCPClient)
+
+        async def cancel_current_task():
+            task = asyncio.current_task()
+            task.cancel()
+            await asyncio.sleep(0)
+
+        session = SimpleNamespace(
+            initialize=cancel_current_task,
+            list_tools=AsyncMock(),
+        )
+        transport_context = AsyncContextProbe((object(), object(), None))
+        session_context = AsyncContextProbe(session)
+        client._open_streamable_http_transport = Mock(
+            return_value=transport_context
+        )
+        config = ServerConfigType(
+            name="optional",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+            startup_required=False,
+        )
+
+        try:
+            with patch(
+                "src.mcp.mcp_client.ClientSession",
+                return_value=session_context,
+            ):
+                with self.assertRaises(asyncio.CancelledError):
+                    await client._connect_streamable_http_server(
+                        config,
+                        "optional",
+                        "",
+                    )
+        finally:
+            task = asyncio.current_task()
+            while task.cancelling():
+                task.uncancel()
+
+        self.assertTrue(session_context.exited)
+        self.assertTrue(transport_context.exited)
+
+    def test_startup_required_defaults_to_fail_fast(self):
+        config = ServerConfigType(
+            name="server",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+        )
+
+        self.assertTrue(config.startup_required)
+
     async def test_stable_tool_call_uses_existing_runtime(self):
         expected = SimpleNamespace(content=[])
         session = SimpleNamespace(call_tool=AsyncMock(return_value=expected))

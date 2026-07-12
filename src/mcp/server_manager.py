@@ -29,6 +29,17 @@ class MCPTransportLifecycleError(MCPServerManagerError):
     pass
 
 
+class MCPServerConnectionError(MCPTransportLifecycleError):
+    """Managed failure to establish an MCP server runtime."""
+
+    def __init__(self, server_name: str, cause: BaseException):
+        self.server_name = server_name
+        self.cause_type = type(cause).__name__
+        super().__init__(
+            f"Failed to connect MCP server {server_name}: {self.cause_type}"
+        )
+
+
 class MCPServerRecoveryError(MCPServerManagerError):
     pass
 
@@ -58,18 +69,26 @@ class MCPServerManager:
         # server_configs_by_name может быть пустым.
         for name, config in self.owner.server_configs_by_name.items():
             runtime = self.owner.server_runtimes.get(name)
+            startup_error = getattr(
+                self.owner,
+                "server_startup_errors",
+                {},
+            ).get(name)
 
             result.append({
                 "name": name,
                 "alias": config.alias or "",
                 "enabled_in_config": bool(config.enabled),
+                "startup_required": bool(
+                    getattr(config, "startup_required", True)
+                ),
                 "connected": runtime is not None,
                 "connect_type": config.connect_type.value,
                 "tool_count": len(runtime.tools) if runtime else 0,
                 "healthy": bool(runtime.healthy) if runtime else False,
                 "reconnecting": bool(runtime.reconnecting) if runtime else False,
                 "generation": runtime.generation if runtime else None,
-                "last_error": runtime.last_error if runtime else None,
+                "last_error": runtime.last_error if runtime else startup_error,
             })
 
         # Fallback: если конфиги не сохранены, но runtime уже есть.
@@ -247,6 +266,10 @@ class MCPServerManager:
         new_runtime.last_error = None
 
         self.owner.server_runtimes[server_name] = new_runtime
+        getattr(self.owner, "server_startup_errors", {}).pop(
+            server_name,
+            None,
+        )
         self.owner._unregister_server_tools(server_name)
         self.owner._register_server_tools(new_runtime)
         return new_runtime
@@ -429,6 +452,7 @@ class MCPServerManager:
 
         runtime = await self.owner._connect_single_server(config)
         await self.replace_runtime(runtime.name, runtime)
+        getattr(self.owner, "server_startup_errors", {}).pop(name, None)
 
         return {"status": "connected", "server": name}
 
@@ -438,6 +462,7 @@ class MCPServerManager:
             config.enabled = False
 
         runtime = self.owner.server_runtimes.pop(name, None)
+        getattr(self.owner, "server_startup_errors", {}).pop(name, None)
         self.owner._unregister_server_tools(name)
 
         if runtime is None:
@@ -455,4 +480,5 @@ class MCPServerManager:
         config.enabled = True
         runtime = await self.owner._connect_single_server(config)
         await self.replace_runtime(name, runtime)
+        getattr(self.owner, "server_startup_errors", {}).pop(name, None)
         return {"status": "reloaded", "server": name}

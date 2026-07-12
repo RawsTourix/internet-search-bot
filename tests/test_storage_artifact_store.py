@@ -29,6 +29,7 @@ class ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
             b"report",
             cycle_id="cycle-1",
             filename="../../report.md",
+            mime_type="text/markdown",
             source="agent_generated",
             metadata={"kind": "report"},
         )
@@ -38,11 +39,21 @@ class ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(artifact.filename, "report.md")
         self.assertEqual(artifact.mime_type, "text/markdown")
         self.assertEqual(await self.store.open_artifact(artifact.artifact_id), b"report")
-        self.assertFalse(any("path" in key for key in artifact.model_fields))
+        self.assertFalse(
+            any("path" in key for key in type(artifact).model_fields)
+        )
         self.assertEqual(
             sorted(path.name for path in self.root.iterdir()),
             ["artifacts", "contents", "cycles", "indexes", "input_batches", "plans"],
         )
+
+        detected = await self.store.save_artifact(
+            b"text",
+            cycle_id="cycle-1",
+            filename="note.txt",
+            source="agent_generated",
+        )
+        self.assertEqual(detected.mime_type, "text/plain")
 
     async def test_public_validation_and_serialization_errors_are_managed(self):
         with self.assertRaises(StorageValidationError):
