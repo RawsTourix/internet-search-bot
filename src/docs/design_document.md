@@ -1,8 +1,8 @@
-# Дизайн-документ: архитектура памяти агента v0.3 → v0.6
+# Дизайн-документ: архитектура ИИ-агента v0.3 → v0.6
 
 ## 0. Назначение документа
 
-Этот документ фиксирует развитие архитектуры памяти ИИ-агента после перехода на JSON-протокол, динамические MCP-инструменты и разделение контекста.
+Этот документ фиксирует развитие архитектуры памяти, рабочего пространства и runtime ИИ-агента после перехода на JSON-протокол, динамические MCP-инструменты и разделение контекста.
 
 Главная цель:
 
@@ -27,12 +27,13 @@
   - `v0.3-final-processing-pipeline`;
   - `v0.3-final-processing-progress`;
 - итог v0.3 и границу feature freeze перед v0.4;
-- ближайшую v0.4: обработку больших данных и подготовку storage-архитектуры;
-- v0.5: PostgreSQL + RAG только для памяти агента;
-- v0.6: возможную backend-перестройку с Redis/arq/workers;
-- принципы context compaction;
-- принципы large result handling;
-- будущие инструменты доступа агента к старой памяти.
+- v0.4: agent workspace, storage foundation, LLM-compaction, file artifacts, DAG planning и input runtime;
+- v0.5: PostgreSQL, lazy indexing, pgvector и RAG для памяти и workspace;
+- v0.6: микросервисную архитектуру, Redis/arq, workers и distributed runtime;
+- принципы result/cycle compaction;
+- работу с файлами и версиями артефактов;
+- `InputBatch` и `CycleInbox`;
+- будущие RAG-инструменты и автоматизируемое DAG-исполнение.
 
 ---
 
@@ -2440,379 +2441,1628 @@ target ratio не означает “удалить ровно X токенов
 
 ---
 
-# Часть VIII. v0.4 — large context & storage preparation
+# Часть VIII. v0.4 — agent workspace, planning & context management foundation
 
 ## 54. Главная идея v0.4
 
-v0.4 должна решить проблему:
+`v0.4` превращает текущий agent runtime в рабочее пространство, способное безопасно выполнять длинные, составные и файловые задачи.
+
+Версия объединяет шесть связанных пакетов:
 
 ```text
-инструменты, браузер, файлы, документы или страницы могут вернуть огромные данные,
-которые нельзя напрямую класть в messages_for_llm.
+v0.4-storage-foundation
+v0.4-result-compaction
+v0.4-cycle-compaction
+v0.4-dag-planning
+v0.4-file-artifacts
+v0.4-input-runtime
 ```
 
-Пример проблемы:
+Главная архитектурная формула:
 
 ```text
-tool_result = 2+ млн символов
-context_window ~= 256k токенов
+полные данные, файлы и история выполнения
+→ внешнее storage/workspace
+
+видимый LLM-контекст
+→ только актуальная рабочая информация,
+   компактные представления и устойчивые ссылки
 ```
 
-Такой результат нельзя отправлять в LLM напрямую.
+`v0.4` работает без PostgreSQL, Redis и workers, но новые компоненты проектируются через интерфейсы, совместимые с последующей миграцией.
 
 ---
 
-## 55. Новый принцип v0.4
+## 55. Граница v0.4
 
-Не так:
+В `v0.4` входят:
+
+- файловая storage foundation;
+- LLM-компактизация больших результатов;
+- LLM-компактизация старой части agent cycle;
+- необязательный DAG-план;
+- получение, чтение, изменение, версионирование и отправка файлов;
+- `InputBatch`;
+- `CycleInbox`, принимающий `InputBatch`;
+- safe checkpoints и per-session lock;
+- progress/trace events новых процессов.
+
+В `v0.4` не входят:
+
+- PostgreSQL и pgvector;
+- embeddings и semantic RAG;
+- постоянный chunk index;
+- Redis/arq и background workers;
+- automatic DAG scheduler;
+- распределённый runtime;
+- микросервисная архитектура.
+
+Главный инвариант:
 
 ```text
-huge tool_result → messages_for_llm
-```
-
-А так:
-
-```text
-huge tool_result
-→ LargeResultStore
-→ result_id
-→ preview + metadata в messages_for_llm
-→ raw content остаётся во внешнем хранилище
-```
-
-Агент видит не весь текст, а ссылку на него:
-
-```json
-{
-  "type": "large_result_ref",
-  "result_id": "res_123",
-  "source_type": "tool_result",
-  "tool_name": "browser_snapshot",
-  "size_chars": 2140000,
-  "preview": "Первые 1000-2000 символов...",
-  "note": "Полный результат сохранён во внешнем хранилище."
-}
+Raw content не должен бесконтрольно жить
+в messages_for_llm или дублироваться в cycle archive.
 ```
 
 ---
 
-## 56. v0.4 — без PostgreSQL, но с правильными интерфейсами
+## 56. Разделение ответственности
 
-В v0.4 не нужно сразу подключать PostgreSQL.
-
-Нужно подготовить интерфейсы:
+Рекомендуемая структура:
 
 ```text
-AgentMemoryStore
-LargeResultStore
-ChunkStore
-ArtifactStore
-```
+src/
+  storage/
+    models.py
+    interfaces.py
+    file_backend.py
+    serializers.py
 
-Первая реализация может быть файловой:
+  memory/
+    context_budget.py
+    result_compaction.py
+    cycle_compaction.py
+    service.py
 
-```text
-FileSystemMemoryStore
-```
-
-Структура на диске:
-
-```text
-storage/
-  cycles/
-  large_results/
-  chunks/
   artifacts/
-  indexes/
+    models.py
+    service.py
+    processors.py
+
+  planning/
+    models.py
+    validation.py
+    service.py
+    tools.py
+
+  runtime/
+    cycle.py
+    session_runtime.py
+    input_batch.py
+    cycle_inbox.py
 ```
 
-Главное:
+Физически все модули не обязательно создавать одним патчем, но границы ответственности должны быть сохранены.
+
+`MCPClient` остаётся orchestrator agent loop, но не должен знать физические пути хранения, реализовывать DAG-validation, напрямую отправлять Telegram-файлы или принимать параллельные изменения `messages_for_llm`.
+
+---
+
+# Часть VIII-A. v0.4-storage-foundation
+
+## 57. Назначение storage foundation
+
+Storage foundation хранит:
+
+- большие результаты инструментов;
+- полные cycle/trace events;
+- пользовательские файлы;
+- файлы, созданные и изменённые агентом;
+- DAG-планы;
+- working memory;
+- sealed input batches.
+
+Первая реализация — локальная файловая.
+
+Главное правило:
 
 ```text
-MCPClient не должен знать, где физически хранится память:
-в файлах, PostgreSQL или другом backend.
-Он должен работать через storage interface.
+runtime зависит от storage interfaces,
+а не от конкретной файловой структуры.
 ```
 
 ---
 
-## 57. LargeResultStore
+## 58. `ContentStore`
 
-Нужно ввести слой хранения больших результатов.
+`ContentStore` хранит произвольное содержимое, которое может быть слишком большим для LLM-контекста.
 
-Минимальная модель:
-
-```text
-result_id
-cycle_id
-tool_call_id
-source_type
-source_name
-raw_path
-content_hash
-size_chars
-size_tokens_estimate
-preview
-metadata
-created_at
-```
-
-`source_type` может быть:
+Источники:
 
 ```text
 tool_result
 browser_snapshot
 browser_html
-downloaded_file
 webpage
-pdf_text
 document_text
-user_file
-generated_artifact
+user_file_content
+generated_text
+cycle_segment
+retrieved_context
+```
+
+Базовый интерфейс:
+
+```python
+class ContentStore(Protocol):
+    async def save_content(...) -> ContentRef: ...
+    async def get_metadata(content_id: str) -> ContentMetadata: ...
+    async def read_content(content_id: str) -> bytes: ...
+    async def read_text(content_id: str) -> str: ...
+    async def read_range(
+        content_id: str,
+        *,
+        offset: int,
+        length: int,
+    ) -> ContentRange: ...
+    async def search_text(
+        content_id: str,
+        *,
+        query: str,
+        limit: int,
+    ) -> list[ContentMatch]: ...
+```
+
+`read_range` и простой линейный `search_text` ещё не являются полноценным RAG. Они нужны, чтобы ссылка на оригинал уже в `v0.4` не была тупиковой.
+
+---
+
+## 59. `ArtifactStore`
+
+`ArtifactStore` хранит файлы как версионируемые объекты рабочего пространства.
+
+```python
+class ArtifactStore(Protocol):
+    async def save_artifact(...) -> ArtifactRef: ...
+    async def get_artifact(artifact_id: str) -> ArtifactRef: ...
+    async def open_artifact(artifact_id: str) -> bytes: ...
+    async def create_version(...) -> ArtifactRef: ...
+    async def list_cycle_artifacts(cycle_id: str) -> list[ArtifactRef]: ...
+    async def mark_for_delivery(
+        artifact_id: str,
+        *,
+        client_type: str,
+    ) -> None: ...
+```
+
+Разделение:
+
+```text
+ArtifactRef
+→ оригинальный файл и его версии
+
+ContentRef
+→ текстовое/извлечённое содержимое,
+   tool output или другой большой payload
 ```
 
 ---
 
-## 58. Политика размеров
+## 60. Основные refs
 
-Примерная политика:
-
-```text
-small:
-  до 20-40k символов
-  можно положить в messages_for_llm напрямую
-
-medium:
-  40k-200k символов
-  preview + archive_ref
-
-large:
-  200k+ символов
-  LargeResultStore + result_id + preview
-
-huge:
-  2 млн+ символов
-  только store/index/retrieve, raw в контекст не класть
-```
-
-Пороговые значения должны быть в конфиге.
-
-Пример:
+### `ContentRef`
 
 ```json
 {
-  "memory": {
-    "inline_result_max_chars": 40000,
-    "preview_result_max_chars": 200000,
-    "large_result_preview_chars": 2000,
-    "enable_large_result_store": true
+  "content_id": "cnt_...",
+  "source_type": "tool_result",
+  "source_name": "web_search",
+  "mime_type": "application/json",
+  "size_bytes": 100000,
+  "size_chars": 85000,
+  "size_tokens_estimate": 42000,
+  "content_hash": "sha256:...",
+  "created_at": 0,
+  "metadata": {}
+}
+```
+
+### `StoredResultRef`
+
+```json
+{
+  "type": "stored_result_ref",
+  "result_id": "res_...",
+  "content_id": "cnt_...",
+  "cycle_id": "cycle_...",
+  "tool_call_id": "call_...",
+  "tool_name": "web_search",
+  "summary_status": "inline | summarized | store_only | oversized | failed",
+  "summary": null,
+  "preview": null,
+  "size_tokens_estimate": 42000,
+  "needs_retrieval": false
+}
+```
+
+### `ArtifactRef`
+
+```json
+{
+  "artifact_id": "art_...",
+  "cycle_id": "cycle_...",
+  "filename": "report.md",
+  "mime_type": "text/markdown",
+  "size_bytes": 12345,
+  "content_hash": "sha256:...",
+  "version": 2,
+  "parent_artifact_id": "art_previous",
+  "source": "agent_generated",
+  "created_at": 0,
+  "metadata": {}
+}
+```
+
+LLM не получает реальные локальные пути. Для неё используются непрозрачные ID.
+
+---
+
+## 61. Файловый backend
+
+```text
+storage/
+  contents/
+    <content_id>/
+      metadata.json
+      content.bin
+
+  artifacts/
+    <artifact_id>/
+      metadata.json
+      file.bin
+
+  cycles/
+    <session_id>/
+      <cycle_id>/
+        cycle.json
+        events.jsonl
+        working_memory.json
+
+  plans/
+    <plan_id>/
+      plan.json
+
+  input_batches/
+    <session_id>/
+      <batch_id>.json
+
+  indexes/
+```
+
+Имена пользовательских файлов не используются как канонический storage path. Каноническим ключом является generated ID.
+
+---
+
+## 62. Атомарная запись и целостность
+
+Запись:
+
+```text
+temporary file
+→ flush
+→ fsync при необходимости
+→ atomic replace/rename
+```
+
+Для объекта сохраняются schema version, hash, timestamps, type и связи с cycle/session.
+
+При несовпадении hash или повреждённом JSON storage возвращает управляемую ошибку, а не частично прочитанные данные.
+
+Сериализация отделяется от domain models, чтобы PostgreSQL backend в `v0.5` не потребовал менять agent logic.
+
+---
+
+## 63. Конфигурация storage
+
+```json
+{
+  "storage": {
+    "backend": "filesystem",
+    "root_dir": "storage",
+    "atomic_writes": true,
+    "verify_content_hash": true,
+    "max_in_memory_content_bytes": 67108864
   }
 }
 ```
 
+`max_in_memory_content_bytes` — абсолютная техническая защита процесса. Она не заменяет относительную оценку результата по context window модели.
+
 ---
 
-## 59. Ingestion вместо поздней очистки
+# Часть VIII-B. v0.4-result-compaction
 
-v0.4 должна не только чистить уже переполненный контекст, а заранее маршрутизировать большие данные.
+## 64. Назначение result compaction
+
+В `v0.3` большой tool result может остаться в `messages_for_llm` и занимать контекст на следующих итерациях.
+
+В `v0.4`:
+
+```text
+tool call
+→ raw result
+→ оценка размера
+→ сохранение оригинала
+→ выбор представления
+→ inline / LLM-summary / stored ref
+→ безопасное представление в messages_for_llm
+```
+
+Сначала сохраняется оригинал, затем запускается суммаризация. Ошибка compact-запроса не должна приводить к потере raw result.
+
+---
+
+## 65. `result_handling`
+
+В `mcp_call_tool` добавляется:
+
+```json
+{
+  "tool_name": "some_tool",
+  "arguments": {},
+  "result_handling": "auto"
+}
+```
+
+Значения:
+
+```text
+auto
+prefer_inline
+compact
+store_only
+```
+
+- `auto` — runtime выбирает стратегию;
+- `prefer_inline` — агент предпочитает полный результат;
+- `compact` — агент заранее просит сохранить оригинал и создать summary;
+- `store_only` — сохранить оригинал и вернуть metadata/ref без отдельного summary.
+
+Ключевое правило:
+
+```text
+Agent controls efficiency.
+Runtime controls safety.
+```
+
+`prefer_inline` является пожеланием. Runtime обязан переопределить его, если результат угрожает context budget или устойчивости процесса.
+
+---
+
+## 66. Относительные бюджеты
+
+Используются существующие параметры:
+
+```text
+context_window_tokens
+reserved_output_tokens
+context_safety_ratio
+context_compaction_target_ratio
+enable_context_compaction
+```
+
+Расчёты:
+
+```python
+usable_input_tokens = (
+    context_window_tokens
+    - effective_reserved_output_tokens
+)
+
+context_trigger_tokens = int(
+    usable_input_tokens * context_safety_ratio
+)
+
+context_target_tokens = int(
+    usable_input_tokens * context_compaction_target_ratio
+)
+
+available_before_trigger = max(
+    0,
+    context_trigger_tokens - current_context_tokens,
+)
+```
+
+Дополнительные параметры:
+
+```json
+{
+  "memory": {
+    "inline_result_max_input_ratio": 0.10,
+    "single_pass_summary_max_input_ratio": 0.60,
+    "result_summary_target_ratio": 0.01,
+    "enable_result_compaction": true
+  }
+}
+```
+
+Результат можно оставить inline, только если он:
+
+1. укладывается в относительный лимит одного результата;
+2. не переводит весь контекст через trigger;
+3. не имеет политики `compact` или `store_only`;
+4. не превышает технический memory limit.
+
+---
+
+## 67. Выбор представления
+
+Решение учитывает:
+
+- размер результата;
+- текущий размер `messages_for_llm`;
+- доступный бюджет до trigger;
+- `result_handling`;
+- текущую `AgentActivity`;
+- активный DAG и ожидаемую дальнейшую работу, если она отражена в плане.
+
+Положительные сценарии:
+
+```text
+простая задача
+→ один небольшой вызов
+→ inline result
+→ сразу финальный ответ
+```
+
+```text
+длинная исследовательская задача
+→ много вызовов
+→ compact/store_only
+→ результаты копятся в workspace
+→ visible context остаётся чистым
+```
+
+Защитный сценарий:
+
+```text
+agent выбрал prefer_inline
+→ tool вернул 2 млн символов
+→ runtime принудительно сохраняет оригинал
+→ inline запрещён
+```
+
+DAG помогает агенту выбрать стратегию, но не является механизмом безопасности.
+
+---
+
+## 68. Single-pass LLM-summary результата
+
+Если result не стоит оставлять inline, но он помещается в отдельный compact request:
+
+```json
+{
+  "type": "result_compaction_request",
+  "original_user_request": "...",
+  "current_goal": "...",
+  "agent_activity": "collecting",
+  "active_plan_node": null,
+  "tool": {
+    "name": "...",
+    "arguments": {}
+  },
+  "result_id": "res_...",
+  "raw_result": "..."
+}
+```
+
+Строгий ответ:
+
+```json
+{
+  "type": "result_compaction",
+  "summary": "Краткое содержание, релевантное текущей задаче.",
+  "key_facts": [],
+  "limitations": [],
+  "suggested_follow_up": [],
+  "needs_original_content": false
+}
+```
+
+Summary должно сохранять ключевые факты, ID, ссылки, имена, ошибки и ограничения, не добавляя сведения из собственных знаний модели.
+
+Summary не заменяет оригинал и всегда связано с `result_id/content_id`.
+
+---
+
+## 69. Oversized fallback
+
+Если result не помещается даже в отдельный compact request, модель не должна делать вид, что прочитала его полностью.
+
+```text
+raw content → ContentStore
+metadata + bounded preview → visible context
+summary_status = oversized
+needs_retrieval = true
+```
+
+```json
+{
+  "type": "stored_result_ref",
+  "result_id": "res_...",
+  "content_id": "cnt_...",
+  "summary_status": "oversized",
+  "size_tokens_estimate": 1050000,
+  "preview": "Ограниченный начальный фрагмент...",
+  "needs_retrieval": true,
+  "note": "Полный результат превышает бюджет одного LLM-summary."
+}
+```
+
+Иерархическая map-reduce-суммаризация переносится в `v0.5/v0.6`.
+
+---
+
+## 70. Original content и будущий chunking
+
+В `v0.4` канонический оригинал хранится целиком. Постоянные chunks не обязательны.
+
+```text
+v0.4:
+original content + metadata + content_id
+
+v0.5, первый retrieval:
+extract/read original
+→ lazy chunking
+→ chunks
+→ embeddings
+→ cache index
+```
+
+Chunks и embeddings являются перестраиваемыми производными данными.
+
+---
+
+## 71. Result ref в visible context
+
+Summarized result:
+
+```json
+{
+  "type": "stored_result_ref",
+  "result_id": "res_...",
+  "content_id": "cnt_...",
+  "tool_name": "web_search",
+  "summary_status": "summarized",
+  "summary": "...",
+  "key_facts": [],
+  "limitations": [],
+  "size_tokens_estimate": 42000,
+  "needs_retrieval": false
+}
+```
+
+Store-only/oversized result содержит bounded preview, metadata и `needs_retrieval=true`.
+
+Raw path не передаётся LLM.
+
+---
+
+## 72. Result compaction и evidence
+
+После `v0.4` raw results не должны автоматически собираться из `cycle_trace` в `final_evidence_pack`.
+
+```text
+small inline result
+→ full evidence
+
+summarized result
+→ summary + result_id + key facts
+
+retrieved range/chunk
+→ фактически прочитанный fragment + source ref
+
+непрочитанная часть stored result
+→ не считается evidence
+```
+
+Final grounding не утверждает сведения из той части источника, которую агент фактически не прочитал.
+
+---
+
+## 73. Result progress и trace
+
+Trace events:
+
+```text
+result_persist_started
+result_persist_done
+result_persist_failed
+result_compaction_started
+result_compaction_done
+result_compaction_failed
+oversized_result_stored
+```
+
+User-visible progress показывается для заметных операций:
+
+```text
+💾 Сохраняю большой результат…
+🧩 Сжимаю большой результат…
+```
+
+Progress event не содержит raw result.
+
+---
+
+# Часть VIII-C. v0.4-cycle-compaction
+
+## 74. Назначение cycle compaction
+
+Даже после result compaction контекст растёт из-за большого числа итераций, пользовательских дополнений, плана, файлов, проверок и промежуточных решений.
+
+```text
+result compaction уже применена
+→ context достиг trigger
+→ выбирается старая закрытая часть cycle
+→ LLM создаёт новое working memory
+→ segment удаляется из visible context
+```
+
+---
+
+## 75. Активный объект cycle
+
+В `v0.4` активный объект создаётся с начала каждого цикла:
+
+```python
+class ActiveAgentCycle:
+    cycle_id: str
+    session_id: str
+    original_user_request: str
+    messages_for_llm: list[dict]
+    cycle_trace: list[dict]
+    working_memory: CycleWorkingMemory | None
+    active_plan_id: str | None
+    artifact_refs: list[str]
+    result_refs: list[str]
+    status: str
+```
+
+`pending_cycle` остаётся сохраняемым состоянием приостановленного цикла, а не единственным объектом, где существует working state.
+
+---
+
+## 76. Атомарные сегменты
+
+Cycle compactor не разрывает OpenAI-compatible последовательность.
+
+Нельзя отделять `assistant tool_calls` от соответствующих `role=tool` results.
+
+Сегмент выбирается только по закрытым логическим блокам:
+
+```text
+user/addendum
+→ assistant action или tool_calls
+→ все связанные tool results
+→ завершённое последующее действие
+```
+
+Не компактизируются:
+
+- system message;
+- original user request;
+- последнее пользовательское дополнение;
+- последний вопрос агента;
+- незакрытая tool-call цепочка;
+- свежий хвост работы;
+- активный plan node;
+- ошибки, влияющие на продолжение;
+- устойчивые result/artifact/plan refs.
+
+---
+
+## 77. `CycleWorkingMemory`
+
+В visible context находится максимум одно актуальное working memory:
+
+```json
+{
+  "type": "cycle_working_memory",
+  "generation": 4,
+  "summary": "Краткое состояние работы...",
+  "working_state": {
+    "current_goal": "...",
+    "completed_actions": [],
+    "confirmed_actions": [],
+    "rejected_actions": [],
+    "important_results": [],
+    "important_decisions": [],
+    "modified_files": [],
+    "pending_confirmation": null,
+    "errors_affecting_continuation": [],
+    "active_plan_id": null,
+    "active_plan_node_id": null,
+    "result_refs": [],
+    "artifact_refs": []
+  },
+  "source_event_range": {
+    "from": 1,
+    "to": 138
+  }
+}
+```
+
+`working_summary` и `working_state` из v0.3 становятся частью этой модели.
+
+---
+
+## 78. Отсутствие summary tree
+
+Нельзя создавать бесконечную цепочку:
+
+```text
+messages → summary A → summary B → summary C
+```
+
+Используются два слоя:
+
+1. неизменяемый полный журнал исходных событий в storage;
+2. одно заменяемое working memory в visible context.
+
+При следующей compaction:
+
+```text
+previous working memory
++ новый закрытый segment
+→ working memory generation N+1
+```
+
+Старые generations могут оставаться в audit storage, но не возвращаются в LLM-контекст и не образуют обязательное дерево ссылок.
+
+---
+
+## 79. LLM-компактизация cycle
+
+Вход:
+
+```json
+{
+  "type": "cycle_compaction_request",
+  "original_user_request": "...",
+  "previous_working_memory": null,
+  "active_plan_state": null,
+  "segment_to_compact": [],
+  "preserve_rules": []
+}
+```
+
+Строгий ответ:
+
+```json
+{
+  "type": "cycle_compaction_result",
+  "summary": "...",
+  "working_state": {
+    "current_goal": "...",
+    "completed_actions": [],
+    "confirmed_actions": [],
+    "rejected_actions": [],
+    "important_results": [],
+    "important_decisions": [],
+    "modified_files": [],
+    "pending_confirmation": null,
+    "errors_affecting_continuation": [],
+    "active_plan_id": null,
+    "active_plan_node_id": null,
+    "result_refs": [],
+    "artifact_refs": []
+  }
+}
+```
+
+LLM не должна удалять refs, добавлять факты, менять пользовательские подтверждения или считать незавершённое действие завершённым.
+
+---
+
+## 80. Trigger, target и recovery
 
 Алгоритм:
 
 ```text
-tool_result получен
-→ estimate size
-→ small: inline
-→ medium: preview + archive_ref
-→ large: save_large_result + result_id
-→ huge: save_large_result + chunking + result_id
+estimate messages_for_llm
+→ ниже trigger: продолжить
+
+→ выше trigger:
+   выбрать закрытый segment
+   сохранить source segment
+   вызвать cycle compactor
+   заменить segment на CycleWorkingMemory
+   повторно estimate
+
+→ target не достигнут:
+   применить следующий безопасный проход
 ```
 
-Так агент вообще не получает в `messages_for_llm` 2 млн символов.
+Compaction не удаляет segment до успешного создания замены.
+
+Если compact LLM-call завершился infrastructure error:
+
+- source segment остаётся;
+- generation не увеличивается;
+- partial summary не принимается;
+- cycle сохраняется как resumable при необходимости.
 
 ---
 
-## 60. Chunking в v0.4
-
-В v0.4 можно сделать basic chunking без embeddings.
-
-Например:
+## 81. Cycle progress и trace
 
 ```text
-chunk_size_chars = 4000-8000
-chunk_overlap_chars = 500-1000
+cycle_compaction_started
+cycle_compaction_done
+cycle_compaction_failed
 ```
 
-Каждый chunk получает:
+User-visible progress:
 
 ```text
-chunk_id
-result_id
-index
-text
-char_start
-char_end
-metadata
+🧠 Освобождаю рабочий контекст…
 ```
 
-Это уже позволит реализовать:
-
-- list chunks;
-- get chunk by id;
-- simple keyword search;
-- preview around match.
-
-Semantic search можно оставить на v0.5.
+Trace хранит before/after tokens, generation и source event range, но не дублирует raw archived segment.
 
 ---
 
-## 61. Context compaction в v0.4
+# Часть VIII-D. v0.4-dag-planning
 
-v0.4 должна реализовать хотя бы Level 1 / Level 2 compaction.
+## 82. Назначение DAG
 
-### Level 1
+DAG-план — необязательный artifact текущего cycle.
 
-Большие tool results заменяются на:
+Он полезен для многоэтапных задач, зависимых действий, нескольких файлов, длительного сбора данных, изменений с последующей проверкой и восстановления после compaction/resume.
 
-```json
-{
-  "type": "large_result_ref",
-  "result_id": "...",
-  "preview": "...",
-  "size_chars": 123456,
-  "archive_ref": "..."
-}
-```
-
-### Level 2
-
-Старая середина цикла заменяется на compact segment:
-
-```json
-{
-  "type": "compacted_cycle_segment",
-  "summary": "...",
-  "preserved": {
-    "original_user_request": "...",
-    "tools_used": [],
-    "important_results": [],
-    "important_decisions": []
-  },
-  "archived_trace_refs": [],
-  "large_result_refs": []
-}
-```
+Простые одношаговые задачи работают без плана.
 
 ---
 
-## 62. Что нельзя терять при compaction
-
-Нельзя терять:
-
-- исходный запрос пользователя;
-- текущую цель;
-- последний вопрос агента пользователю;
-- последний ответ пользователя;
-- подтверждённые действия;
-- отклонённые действия;
-- изменённые файлы;
-- ошибки, влияющие на продолжение;
-- ID больших результатов;
-- ссылки на chunks;
-- ссылки на архивированные trace events.
-
----
-
-## 63. v0.4 как подготовка к PostgreSQL
-
-v0.4 должна подготовить структуру, но не подключать БД.
-
-Рекомендуемый модуль:
-
-```text
-src/memory/
-  __init__.py
-  models.py
-  stores.py
-  file_store.py
-  chunking.py
-  serializers.py
-```
-
-Возможные интерфейсы:
+## 83. Модели плана
 
 ```python
-class AgentMemoryStore(Protocol):
-    async def save_cycle(...)
-    async def update_cycle(...)
-    async def save_trace_event(...)
-    async def save_large_result(...)
-    async def get_large_result(...)
-    async def list_result_chunks(...)
+class AgentPlan:
+    plan_id: str
+    cycle_id: str
+    goal: str
+    revision: int
+    nodes: list[PlanNode]
+    created_at: float
+    updated_at: float
+    metadata: dict
 ```
 
----
+```python
+class PlanNode:
+    node_id: str
+    title: str
+    description: str
+    kind: str
+    depends_on: list[str]
+    status: str
+    result_refs: list[str]
+    artifact_refs: list[str]
+    notes: list[str]
+```
 
-# Часть IX. v0.5 — PostgreSQL + RAG только для памяти
-
-## 64. Главная идея v0.5
-
-v0.5 подключает PostgreSQL и RAG, но **только для памяти агента/сессии**.
-
-Не нужно сразу перестраивать весь проект под полноценный backend.
-
-Не нужно сразу вводить:
-
-- users/workspaces;
-- отдельные API routers;
-- очереди;
-- Redis;
-- arq workers;
-- микросервисную архитектуру.
-
-Цель v0.5:
+Статусы:
 
 ```text
-PostgreSQL + pgvector только для agent memory.
+pending
+ready
+in_progress
+blocked
+done
+failed
+skipped
 ```
 
 ---
 
-## 65. Зачем PostgreSQL в v0.5
+## 84. Валидация DAG
 
-PostgreSQL нужен для:
+Runtime проверяет:
 
-- долговременных сессий;
-- agent cycles;
-- сообщений цикла;
-- trace events;
-- больших результатов;
-- chunks;
-- artifacts;
-- summaries;
-- embeddings;
-- связей между объектами.
-
-`pgvector` нужен для semantic search.
+1. уникальность node IDs;
+2. существование dependencies;
+3. отсутствие cycles;
+4. невозможность завершить node до обязательных dependencies;
+5. безопасное удаление node с dependants;
+6. связи done-node с result/artifact refs;
+7. увеличение revision;
+8. защиту от изменения устаревшей revision.
 
 ---
 
-## 66. Минимальные таблицы v0.5
+## 85. Manager tools плана
+
+```text
+agent_plan_create
+agent_plan_get
+agent_plan_add_node
+agent_plan_update_node
+agent_plan_remove_node
+agent_plan_get_ready_nodes
+```
+
+Tools работают через `PlanningService`, а не напрямую редактируют JSON.
+
+Полный план хранится во внешнем storage. В context остаётся compact state:
+
+```json
+{
+  "type": "active_plan_state",
+  "plan_id": "plan_...",
+  "revision": 5,
+  "current_node_id": "node_4",
+  "ready_node_ids": ["node_4", "node_7"],
+  "completed_node_ids": ["node_1", "node_2"],
+  "blocked_node_ids": ["node_5"]
+}
+```
+
+---
+
+## 86. DAG — карта, а не scheduler
+
+В `v0.4` LLM создаёт и обновляет plan, выбирает ready node и выполняет действия через обычный agent loop.
+
+В `v0.4` нет automatic parallel execution, worker queue, background scheduler и automatic retry nodes.
+
+Это переносится в `v0.6`.
+
+---
+
+## 87. Lifecycle и `AgentActivity`
+
+Lifecycle status остаётся:
+
+```text
+IDLE
+RUNNING
+WAITING_USER
+DONE
+ERROR
+```
+
+Дополнительная activity:
+
+```text
+planning
+collecting
+processing
+executing
+validating
+finalizing
+```
+
+Activity не является жёсткой машиной состояний. Она используется для trace, progress, prompt/context policy и диагностики.
+
+---
+
+## 88. Plan events
+
+```text
+plan_created
+plan_updated
+plan_node_started
+plan_node_done
+plan_node_blocked
+plan_validation_failed
+```
+
+Cycle compaction обязана сохранять plan ID, revision, active/ready/blocked nodes и связи с result/artifact refs.
+
+---
+
+# Часть VIII-E. v0.4-file-artifacts
+
+## 89. Общий принцип
+
+Агент не работает с произвольными локальными путями.
+
+```text
+client file
+→ ingress
+→ ArtifactStore
+→ ArtifactRef
+→ UnifiedMessage.attachments
+→ artifact tools
+```
+
+Содержимое файла, прочитанное агентом, является результатом manager tool и проходит через общую result-compaction policy.
+
+---
+
+## 90. `attachments` в `UnifiedMessage`
+
+```python
+class UnifiedMessage(BaseModel):
+    ...
+    attachments: list[ArtifactRef] = Field(default_factory=list)
+```
+
+LLM payload:
+
+```json
+{
+  "type": "user_request",
+  "user_request": "Проверь и исправь конфигурацию.",
+  "attachments": [
+    {
+      "artifact_id": "art_...",
+      "filename": "config.json",
+      "mime_type": "application/json",
+      "size_bytes": 4812,
+      "version": 1
+    }
+  ]
+}
+```
+
+Файл не разворачивается автоматически целиком в user message.
+
+---
+
+## 91. File ingress
+
+Ingress service или adapter:
+
+1. получает файл;
+2. проверяет metadata и размер;
+3. вычисляет hash;
+4. сохраняет в `ArtifactStore`;
+5. создаёт `ArtifactRef`;
+6. добавляет ref в `InputBatch`;
+7. запускает agent cycle только после sealing batch.
+
+---
+
+## 92. Artifact tools
+
+Минимально:
+
+```text
+artifact_list
+artifact_get_metadata
+artifact_read_text
+artifact_create_text
+artifact_write_text
+artifact_create_version
+artifact_mark_for_delivery
+```
+
+`artifact_read_text` делегирует большое содержимое `ContentStore` и result compaction.
+
+---
+
+## 93. Версионирование
+
+Изменение пользовательского файла создаёт новую версию:
+
+```text
+art_123 version 1 — original
+art_456 version 2 — agent edit
+```
+
+```json
+{
+  "artifact_id": "art_456",
+  "parent_artifact_id": "art_123",
+  "version": 2,
+  "operation": "agent_edit"
+}
+```
+
+Это обеспечивает аудит, откат, сравнение и отсутствие потери оригинала.
+
+---
+
+## 94. Delivery
+
+Agent runtime не вызывает Telegram API напрямую.
+
+```python
+class AgentResult(BaseModel):
+    ...
+    artifacts: list[ArtifactRef] = Field(default_factory=list)
+```
+
+Adapter доставляет:
+
+```text
+Telegram → sendDocument/sendPhoto
+Web → attachment/download endpoint
+CLI → controlled local export
+```
+
+---
+
+## 95. Форматы v0.4
+
+Storage принимает любые бинарные файлы, но встроенная работа первой версии ограничивается текстовыми форматами:
+
+- txt/markdown;
+- JSON/YAML;
+- CSV;
+- source code;
+- другие декодируемые text files.
+
+Интерфейс processors:
+
+```python
+class ArtifactProcessor(Protocol):
+    def supports(... ) -> bool: ...
+    async def extract_text(...) -> ContentRef: ...
+    async def modify(...) -> ArtifactRef: ...
+```
+
+В `v0.4` достаточно `PlainTextArtifactProcessor`.
+
+PDF/DOCX/XLSX/images/audio/video могут обрабатываться внешними MCP-tools. Lazy extraction/indexing переносится в `v0.5`.
+
+---
+
+# Часть VIII-F. v0.4-input-runtime
+
+## 96. Transport message и logical user turn
+
+Один пользовательский запрос может состоять из нескольких transport messages:
+
+- подпись и несколько файлов;
+- Telegram media group;
+- текст сразу после файла;
+- дополнения во время active cycle.
+
+Поэтому:
+
+```text
+transport message
+≠ logical user turn
+```
+
+---
+
+## 97. `InputBatch`
+
+```python
+class InputBatch:
+    batch_id: str
+    session_id: str
+    source: str
+    messages: list[InboundMessage]
+    attachments: list[ArtifactRef]
+    opened_at: float
+    updated_at: float
+    status: str
+    metadata: dict
+```
+
+Статусы:
+
+```text
+open
+sealed
+queued
+consumed
+cancelled
+```
+
+Sealed payload:
+
+```json
+{
+  "type": "user_input_batch",
+  "batch_id": "batch_...",
+  "text_parts": [
+    "Проверь эти файлы.",
+    "Особенно обрати внимание на конфигурацию."
+  ],
+  "attachments": [
+    {"artifact_id": "art_1"},
+    {"artifact_id": "art_2"}
+  ]
+}
+```
+
+Agent runtime получает только sealed batch.
+
+---
+
+## 98. Формирование initial batch
+
+Группировка может использовать:
+
+- client-provided media/group ID;
+- явный `batch_id`;
+- configurable debounce window;
+- UI/команду «запустить»;
+- adapter-specific rules.
+
+Это предотвращает запуск cycle по первому файлу до поступления остальных.
+
+---
+
+## 99. `CycleInbox` принимает `InputBatch`
+
+`CycleInbox` не хранит отдельные сырые transport messages как самостоятельные LLM-turns.
+
+```python
+class CycleInbox:
+    cycle_id: str
+    pending_batches: deque[InputBatch]
+```
+
+Общий маршрут:
+
+```text
+transport messages
+→ InputBatch
+→ cycle не активен: запустить новый cycle
+→ cycle активен: enqueue sealed InputBatch в CycleInbox
+```
+
+Одна модель используется для initial request, нескольких файлов, текстового addendum и дополнительных файлов во время работы.
+
+---
+
+## 100. Safe checkpoints
+
+User input нельзя вставлять между assistant tool calls и corresponding tool results.
+
+Safe checkpoint наступает после того, как:
+
+1. LLM полностью вернула response;
+2. все tool calls выполнены или получили tool error;
+3. все `role=tool` messages добавлены;
+4. атомарный шаг записан в trace;
+5. до следующего LLM-call проверен `CycleInbox`.
+
+Pending batches превращаются в один payload:
+
+```json
+{
+  "type": "user_addendum_batch",
+  "batch_ids": ["batch_1", "batch_2"],
+  "text_parts": ["...", "..."],
+  "attachments": [
+    {"artifact_id": "art_8"}
+  ]
+}
+```
+
+Полезный tool call не игнорируется ради нового сообщения.
+
+---
+
+## 101. Дополнение во время finalization
+
+```text
+batch до final_processing_started
+→ включить на ближайшем safe checkpoint
+
+batch во время final processing,
+но final response ещё не доставлен
+→ draft помечается stale
+→ новая agent iteration с addendum
+
+batch после DONE/delivery
+→ новый cycle
+```
+
+Нельзя доставить финальный ответ, заведомо игнорирующий уже принятый batch.
+
+---
+
+## 102. `SessionRuntime` и lock
+
+```python
+class SessionRuntime:
+    lock: asyncio.Lock
+    active_cycle_id: str | None
+    active_task: asyncio.Task | None
+    cycle_inbox: CycleInbox | None
+    open_input_batch: InputBatch | None
+```
+
+Per-session lock защищает запуск одного active cycle, sealing/enqueue batch, изменение active cycle reference и finalization race.
+
+Второй HTTP request не должен напрямую менять `messages_for_llm` работающего request.
+
+---
+
+## 103. Telegram media group
+
+Adapter использует `media_group_id`, когда он доступен:
+
+- сохраняет каждый файл;
+- добавляет refs в один InputBatch;
+- ждёт короткий период тишины или явное sealing;
+- запускает cycle только после sealing.
+
+Подпись одного элемента группы относится ко всему batch.
+
+---
+
+## 104. Input events
+
+```text
+input_batch_opened
+input_batch_item_added
+input_batch_sealed
+input_batch_queued
+input_batch_consumed
+cycle_input_enqueued
+cycle_input_consumed
+```
+
+User-visible progress:
+
+```text
+📎 Файл принят.
+📥 Дополнение принято и будет учтено на следующем этапе.
+```
+
+Принятое в inbox дополнение ещё не считается обработанным.
+
+---
+
+# Часть VIII-G. Реализация v0.4
+
+## 105. Пакеты
+
+### `v0.4-storage-foundation`
+
+- `ContentStore`;
+- `ArtifactStore`;
+- models refs;
+- filesystem backend;
+- atomic writes;
+- configuration.
+
+### `v0.4-result-compaction`
+
+- `result_handling`;
+- relative budgets;
+- raw result persistence;
+- single-pass LLM-summary;
+- oversized fallback;
+- progress/trace events.
+
+### `v0.4-cycle-compaction`
+
+- active cycle object;
+- atomic segment selection;
+- `CycleWorkingMemory`;
+- no summary tree;
+- generations;
+- recovery tests.
+
+### `v0.4-dag-planning`
+
+- DAG models;
+- validation;
+- manager tools;
+- plan refs;
+- progress events.
+
+### `v0.4-file-artifacts`
+
+- attachments in `UnifiedMessage`;
+- ingress;
+- read/create/version;
+- artifacts in `AgentResult`;
+- Telegram delivery.
+
+### `v0.4-input-runtime`
+
+- `InputBatch`;
+- `CycleInbox<InputBatch>`;
+- safe checkpoints;
+- per-session lock;
+- addenda during active cycle.
+
+---
+
+## 106. Порядок реализации
+
+```text
+1. storage foundation
+2. result compaction
+3. cycle compaction
+4. DAG planning
+5. file artifacts
+6. input runtime
+7. integration tests
+8. docs/README stabilization
+```
+
+Storage идёт первым, потому что все последующие подсистемы используют refs.
+
+Input runtime идёт после file artifacts, потому что batch может содержать attachments.
+
+---
+
+## 107. Acceptance criteria v0.4
+
+### Small result
+
+```text
+простая задача + небольшой tool result
+→ inline result
+→ agent может сразу ответить
+```
+
+### Large result
+
+```text
+опасный для context result
+→ original persisted
+→ compact/store_only
+→ full raw отсутствует в messages_for_llm
+→ result_id доступен
+```
+
+### Oversized result
+
+```text
+не помещается в summary request
+→ original persisted
+→ summary_status=oversized
+→ needs_retrieval=true
+→ нет ложного полного summary
+```
+
+### Cycle compaction
+
+```text
+context достигает trigger
+→ closed segment
+→ CycleWorkingMemory
+→ valid tool-call sequence
+→ context уменьшается
+```
+
+### Summary generation
+
+```text
+повторная compaction
+→ одно visible working memory
+→ no summary tree
+```
+
+### DAG
+
+```text
+plan с cycle
+→ validation rejects mutation
+→ stored plan remains intact
+```
+
+### File versioning
+
+```text
+agent edits user text file
+→ new artifact version
+→ original remains available
+```
+
+### Multiple files
+
+```text
+несколько Telegram updates media group
+→ one InputBatch
+→ one logical user turn
+→ cycle не стартует по первому файлу
+```
+
+### Active-cycle addendum
+
+```text
+batch во время tool execution
+→ CycleInbox
+→ tool sequence finishes
+→ addendum at safe checkpoint
+```
+
+---
+
+## 108. Что переносится
+
+В `v0.5`:
+
+- PostgreSQL;
+- lazy extraction сложных файлов;
+- persistent chunk cache;
+- embeddings;
+- semantic RAG;
+- search over old cycles;
+- processing oversized sources by parts.
+
+В `v0.6`:
+
+- Redis/arq;
+- durable distributed CycleInbox;
+- background workers;
+- automatic DAG scheduler;
+- parallel nodes;
+- background hierarchical summarization;
+- microservice runtime.
+
+---
+
+# Часть IX. v0.5 — PostgreSQL, lazy indexing и RAG для agent workspace
+
+## 109. Главная идея v0.5
+
+`v0.5` переносит memory/workspace metadata в PostgreSQL и добавляет retrieval по текущим и предыдущим cycles, stored results, files, trace/events и plan relations.
+
+```text
+PostgreSQL + pgvector
+для долговременной памяти и agent workspace,
+без полной микросервисной перестройки.
+```
+
+---
+
+## 110. Совместимость backend
+
+PostgreSQL implementations реализуют те же contracts, что filesystem backend `v0.4`.
+
+Возможна hybrid storage:
+
+```text
+PostgreSQL
+→ metadata, relations, statuses, indexes
+
+filesystem / object storage
+→ large binary/raw payloads
+```
+
+Agent loop не меняет business logic при смене backend.
+
+---
+
+## 111. Минимальные сущности PostgreSQL
 
 ```text
 agent_sessions
 agent_cycles
 cycle_messages
 cycle_trace_events
-large_results
-large_result_chunks
+cycle_working_memories
+stored_contents
+stored_result_refs
+result_compactions
+artifacts
+artifact_versions
+artifact_extractions
+agent_plans
+agent_plan_nodes
+agent_plan_edges
+agent_plan_revisions
+input_batches
+input_batch_items
+cycle_inbox_items
+content_chunks
 chunk_embeddings
-cycle_artifacts
-cycle_summaries
+retrieval_events
 ```
+
+Физические таблицы могут объединяться, но domain relations должны сохраниться.
 
 ---
 
-## 67. Таблица `agent_sessions`
+## 112. Основные таблицы cycle
+
+### `agent_sessions`
 
 ```text
 id
@@ -2823,30 +4073,27 @@ updated_at
 metadata_json
 ```
 
----
-
-## 68. Таблица `agent_cycles`
+### `agent_cycles`
 
 ```text
 id
 session_id
 status
+activity
 original_user_request
 final_answer
 error
 error_kind
 can_resume
-working_summary
-working_state
+active_plan_id
+working_memory_generation
 created_at
 updated_at
 completed_at
 metadata_json
 ```
 
----
-
-## 69. Таблица `cycle_messages`
+### `cycle_messages`
 
 ```text
 id
@@ -2855,12 +4102,11 @@ role
 content_json
 tool_call_id
 message_index
+input_batch_id
 created_at
 ```
 
----
-
-## 70. Таблица `cycle_trace_events`
+### `cycle_trace_events`
 
 ```text
 id
@@ -2870,262 +4116,462 @@ payload_json
 created_at
 ```
 
-Примеры event_type:
-
-```text
-cycle_started
-llm_response
-assistant_tool_calls
-tool_call
-tool_result_full
-large_result_saved
-tool_error
-context_compaction
-critical_error
-cycle_completed
-```
-
 ---
 
-## 71. Таблица `large_results`
+## 113. Stored content/results
+
+### `stored_contents`
 
 ```text
 id
-cycle_id
-tool_call_id
-source_type
-source_name
-raw_text_path
+storage_backend
+storage_uri
+mime_type
 content_hash
+size_bytes
 size_chars
 size_tokens_estimate
+source_type
+created_at
+metadata_json
+```
+
+### `stored_result_refs`
+
+```text
+id
+content_id
+cycle_id
+tool_call_id
+tool_name
+summary_status
+summary_json
 preview
-metadata_json
+needs_retrieval
 created_at
+metadata_json
 ```
 
 ---
 
-## 72. Таблица `large_result_chunks`
+## 114. Artifacts и plans
+
+Artifacts:
 
 ```text
-id
-result_id
-chunk_index
-text
-char_start
-char_end
-token_estimate
-metadata_json
-created_at
+artifacts
+artifact_versions
+artifact_extractions
 ```
+
+Plans:
+
+```text
+agent_plans
+agent_plan_nodes
+agent_plan_edges
+agent_plan_revisions
+```
+
+Plan revision может храниться snapshot или event log.
 
 ---
 
-## 73. Таблица `chunk_embeddings`
+## 115. Batches и inbox
 
 ```text
-id
-chunk_id
-embedding_model
-embedding
-created_at
+input_batches
+input_batch_items
+cycle_inbox_items
+```
+
+`CycleInbox` по-прежнему оперирует `InputBatch`, а не отдельными transport messages.
+
+Persisted metadata позволяет восстановить pending input после рестарта процесса.
+
+---
+
+## 116. Lazy extraction и chunking
+
+Первый retrieval:
+
+```text
+ContentRef / ArtifactRef
+→ processor
+→ text extraction при необходимости
+→ chunker
+→ chunks
+→ embeddings
+→ cached index
+```
+
+Chunking зависит от типа:
+
+```text
+plain text → paragraphs/semantic boundaries
+PDF → pages/sections
+spreadsheet → sheets/ranges
+source code → modules/classes/functions
+HTML → headings/content blocks
+```
+
+Chunks и embeddings можно перестроить при смене extractor/chunker version.
+
+---
+
+## 117. `content_chunks` и embeddings
+
+```text
+content_chunks:
+  id
+  content_id
+  chunk_index
+  text
+  char_start
+  char_end
+  page_number
+  section_path
+  token_estimate
+  chunker_name
+  chunker_version
+  metadata_json
+```
+
+```text
+chunk_embeddings:
+  id
+  chunk_id
+  embedding_model
+  embedding
+  created_at
 ```
 
 `embedding` хранится через pgvector.
 
 ---
 
-## 74. Таблица `cycle_artifacts`
-
-```text
-id
-cycle_id
-artifact_type
-name
-uri
-mime_type
-metadata_json
-created_at
-```
-
----
-
-## 75. Таблица `cycle_summaries`
-
-Необязательная на первом этапе.
-
-Может понадобиться для разных summary:
-
-```text
-dialog_summary
-working_summary
-error_summary
-embedding_summary
-tool_summary
-```
-
----
-
-## 76. RAG-инструменты v0.5
-
-Read-only инструменты для агента:
+## 118. Retrieval tools
 
 ```text
 agent_memory_get_cycle
-agent_memory_get_result
-agent_memory_get_chunk
-agent_memory_list_result_chunks
-agent_memory_search_result
 agent_memory_search_cycles
-agent_memory_get_tool_result
+content_get_metadata
+content_read_range
+content_list_chunks
+content_get_chunk
+content_search
+artifact_get_metadata
+artifact_search_content
+agent_plan_get
+agent_plan_search_results
 ```
-
----
-
-## 77. `agent_memory_get_cycle`
-
-Получить конкретный agent cycle.
-
-Параметры:
 
 ```json
 {
-  "cycle_id": "string",
-  "mode": "summary | messages | trace | full"
-}
-```
-
----
-
-## 78. `agent_memory_search_cycles`
-
-Найти релевантные старые циклы.
-
-Параметры:
-
-```json
-{
-  "query": "string",
+  "content_id": "cnt_...",
+  "query": "ошибка подключения",
   "limit": 5,
-  "scope": "summary | full | errors | tools"
+  "search_type": "keyword | semantic | hybrid"
 }
 ```
 
 ---
 
-## 79. `agent_memory_search_result`
-
-Поиск внутри большого результата.
-
-Параметры:
-
-```json
-{
-  "result_id": "string",
-  "query": "string",
-  "limit": 5,
-  "search_type": "keyword | semantic"
-}
-```
-
----
-
-## 80. Retrieved chunks тоже временные
-
-Если агент достал chunks из RAG, их нельзя навсегда оставлять в `messages_for_llm`.
-
-Правильный цикл:
+## 119. Retrieved context временный
 
 ```text
 retrieve chunks
-→ LLM использовала их
-→ агент сделал extracted notes
-→ raw chunks убираются из visible context
-→ остаются chunk_ids + extracted_facts
+→ LLM uses data
+→ extracted notes/facts persisted
+→ raw chunks removed at later compaction
+→ chunk IDs + content ID + facts remain
 ```
-
-Пример compact replacement:
 
 ```json
 {
   "type": "retrieved_context_summary",
-  "result_id": "res_123",
+  "content_id": "cnt_...",
   "used_chunk_ids": ["ch_1", "ch_8"],
   "extracted_facts": ["...", "..."],
-  "archive_ref": "..."
+  "retrieval_event_id": "ret_..."
 }
 ```
 
 ---
 
-# Часть X. v0.6 — backend architecture / workers
+## 120. RAG, activity и grounding
 
-## 81. Главная идея v0.6
+Retrieval выполняется при:
 
-v0.6 — потенциальная перестройка архитектуры, если проект вырастет.
+```text
+status = RUNNING
+activity = PROCESSING
+```
 
-Сюда можно отложить:
+Agent может чередовать processing, planning, executing, validating и collecting.
 
-- Redis;
-- arq;
-- background workers;
-- очереди;
-- background indexing;
-- background embedding generation;
-- background summarization;
-- ретраи;
-- периодическую очистку;
-- полноценные сервисные слои.
+Для evidence сохраняется provenance:
+
+```text
+content_id
+chunk_id/range
+retrieval_event_id
+source result/artifact
+```
+
+Final grounding использует только фактически retrieved или inline evidence.
 
 ---
 
-## 82. Когда нужен Redis/arq
+## 121. Что не входит в v0.5
 
-Redis/arq нужен, когда появляются тяжёлые фоновые операции:
-
-```text
-1. Индексация огромных PDF/HTML/браузерных snapshot.
-2. Разбиение 2+ млн символов на chunks.
-3. Генерация embeddings для сотен/тысяч chunks.
-4. Background summarization.
-5. Reindex старой памяти.
-6. Очистка старых данных.
-7. Retry при падении embedding API.
-```
-
-До этого можно обойтись синхронной/полусинхронной обработкой.
+- обязательная микросервисная архитектура;
+- Redis как обязательная runtime dependency;
+- distributed workers;
+- automatic DAG scheduler;
+- массовая background-индексация всех files;
+- automatic parallel plan nodes;
+- полноценный multi-tenant workspace.
 
 ---
 
-## 83. Возможная структура v0.6
+## 122. Acceptance criteria v0.5
 
 ```text
-src/
-  memory/
-    models.py
-    repositories.py
-    services.py
-    stores.py
-    rag.py
-    chunking.py
-    embeddings.py
-
-  workers/
-    tasks.py
-    arq_settings.py
-
-  db/
-    session.py
-    migrations/
-
-  mcp/
-    mcp_client.py
-
-  agent/
-    protocol.py
-    prompts.py
+filesystem backend заменяется PostgreSQL-compatible backend
+без переписывания agent loop.
 ```
+
+```text
+first RAG read
+→ lazy extraction/chunking
+→ index persisted
+→ repeated retrieval uses cache.
+```
+
+```text
+semantic search returns refs + provenance,
+not uncontrolled raw payload.
+```
+
+```text
+cycle resume after process restart
+restores messages, working memory, plan,
+artifacts and pending batch metadata.
+```
+
+---
+
+# Часть X. v0.6 — microservices, workers и distributed runtime
+
+## 123. Главная идея v0.6
+
+`v0.6` разделяет выросшую систему на сервисы и переносит тяжёлые операции в workers.
+
+```text
+устойчивый distributed agent runtime
+с durable queues, workers и service boundaries
+```
+
+Микросервисы нужны, когда появляются concurrent users, тяжёлая file processing, длительный indexing, независимые DAG nodes и resume после restart.
+
+---
+
+## 124. Возможные сервисы
+
+```text
+Gateway / Client API
+→ Telegram/Web/CLI ingress
+→ InputBatch
+→ delivery
+
+Agent Runtime Service
+→ agent cycle
+→ LLM iterations
+→ safe checkpoints
+→ working memory
+→ plan decisions
+
+MCP Tool Runtime Service
+→ MCP servers
+→ tool calls
+→ lifecycle/recovery
+
+Memory / Workspace Service
+→ sessions/cycles/content/artifacts
+→ RAG/plans/provenance
+
+Worker Service
+→ extraction/chunking/embeddings
+→ summarization
+→ heavy file transformations
+
+Notification / Delivery Service
+→ progress/final text/artifacts
+```
+
+Не все services обязаны появиться одновременно.
+
+---
+
+## 125. Redis/arq
+
+Используются для:
+
+- durable background jobs;
+- delayed retries;
+- distributed locks;
+- progress/pub-sub;
+- active cycle signals;
+- CycleInbox delivery;
+- scheduler state;
+- rate limiting.
+
+PostgreSQL остаётся долговременным source of truth. Redis не должен быть единственным storage cycle state.
+
+---
+
+## 126. Durable `CycleInbox`
+
+```text
+InputBatch persisted in PostgreSQL
+→ event/queue in Redis
+→ active runtime worker receives batch
+→ safe checkpoint consumes batch
+→ status persisted
+```
+
+Требования:
+
+- at-least-once delivery;
+- idempotent consumption by `batch_id`;
+- ordering within session/cycle;
+- replay after worker restart;
+- protection from duplicate addenda.
+
+---
+
+## 127. Automatic DAG scheduler
+
+Scheduler:
+
+- calculates ready nodes;
+- queues nodes;
+- runs safe independent nodes in parallel;
+- observes resource limits;
+- performs retries;
+- blocks dependants on failure;
+- updates plan revision;
+- persists node results.
+
+LLM отвечает за смысловой plan. Scheduler отвечает за валидное исполнение зафиксированного graph.
+
+Необратимые действия требуют policy/confirmation и не запускаются параллельно автоматически.
+
+---
+
+## 128. Background operations
+
+```text
+document extraction
+lazy/bulk chunking
+embedding generation
+hierarchical summarization
+reindex
+artifact conversion
+security scanning
+cleanup/retention
+large-result preprocessing
+```
+
+Каждая job имеет ID, status, retry policy, idempotency key, progress, input/output refs и error.
+
+---
+
+## 129. Hierarchical summarization
+
+Для oversized source:
+
+```text
+source
+→ chunks
+→ per-chunk summaries
+→ section summaries
+→ final summary
+```
+
+Summary хранит provenance и не заменяет original content.
+
+---
+
+## 130. Object storage
+
+Локальная папка может быть заменена на S3-compatible storage/MinIO/cloud blob storage.
+
+`ContentStore` и `ArtifactStore` interfaces из `v0.4` должны позволять замену backend без изменения agent logic.
+
+---
+
+## 131. Idempotency и lifecycle
+
+Ключи:
+
+```text
+cycle_id
+tool_call_id
+batch_id
+plan_id + revision
+artifact_id + version
+job_id
+```
+
+Повторная доставка события не должна дважды выполнять необратимое действие, создавать лишнюю file version, завершать node или добавлять batch.
+
+Tool/job lifecycle:
+
+```text
+queued
+running
+retrying
+recovered
+failed
+done
+cancelled
+```
+
+---
+
+## 132. Observability
+
+Нужны structured logs, trace IDs, cycle/tool/job correlations, metrics, distributed tracing, context/compaction metrics, queue depth и worker health.
+
+User-visible progress остаётся отдельным адаптированным слоем.
+
+---
+
+## 133. Постепенная миграция
+
+```text
+1. Workers for extraction/embeddings.
+2. Durable jobs.
+3. Workspace/memory service.
+4. MCP tool runtime service.
+5. Gateway and Agent Runtime separation.
+6. Automatic DAG scheduler.
+```
+
+Монолит `v0.5` не переписывается целиком одним шагом.
+
+---
+
+## 134. Не-цели v0.6
+
+- microservices ради microservices;
+- отдельный service для каждого Python-модуля;
+- потеря local development mode;
+- перенос durable domain state в Redis;
+- отказ от storage interfaces;
+- automatic unsafe parallel actions.
 
 ---
 
@@ -3348,111 +4794,149 @@ compaction placeholder
 
 ---
 
-## v0.4 — storage preparation + large result handling
+## v0.4 — agent workspace, planning & context management
 
 Цель:
 
 ```text
-не класть огромные данные в messages_for_llm
+Создать рабочее пространство агента:
+полные данные хранятся вне LLM-контекста,
+а runtime работает с компактными представлениями,
+файлами, InputBatch и необязательным DAG-планом.
 ```
 
-Задачи:
+Пакеты:
 
 ```text
-1. Добавить memory/storage interfaces.
-2. Добавить FileSystemMemoryStore.
-3. Добавить LargeResultStore.
-4. Добавить result_id для huge outputs.
-5. Добавить preview + metadata.
-6. Добавить basic chunking без embeddings.
-7. Добавить large_result_refs в working_state.
-8. Реализовать context compaction Level 1/2.
-9. Стабилизировать agent_cycle_archive под будущую БД.
+v0.4-storage-foundation
+v0.4-result-compaction
+v0.4-cycle-compaction
+v0.4-dag-planning
+v0.4-file-artifacts
+v0.4-input-runtime
+```
+
+Ключевые результаты:
+
+```text
+ContentStore / ArtifactStore
+filesystem backend
+result/content/artifact refs
+relative context budgets
+result_handling with runtime override
+single-pass result summary
+oversized fallback
+one CycleWorkingMemory
+optional DAG artifact
+file versioning and delivery
+InputBatch
+CycleInbox<InputBatch>
+safe checkpoints
+per-session lock
 ```
 
 ---
 
-## v0.5 — PostgreSQL + RAG только для agent memory
+## v0.5 — PostgreSQL, lazy indexing и RAG
 
 Цель:
 
 ```text
-долговременная память агента + semantic retrieval
+Перенести memory/workspace metadata в PostgreSQL,
+добавить pgvector и retrieval по results, files, cycles и plans.
 ```
 
 Задачи:
 
 ```text
-1. Подключить PostgreSQL.
-2. Подключить pgvector.
-3. Добавить SQLAlchemy/asyncpg.
-4. Добавить Alembic migrations.
-5. Реализовать repository layer.
-6. Реализовать PostgresAgentMemoryStore.
-7. Перенести FileSystemMemoryStore на интерфейсную совместимость.
-8. Добавить таблицы agent memory.
-9. Добавить embeddings для chunks.
-10. Добавить read-only memory tools.
+PostgreSQL + migrations
+Postgres storage/repositories
+hybrid raw content storage
+lazy extraction/chunking
+pgvector embeddings
+keyword/semantic/hybrid retrieval
+provenance-aware memory tools
+persistent batch/inbox metadata
+resume workspace after restart
 ```
 
 ---
 
-## v0.6 — workers / Redis / архитектурное расширение
+## v0.6 — microservices, Redis и workers
 
 Цель:
 
 ```text
-фоновые задачи и зрелая backend-архитектура
+Перейти к distributed runtime
+с durable queues, workers и DAG scheduling.
 ```
 
 Задачи:
 
 ```text
-1. Redis.
-2. arq workers.
-3. Background chunking.
-4. Background embeddings.
-5. Background summarization.
-6. Retry logic.
-7. Очистка старой памяти.
-8. Retention policy.
-9. Возможное разделение API/services/repositories.
+Redis/arq
+durable jobs/retries
+distributed CycleInbox
+worker extraction/chunking/embeddings
+background hierarchical summarization
+automatic DAG scheduler
+safe parallel nodes
+object storage
+service boundaries
+observability/idempotency
 ```
 
 ---
 
 # Главные принципы
 
-1. Не делать тяжёлый task manager в v0.3/v0.4.
-2. Не пытаться программно угадывать смену темы.
-3. `WAITING_USER` сохраняет текущий pending cycle.
-4. Завершённые циклы не загрязняют новый LLM-контекст.
-5. Огромные данные не кладутся напрямую в `messages_for_llm`.
-6. Большие результаты получают `result_id`.
-7. Raw content хранится во внешнем storage.
-8. LLM видит preview + metadata + retrieval instructions.
-9. Context compaction заменяет подробности на summary/state, а не удаляет смысл.
-10. v0.4 должна работать без PostgreSQL, но через интерфейсы.
-11. v0.5 подключает PostgreSQL/pgvector только для памяти агента.
-12. v0.6 — отдельный этап для Redis/arq/workers.
-13. Progress events на v0.3-progress-events генерирует Agent Runtime, а не внешние MCP-серверы.
-14. Telegram live-progress в MVP делается через callback/editMessageText, а не через PostgreSQL watcher.
-15. `mcp_call_tool` в progress events должен хранить и manager tool, и target tool.
-16. Progress localization задаётся через `message.metadata.progress_locale`, дефолт — `ru`.
-17. Progress event не должен содержать секреты, raw tool results и большие payloads.
-18. LLM-generated progress может быть только дополнительным слоем, источник истины — runtime event.
-19. Для Telegram notification-center сигнала финальный ответ/ошибка должны отправляться новым сообщением; `editMessageText` остаётся для live-progress.
-20. Инфраструктурные ошибки отображаются в трёх слоях: технические logs/trace, короткий progress event с кодом/типом ошибки, финальное notification-сообщение с compact technical summary.
-21. Логи нельзя заменять абстрактными человекочитаемыми сообщениями; коды HTTP, классы ошибок, attempts и context должны сохраняться.
-22. MCPServerManager должен быть lifecycle coordinator для MCP-серверов, а не тонкой прокладкой к MCPClient.
-23. Agent loop не должен напрямую управлять reconnect/restart конкретных MCP runtime.
-24. Recovery-сценарий должен быть единым, но правила восстановления — transport-specific.
-25. Stale runtime не должен висеть до общего tool_call_timeout; lifecycle-layer должен fail/recover быстрее.
-26. Runtime/tool metadata должны проектироваться PostgreSQL-friendly, даже если PostgreSQL появится только в v0.5+.
-27. Будущие workers должны опираться на тот же жизненный цикл tool calls: queued/running/retrying/recovered/failed/done.
-28. Surface-specific formatting не должно жить в system prompt; для этого используется delivery_constraints в финальной обработке.
-29. Delivery constraints влияют только на форму ответа, а не на факты, выводы, выбор инструментов или содержание.
-30. Финальная обработка ответа должна разделять форматирование и проверку по собранным данным.
-31. Внутренние режимы final processing сохраняются в trace/data, но user-visible progress должен быть простым и понятным.
-32. DAG/task planner в будущих версиях должен быть отдельным artifact agent cycle, а не частью system prompt или полного messages_for_llm.
-
+1. `messages_for_llm` — рабочий контекст, а не долговременное хранилище.
+2. Полные results, files и старые cycle segments сохраняются через storage interfaces.
+3. Runtime зависит от `ContentStore` / `ArtifactStore`, а не от файловых путей.
+4. Большой result сначала сохраняется и только потом компактизируется.
+5. Агент может указать `result_handling`, но runtime имеет последнее слово по безопасности.
+6. `prefer_inline` не отключает защиту от переполнения.
+7. Размер result оценивается относительно context budget модели.
+8. Абсолютные лимиты — только техническая защита процесса.
+9. Small result простой задачи может остаться inline.
+10. Single-pass summary применяется только к result, помещающемуся в отдельный compact request.
+11. Oversized result получает `needs_retrieval=true`, а не ложное полное summary.
+12. Canonical original content хранится целиком.
+13. Chunks/embeddings — перестраиваемые производные данные.
+14. Lazy chunking и semantic RAG относятся к `v0.5`.
+15. Cycle compaction работает только с закрытыми атомарными segments.
+16. Нельзя разрывать assistant tool calls и corresponding tool messages.
+17. В visible context максимум одно актуальное `CycleWorkingMemory`.
+18. Старые summary generations не образуют дерево.
+19. Исходные cycle events остаются source of truth.
+20. Compaction не удаляет segment до успешного replacement.
+21. Compaction является trace/progress event.
+22. Progress не содержит raw results, secrets и большие payloads.
+23. Final grounding использует только фактически доступное evidence.
+24. Непрочитанная часть stored content не считается evidence.
+25. DAG — отдельный artifact cycle, а не system-prompt text.
+26. DAG необязателен для simple tasks.
+27. В `v0.4` DAG — карта, а не scheduler.
+28. Lifecycle status и `AgentActivity` — разные оси.
+29. File представлен `ArtifactRef`, а не arbitrary local path.
+30. Edit пользовательского file создаёт новую version.
+31. File delivery выполняет adapter layer.
+32. Прочитанное file content проходит result-compaction policy.
+33. Transport message не равен logical user turn.
+34. `InputBatch` объединяет text и attachments.
+35. `CycleInbox` принимает sealed `InputBatch`.
+36. Initial request и active-cycle addendum используют одну batch model.
+37. Addendum вставляется только в safe checkpoint.
+38. Полезный tool call не игнорируется ради нового input.
+39. Per-session lock защищает active cycle и inbox.
+40. `WAITING_USER`/infrastructure interruption сохраняют resumable workspace.
+41. v0.4 работает без PostgreSQL, но через PostgreSQL-friendly interfaces.
+42. v0.5 добавляет PostgreSQL/pgvector без обязательных microservices.
+43. v0.6 вводит Redis/workers/services при реальной необходимости.
+44. PostgreSQL — durable source of truth; Redis его не заменяет.
+45. Background jobs должны быть idempotent.
+46. MCPServerManager остаётся lifecycle coordinator MCP runtime.
+47. Agent loop не управляет reconnect/restart transport напрямую.
+48. Surface-specific formatting применяется на финальной стадии.
+49. Delivery constraints влияют на форму, а не на facts/actions.
+50. Новые слои сохраняют local development mode.
