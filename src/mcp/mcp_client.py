@@ -524,6 +524,7 @@ class MCPClient:
         
         # Настройки таймаутов
         self.tool_call_timeout = 240.0  # Таймаут для вызова инструментов
+        self.mcp_startup_timeout = 30.0
         self.mcp_transport_call_timeout = 15.0
         self.mcp_reconnect_timeout = 10.0
         self.mcp_call_retries_after_recovery = 1
@@ -1020,7 +1021,11 @@ class MCPClient:
             runtime: MCPServerRuntime | None = None
             server_name = server_config.name or "unnamed"
             try:
-                runtime = await self._connect_single_server(server_config)
+                # asyncio.timeout keeps transport context ownership in this
+                # task; wait_for would open it in a child task and later make
+                # AnyIO cancel-scope cleanup fail during shutdown.
+                async with asyncio.timeout(self.mcp_startup_timeout):
+                    runtime = await self._connect_single_server(server_config)
                 self._register_server_tools(runtime)
                 self.server_runtimes[runtime.name] = runtime
                 self.server_startup_errors.pop(server_name, None)

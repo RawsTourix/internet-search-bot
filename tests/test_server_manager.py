@@ -70,6 +70,7 @@ def make_startup_client():
     client.server_configs_by_name = {}
     client.tool_registry = {}
     client.available_tools = []
+    client.mcp_startup_timeout = 1.0
     client._connect_single_server = AsyncMock()
     client._register_server_tools = Mock()
     client._unregister_server_tools = Mock()
@@ -156,6 +157,79 @@ class MCPServerManagerTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(raised.exception, failure)
         self.assertIn("required", client.server_startup_errors)
+
+    async def test_optional_startup_timeout_does_not_block_gateway(self):
+        client = make_startup_client()
+        client.mcp_startup_timeout = 0.01
+        optional = ServerConfigType(
+            name="hanging",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+            startup_required=False,
+        )
+
+        async def hang_forever(_config):
+            await asyncio.Event().wait()
+
+        client._connect_single_server.side_effect = hang_forever
+
+        await client.connect_to_servers([optional])
+
+        self.assertNotIn("hanging", client.server_runtimes)
+        self.assertIn("hanging", client.server_startup_errors)
+        self.assertIn("TimeoutError", client.server_startup_errors["hanging"])
+
+    async def test_startup_connection_stays_in_caller_task(self):
+        client = make_startup_client()
+        config = ServerConfigType(
+            name="available",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+            startup_required=False,
+        )
+        runtime = MCPServerRuntime(
+            name="available",
+            alias="",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+        )
+        caller_task = asyncio.current_task()
+        connection_tasks = []
+
+        async def connect(_config):
+            connection_tasks.append(asyncio.current_task())
+            return runtime
+
+        client._connect_single_server.side_effect = connect
+
+        await client.connect_to_servers([config])
+
+        self.assertEqual(connection_tasks, [caller_task])
+
+    async def test_external_cancellation_bypasses_startup_timeout(self):
+        client = make_startup_client()
+        optional = ServerConfigType(
+            name="optional",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            url="http://127.0.0.1:8011/mcp/",
+            startup_required=False,
+        )
+
+        async def cancel_current_task(_config):
+            task = asyncio.current_task()
+            task.cancel()
+            await asyncio.sleep(0)
+
+        client._connect_single_server.side_effect = cancel_current_task
+
+        try:
+            with self.assertRaises(asyncio.CancelledError):
+                await client.connect_to_servers([optional])
+        finally:
+            task = asyncio.current_task()
+            while task.cancelling():
+                task.uncancel()
+
+        self.assertNotIn("optional", client.server_startup_errors)
 
     async def test_internal_transport_cancellation_is_managed_and_closed_in_task(self):
         client = object.__new__(MCPClient)

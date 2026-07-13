@@ -45,6 +45,23 @@ _READ_BLOCK_BYTES = 64 * 1024
 _EXCERPT_RADIUS_CHARS = 120
 
 
+def _fsync_directory(path: Path) -> None:
+    """Best-effort persistence for directory entry updates on POSIX."""
+    if os.name == "nt":
+        return
+
+    try:
+        descriptor = os.open(path, os.O_RDONLY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+    except OSError:
+        # File data is already durable; unsupported directory fsync must not
+        # turn a successful atomic write into an application-level failure.
+        pass
+
+
 class _AtomicFileBackend:
     """Shared path, atomic-write, and integrity primitives for file stores."""
 
@@ -114,6 +131,7 @@ class _AtomicFileBackend:
             if self.config.atomic_writes:
                 os.replace(temporary_dir, final_dir)
                 temporary_dir = None
+                _fsync_directory(parent)
         except StorageError:
             raise
         except (OSError, ValueError) as error:
@@ -145,6 +163,7 @@ class _AtomicFileBackend:
             if self.config.atomic_writes:
                 self._write_file(temporary_path, metadata_bytes)
                 os.replace(temporary_path, metadata_path)
+                _fsync_directory(object_dir)
             else:
                 self._write_file(metadata_path, metadata_bytes)
         except (OSError, ValueError) as error:
@@ -614,7 +633,7 @@ class FileSystemArtifactStore(ArtifactStore):
             backend if isinstance(backend, _AtomicFileBackend) else _AtomicFileBackend(backend)
         )
         self.config = self._backend.config
-        self._metadata_locks: dict[str, asyncio.Lock] = {}
+        self._metadata_locks: dict[str, tuple[asyncio.Lock, int]] = {}
         self._metadata_locks_guard = threading.Lock()
 
     async def save_artifact(
@@ -793,17 +812,25 @@ class FileSystemArtifactStore(ArtifactStore):
     ) -> None:
         """Idempotently add a delivery target to artifact metadata."""
         self._validate_artifact_id(artifact_id)
-        if not isinstance(client_type, str) or not client_type.strip():
+        if not isinstance(client_type, str):
+            raise StorageValidationError(
+                f"Invalid delivery target for artifact {artifact_id}"
+            )
+        client_type = client_type.strip()
+        if not client_type:
             raise StorageValidationError(
                 f"Invalid delivery target for artifact {artifact_id}"
             )
         lock = self._metadata_lock(artifact_id)
-        async with lock:
-            await asyncio.to_thread(
-                self._mark_for_delivery_sync,
-                artifact_id,
-                client_type,
-            )
+        try:
+            async with lock:
+                await asyncio.to_thread(
+                    self._mark_for_delivery_sync,
+                    artifact_id,
+                    client_type,
+                )
+        finally:
+            self._release_metadata_lock(artifact_id, lock)
 
     def _mark_for_delivery_sync(self, artifact_id: str, client_type: str) -> None:
         artifact = self._get_artifact_sync(artifact_id)
@@ -844,11 +871,29 @@ class FileSystemArtifactStore(ArtifactStore):
 
     def _metadata_lock(self, artifact_id: str) -> asyncio.Lock:
         with self._metadata_locks_guard:
-            lock = self._metadata_locks.get(artifact_id)
-            if lock is None:
+            entry = self._metadata_locks.get(artifact_id)
+            if entry is None:
                 lock = asyncio.Lock()
-                self._metadata_locks[artifact_id] = lock
+                reference_count = 0
+            else:
+                lock, reference_count = entry
+            self._metadata_locks[artifact_id] = (lock, reference_count + 1)
             return lock
+
+    def _release_metadata_lock(
+        self,
+        artifact_id: str,
+        lock: asyncio.Lock,
+    ) -> None:
+        with self._metadata_locks_guard:
+            entry = self._metadata_locks.get(artifact_id)
+            if entry is None or entry[0] is not lock:
+                return
+            reference_count = entry[1] - 1
+            if reference_count == 0:
+                self._metadata_locks.pop(artifact_id, None)
+            else:
+                self._metadata_locks[artifact_id] = (lock, reference_count)
 
     @staticmethod
     def _validate_artifact_id(artifact_id: str) -> None:

@@ -12,6 +12,7 @@ from src.storage.errors import (
     StorageSerializationError,
     StorageValidationError,
 )
+from src.storage import file_backend as file_backend_module
 from src.storage.file_backend import FileSystemArtifactStore
 
 
@@ -23,6 +24,25 @@ class ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
 
     def tearDown(self):
         self.temporary.cleanup()
+
+    def test_directory_fsync_is_best_effort_on_posix(self):
+        with (
+            patch.object(file_backend_module.os, "open", return_value=42) as open_mock,
+            patch.object(file_backend_module.os, "fsync") as fsync_mock,
+            patch.object(file_backend_module.os, "close") as close_mock,
+            patch.object(file_backend_module.os, "name", "posix"),
+        ):
+            file_backend_module._fsync_directory(self.root)
+
+        open_mock.assert_called_once_with(self.root, file_backend_module.os.O_RDONLY)
+        fsync_mock.assert_called_once_with(42)
+        close_mock.assert_called_once_with(42)
+
+        with (
+            patch.object(file_backend_module.os, "open", side_effect=OSError("unsupported")),
+            patch.object(file_backend_module.os, "name", "posix"),
+        ):
+            file_backend_module._fsync_directory(self.root)
 
     async def test_initial_save_and_safe_filename(self):
         artifact = await self.store.save_artifact(
@@ -141,6 +161,25 @@ class ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
         updated = await self.store.get_artifact(artifact.artifact_id)
         self.assertEqual(updated.delivery_targets, ["telegram", "web"])
         self.assertEqual(await self.store.open_artifact(artifact.artifact_id), b"file")
+        self.assertEqual(self.store._metadata_locks, {})
+
+    async def test_delivery_target_is_trimmed_before_idempotency_check(self):
+        artifact = await self.store.save_artifact(
+            b"file", cycle_id="cycle-1", filename="file.bin", source="test"
+        )
+
+        await self.store.mark_for_delivery(
+            artifact.artifact_id,
+            client_type=" telegram ",
+        )
+        await self.store.mark_for_delivery(
+            artifact.artifact_id,
+            client_type="telegram",
+        )
+
+        updated = await self.store.get_artifact(artifact.artifact_id)
+        self.assertEqual(updated.delivery_targets, ["telegram"])
+        self.assertEqual(self.store._metadata_locks, {})
 
     async def test_delivery_metadata_update_is_atomic(self):
         artifact = await self.store.save_artifact(
@@ -156,6 +195,7 @@ class ArtifactStoreTests(unittest.IsolatedAsyncioTestCase):
 
         unchanged = await self.store.get_artifact(artifact.artifact_id)
         self.assertEqual(unchanged.delivery_targets, [])
+        self.assertEqual(self.store._metadata_locks, {})
         object_dir = self.root / "artifacts" / artifact.artifact_id
         self.assertFalse(any(path.name.startswith("metadata.json.tmp") for path in object_dir.iterdir()))
 

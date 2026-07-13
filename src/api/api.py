@@ -4,7 +4,13 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 # Импорт модулей
-from .config import HTTP_PROXY, HTTPS_PROXY, AGENT_CONFIG_PATH
+from .config import (
+    AGENT_CONFIG_PATH,
+    HTTP_PROXY,
+    HTTPS_PROXY,
+    safe_llm_config_summary,
+    safe_mcp_server_config_summary,
+)
 from ..mcp.mcp_client import MCPClient, load_config
 from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import APIError
@@ -53,9 +59,22 @@ class Api:
                 self.storage_config,
             ) = load_config(config_path)
 
-            # Логирование конфигурации
-            logger.debug(f"server_configs: {self.server_configs}")
-            logger.debug(f"llm_config: {self.llm_config}")
+            # Логируем только безопасную сводку: конфигурация также содержит
+            # api_key, Authorization headers и env-переменные MCP-серверов.
+            llm_log_summary = safe_llm_config_summary(self.llm_config)
+            logger.debug(
+                "LLM config: model=%s api_url=%s openai_compatible=%s "
+                "context_window_tokens=%s final_audit=%s",
+                llm_log_summary["model"],
+                llm_log_summary["api_url"],
+                llm_log_summary["openai_compatible"],
+                llm_log_summary["context_window_tokens"],
+                llm_log_summary["final_audit"],
+            )
+            logger.debug(
+                "MCP servers configured: %s",
+                safe_mcp_server_config_summary(self.server_configs),
+            )
 
             storage_root = Path(self.storage_config.root_dir).expanduser()
             if not storage_root.is_absolute():
