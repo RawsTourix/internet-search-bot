@@ -55,7 +55,7 @@ class LLMHTTPError(LLMError):
         self.retry_after = retry_after
 
         super().__init__(
-            f"Ошибка LLM API: {status_code} - {response_text}"
+            f"Ошибка LLM API: HTTP {status_code}"
         )
 
 

@@ -1499,6 +1499,8 @@ class MCPClient:
         final_text: list[str],
         cycle_id: str,
         client_type: ClientType | None = None,
+        session_id: str | None = None,
+        progress_callback=None,
     ) -> None:
         self._trace_event(
             cycle_trace,
@@ -1529,6 +1531,9 @@ class MCPClient:
                 client_type=client_type,
                 force_reason=force_reason,
                 context="Forced final answer after max_iterations",
+                session_id=session_id,
+                cycle_id=cycle_id,
+                progress_callback=progress_callback,
             )
         except (
             LLMHTTPError,
@@ -1567,6 +1572,11 @@ class MCPClient:
         draft_answer: str,
         client_type: ClientType | None,
         context: str = "Final format",
+        state: SessionState | None = None,
+        session_id: str | None = None,
+        cycle_id: str | None = None,
+        progress_callback=None,
+        cycle_trace: list[dict[str, Any]] | None = None,
     ) -> str:
         payload = {
             "type": "final_format_request",
@@ -1607,6 +1617,11 @@ class MCPClient:
             ],
             [],
             context=context,
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
         )
 
         return (response.get("content") or "").strip()
@@ -1619,6 +1634,11 @@ class MCPClient:
         strict: bool,
         force_reason: dict[str, Any] | None = None,
         context: str = "Final grounding",
+        state: SessionState | None = None,
+        session_id: str | None = None,
+        cycle_id: str | None = None,
+        progress_callback=None,
+        cycle_trace: list[dict[str, Any]] | None = None,
     ) -> str:
         task = (
             "Очисти draft_answer от неподтверждённых утверждений. "
@@ -1690,6 +1710,11 @@ class MCPClient:
             ],
             [],
             context=context,
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
         )
 
         return (response.get("content") or "").strip()
@@ -1703,6 +1728,11 @@ class MCPClient:
         evidence_pack: dict[str, Any] | None = None,
         force_reason: dict[str, Any] | None = None,
         context: str = "Final processing",
+        state: SessionState | None = None,
+        session_id: str | None = None,
+        cycle_id: str | None = None,
+        progress_callback=None,
+        cycle_trace: list[dict[str, Any]] | None = None,
     ) -> str:
         if decision.mode == FinalProcessingMode.SKIP:
             return draft_answer.strip()
@@ -1712,6 +1742,11 @@ class MCPClient:
                 draft_answer=draft_answer,
                 client_type=client_type,
                 context=f"{context}: format_only",
+                state=state,
+                session_id=session_id,
+                cycle_id=cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=cycle_trace,
             )
             return formatted or draft_answer.strip()
 
@@ -1721,6 +1756,11 @@ class MCPClient:
             strict=decision.mode == FinalProcessingMode.STRICT_GROUNDED,
             force_reason=force_reason,
             context=f"{context}: {decision.mode.value}",
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
         )
 
         grounded = grounded or draft_answer.strip()
@@ -1729,6 +1769,11 @@ class MCPClient:
             draft_answer=grounded,
             client_type=client_type,
             context=f"{context}: final_format",
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
         )
 
         return formatted or grounded
@@ -1742,6 +1787,9 @@ class MCPClient:
         client_type: ClientType | None,
         force_reason: dict[str, Any],
         context: str = "Forced final answer",
+        session_id: str | None = None,
+        cycle_id: str | None = None,
+        progress_callback=None,
     ) -> str:
         evidence_pack = self._build_final_evidence_pack(
             original_user_request=original_user_request,
@@ -1789,6 +1837,11 @@ class MCPClient:
             ],
             [],
             context=context,
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
         )
 
         draft = (response.get("content") or "").strip()
@@ -1804,6 +1857,11 @@ class MCPClient:
             evidence_pack=evidence_pack,
             force_reason=force_reason,
             context=f"{context}: strict_grounded_and_format",
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
         )
 
     async def _audit_final_answer(
@@ -1814,6 +1872,11 @@ class MCPClient:
         decision: FinalProcessingDecision | None = None,
         evidence_pack: dict[str, Any] | None = None,
         context: str = "Final audit",
+        state: SessionState | None = None,
+        session_id: str | None = None,
+        cycle_id: str | None = None,
+        progress_callback=None,
+        cycle_trace: list[dict[str, Any]] | None = None,
     ) -> str:
         return await self._process_final_answer(
             draft_answer=draft_answer,
@@ -1824,6 +1887,11 @@ class MCPClient:
             ),
             evidence_pack=evidence_pack,
             context=context,
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
         )
     
     def _delivery_constraints(self, client_type: ClientType | None) -> dict:
@@ -2106,13 +2174,34 @@ class MCPClient:
         self,
         content: str,
         messages: list[dict[str, Any]],
+        *,
+        state: SessionState | None = None,
+        session_id: str | None = None,
+        cycle_id: str | None = None,
+        progress_callback=None,
+        cycle_trace: list[dict[str, Any]] | None = None,
     ) -> AgentAction:
         try:
             return AgentAction.model_validate_json(content)
 
         except Exception as original_error:
+            validation_errors = []
+            if isinstance(original_error, ValidationError):
+                validation_errors = [
+                    {
+                        "type": error.get("type"),
+                        "loc": list(error.get("loc") or ()),
+                        "msg": error.get("msg"),
+                    }
+                    for error in original_error.errors(include_input=False)
+                ]
+
             logger.warning(
-                f"AgentAction JSON parse failed, trying repair: {original_error!r}"
+                "AgentAction JSON parse failed, trying repair: "
+                "error_type=%s error_count=%s content_chars=%s",
+                type(original_error).__name__,
+                len(validation_errors),
+                len(content),
             )
 
             repair_payload = {
@@ -2120,7 +2209,7 @@ class MCPClient:
                 "task": "Repair invalid AgentAction JSON. Do not add new facts. Preserve meaning.",
                 "schema": AgentAction.model_json_schema(),
                 "invalid_content": content,
-                "error": repr(original_error),
+                "validation_errors": validation_errors,
             }
 
             repair_messages = [
@@ -2141,6 +2230,12 @@ class MCPClient:
                 repair_messages,
                 [],
                 context="AgentAction JSON repair",
+                state=state,
+                session_id=session_id,
+                cycle_id=cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=cycle_trace,
+                redact_error_details=True,
             )
 
             repaired_content = repair_response.get("content", "") or ""
@@ -2151,9 +2246,9 @@ class MCPClient:
             except Exception as repair_error:
                 raise ValueError(
                     "LLM returned invalid AgentAction JSON even after repair. "
-                    f"original_error={original_error!r}; repair_error={repair_error!r}; "
-                    f"content={content!r}; repaired={repaired_content!r}"
-                ) from repair_error
+                    f"original_error_type={type(original_error).__name__}; "
+                    f"repair_error_type={type(repair_error).__name__}"
+                ) from None
 
     def _tool_result_payload(
         self,
@@ -3126,7 +3221,13 @@ class MCPClient:
                         progress_callback=progress_callback,
                         cycle_trace=cycle_trace,
                     )
-                    logger.debug(f"Получен ответ от модели: {llm_response}")
+                    tool_calls = llm_response.get("tool_calls", []) or []
+                    content = llm_response.get("content", "") or ""
+                    logger.debug(
+                        "Получен ответ от модели: content_chars=%s tool_calls=%s",
+                        len(content or ""),
+                        len(tool_calls),
+                    )
                     
                     # Проверяем наличие вызовов инструментов
                     self._trace_event(
@@ -3135,14 +3236,12 @@ class MCPClient:
                         iteration=state.iterations,
                         response=llm_response,
                     )
-                    tool_calls = llm_response.get("tool_calls", [])
-                    content = llm_response.get("content", "")
                     
                     # Добавляем текстовый ответ
                     if content:
                         logger.info(
-                            f"Получен текстовый ответ от модели:"
-                            f"{content}"
+                            "Получен текстовый ответ от модели: content_chars=%s",
+                            len(content),
                         )
                     
                     if not tool_calls:
@@ -3185,6 +3284,11 @@ class MCPClient:
                                     action = await self._parse_or_repair_agent_action(
                                         content,
                                         messages,
+                                        state=state,
+                                        session_id=session_id,
+                                        cycle_id=cycle_id,
+                                        progress_callback=progress_callback,
+                                        cycle_trace=cycle_trace,
                                     )
 
                                 except Exception as repair_error:
@@ -3529,6 +3633,9 @@ class MCPClient:
                                         "Forced final answer because LLM requested "
                                         "tool on last iteration"
                                     ),
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    progress_callback=progress_callback,
                                 )
                                 final_text.clear()
                                 final_text.append(answer)
@@ -3559,6 +3666,11 @@ class MCPClient:
                             action = await self._parse_or_repair_agent_action(
                                 final_content,
                                 messages,
+                                state=state,
+                                session_id=session_id,
+                                cycle_id=cycle_id,
+                                progress_callback=progress_callback,
+                                cycle_trace=cycle_trace,
                             )
 
                             if action.agent_request:
@@ -3691,6 +3803,8 @@ class MCPClient:
                     final_text=final_text,
                     cycle_id=cycle_id,
                     client_type=client_type,
+                    session_id=session_id,
+                    progress_callback=progress_callback,
                 )
             
             if not final_text:
@@ -3777,6 +3891,11 @@ class MCPClient:
                                 "Final processing before AgentResult: "
                                 f"{decision.mode.value}"
                             ),
+                            state=state,
+                            session_id=session_id,
+                            cycle_id=cycle_id,
+                            progress_callback=progress_callback,
+                            cycle_trace=cycle_trace,
                         )
 
                         if processed_text:
@@ -3945,7 +4064,10 @@ class MCPClient:
                 session=session,
             )
 
-            logger.info(f"Завершение обработки запроса. Результат: {result_text}")
+            logger.info(
+                "Завершение обработки запроса: result_chars=%s",
+                len(result_text),
+            )
 
             return AgentResult(
                 content=result_text,
@@ -4518,7 +4640,7 @@ class MCPClient:
         max_tokens_override: int | None = None,
         temperature_override: float | None = None,
         top_p_override: float | None = None,
-        redact_error_details: bool = False,
+        redact_error_details: bool = True,
     ) -> Dict[str, Any]:
         max_attempts = self.llm_max_retries + 1
 
@@ -4737,6 +4859,32 @@ class MCPClient:
                 )
 
                 await asyncio.sleep(delay)
+
+            except LLMError as e:
+                error_repr = safe_error_repr(e)
+                logger.error(
+                    f"{context}: LLM response error не подходит для retry; "
+                    f"attempt={attempt}/{max_attempts}; error={error_repr}"
+                )
+                await self._emit_llm_retry_progress(
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                    context=context,
+                    event_type="llm_error",
+                    message_key="llm_response_error",
+                    severity="error",
+                    data={
+                        "attempt": attempt,
+                        "max_attempts": max_attempts,
+                        "delay": 0,
+                        "error_type": type(e).__name__,
+                        "error_repr": error_repr,
+                    },
+                )
+                raise
     
     def _format_messages_for_custom_llm(
         self, 

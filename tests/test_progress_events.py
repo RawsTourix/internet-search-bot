@@ -229,6 +229,9 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.client._ground_final_answer = AsyncMock(return_value="grounded")
         self.client._format_final_answer = AsyncMock(return_value="formatted")
         evidence_pack = {"type": "final_evidence_pack"}
+        state = SessionState(progress_locale="ru")
+        cycle_trace = []
+        events = []
 
         result = await self.client._process_final_answer(
             draft_answer="draft",
@@ -238,6 +241,11 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "tools_used",
             ),
             evidence_pack=evidence_pack,
+            state=state,
+            session_id="session-1",
+            cycle_id="cycle-1",
+            progress_callback=events.append,
+            cycle_trace=cycle_trace,
         )
 
         self.assertEqual(result, "formatted")
@@ -251,6 +259,23 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
             self.client._format_final_answer.await_args.kwargs["draft_answer"],
             "grounded",
         )
+        for llm_stage in (
+            self.client._ground_final_answer,
+            self.client._format_final_answer,
+        ):
+            self.assertIs(llm_stage.await_args.kwargs["state"], state)
+            self.assertEqual(
+                llm_stage.await_args.kwargs["session_id"],
+                "session-1",
+            )
+            self.assertEqual(
+                llm_stage.await_args.kwargs["cycle_id"],
+                "cycle-1",
+            )
+            self.assertIs(
+                llm_stage.await_args.kwargs["cycle_trace"],
+                cycle_trace,
+            )
 
     async def test_emit_final_processing_progress_event_is_persistent(self):
         state = SessionState(progress_locale="ru")
@@ -619,6 +644,17 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
             "HTTP-ошибка LLM: Ошибка LLM API: 429 - rate limited"
         )
         self.assertEqual(summary, "LLMHTTPError / HTTP 429")
+
+    def test_sanitized_http_error_preserves_status_for_telegram(self):
+        provider_sentinel = "PROVIDER_ECHOED_PRIVATE_PROMPT"
+        error = LLMHTTPError(404, provider_sentinel)
+        error_text = f"HTTP-ошибка LLM на итерации 1: {error}"
+
+        self.assertEqual(
+            telegram_server.extract_error_type_summary(error_text),
+            "LLMHTTPError / HTTP 404",
+        )
+        self.assertNotIn(provider_sentinel, error_text)
 
     def test_llm_http_404_is_rendered_as_configuration_error(self):
         text = telegram_server.format_agent_error_for_telegram(

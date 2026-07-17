@@ -42,6 +42,9 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
             "⚠️ LLM timeout. Повторы исчерпаны. "
             "Попытка {attempt}/{max_attempts}."
         ),
+        "llm_response_error": (
+            "⚠️ LLM вернула некорректный ответ. Повтор не выполняется."
+        ),
         "infrastructure_interruption": (
             "⚠️ Инфраструктурная ошибка. Состояние задачи сохранено."
         ),
@@ -108,6 +111,9 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "llm_timeout_exhausted": (
             "⚠️ LLM timeout. Retries exhausted. "
             "Attempt {attempt}/{max_attempts}."
+        ),
+        "llm_response_error": (
+            "⚠️ LLM returned an invalid response. Retry is not allowed."
         ),
         "infrastructure_interruption": (
             "⚠️ Infrastructure error. Task state has been saved."
