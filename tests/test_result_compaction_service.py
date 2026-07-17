@@ -118,6 +118,16 @@ class ResultCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
             "text/plain",
         )
 
+    def test_small_mime_detection_failure_falls_back_to_text(self):
+        with patch(
+            "src.memory.result_compaction.json.loads",
+            side_effect=RecursionError("too deeply nested"),
+        ):
+            self.assertEqual(
+                self.service._detect_mime_type("[[[...]]]"),
+                "text/plain",
+            )
+
     def test_large_mime_detection_does_not_parse_full_json(self):
         padding = "x" * (
             self.service.JSON_MIME_PARSE_MAX_CHARS + 1

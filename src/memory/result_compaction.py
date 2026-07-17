@@ -253,7 +253,7 @@ class ResultCompactionService:
         if len(raw_result) <= ResultCompactionService.JSON_MIME_PARSE_MAX_CHARS:
             try:
                 parsed = json.loads(raw_result)
-            except (TypeError, ValueError):
+            except Exception:
                 return "text/plain"
             return (
                 "application/json"
