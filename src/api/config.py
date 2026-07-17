@@ -49,4 +49,13 @@ def safe_memory_config_summary(config: Any) -> dict[str, Any]:
         ),
         "result_summary_target_ratio": config.result_summary_target_ratio,
         "result_preview_max_chars": config.result_preview_max_chars,
+        "cycle_compaction_summary_target_ratio": (
+            config.cycle_compaction_summary_target_ratio
+        ),
+        "cycle_compaction_keep_recent_blocks": (
+            config.cycle_compaction_keep_recent_blocks
+        ),
+        "cycle_compaction_max_passes": (
+            config.cycle_compaction_max_passes
+        ),
     }

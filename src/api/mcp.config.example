@@ -75,6 +75,9 @@
         "inline_result_max_input_ratio": 0.10,
         "single_pass_summary_max_input_ratio": 0.60,
         "result_summary_target_ratio": 0.01,
-        "result_preview_max_chars": 4000
+        "result_preview_max_chars": 4000,
+        "cycle_compaction_summary_target_ratio": 0.02,
+        "cycle_compaction_keep_recent_blocks": 2,
+        "cycle_compaction_max_passes": 3
     }
 }

@@ -15,3 +15,19 @@ class MemoryConfigValidationError(MemoryLayerError):
 
 class ResultCompactionError(MemoryLayerError):
     """A stored result could not be represented as requested."""
+
+
+class CycleCompactionError(MemoryLayerError):
+    """Base class for managed active-cycle compaction failures."""
+
+
+class CycleCompactionOutputError(CycleCompactionError):
+    """The internal compactor returned an invalid structured result."""
+
+
+class CycleSegmentSelectionError(CycleCompactionError):
+    """The visible message history is unsafe for atomic replacement."""
+
+
+class CycleContextLimitError(CycleCompactionError):
+    """The cycle cannot safely continue within the hard context limit."""

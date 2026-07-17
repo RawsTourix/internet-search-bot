@@ -35,6 +35,14 @@ from .server_manager import MCPServerConnectionError, MCPServerManager
 from ..agent.protocol import AgentAction, ProgressEvent, dumps_json
 from ..storage import StorageConfigType, StorageServices, StorageValidationError
 from ..memory import (
+    CycleCompactionOutcome,
+    CycleCompactionOutputError,
+    CycleCompactionService,
+    CycleContextLimitError,
+    CycleSegmentSelectionError,
+    CycleSegmentSelector,
+    CycleWorkingMemory,
+    CycleWorkingState,
     InvalidResultHandlingError,
     MemoryConfigType,
     MemoryConfigValidationError,
@@ -44,9 +52,15 @@ from ..memory import (
     ResultContextBudgetPolicy,
     ResultHandling,
     ResultProcessingOutcome,
+    build_cycle_compaction_system_prompt,
+    build_cycle_working_memory_message,
+    extract_cycle_refs,
+    parse_cycle_working_memory_message,
+    validate_openai_tool_sequence,
     build_result_compaction_system_prompt,
     estimate_untrusted_result_tokens,
 )
+from ..runtime import ActiveAgentCycle, AgentCycleSnapshot
 from ..storage.models import new_result_id
 
 # Модели
@@ -163,55 +177,6 @@ class DialogTurn:
 
 
 @dataclass
-class AgentCycleSnapshot:
-    """
-    Снимок незавершённого агентного цикла.
-
-    Используется при WAITING_USER: агент приостанавливает работу,
-    но не должен терять messages_for_llm, cycle_trace и рабочий контекст.
-    """
-
-    cycle_id: str
-    original_user_request: str
-    messages_for_llm: List[Dict[str, Any]]
-    cycle_trace: List[Dict[str, Any]]
-
-    # status:
-    # - "waiting_user": агент ждёт ответ пользователя;
-    # - "running": цикл возобновлён и выполняется;
-    # - "interrupted": цикл прерван инфраструктурной ошибкой,
-    #   но может быть продолжен позже.
-    status: str = "waiting_user"
-    waiting_question: str | None = None
-    interruption_reason: str | None = None
-    interrupted_at: float | None = None
-
-    # TODO v0.4: Context compaction.
-    # Когда messages_for_llm приближается к context_window_tokens,
-    # старые подробные сообщения и большие tool results должны быть
-    # перенесены в archival_logs/cycle_trace, а видимый LLM-контекст
-    # должен быть заменён на компактный working_summary + working_state.
-    #
-    # working_summary — человекочитаемое краткое описание текущего цикла:
-    # цель, что уже сделано, какие решения приняты, что осталось.
-    #
-    # working_state — машинно-читаемое состояние цикла:
-    # confirmed_actions, rejected_actions, modified_files, pending_confirmation,
-    # archived_trace_refs, tool_call_ids и другие ссылки на очищенные данные.
-    #
-    # Важно: compaction не должна молча удалять смысл. Она должна сохранять
-    # восстановимое состояние работы и ссылки на полный архив.
-    working_summary: str = ""
-    working_state: Dict[str, Any] = field(default_factory=dict)
-
-    tools_used: List[str] = field(default_factory=list)
-    progress_events: List[Dict[str, Any]] = field(default_factory=list)
-
-    created_at: float = field(default_factory=time.time)
-    updated_at: float = field(default_factory=time.time)
-
-
-@dataclass
 class SessionMemory:
     """
     Долговременная память сессии.
@@ -233,7 +198,7 @@ class SessionMemory:
     last_cycle_trace: List[Dict[str, Any]] = field(default_factory=list)
 
     # Незавершённый цикл, если агент остановился на WAITING_USER.
-    pending_cycle: AgentCycleSnapshot | None = None
+    pending_cycle: ActiveAgentCycle | None = None
 
     # Краткая информация о последнем ошибочном цикле.
     # Полный trace всё равно лежит в archival_logs.
@@ -530,6 +495,12 @@ class MCPClient:
             config=self.memory_config,
             budget_policy=self.result_budget_policy,
         )
+        self.cycle_segment_selector = CycleSegmentSelector(
+            self._estimate_messages_tokens
+        )
+        self.cycle_compaction_service = CycleCompactionService(
+            content_store=self.content_store,
+        )
 
         headers = dict(llm_config.headers or {})
 
@@ -577,7 +548,7 @@ class MCPClient:
         # Память сессий
         self.sessions: Dict[str, SessionMemory] = {}
         self.session_states: Dict[str, SessionState] = {}
-        # TODO v0.4-cycle-compaction:
+        # TODO v0.5:
         # migrate cycle archive/events/working memory to a dedicated CycleStore
         # built on the storage foundation.
         self.archive_dir = Path("logging/agent_traces")
@@ -1446,54 +1417,163 @@ class MCPClient:
             }
         ]
 
+    def _find_original_user_message_index(
+        self,
+        messages: List[Dict[str, Any]],
+    ) -> int:
+        for index in range(len(messages) - 1, -1, -1):
+            message = messages[index]
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                payload = json.loads(content)
+            except Exception:
+                continue
+            if (
+                isinstance(payload, dict)
+                and payload.get("type") == "user_request"
+                and isinstance(payload.get("user_request"), str)
+            ):
+                return index
+        raise CycleSegmentSelectionError(
+            "current_cycle_user_request_message_missing"
+        )
+
+    def _coerce_active_cycle(
+        self,
+        pending_cycle: Any,
+        *,
+        session_id: str,
+    ) -> ActiveAgentCycle:
+        """Accept the current model and minimally migrate legacy snapshots."""
+        if isinstance(pending_cycle, ActiveAgentCycle):
+            return pending_cycle
+
+        messages = list(getattr(pending_cycle, "messages_for_llm", []))
+        cycle_trace = list(getattr(pending_cycle, "cycle_trace", []))
+        original_request = str(
+            getattr(pending_cycle, "original_user_request", "")
+        ).strip()
+        if not original_request:
+            raise CycleSegmentSelectionError(
+                "legacy_cycle_original_request_missing"
+            )
+
+        working_memory = getattr(pending_cycle, "working_memory", None)
+        if not isinstance(working_memory, CycleWorkingMemory):
+            legacy_summary = str(
+                getattr(pending_cycle, "working_summary", "")
+            ).strip()
+            legacy_state = getattr(pending_cycle, "working_state", {})
+            if legacy_summary:
+                state_payload = (
+                    dict(legacy_state)
+                    if isinstance(legacy_state, dict)
+                    else {}
+                )
+                state_payload.setdefault("current_goal", original_request)
+                try:
+                    migrated_state = CycleWorkingState.model_validate(
+                        state_payload
+                    )
+                except Exception:
+                    migrated_state = CycleWorkingState(
+                        current_goal=original_request
+                    )
+                working_memory = CycleWorkingMemory(
+                    generation=1,
+                    summary=legacy_summary,
+                    working_state=migrated_state,
+                    archived_segment_count=1,
+                )
+            else:
+                working_memory = None
+
+        original_user_message_index = (
+            self._find_original_user_message_index(messages)
+        )
+        if (
+            working_memory is not None
+            and not any(
+                parse_cycle_working_memory_message(message) is not None
+                for message in messages
+            )
+        ):
+            messages.insert(
+                original_user_message_index + 1,
+                build_cycle_working_memory_message(working_memory),
+            )
+
+        return ActiveAgentCycle(
+            cycle_id=str(getattr(pending_cycle, "cycle_id", "")).strip(),
+            session_id=session_id,
+            original_user_request=original_request,
+            messages_for_llm=messages,
+            cycle_trace=cycle_trace,
+            original_user_message_index=original_user_message_index,
+            working_memory=working_memory,
+            status=str(getattr(pending_cycle, "status", "waiting_user")),
+            waiting_question=getattr(
+                pending_cycle,
+                "waiting_question",
+                None,
+            ),
+            interruption_reason=getattr(
+                pending_cycle,
+                "interruption_reason",
+                None,
+            ),
+            interrupted_at=getattr(
+                pending_cycle,
+                "interrupted_at",
+                None,
+            ),
+            result_refs=list(getattr(pending_cycle, "result_refs", [])),
+            artifact_refs=list(
+                getattr(pending_cycle, "artifact_refs", [])
+            ),
+            active_plan_id=getattr(
+                pending_cycle,
+                "active_plan_id",
+                None,
+            ),
+            tools_used=list(getattr(pending_cycle, "tools_used", [])),
+            progress_events=list(
+                getattr(pending_cycle, "progress_events", [])
+            ),
+            created_at=float(
+                getattr(pending_cycle, "created_at", time.time())
+            ),
+            updated_at=float(
+                getattr(pending_cycle, "updated_at", time.time())
+            ),
+        )
+
     def _save_interrupted_cycle(
         self,
         *,
         session: SessionMemory,
-        cycle_id: str,
-        original_user_request: str,
-        messages_for_llm: List[Dict[str, Any]],
-        cycle_trace: List[Dict[str, Any]],
+        active_cycle: ActiveAgentCycle,
         state: SessionState,
         error_message: str,
         previous_cycle_progress_events: List[Dict[str, Any]],
-        cycle_snapshot: AgentCycleSnapshot | None,
-    ) -> AgentCycleSnapshot:
+    ) -> ActiveAgentCycle:
         now = time.time()
-        snapshot = AgentCycleSnapshot(
-            cycle_id=cycle_id,
-            original_user_request=original_user_request,
-            messages_for_llm=list(messages_for_llm),
-            cycle_trace=list(cycle_trace),
-            status="interrupted",
-            waiting_question=None,
-            interruption_reason=error_message,
-            interrupted_at=now,
-            working_summary=(
-                cycle_snapshot.working_summary
-                if cycle_snapshot is not None
-                else ""
-            ),
-            working_state=(
-                dict(cycle_snapshot.working_state)
-                if cycle_snapshot is not None
-                else {}
-            ),
-            tools_used=list(state.tools_used),
-            progress_events=(
-                previous_cycle_progress_events
-                + list(state.progress_events)
-            ),
-            created_at=(
-                cycle_snapshot.created_at
-                if cycle_snapshot is not None
-                else now
-            ),
-            updated_at=now,
+        active_cycle.status = "interrupted"
+        active_cycle.waiting_question = None
+        active_cycle.interruption_reason = error_message
+        active_cycle.interrupted_at = now
+        active_cycle.tools_used = list(state.tools_used)
+        active_cycle.progress_events = (
+            previous_cycle_progress_events
+            + list(state.progress_events)
         )
-
-        session.pending_cycle = snapshot
-        return snapshot
+        active_cycle.updated_at = now
+        session.pending_cycle = active_cycle
+        return active_cycle
 
     def _save_last_error_cycle(
         self,
@@ -3079,7 +3159,7 @@ class MCPClient:
         cycle_trace: List[Dict[str, Any]] = []
         messages_for_llm: List[Dict[str, Any]] = []
         session: SessionMemory | None = None
-        cycle_snapshot: AgentCycleSnapshot | None = None
+        active_cycle: ActiveAgentCycle | None = None
         original_user_request = query
         previous_cycle_progress_events: List[Dict[str, Any]] = []
         preserve_context_on_error = False
@@ -3098,23 +3178,30 @@ class MCPClient:
 
             # Инициализируем память сессии до построения рабочего контекста.
             session = self._get_or_create_session(session_id)
-            cycle_snapshot = session.pending_cycle
+            pending_cycle = session.pending_cycle
 
-            if cycle_snapshot is not None:
-                cycle_id = cycle_snapshot.cycle_id
-                cycle_trace = cycle_snapshot.cycle_trace
-                messages_for_llm = cycle_snapshot.messages_for_llm
-                original_user_request = cycle_snapshot.original_user_request
-                previous_question = cycle_snapshot.waiting_question
+            if pending_cycle is not None:
+                active_cycle = self._coerce_active_cycle(
+                    pending_cycle,
+                    session_id=session_id,
+                )
+                session.pending_cycle = None
+                cycle_id = active_cycle.cycle_id
+                cycle_trace = active_cycle.cycle_trace
+                messages_for_llm = active_cycle.messages_for_llm
+                original_user_request = (
+                    active_cycle.original_user_request
+                )
+                previous_question = active_cycle.waiting_question
 
-                if cycle_snapshot.status == "interrupted":
+                if active_cycle.status == "interrupted":
                     messages_for_llm.append({
                         "role": "user",
                         "content": dumps_json({
                             "type": "user_resume_interrupted_cycle",
                             "reply": query,
                             "previous_interruption": (
-                                cycle_snapshot.interruption_reason
+                                active_cycle.interruption_reason
                             ),
                         }),
                     })
@@ -3123,7 +3210,7 @@ class MCPClient:
                         "user_resume_interrupted_cycle",
                         reply=query,
                         previous_interruption=(
-                            cycle_snapshot.interruption_reason
+                            active_cycle.interruption_reason
                         ),
                     )
                 else:
@@ -3142,11 +3229,14 @@ class MCPClient:
                         previous_question=previous_question,
                     )
 
-                cycle_snapshot.status = "running"
-                cycle_snapshot.updated_at = time.time()
-                state.tools_used = list(cycle_snapshot.tools_used)
+                active_cycle.status = "running"
+                active_cycle.waiting_question = None
+                active_cycle.interruption_reason = None
+                active_cycle.interrupted_at = None
+                active_cycle.updated_at = time.time()
+                state.tools_used = list(active_cycle.tools_used)
                 previous_cycle_progress_events = list(
-                    cycle_snapshot.progress_events
+                    active_cycle.progress_events
                 )
                 state.progress_events = []
 
@@ -3175,6 +3265,21 @@ class MCPClient:
                     current_user_payload=user_payload,
                     keep_last_turns=4,
                 )
+                original_user_message_index = (
+                    self._find_original_user_message_index(
+                        messages_for_llm
+                    )
+                )
+                active_cycle = ActiveAgentCycle(
+                    cycle_id=cycle_id,
+                    session_id=session_id,
+                    original_user_request=original_user_request,
+                    messages_for_llm=messages_for_llm,
+                    cycle_trace=cycle_trace,
+                    original_user_message_index=(
+                        original_user_message_index
+                    ),
+                )
 
                 self._trace_event(
                     cycle_trace,
@@ -3193,6 +3298,11 @@ class MCPClient:
                     event_type="cycle_started",
                 )
 
+            if active_cycle is None:
+                raise CycleSegmentSelectionError(
+                    "active_cycle_initialization_failed"
+                )
+
             messages = messages_for_llm
             
             logger.debug(
@@ -3207,32 +3317,39 @@ class MCPClient:
             
             # Основной цикл обработки            
             for i in range(self.max_iterations):
-                state.iterations = i + 1
-                logger.info(f"Итерация {state.iterations}/{self.max_iterations}")
-
-                await self._emit_progress_event(
-                    state=state,
-                    session_id=session_id,
-                    cycle_id=cycle_id,
-                    progress_callback=progress_callback,
-                    cycle_trace=cycle_trace,
-                    event_type="iteration_started",
-                    visibility="debug",
-                    message_kwargs={
-                        "iteration": state.iterations,
-                        "max_iterations": self.max_iterations,
-                    },
-                )
-                
                 try:
-                    # Вызываем LLM с таймаутом
-                    messages_for_llm = await self._compact_context_if_needed(
-                        messages_for_llm=messages_for_llm,
-                        cycle_snapshot=cycle_snapshot,
-                        cycle_trace=cycle_trace,
-                        cycle_id=cycle_id,
+                    compaction_outcome = (
+                        await self._compact_context_if_needed(
+                            active_cycle=active_cycle,
+                            state=state,
+                            session_id=session_id,
+                            progress_callback=progress_callback,
+                        )
+                    )
+                    messages_for_llm = (
+                        compaction_outcome.messages_for_llm
                     )
                     messages = messages_for_llm
+                    state.iterations = i + 1
+                    logger.info(
+                        f"Итерация {state.iterations}/"
+                        f"{self.max_iterations}"
+                    )
+
+                    await self._emit_progress_event(
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
+                        event_type="iteration_started",
+                        visibility="debug",
+                        message_kwargs={
+                            "iteration": state.iterations,
+                            "max_iterations": self.max_iterations,
+                        },
+                    )
+
                     self._trace_event(
                         cycle_trace,
                         "iteration_started",
@@ -3502,6 +3619,19 @@ class MCPClient:
                             )
                             tool_result_count += 1
 
+                            if (
+                                processing_outcome.stored_result_ref
+                                is not None
+                            ):
+                                result_id = (
+                                    processing_outcome
+                                    .stored_result_ref.result_id
+                                )
+                                if result_id not in active_cycle.result_refs:
+                                    active_cycle.result_refs.append(
+                                        result_id
+                                    )
+
                             result_unavailable = (
                                 processing_outcome.persistence_failed
                                 and processing_outcome.visible_payload.get("type")
@@ -3658,11 +3788,16 @@ class MCPClient:
                     # Если последняя итерация и были вызовы, получаем финальный ответ
                     if i == self.max_iterations - 1 and tool_result_count:
                         try:
-                            messages_for_llm = await self._compact_context_if_needed(
-                                messages_for_llm=messages_for_llm,
-                                cycle_snapshot=cycle_snapshot,
-                                cycle_trace=cycle_trace,
-                                cycle_id=cycle_id,
+                            compaction_outcome = (
+                                await self._compact_context_if_needed(
+                                    active_cycle=active_cycle,
+                                    state=state,
+                                    session_id=session_id,
+                                    progress_callback=progress_callback,
+                                )
+                            )
+                            messages_for_llm = (
+                                compaction_outcome.messages_for_llm
                             )
                             messages = messages_for_llm
                             final_response = await self._call_llm_with_retries(
@@ -3798,6 +3933,20 @@ class MCPClient:
                             )
                             break
 
+                        except CycleContextLimitError:
+                            error_message = (
+                                "Runtime не смог безопасно продолжить задачу "
+                                "из-за размера рабочего контекста. "
+                                "Состояние цикла сохранено для продолжения."
+                            )
+                            self._finish_with_error(
+                                state,
+                                final_text,
+                                error_message,
+                            )
+                            preserve_context_on_error = True
+                            error_kind = "context_limit_interruption"
+                            break
                         except LLMTimeoutError as e:
                             error_message = f"Таймаут при получении финального ответа: {e}"
                             self._finish_with_error(state, final_text, error_message)
@@ -3835,6 +3984,21 @@ class MCPClient:
                             self._finish_with_error(state, final_text, error_message, log_exception=True)
                             break
                             
+                except CycleContextLimitError:
+                    error_message = (
+                        "Runtime не смог безопасно продолжить задачу "
+                        "из-за размера рабочего контекста. "
+                        "Состояние цикла сохранено для продолжения."
+                    )
+                    self._finish_with_error(
+                        state,
+                        final_text,
+                        error_message,
+                    )
+                    preserve_context_on_error = True
+                    error_kind = "context_limit_interruption"
+                    break
+
                 except LLMTimeoutError as e:
                     error_message = f"Таймаут LLM на итерации {i+1}: {e}"
                     self._finish_with_error(state, final_text, error_message)
@@ -4049,40 +4213,23 @@ class MCPClient:
                     )
 
             session.last_cycle_trace = cycle_trace[-30:]
+            active_cycle.tools_used = list(state.tools_used)
+            active_cycle.progress_events = (
+                previous_cycle_progress_events
+                + list(state.progress_events)
+            )
+            active_cycle.updated_at = time.time()
 
             if state.status == AgentStatus.WAITING_USER:
-                session.pending_cycle = AgentCycleSnapshot(
-                    cycle_id=cycle_id,
-                    original_user_request=original_user_request,
-                    messages_for_llm=list(messages_for_llm),
-                    cycle_trace=list(cycle_trace),
-                    status="waiting_user",
-                    waiting_question=result_text,
-                    working_summary=(
-                        cycle_snapshot.working_summary
-                        if cycle_snapshot is not None
-                        else ""
-                    ),
-                    working_state=(
-                        dict(cycle_snapshot.working_state)
-                        if cycle_snapshot is not None
-                        else {}
-                    ),
-                    tools_used=list(state.tools_used),
-                    progress_events=(
-                        previous_cycle_progress_events
-                        + list(state.progress_events)
-                    ),
-                    created_at=(
-                        cycle_snapshot.created_at
-                        if cycle_snapshot is not None
-                        else time.time()
-                    ),
-                    updated_at=time.time(),
-                )
-                cycle_snapshot = session.pending_cycle
+                active_cycle.status = "waiting_user"
+                active_cycle.waiting_question = result_text
+                active_cycle.interruption_reason = None
+                active_cycle.interrupted_at = None
+                session.pending_cycle = active_cycle
 
             elif state.status == AgentStatus.DONE:
+                active_cycle.status = "done"
+                active_cycle.waiting_question = None
                 session.pending_cycle = None
 
                 if result_text:
@@ -4095,6 +4242,7 @@ class MCPClient:
                     )
 
             elif state.status == AgentStatus.ERROR:
+                active_cycle.status = "error"
                 error_message = state.last_error or result_text
                 self._trace_event(
                     cycle_trace,
@@ -4114,18 +4262,14 @@ class MCPClient:
                 )
 
                 if preserve_context_on_error:
-                    cycle_snapshot = self._save_interrupted_cycle(
+                    active_cycle = self._save_interrupted_cycle(
                         session=session,
-                        cycle_id=cycle_id,
-                        original_user_request=original_user_request,
-                        messages_for_llm=messages_for_llm,
-                        cycle_trace=cycle_trace,
+                        active_cycle=active_cycle,
                         state=state,
                         error_message=error_message,
                         previous_cycle_progress_events=(
                             previous_cycle_progress_events
                         ),
-                        cycle_snapshot=cycle_snapshot,
                     )
                 else:
                     session.pending_cycle = None
@@ -4138,7 +4282,7 @@ class MCPClient:
                 cycle_trace=cycle_trace,
                 result_text=result_text,
                 state=state,
-                cycle_snapshot=cycle_snapshot,
+                active_cycle=active_cycle,
                 session=session,
             )
 
@@ -4183,7 +4327,16 @@ class MCPClient:
             if session is None:
                 session = self._get_or_create_session(session_id)
 
-            if isinstance(e, LLMHTTPError):
+            if isinstance(e, CycleContextLimitError):
+                outer_error_kind = "context_limit_interruption"
+                can_resume = True
+                error_message = (
+                    "Runtime не смог безопасно продолжить задачу из-за "
+                    "размера рабочего контекста. Состояние цикла сохранено "
+                    "для продолжения."
+                )
+                state.last_error = error_message
+            elif isinstance(e, LLMHTTPError):
                 outer_error_kind, can_resume = self._classify_llm_http_error(e)
             else:
                 can_resume = self._is_infrastructure_error(e)
@@ -4219,19 +4372,15 @@ class MCPClient:
                 can_resume=can_resume,
             )
 
-            if can_resume:
-                cycle_snapshot = self._save_interrupted_cycle(
+            if can_resume and active_cycle is not None:
+                active_cycle = self._save_interrupted_cycle(
                     session=session,
-                    cycle_id=cycle_id,
-                    original_user_request=original_user_request,
-                    messages_for_llm=messages_for_llm,
-                    cycle_trace=cycle_trace,
+                    active_cycle=active_cycle,
                     state=state,
                     error_message=error_message,
                     previous_cycle_progress_events=(
                         previous_cycle_progress_events
                     ),
-                    cycle_snapshot=cycle_snapshot,
                 )
             else:
                 session.pending_cycle = None
@@ -4245,7 +4394,7 @@ class MCPClient:
                     cycle_trace=cycle_trace,
                     result_text=error_message,
                     state=state,
-                    cycle_snapshot=cycle_snapshot,
+                    active_cycle=active_cycle,
                     session=session,
                 )
             except Exception as archive_error:
@@ -5313,18 +5462,13 @@ class MCPClient:
         cycle_trace: List[Dict[str, Any]],
         result_text: str,
         state: SessionState,
-        cycle_snapshot: AgentCycleSnapshot | None = None,
+        active_cycle: ActiveAgentCycle | None = None,
         session: SessionMemory | None = None,
     ) -> None:
-        if cycle_snapshot is None:
+        if active_cycle is None:
             archived_progress_events = list(state.progress_events)
-        elif cycle_snapshot.status in {"waiting_user", "interrupted"}:
-            archived_progress_events = list(cycle_snapshot.progress_events)
         else:
-            archived_progress_events = (
-                list(cycle_snapshot.progress_events)
-                + list(state.progress_events)
-            )
+            archived_progress_events = list(active_cycle.progress_events)
 
         has_current_error = (
             state.status == AgentStatus.ERROR
@@ -5333,11 +5477,8 @@ class MCPClient:
             and session.last_error_cycle.get("cycle_id") == cycle_id
         )
         cycle_status = (
-            cycle_snapshot.status
-            if (
-                cycle_snapshot is not None
-                and cycle_snapshot.status in {"waiting_user", "interrupted"}
-            )
+            active_cycle.status
+            if active_cycle is not None
             else str(
                 state.status.value
                 if hasattr(state.status, "value")
@@ -5376,32 +5517,67 @@ class MCPClient:
             ),
             "cycle_status": cycle_status,
             "interruption_reason": (
-                cycle_snapshot.interruption_reason
-                if cycle_snapshot is not None
+                active_cycle.interruption_reason
+                if active_cycle is not None
                 else None
             ),
             "progress_events": archived_progress_events,
             "messages_for_llm": messages_for_llm,
             "cycle_trace": cycle_trace,
+            "working_memory": (
+                active_cycle.working_memory.model_dump(mode="json")
+                if (
+                    active_cycle is not None
+                    and active_cycle.working_memory is not None
+                )
+                else None
+            ),
+            "compaction_generation": (
+                active_cycle.working_memory.generation
+                if (
+                    active_cycle is not None
+                    and active_cycle.working_memory is not None
+                )
+                else 0
+            ),
+            "archived_segment_refs": (
+                list(active_cycle.working_memory.archived_segment_refs)
+                if (
+                    active_cycle is not None
+                    and active_cycle.working_memory is not None
+                )
+                else []
+            ),
             "working_summary": (
-                cycle_snapshot.working_summary
-                if cycle_snapshot is not None
+                active_cycle.working_memory.summary
+                if (
+                    active_cycle is not None
+                    and active_cycle.working_memory is not None
+                )
                 else ""
             ),
             "working_state": (
-                cycle_snapshot.working_state
-                if cycle_snapshot is not None
+                active_cycle.working_memory.working_state.model_dump(
+                    mode="json"
+                )
+                if (
+                    active_cycle is not None
+                    and active_cycle.working_memory is not None
+                )
                 else {}
             ),
             "waiting_question": (
-                cycle_snapshot.waiting_question
+                active_cycle.waiting_question
                 if (
-                    cycle_snapshot is not None
+                    active_cycle is not None
                     and state.status == AgentStatus.WAITING_USER
                 )
                 else None
             ),
         }
+
+        # TODO v0.5: replace the compatibility cycle JSON archive with a
+        # persistent CycleStore/PostgreSQL implementation.
 
         safe_session_id = self._safe_filename_part(session_id)
         safe_cycle_id = self._safe_filename_part(cycle_id)
@@ -5457,59 +5633,543 @@ class MCPClient:
             ),
         )
 
+    def _cycle_summary_target_tokens(self) -> int:
+        return min(
+            self.llm_config.max_tokens,
+            max(
+                128,
+                int(
+                    self._context_usable_input_tokens()
+                    * self.memory_config
+                    .cycle_compaction_summary_target_ratio
+                ),
+            ),
+        )
+
+    def _cycle_compactor_segment_budget(
+        self,
+        active_cycle: ActiveAgentCycle,
+    ) -> int:
+        metadata_without_segment = {
+            "type": "cycle_compaction_request",
+            "original_user_request": active_cycle.original_user_request,
+            "previous_working_memory": (
+                active_cycle.working_memory.model_dump()
+                if active_cycle.working_memory is not None
+                else None
+            ),
+            "active_plan_state": None,
+            "segment_content_id": "cnt_" + "0" * 32,
+            "segment_message_count": 1,
+            "segment_tokens_estimate": 1,
+            "target_summary_tokens": self._cycle_summary_target_tokens(),
+            "preserve_rules": [
+                "Preserve runtime-known opaque references.",
+            ],
+        }
+        overhead_messages = [
+            {
+                "role": "system",
+                "content": build_cycle_compaction_system_prompt(),
+            },
+            {
+                "role": "user",
+                "content": dumps_json(metadata_without_segment),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "BEGIN_UNTRUSTED_CYCLE_SEGMENT\n"
+                    "\nEND_UNTRUSTED_CYCLE_SEGMENT"
+                ),
+            },
+        ]
+        return max(
+            1,
+            self._context_trigger_tokens()
+            - self._estimate_messages_tokens(overhead_messages),
+        )
+
     async def _compact_context_if_needed(
         self,
         *,
-        messages_for_llm: List[Dict[str, Any]],
-        cycle_snapshot: AgentCycleSnapshot | None,
-        cycle_trace: List[Dict[str, Any]],
-        cycle_id: str,
-    ) -> List[Dict[str, Any]]:
-        """
-        TODO v0.4-cycle-compaction: compaction истории agent cycle.
-
-        Сейчас:
-        - оценивает размер контекста;
-        - если лимит превышен, логирует warning;
-        - возвращает messages_for_llm без изменений.
-
-        Result compaction выполняется отдельно сразу после завершения
-        каждого tool call. Этот метод в будущем будет заменять старые
-        закрытые части истории цикла на working_summary/working_state,
-        не разрывая assistant tool_calls и соответствующие role=tool.
-        """
-
-        tokens = self._estimate_messages_tokens(messages_for_llm)
-
-        if tokens < self._context_trigger_tokens():
-            return messages_for_llm
-
-        compaction_status = (
-            "enabled_not_implemented"
-            if self.llm_config.enable_context_compaction
-            else "disabled"
+        active_cycle: ActiveAgentCycle,
+        state: SessionState,
+        session_id: str,
+        progress_callback,
+    ) -> CycleCompactionOutcome:
+        messages_for_llm = active_cycle.messages_for_llm
+        cycle_trace = active_cycle.cycle_trace
+        before_tokens = self._estimate_messages_tokens(messages_for_llm)
+        trigger_tokens = self._context_trigger_tokens()
+        target_tokens = self._context_target_tokens()
+        usable_input_tokens = self._context_usable_input_tokens()
+        current_generation = (
+            active_cycle.working_memory.generation
+            if active_cycle.working_memory is not None
+            else 0
         )
 
-        logger.warning(
-            "Context compaction needed but not implemented yet: "
-            f"cycle_id={cycle_id}, "
-            f"estimated_tokens={tokens}, "
-            f"trigger_tokens={self._context_trigger_tokens()}, "
-            f"target_tokens={self._context_target_tokens()}, "
-            f"compaction_status={compaction_status}"
-        )
+        def outcome(
+            *,
+            changed: bool,
+            after_tokens: int,
+            passes_completed: int,
+            failure_reason: str | None = None,
+        ) -> CycleCompactionOutcome:
+            return CycleCompactionOutcome(
+                changed=changed,
+                messages_for_llm=messages_for_llm,
+                working_memory=active_cycle.working_memory,
+                before_tokens=before_tokens,
+                after_tokens=after_tokens,
+                passes_completed=passes_completed,
+                target_reached=after_tokens <= target_tokens,
+                failure_reason=failure_reason,
+            )
 
+        async def emit_failure(
+            *,
+            reason: str,
+            error_type: str,
+            current_tokens: int,
+            passes_completed: int,
+            segment_content_id: str | None = None,
+            logical_failure: bool,
+            enforce_hard_limit: bool = True,
+        ) -> CycleCompactionOutcome:
+            if logical_failure:
+                active_cycle.compaction_failures += 1
+                active_cycle.last_compaction_message_count = len(
+                    messages_for_llm
+                )
+            failure_data = {
+                "error_type": error_type,
+                "reason": reason,
+                "before_tokens": current_tokens,
+                "generation": (
+                    active_cycle.working_memory.generation
+                    if active_cycle.working_memory is not None
+                    else 0
+                ),
+            }
+            if segment_content_id is not None:
+                failure_data["segment_content_id"] = segment_content_id
+            self._trace_event(
+                cycle_trace,
+                "cycle_compaction_failed",
+                **failure_data,
+            )
+            progress_failure_data = {
+                key: value
+                for key, value in failure_data.items()
+                if key != "segment_content_id"
+            }
+            await self._emit_progress_event(
+                state=state,
+                session_id=session_id,
+                cycle_id=active_cycle.cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=cycle_trace,
+                event_type="cycle_compaction_failed",
+                severity="warning",
+                visibility="user",
+                data=progress_failure_data,
+            )
+            logger.warning(
+                "Cycle compaction failed: cycle_id=%s generation=%s "
+                "before_tokens=%s passes_completed=%s reason=%s "
+                "error_type=%s segment_content_id=%s",
+                active_cycle.cycle_id,
+                failure_data["generation"],
+                current_tokens,
+                passes_completed,
+                reason,
+                error_type,
+                segment_content_id,
+            )
+            if (
+                enforce_hard_limit
+                and current_tokens >= usable_input_tokens
+            ):
+                raise CycleContextLimitError(
+                    "Runtime could not safely reduce the active cycle "
+                    "below the hard context limit."
+                )
+            return outcome(
+                changed=passes_completed > 0,
+                after_tokens=current_tokens,
+                passes_completed=passes_completed,
+                failure_reason=reason,
+            )
+
+        if before_tokens < trigger_tokens:
+            return outcome(
+                changed=False,
+                after_tokens=before_tokens,
+                passes_completed=0,
+            )
+
+        if not self.llm_config.enable_context_compaction:
+            self._trace_event(
+                cycle_trace,
+                "context_warning",
+                estimated_tokens=before_tokens,
+                trigger_tokens=trigger_tokens,
+                target_tokens=target_tokens,
+                compaction_status="disabled",
+            )
+            if before_tokens >= usable_input_tokens:
+                raise CycleContextLimitError(
+                    "Context compaction is disabled and the active cycle "
+                    "has reached the hard context limit."
+                )
+            return outcome(
+                changed=False,
+                after_tokens=before_tokens,
+                passes_completed=0,
+                failure_reason="compaction_disabled",
+            )
+
+        if (
+            active_cycle.compaction_failures > 0
+            and active_cycle.last_compaction_message_count
+            == len(messages_for_llm)
+        ):
+            self._trace_event(
+                cycle_trace,
+                "cycle_compaction_skipped",
+                reason="unchanged_context_after_failure",
+                before_tokens=before_tokens,
+                generation=current_generation,
+                message_count=len(messages_for_llm),
+            )
+            if before_tokens >= usable_input_tokens:
+                raise CycleContextLimitError(
+                    "Repeated cycle compaction was skipped for unchanged "
+                    "context at the hard limit."
+                )
+            return outcome(
+                changed=False,
+                after_tokens=before_tokens,
+                passes_completed=0,
+                failure_reason="unchanged_context_after_failure",
+            )
+
+        started_data = {
+            "before_tokens": before_tokens,
+            "trigger_tokens": trigger_tokens,
+            "target_tokens": target_tokens,
+            "current_generation": current_generation,
+            "max_passes": (
+                self.memory_config.cycle_compaction_max_passes
+            ),
+        }
         self._trace_event(
             cycle_trace,
-            "context_warning",
-            cycle_id=cycle_id,
-            estimated_tokens=tokens,
-            trigger_tokens=self._context_trigger_tokens(),
-            target_tokens=self._context_target_tokens(),
-            compaction_status=compaction_status,
+            "cycle_compaction_started",
+            **started_data,
+        )
+        await self._emit_progress_event(
+            state=state,
+            session_id=session_id,
+            cycle_id=active_cycle.cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
+            event_type="cycle_compaction_started",
+            severity="info",
+            visibility="user",
+            data=started_data,
         )
 
-        return messages_for_llm
+        current_tokens = before_tokens
+        passes_completed = 0
+        max_passes = self.memory_config.cycle_compaction_max_passes
+        summary_target_tokens = self._cycle_summary_target_tokens()
+
+        for pass_index in range(1, max_passes + 1):
+            selection = self.cycle_segment_selector.select(
+                messages=messages_for_llm,
+                original_user_message_index=(
+                    active_cycle.original_user_message_index
+                ),
+                current_tokens=current_tokens,
+                target_tokens=target_tokens,
+                expected_summary_tokens=summary_target_tokens,
+                max_compactor_input_tokens=(
+                    self._cycle_compactor_segment_budget(active_cycle)
+                ),
+                keep_recent_blocks=(
+                    self.memory_config.cycle_compaction_keep_recent_blocks
+                ),
+            )
+            if selection is None:
+                self._trace_event(
+                    cycle_trace,
+                    "cycle_compaction_skipped",
+                    reason="no_safe_segment",
+                    before_tokens=current_tokens,
+                    generation=(
+                        active_cycle.working_memory.generation
+                        if active_cycle.working_memory is not None
+                        else 0
+                    ),
+                    pass_index=pass_index,
+                )
+                if passes_completed == 0:
+                    return await emit_failure(
+                        reason="no_safe_segment",
+                        error_type="CycleSegmentSelectionError",
+                        current_tokens=current_tokens,
+                        passes_completed=passes_completed,
+                        logical_failure=True,
+                    )
+                break
+
+            generation_candidate = (
+                active_cycle.working_memory.generation + 1
+                if active_cycle.working_memory is not None
+                else 1
+            )
+            try:
+                segment_content_ref = (
+                    await self.cycle_compaction_service.persist_segment(
+                        active_cycle=active_cycle,
+                        selection=selection,
+                        generation=generation_candidate,
+                        tokens_estimate=selection.estimated_tokens,
+                    )
+                )
+            except Exception as error:
+                return await emit_failure(
+                    reason="segment_persistence_failed",
+                    error_type=type(error).__name__,
+                    current_tokens=current_tokens,
+                    passes_completed=passes_completed,
+                    logical_failure=True,
+                )
+
+            segment_saved_data = {
+                "pass_index": pass_index,
+                "generation_candidate": generation_candidate,
+                "segment_content_id": segment_content_ref.content_id,
+                "message_start": selection.start,
+                "message_end_exclusive": selection.end_exclusive,
+                "message_count": len(selection.messages),
+                "segment_tokens_estimate": selection.estimated_tokens,
+            }
+            self._trace_event(
+                cycle_trace,
+                "cycle_compaction_segment_saved",
+                **segment_saved_data,
+            )
+
+            request = self.cycle_compaction_service.build_request(
+                active_cycle=active_cycle,
+                selection=selection,
+                segment_content_ref=segment_content_ref,
+                target_summary_tokens=summary_target_tokens,
+            )
+            extracted_refs = extract_cycle_refs(selection.messages)
+            compactor_messages = (
+                self.cycle_compaction_service.build_llm_messages(
+                    request=request,
+                    selection=selection,
+                )
+            )
+            if (
+                self._estimate_messages_tokens(compactor_messages)
+                > trigger_tokens
+            ):
+                return await emit_failure(
+                    reason="compactor_input_limit_exceeded",
+                    error_type="CycleSegmentSelectionError",
+                    current_tokens=current_tokens,
+                    passes_completed=passes_completed,
+                    segment_content_id=segment_content_ref.content_id,
+                    logical_failure=True,
+                )
+
+            try:
+                response = await self._call_llm_with_retries(
+                    compactor_messages,
+                    [],
+                    context=(
+                        "Cycle compaction: generation "
+                        f"{generation_candidate}"
+                    ),
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=active_cycle.cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                    max_tokens_override=summary_target_tokens,
+                    temperature_override=0.1,
+                    redact_error_details=True,
+                )
+                compaction_result = (
+                    self.cycle_compaction_service.parse_compaction_result(
+                        response.get("content", "") or ""
+                    )
+                )
+            except (
+                LLMTimeoutError,
+                LLMTransportError,
+                LLMHTTPError,
+                asyncio.TimeoutError,
+            ) as error:
+                await emit_failure(
+                    reason="compactor_infrastructure_error",
+                    error_type=type(error).__name__,
+                    current_tokens=current_tokens,
+                    passes_completed=passes_completed,
+                    segment_content_id=segment_content_ref.content_id,
+                    logical_failure=False,
+                    enforce_hard_limit=False,
+                )
+                raise
+            except (CycleCompactionOutputError, LLMError) as error:
+                return await emit_failure(
+                    reason="invalid_compaction_output",
+                    error_type=type(error).__name__,
+                    current_tokens=current_tokens,
+                    passes_completed=passes_completed,
+                    segment_content_id=segment_content_ref.content_id,
+                    logical_failure=True,
+                )
+
+            new_working_memory = (
+                self.cycle_compaction_service.build_working_memory(
+                    active_cycle=active_cycle,
+                    selection=selection,
+                    segment_content_ref=segment_content_ref,
+                    compaction_result=compaction_result,
+                    extracted_refs=extracted_refs,
+                )
+            )
+            try:
+                candidate_messages = (
+                    self.cycle_compaction_service
+                    .build_candidate_messages(
+                        active_cycle=active_cycle,
+                        selection=selection,
+                        working_memory=new_working_memory,
+                    )
+                )
+                validate_openai_tool_sequence(candidate_messages)
+            except CycleSegmentSelectionError as error:
+                return await emit_failure(
+                    reason="invalid_candidate_sequence",
+                    error_type=type(error).__name__,
+                    current_tokens=current_tokens,
+                    passes_completed=passes_completed,
+                    segment_content_id=segment_content_ref.content_id,
+                    logical_failure=True,
+                )
+
+            after_tokens = self._estimate_messages_tokens(
+                candidate_messages
+            )
+            if after_tokens >= current_tokens:
+                return await emit_failure(
+                    reason="no_context_reduction",
+                    error_type="CycleCompactionError",
+                    current_tokens=current_tokens,
+                    passes_completed=passes_completed,
+                    segment_content_id=segment_content_ref.content_id,
+                    logical_failure=True,
+                )
+
+            messages_for_llm[:] = candidate_messages
+            active_cycle.working_memory = new_working_memory
+            active_cycle.result_refs = list(
+                new_working_memory.working_state.result_refs
+            )
+            active_cycle.artifact_refs = list(
+                new_working_memory.working_state.artifact_refs
+            )
+            if new_working_memory.working_state.active_plan_id:
+                active_cycle.active_plan_id = (
+                    new_working_memory.working_state.active_plan_id
+                )
+            active_cycle.updated_at = time.time()
+            active_cycle.compaction_failures = 0
+            active_cycle.last_compaction_message_count = None
+            passes_completed += 1
+
+            pass_data = {
+                "pass_index": pass_index,
+                "generation": new_working_memory.generation,
+                "before_tokens": current_tokens,
+                "after_tokens": after_tokens,
+                "reclaimed_tokens": current_tokens - after_tokens,
+                "segment_content_id": segment_content_ref.content_id,
+            }
+            self._trace_event(
+                cycle_trace,
+                "cycle_compaction_pass_done",
+                **pass_data,
+            )
+            logger.info(
+                "Cycle compaction pass done: cycle_id=%s generation=%s "
+                "before_tokens=%s after_tokens=%s selected_message_count=%s "
+                "selected_block_count=%s pass_index=%s "
+                "segment_content_id=%s target_reached=%s",
+                active_cycle.cycle_id,
+                new_working_memory.generation,
+                current_tokens,
+                after_tokens,
+                len(selection.messages),
+                selection.selected_block_count,
+                pass_index,
+                segment_content_ref.content_id,
+                after_tokens <= target_tokens,
+            )
+            current_tokens = after_tokens
+            if current_tokens <= target_tokens:
+                break
+
+        if current_tokens >= usable_input_tokens:
+            return await emit_failure(
+                reason="hard_context_limit_after_compaction",
+                error_type="CycleContextLimitError",
+                current_tokens=current_tokens,
+                passes_completed=passes_completed,
+                logical_failure=False,
+            )
+
+        done_data = {
+            "before_tokens": before_tokens,
+            "after_tokens": current_tokens,
+            "passes_completed": passes_completed,
+            "generation": (
+                active_cycle.working_memory.generation
+                if active_cycle.working_memory is not None
+                else 0
+            ),
+            "target_reached": current_tokens <= target_tokens,
+        }
+        self._trace_event(
+            cycle_trace,
+            "cycle_compaction_done",
+            **done_data,
+        )
+        await self._emit_progress_event(
+            state=state,
+            session_id=session_id,
+            cycle_id=active_cycle.cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
+            event_type="cycle_compaction_done",
+            severity="success",
+            visibility="internal",
+            data=done_data,
+        )
+        return outcome(
+            changed=passes_completed > 0,
+            after_tokens=current_tokens,
+            passes_completed=passes_completed,
+        )
 
     def _get_or_create_state(self, session_id: str) -> SessionState:
         """

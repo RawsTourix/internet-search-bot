@@ -1,0 +1,46 @@
+"""Mutable runtime state owned by one active agent cycle."""
+
+from __future__ import annotations
+
+import time
+from dataclasses import dataclass, field
+from typing import Any
+
+from ..memory.models import CycleWorkingMemory
+
+
+@dataclass(slots=True)
+class ActiveAgentCycle:
+    cycle_id: str
+    session_id: str
+    original_user_request: str
+
+    messages_for_llm: list[dict[str, Any]]
+    cycle_trace: list[dict[str, Any]]
+
+    original_user_message_index: int
+
+    working_memory: CycleWorkingMemory | None = None
+
+    status: str = "running"
+    waiting_question: str | None = None
+    interruption_reason: str | None = None
+    interrupted_at: float | None = None
+
+    result_refs: list[str] = field(default_factory=list)
+    artifact_refs: list[str] = field(default_factory=list)
+    active_plan_id: str | None = None
+
+    tools_used: list[str] = field(default_factory=list)
+    progress_events: list[dict[str, Any]] = field(default_factory=list)
+
+    compaction_failures: int = 0
+    last_compaction_message_count: int | None = None
+
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+
+
+# Compatibility name for internal imports and older callers. There is only
+# one dataclass model; this is intentionally an alias rather than a subclass.
+AgentCycleSnapshot = ActiveAgentCycle

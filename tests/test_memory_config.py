@@ -55,6 +55,9 @@ class MemoryConfigTests(unittest.TestCase):
                     "single_pass_summary_max_input_ratio": 0.8,
                     "result_summary_target_ratio": 0.05,
                     "result_preview_max_chars": 123,
+                    "cycle_compaction_summary_target_ratio": 0.03,
+                    "cycle_compaction_keep_recent_blocks": 4,
+                    "cycle_compaction_max_passes": 5,
                 })
             )
         )
@@ -64,6 +67,12 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertEqual(memory.single_pass_summary_max_input_ratio, 0.8)
         self.assertEqual(memory.result_summary_target_ratio, 0.05)
         self.assertEqual(memory.result_preview_max_chars, 123)
+        self.assertEqual(
+            memory.cycle_compaction_summary_target_ratio,
+            0.03,
+        )
+        self.assertEqual(memory.cycle_compaction_keep_recent_blocks, 4)
+        self.assertEqual(memory.cycle_compaction_max_passes, 5)
 
     def test_invalid_memory_config_is_managed(self):
         invalid_values = (
@@ -78,6 +87,10 @@ class MemoryConfigTests(unittest.TestCase):
                 "result_summary_target_ratio": 0.6,
             },
             {"result_preview_max_chars": 0},
+            {"cycle_compaction_summary_target_ratio": 0},
+            {"cycle_compaction_keep_recent_blocks": 0},
+            {"cycle_compaction_max_passes": 0},
+            {"cycle_compaction_max_passes": 11},
             {"extra": True},
         )
 
@@ -91,6 +104,9 @@ class MemoryConfigTests(unittest.TestCase):
             {"single_pass_summary_max_input_ratio": 0},
             {"result_summary_target_ratio": 2},
             {"result_preview_max_chars": -1},
+            {"cycle_compaction_summary_target_ratio": 1.1},
+            {"cycle_compaction_keep_recent_blocks": -1},
+            {"cycle_compaction_max_passes": 11},
         ):
             with self.subTest(kwargs=kwargs):
                 with self.assertRaises(ValidationError):

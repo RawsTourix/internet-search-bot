@@ -64,6 +64,11 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "cycle_done": "✅ Задача завершена.",
         "cycle_error": "⚠️ Задача завершилась с ошибкой.",
         "context_warning": "⚠️ Контекст задачи стал большим.",
+        "cycle_compaction_started": "🧠 Освобождаю рабочий контекст…",
+        "cycle_compaction_done": "✅ Рабочий контекст обновлён.",
+        "cycle_compaction_failed": (
+            "⚠️ Не удалось безопасно сжать рабочий контекст."
+        ),
         "result_persist_started": "💾 Сохраняю большой результат…",
         "result_persist_done": "✅ Большой результат сохранён.",
         "result_persist_failed": "⚠️ Не удалось сохранить большой результат.",
@@ -138,6 +143,11 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "cycle_done": "✅ Task completed.",
         "cycle_error": "⚠️ Task failed.",
         "context_warning": "⚠️ Task context is getting large.",
+        "cycle_compaction_started": "🧠 Freeing working context…",
+        "cycle_compaction_done": "✅ Working context updated.",
+        "cycle_compaction_failed": (
+            "⚠️ Failed to compact the working context safely."
+        ),
         "result_persist_started": "💾 Saving the large result…",
         "result_persist_done": "✅ Large result saved.",
         "result_persist_failed": "⚠️ Failed to save the large result.",
