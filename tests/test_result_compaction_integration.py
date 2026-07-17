@@ -229,6 +229,18 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         summary_messages = call_args.args[0]
         self.assertIn("prompt injection", summary_messages[0]["content"])
+        self.assertIn(
+            '"additionalProperties":false',
+            summary_messages[0]["content"],
+        )
+        self.assertIn(
+            '"suggested_follow_up"',
+            summary_messages[0]["content"],
+        )
+        self.assertIn(
+            '"type":"result_compaction"',
+            summary_messages[0]["content"],
+        )
         self.assertNotIn(sentinel, summary_messages[1]["content"])
         self.assertIn(sentinel, summary_messages[2]["content"])
 
@@ -274,7 +286,7 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             return_value={"content": "not-json"}
         )
 
-        outcome, messages, trace, _ = await self._process(
+        outcome, messages, trace, events = await self._process(
             raw,
             handling=ResultHandling.COMPACT,
         )
@@ -291,7 +303,54 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "result_compaction_failed",
             [event["type"] for event in trace],
         )
+        failed_event = next(
+            event for event in events
+            if event["type"] == "result_compaction_failed"
+        )
+        self.assertEqual(
+            failed_event["data"]["validation_issue_count"],
+            1,
+        )
+        self.assertEqual(
+            failed_event["data"]["validation_issues"],
+            [{"type": "json_invalid", "location": ["$"]}],
+        )
         self.client._call_llm_with_retries.assert_awaited_once()
+
+    async def test_validation_diagnostics_redact_untrusted_field_names(self):
+        raw = "x" * 2_000
+        untrusted_field = "RAW_RESPONSE_SENTINEL"
+        self.client._call_llm_with_retries = AsyncMock(return_value={
+            "content": dumps_json({
+                "summary": "summary",
+                untrusted_field: "must not be logged",
+            })
+        })
+
+        with self.assertLogs("mcp_client", level="INFO") as captured:
+            outcome, _, trace, events = await self._process(
+                raw,
+                handling=ResultHandling.COMPACT,
+            )
+
+        self.assertTrue(outcome.summary_failed)
+        failed_event = next(
+            event for event in events
+            if event["type"] == "result_compaction_failed"
+        )
+        self.assertEqual(
+            failed_event["data"]["validation_issues"],
+            [{
+                "type": "extra_forbidden",
+                "location": ["<untrusted-field>"],
+            }],
+        )
+        serialized = (
+            json.dumps(trace, ensure_ascii=False)
+            + json.dumps(events, ensure_ascii=False)
+            + "\n".join(captured.output)
+        )
+        self.assertNotIn(untrusted_field, serialized)
 
     async def test_summary_http_failure_redacts_provider_response(self):
         raw = "x" * 2_000

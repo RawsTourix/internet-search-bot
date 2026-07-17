@@ -157,11 +157,11 @@ class MessageProcessor:
         elif command == "/reset":
             try:
                 await API.reset(self._build_session_id(message))
-                return "Память успешно очищена."
+                return "✅ Память успешно очищена."
             except Exception as e:
-                return f"Ошибка очистки памяти: {e}."
+                return f"⚠️ Ошибка очистки памяти: {e}."
         else:
-            return f"Неизвестная команда: {command}"
+            return f"⚠️ Неизвестная команда: {command}"
     
     def _get_help_text(self) -> str:
         """Справочная информация"""

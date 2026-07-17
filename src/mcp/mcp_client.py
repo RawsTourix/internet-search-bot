@@ -44,7 +44,7 @@ from ..memory import (
     ResultContextBudgetPolicy,
     ResultHandling,
     ResultProcessingOutcome,
-    RESULT_COMPACTION_SYSTEM_PROMPT,
+    build_result_compaction_system_prompt,
 )
 from ..storage.models import new_result_id
 
@@ -2284,7 +2284,7 @@ class MCPClient:
         messages_without_raw = [
             {
                 "role": "system",
-                "content": RESULT_COMPACTION_SYSTEM_PROMPT,
+                "content": build_result_compaction_system_prompt(),
             },
             {
                 "role": "user",
@@ -2299,6 +2299,38 @@ class MCPClient:
             },
         ]
         return self._estimate_messages_tokens(messages_without_raw)
+
+    @staticmethod
+    def _result_compaction_validation_diagnostics(
+        error: Exception,
+    ) -> dict[str, Any]:
+        if not isinstance(error, ValidationError):
+            return {}
+
+        trusted_fields = set(ResultCompactionSummary.model_fields)
+        issues: list[dict[str, Any]] = []
+        for issue in error.errors(
+            include_url=False,
+            include_context=False,
+            include_input=False,
+        )[:10]:
+            safe_location: list[str | int] = []
+            for part in issue.get("loc", ()):
+                if isinstance(part, int):
+                    safe_location.append(part)
+                elif isinstance(part, str) and part in trusted_fields:
+                    safe_location.append(part)
+                else:
+                    safe_location.append("<untrusted-field>")
+            issues.append({
+                "type": str(issue.get("type", "validation_error")),
+                "location": safe_location or ["$"],
+            })
+
+        return {
+            "validation_issue_count": error.error_count(),
+            "validation_issues": issues,
+        }
 
     @staticmethod
     def _strip_single_markdown_fence(content: str) -> str:
@@ -2326,7 +2358,7 @@ class MCPClient:
         messages = [
             {
                 "role": "system",
-                "content": RESULT_COMPACTION_SYSTEM_PROMPT,
+                "content": build_result_compaction_system_prompt(),
             },
             {
                 "role": "user",
@@ -2713,6 +2745,9 @@ class MCPClient:
                 )
             except Exception as error:
                 summary_failed = True
+                validation_diagnostics = (
+                    self._result_compaction_validation_diagnostics(error)
+                )
                 stored_ref = self.result_compaction_service.build_failed_ref(
                     result_id=result_id,
                     content_ref=content_ref,
@@ -2729,6 +2764,7 @@ class MCPClient:
                         "content_id": content_ref.content_id,
                         "error_type": type(error).__name__,
                         "summary_status": "failed",
+                        **validation_diagnostics,
                     },
                     state=state,
                     session_id=session_id,
@@ -2741,12 +2777,14 @@ class MCPClient:
                 )
                 logger.warning(
                     "Result compaction failed: tool=%s call_id=%s "
-                    "result_id=%s content_id=%s error_type=%s",
+                    "result_id=%s content_id=%s error_type=%s "
+                    "validation_issues=%s",
                     effective_tool_name,
                     tool_call_id,
                     result_id,
                     content_ref.content_id,
                     type(error).__name__,
+                    validation_diagnostics.get("validation_issues"),
                 )
             else:
                 stored_ref = (

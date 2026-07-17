@@ -18,6 +18,7 @@ from .models import (
 from .result_compaction import (
     RESULT_COMPACTION_SYSTEM_PROMPT,
     ResultCompactionService,
+    build_result_compaction_system_prompt,
 )
 
 __all__ = [
@@ -34,4 +35,5 @@ __all__ = [
     "ResultHandling",
     "ResultProcessingOutcome",
     "RESULT_COMPACTION_SYSTEM_PROMPT",
+    "build_result_compaction_system_prompt",
 ]
