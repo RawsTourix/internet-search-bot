@@ -14,6 +14,7 @@ from .interfaces import ArtifactStore, ContentStore
 
 @dataclass(slots=True)
 class StorageServices:
+    config: StorageConfigType
     content_store: ContentStore
     artifact_store: ArtifactStore
 
@@ -26,6 +27,7 @@ def create_storage_services(config: StorageConfigType) -> StorageServices:
         )
     backend = _AtomicFileBackend(config)
     return StorageServices(
+        config=config,
         content_store=FileSystemContentStore(backend),
         artifact_store=FileSystemArtifactStore(backend),
     )

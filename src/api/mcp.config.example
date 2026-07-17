@@ -69,5 +69,12 @@
         "atomic_writes": true,
         "verify_content_hash": true,
         "max_in_memory_content_bytes": 67108864
+    },
+    "memory": {
+        "enable_result_compaction": true,
+        "inline_result_max_input_ratio": 0.10,
+        "single_pass_summary_max_input_ratio": 0.60,
+        "result_summary_target_ratio": 0.01,
+        "result_preview_max_chars": 4000
     }
 }

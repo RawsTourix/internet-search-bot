@@ -15,6 +15,7 @@ from src.gateway import (
     make_http_progress_callback,
 )
 from src.core.errors import LLMHTTPError, LLMTimeoutError, LLMTransportError
+from src.api.api import API
 from src.mcp.mcp_client import (
     FinalProcessingDecision,
     FinalProcessingMode,
@@ -83,6 +84,13 @@ class ProgressRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(event.type, "final_processing_started")
+
+    def test_api_passes_memory_config_to_mcp_client(self):
+        self.assertIs(API.mcp_client.memory_config, API.memory_config)
+        self.assertIs(
+            API.mcp_client.result_compaction_service.config,
+            API.memory_config,
+        )
 
     def test_progress_data_is_sanitized_and_truncated(self):
         result = self.client._safe_progress_data({

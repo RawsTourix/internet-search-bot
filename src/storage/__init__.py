@@ -18,6 +18,7 @@ from .models import (
     ContentMetadata,
     ContentRange,
     ContentRef,
+    SummaryStatus,
     StoredResultRef,
 )
 
@@ -37,6 +38,7 @@ __all__ = [
     "StorageSerializationError",
     "StorageServices",
     "StorageValidationError",
+    "SummaryStatus",
     "StoredResultRef",
     "UnsupportedStorageBackendError",
     "create_storage_services",

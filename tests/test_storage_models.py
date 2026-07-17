@@ -64,6 +64,10 @@ class StorageModelTests(unittest.TestCase):
                     tool_call_id="call-1",
                     tool_name="search",
                     summary_status=status,
+                    size_bytes=5,
+                    size_chars=5,
+                    size_tokens_estimate=3,
+                    content_hash=HASH,
                 )
                 self.assertEqual(result.summary_status, status)
                 self.assertEqual(
@@ -80,6 +84,10 @@ class StorageModelTests(unittest.TestCase):
                 tool_call_id="call-1",
                 tool_name="search",
                 summary_status="unknown",
+                size_bytes=5,
+                size_chars=5,
+                size_tokens_estimate=3,
+                content_hash=HASH,
             )
 
     def test_invalid_version_id_hash_extra_and_naive_datetime_are_rejected(self):

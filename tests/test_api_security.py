@@ -2,8 +2,10 @@ import unittest
 
 from src.api.config import (
     safe_llm_config_summary,
+    safe_memory_config_summary,
     safe_mcp_server_config_summary,
 )
+from src.memory import MemoryConfigType
 from src.mcp.mcp_client import LLMConfigType, ServerConfigType, ServerConnectType
 
 
@@ -30,6 +32,7 @@ class ApiConfigLoggingTests(unittest.TestCase):
             {
                 "llm": safe_llm_config_summary(llm_config),
                 "servers": safe_mcp_server_config_summary(server_configs),
+                "memory": safe_memory_config_summary(MemoryConfigType()),
             }
         )
 
@@ -39,6 +42,7 @@ class ApiConfigLoggingTests(unittest.TestCase):
         self.assertNotIn("mcp-env-secret", summaries)
         self.assertIn("test-model", summaries)
         self.assertIn("private-server", summaries)
+        self.assertIn("enable_result_compaction", summaries)
 
 
 if __name__ == "__main__":

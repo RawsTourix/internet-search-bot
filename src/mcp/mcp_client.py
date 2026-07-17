@@ -15,7 +15,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ValidationError, model_validator
 from typing import Optional, List, Dict, Any, Tuple, Callable, Awaitable
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from contextlib import AsyncExitStack
 from types import SimpleNamespace
@@ -34,6 +34,19 @@ from ..agent.progress_messages import normalize_progress_locale, progress_text
 from .server_manager import MCPServerConnectionError, MCPServerManager
 from ..agent.protocol import AgentAction, ProgressEvent, dumps_json
 from ..storage import StorageConfigType, StorageServices, StorageValidationError
+from ..memory import (
+    InvalidResultHandlingError,
+    MemoryConfigType,
+    MemoryConfigValidationError,
+    ResultCompactionRequest,
+    ResultCompactionService,
+    ResultCompactionSummary,
+    ResultContextBudgetPolicy,
+    ResultHandling,
+    ResultProcessingOutcome,
+    RESULT_COMPACTION_SYSTEM_PROMPT,
+)
+from ..storage.models import new_result_id
 
 # Модели
 class ServerConnectType(str, Enum):
@@ -450,7 +463,10 @@ class MCPClient:
         ...     api_url="https://api.openai.com/v1/chat/completions",
         ...     api_key="sk-..."
         ... )
-        >>> client = MCPClient(llm_config)
+        >>> client = MCPClient(
+        ...     llm_config,
+        ...     storage_services=storage_services,
+        ... )
     """
     SENSITIVE_PROGRESS_KEYS = {
         "api_key", "apikey", "token", "password", "secret",
@@ -461,7 +477,8 @@ class MCPClient:
         self,
         llm_config: LLMConfigType,
         *,
-        storage_services: StorageServices | None = None,
+        storage_services: StorageServices,
+        memory_config: MemoryConfigType | None = None,
     ):
         """
         Description:
@@ -471,7 +488,8 @@ class MCPClient:
         Args:
         ---------------
             llm_config: Конфигурация для LLM
-            storage_services: Внедрённые storage interfaces; временно optional
+            storage_services: Внедрённые storage interfaces
+            memory_config: Настройки обработки результатов инструментов
         """
         self.session = None
         self.exit_stack = AsyncExitStack()
@@ -482,18 +500,35 @@ class MCPClient:
         self.llm_config = llm_config
 
         self.storage_services = storage_services
-        self.content_store = (
-            storage_services.content_store
-            if storage_services is not None
-            else None
+        self.content_store = storage_services.content_store
+        self.artifact_store = storage_services.artifact_store
+        self.memory_config = memory_config or MemoryConfigType()
+        self.result_budget_policy = ResultContextBudgetPolicy(
+            context_window_tokens=llm_config.context_window_tokens,
+            reserved_output_tokens=llm_config.reserved_output_tokens,
+            max_output_tokens=llm_config.max_tokens,
+            context_safety_ratio=llm_config.context_safety_ratio,
+            context_compaction_target_ratio=(
+                llm_config.context_compaction_target_ratio
+            ),
+            inline_result_max_input_ratio=(
+                self.memory_config.inline_result_max_input_ratio
+            ),
+            single_pass_summary_max_input_ratio=(
+                self.memory_config.single_pass_summary_max_input_ratio
+            ),
+            result_summary_target_ratio=(
+                self.memory_config.result_summary_target_ratio
+            ),
+            max_in_memory_content_bytes=(
+                storage_services.config.max_in_memory_content_bytes
+            ),
         )
-        self.artifact_store = (
-            storage_services.artifact_store
-            if storage_services is not None
-            else None
+        self.result_compaction_service = ResultCompactionService(
+            content_store=self.content_store,
+            config=self.memory_config,
+            budget_policy=self.result_budget_policy,
         )
-        # TODO v0.4-result-compaction:
-        # content_store becomes required for raw tool result persistence.
 
         headers = dict(llm_config.headers or {})
 
@@ -639,6 +674,21 @@ class MCPClient:
                                 "Аргументы инструмента по его inputSchema."
                             ),
                             "additionalProperties": True,
+                        },
+                        "result_handling": {
+                            "type": "string",
+                            "enum": [
+                                "auto",
+                                "prefer_inline",
+                                "compact",
+                                "store_only",
+                            ],
+                            "default": "auto",
+                            "description": (
+                                "Предпочтительный способ обработки результата. "
+                                "Runtime может переопределить его ради "
+                                "безопасности."
+                            ),
                         },
                     },
                     "required": ["tool_name", "arguments"],
@@ -1255,6 +1305,43 @@ class MCPClient:
                 if tool_name == "mcp_get_runtime_context":
                     evidence["runtime_contexts"].append(evidence_item)
 
+                continue
+
+            if event_type == "tool_result_stored":
+                result_ref = event.get("result_ref")
+                if not isinstance(result_ref, dict):
+                    continue
+
+                evidence_item = {
+                    "representation": "stored_result_ref",
+                    "tool_name": event.get("tool_name"),
+                    "tool_call_id": event.get("tool_call_id"),
+                    "result_ref": dict(result_ref),
+                }
+                status = result_ref.get("summary_status")
+                limitation_message = None
+                if status in {"store_only", "oversized"}:
+                    limitation_message = (
+                        "Полное содержимое результата не было обработано "
+                        "агентом."
+                    )
+                elif status == "failed":
+                    limitation_message = (
+                        "Оригинал сохранён, но краткое описание не было "
+                        "создано."
+                    )
+
+                if limitation_message is not None:
+                    evidence_item["limitations"] = [limitation_message]
+                    evidence["limitations"].append({
+                        "type": "stored_result_limitation",
+                        "tool_name": event.get("tool_name"),
+                        "tool_call_id": event.get("tool_call_id"),
+                        "summary_status": status,
+                        "message": limitation_message,
+                    })
+
+                evidence["tool_results"].append(evidence_item)
                 continue
 
             if event_type == "tool_error":
@@ -2102,6 +2189,641 @@ class MCPClient:
             ),
         }
 
+    def _parse_result_handling(
+        self,
+        arguments: dict[str, Any],
+    ) -> ResultHandling:
+        value = arguments.get("result_handling", ResultHandling.AUTO.value)
+        try:
+            return ResultHandling(value)
+        except (TypeError, ValueError) as error:
+            raise InvalidResultHandlingError(
+                f"Unknown result_handling: {value!r}"
+            ) from error
+
+    def _resolve_effective_tool_context(
+        self,
+        outer_tool_name: str,
+        outer_arguments: dict[str, Any],
+    ) -> tuple[str, dict[str, Any], ResultHandling]:
+        if outer_tool_name != "mcp_call_tool":
+            return (
+                outer_tool_name,
+                outer_arguments,
+                ResultHandling.AUTO,
+            )
+
+        handling = self._parse_result_handling(outer_arguments)
+        effective_tool_name = str(outer_arguments.get("tool_name") or "")
+        effective_arguments = outer_arguments.get("arguments") or {}
+        if not isinstance(effective_arguments, dict):
+            raise ValueError("mcp_call_tool arguments must be an object")
+        return effective_tool_name, effective_arguments, handling
+
+    def _extract_canonical_tool_result(
+        self,
+        *,
+        tool_payload: dict[str, Any],
+        fallback_text: str,
+    ) -> str:
+        if (
+            tool_payload.get("type") == "tool_result"
+            and isinstance(tool_payload.get("content"), str)
+        ):
+            return tool_payload["content"]
+        return fallback_text
+
+    def _result_summary_request(
+        self,
+        *,
+        result_id: str,
+        original_user_request: str,
+        effective_tool_name: str,
+        effective_arguments: dict[str, Any],
+        size_bytes: int,
+        size_chars: int,
+        size_tokens_estimate: int,
+        summary_target_tokens: int,
+    ) -> ResultCompactionRequest:
+        return ResultCompactionRequest(
+            original_user_request=original_user_request,
+            current_goal=original_user_request,
+            agent_activity=None,
+            active_plan_node=None,
+            result_id=result_id,
+            tool_name=effective_tool_name,
+            tool_arguments=effective_arguments,
+            size_bytes=size_bytes,
+            size_chars=size_chars,
+            size_tokens_estimate=size_tokens_estimate,
+            summary_target_tokens=summary_target_tokens,
+        )
+
+    def _result_summary_request_overhead_tokens(
+        self,
+        *,
+        original_user_request: str,
+        effective_tool_name: str,
+        effective_arguments: dict[str, Any],
+        size_bytes: int,
+        size_chars: int,
+        size_tokens_estimate: int,
+    ) -> int:
+        request = self._result_summary_request(
+            result_id="res_" + "0" * 32,
+            original_user_request=original_user_request,
+            effective_tool_name=effective_tool_name,
+            effective_arguments=effective_arguments,
+            size_bytes=size_bytes,
+            size_chars=size_chars,
+            size_tokens_estimate=size_tokens_estimate,
+            summary_target_tokens=(
+                self.result_budget_policy.summary_target_tokens
+            ),
+        )
+        messages_without_raw = [
+            {
+                "role": "system",
+                "content": RESULT_COMPACTION_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": request.model_dump_json(),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "BEGIN_UNTRUSTED_TOOL_RESULT\n"
+                    "\nEND_UNTRUSTED_TOOL_RESULT"
+                ),
+            },
+        ]
+        return self._estimate_messages_tokens(messages_without_raw)
+
+    @staticmethod
+    def _strip_single_markdown_fence(content: str) -> str:
+        content = content.strip()
+        match = re.fullmatch(
+            r"```(?:json)?\s*\n?(.*?)\n?```",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        return match.group(1).strip() if match else content
+
+    async def _summarize_tool_result(
+        self,
+        *,
+        request: ResultCompactionRequest,
+        raw_result: str,
+        decision,
+        effective_tool_name: str,
+        state: SessionState,
+        session_id: str,
+        cycle_id: str,
+        progress_callback,
+        cycle_trace: list[dict[str, Any]],
+    ) -> ResultCompactionSummary:
+        messages = [
+            {
+                "role": "system",
+                "content": RESULT_COMPACTION_SYSTEM_PROMPT,
+            },
+            {
+                "role": "user",
+                "content": request.model_dump_json(),
+            },
+            {
+                "role": "user",
+                "content": (
+                    "BEGIN_UNTRUSTED_TOOL_RESULT\n"
+                    + raw_result
+                    + "\nEND_UNTRUSTED_TOOL_RESULT"
+                ),
+            },
+        ]
+        response = await self._call_llm_with_retries(
+            messages,
+            [],
+            context=f"Result compaction: {effective_tool_name}",
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
+            max_tokens_override=decision.summary_target_tokens,
+            temperature_override=0.1,
+            redact_error_details=True,
+        )
+        content = response.get("content", "") or ""
+        return ResultCompactionSummary.model_validate_json(
+            self._strip_single_markdown_fence(content)
+        )
+
+    async def _record_result_stage(
+        self,
+        *,
+        event_type: str,
+        data: dict[str, Any],
+        state: SessionState,
+        session_id: str,
+        cycle_id: str,
+        progress_callback,
+        cycle_trace: list[dict[str, Any]],
+        outer_tool_name: str,
+        effective_tool_name: str,
+        severity: str = "info",
+        visibility: str = "user",
+    ) -> None:
+        self._trace_event(cycle_trace, event_type, **data)
+        await self._emit_progress_event(
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
+            event_type=event_type,
+            tool_name=outer_tool_name,
+            target_tool_name=(
+                effective_tool_name
+                if effective_tool_name != outer_tool_name
+                else None
+            ),
+            server_name=self._resolve_progress_server_name(
+                effective_tool_name
+            ),
+            severity=severity,
+            visibility=visibility,
+            data=data,
+        )
+
+    async def _process_tool_result_for_context(
+        self,
+        *,
+        outer_tool_name: str,
+        effective_tool_name: str,
+        tool_call_id: str,
+        outer_arguments: dict[str, Any],
+        effective_arguments: dict[str, Any],
+        raw_tool_result_text: str,
+        tool_payload: dict[str, Any],
+        result_handling: ResultHandling,
+        messages_for_llm: list[dict[str, Any]],
+        original_user_request: str,
+        session_id: str,
+        cycle_id: str,
+        state: SessionState,
+        cycle_trace: list[dict[str, Any]],
+        progress_callback,
+    ) -> ResultProcessingOutcome:
+        canonical_result = self._extract_canonical_tool_result(
+            tool_payload=tool_payload,
+            fallback_text=raw_tool_result_text,
+        )
+        result_size_bytes = len(canonical_result.encode("utf-8"))
+        result_size_chars = len(canonical_result)
+        result_tokens = self._estimate_tokens_rough(canonical_result)
+        current_context_tokens = self._estimate_messages_tokens(
+            messages_for_llm
+        )
+        summary_overhead_tokens = (
+            self._result_summary_request_overhead_tokens(
+                original_user_request=original_user_request,
+                effective_tool_name=effective_tool_name,
+                effective_arguments=effective_arguments,
+                size_bytes=result_size_bytes,
+                size_chars=result_size_chars,
+                size_tokens_estimate=result_tokens,
+            )
+        )
+        decision = self.result_compaction_service.decide(
+            handling=result_handling,
+            current_context_tokens=current_context_tokens,
+            result_tokens=result_tokens,
+            result_size_bytes=result_size_bytes,
+            summary_request_overhead_tokens=summary_overhead_tokens,
+        )
+
+        if decision.representation == "inline":
+            self._trace_event(
+                cycle_trace,
+                "tool_result_full",
+                tool_name=effective_tool_name,
+                tool_call_id=tool_call_id,
+                result=tool_payload,
+            )
+            messages_for_llm.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": dumps_json(tool_payload),
+            })
+            logger.info(
+                "Tool result processed: outer_tool=%s tool=%s call_id=%s "
+                "chars=%s bytes=%s tokens=%s handling=%s "
+                "representation=inline",
+                outer_tool_name,
+                effective_tool_name,
+                tool_call_id,
+                result_size_chars,
+                result_size_bytes,
+                result_tokens,
+                result_handling.value,
+            )
+            return ResultProcessingOutcome(
+                decision=decision,
+                visible_payload=tool_payload,
+            )
+
+        result_id = new_result_id()
+        stage_data = {
+            "result_id": result_id,
+            "tool_name": effective_tool_name,
+            "tool_call_id": tool_call_id,
+            "size_bytes": result_size_bytes,
+            "size_chars": result_size_chars,
+            "size_tokens_estimate": result_tokens,
+            "result_handling": result_handling.value,
+            "representation": decision.representation,
+            "runtime_override": decision.runtime_override,
+        }
+        await self._record_result_stage(
+            event_type="result_persist_started",
+            data=stage_data,
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
+            outer_tool_name=outer_tool_name,
+            effective_tool_name=effective_tool_name,
+        )
+
+        try:
+            content_ref = await self.result_compaction_service.persist_result(
+                result_id=result_id,
+                raw_result=canonical_result,
+                effective_tool_name=effective_tool_name,
+                manager_tool_name=outer_tool_name,
+                cycle_id=cycle_id,
+                tool_call_id=tool_call_id,
+                result_handling=result_handling,
+                result_tokens=result_tokens,
+            )
+        except Exception as error:
+            failure_data = {
+                **stage_data,
+                "error_type": type(error).__name__,
+            }
+            await self._record_result_stage(
+                event_type="result_persist_failed",
+                data=failure_data,
+                state=state,
+                session_id=session_id,
+                cycle_id=cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=cycle_trace,
+                outer_tool_name=outer_tool_name,
+                effective_tool_name=effective_tool_name,
+                severity="warning",
+            )
+            logger.error(
+                "Tool result persistence failed: outer_tool=%s tool=%s "
+                "call_id=%s chars=%s bytes=%s tokens=%s "
+                "handling=%s representation=%s error_type=%s",
+                outer_tool_name,
+                effective_tool_name,
+                tool_call_id,
+                result_size_chars,
+                result_size_bytes,
+                result_tokens,
+                result_handling.value,
+                decision.representation,
+                type(error).__name__,
+            )
+
+            inline_fallback = self.result_compaction_service.decide(
+                handling=ResultHandling.PREFER_INLINE,
+                current_context_tokens=current_context_tokens,
+                result_tokens=result_tokens,
+                result_size_bytes=result_size_bytes,
+                summary_request_overhead_tokens=summary_overhead_tokens,
+            )
+            if inline_fallback.representation == "inline":
+                fallback_decision = replace(
+                    inline_fallback,
+                    reason="persistence_failed_safe_inline_fallback",
+                    runtime_override=True,
+                )
+                self._trace_event(
+                    cycle_trace,
+                    "result_persistence_inline_fallback",
+                    result_id=result_id,
+                    tool_name=effective_tool_name,
+                    tool_call_id=tool_call_id,
+                    requested_handling=result_handling.value,
+                )
+                self._trace_event(
+                    cycle_trace,
+                    "tool_result_full",
+                    tool_name=effective_tool_name,
+                    tool_call_id=tool_call_id,
+                    result=tool_payload,
+                )
+                messages_for_llm.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": dumps_json(tool_payload),
+                })
+                return ResultProcessingOutcome(
+                    decision=fallback_decision,
+                    visible_payload=tool_payload,
+                    persistence_failed=True,
+                )
+
+            error_payload = {
+                "type": "tool_result_processing_error",
+                "trusted": False,
+                "tool_name": effective_tool_name,
+                "error": (
+                    "Инструмент завершился, но большой результат не удалось "
+                    "безопасно сохранить."
+                ),
+                "result_available": False,
+                "retry_recommended": False,
+                "security_note": (
+                    "Raw result intentionally omitted for context safety."
+                ),
+            }
+            self._trace_event(
+                cycle_trace,
+                "tool_result_processing_error",
+                result_id=result_id,
+                tool_name=effective_tool_name,
+                tool_call_id=tool_call_id,
+                error_type=type(error).__name__,
+                result_available=False,
+                retry_recommended=False,
+            )
+            messages_for_llm.append({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": dumps_json(error_payload),
+            })
+            return ResultProcessingOutcome(
+                decision=decision,
+                visible_payload=error_payload,
+                persistence_failed=True,
+            )
+
+        await self._record_result_stage(
+            event_type="result_persist_done",
+            data={
+                **stage_data,
+                "content_id": content_ref.content_id,
+                "content_hash": content_ref.content_hash,
+            },
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
+            outer_tool_name=outer_tool_name,
+            effective_tool_name=effective_tool_name,
+            severity="success",
+            visibility="internal",
+        )
+
+        summary_failed = False
+        if decision.representation == "store_only":
+            stored_ref = (
+                self.result_compaction_service.build_store_only_ref(
+                    result_id=result_id,
+                    content_ref=content_ref,
+                    cycle_id=cycle_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=effective_tool_name,
+                    raw_result=canonical_result,
+                    size_tokens_estimate=result_tokens,
+                )
+            )
+        elif decision.representation == "oversized":
+            stored_ref = (
+                self.result_compaction_service.build_oversized_ref(
+                    result_id=result_id,
+                    content_ref=content_ref,
+                    cycle_id=cycle_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=effective_tool_name,
+                    raw_result=canonical_result,
+                    size_tokens_estimate=result_tokens,
+                )
+            )
+            await self._record_result_stage(
+                event_type="oversized_result_stored",
+                data={
+                    **stage_data,
+                    "content_id": content_ref.content_id,
+                    "content_hash": content_ref.content_hash,
+                    "summary_status": "oversized",
+                },
+                state=state,
+                session_id=session_id,
+                cycle_id=cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=cycle_trace,
+                outer_tool_name=outer_tool_name,
+                effective_tool_name=effective_tool_name,
+            )
+        else:
+            await self._record_result_stage(
+                event_type="result_compaction_started",
+                data={
+                    **stage_data,
+                    "content_id": content_ref.content_id,
+                    "summary_target_tokens": decision.summary_target_tokens,
+                },
+                state=state,
+                session_id=session_id,
+                cycle_id=cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=cycle_trace,
+                outer_tool_name=outer_tool_name,
+                effective_tool_name=effective_tool_name,
+            )
+            request = self._result_summary_request(
+                result_id=result_id,
+                original_user_request=original_user_request,
+                effective_tool_name=effective_tool_name,
+                effective_arguments=effective_arguments,
+                size_bytes=result_size_bytes,
+                size_chars=result_size_chars,
+                size_tokens_estimate=result_tokens,
+                summary_target_tokens=decision.summary_target_tokens,
+            )
+            try:
+                summary = await self._summarize_tool_result(
+                    request=request,
+                    raw_result=canonical_result,
+                    decision=decision,
+                    effective_tool_name=effective_tool_name,
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                )
+            except Exception as error:
+                summary_failed = True
+                stored_ref = self.result_compaction_service.build_failed_ref(
+                    result_id=result_id,
+                    content_ref=content_ref,
+                    cycle_id=cycle_id,
+                    tool_call_id=tool_call_id,
+                    tool_name=effective_tool_name,
+                    raw_result=canonical_result,
+                    size_tokens_estimate=result_tokens,
+                )
+                await self._record_result_stage(
+                    event_type="result_compaction_failed",
+                    data={
+                        **stage_data,
+                        "content_id": content_ref.content_id,
+                        "error_type": type(error).__name__,
+                        "summary_status": "failed",
+                    },
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                    outer_tool_name=outer_tool_name,
+                    effective_tool_name=effective_tool_name,
+                    severity="warning",
+                )
+                logger.warning(
+                    "Result compaction failed: tool=%s call_id=%s "
+                    "result_id=%s content_id=%s error_type=%s",
+                    effective_tool_name,
+                    tool_call_id,
+                    result_id,
+                    content_ref.content_id,
+                    type(error).__name__,
+                )
+            else:
+                stored_ref = (
+                    self.result_compaction_service.build_summarized_ref(
+                        result_id=result_id,
+                        content_ref=content_ref,
+                        cycle_id=cycle_id,
+                        tool_call_id=tool_call_id,
+                        tool_name=effective_tool_name,
+                        summary=summary,
+                        size_chars=result_size_chars,
+                        size_tokens_estimate=result_tokens,
+                    )
+                )
+                await self._record_result_stage(
+                    event_type="result_compaction_done",
+                    data={
+                        **stage_data,
+                        "content_id": content_ref.content_id,
+                        "summary_status": "summarized",
+                        "summary_chars": len(summary.summary),
+                        "key_fact_count": len(summary.key_facts),
+                        "needs_retrieval": (
+                            summary.needs_original_content
+                        ),
+                    },
+                    state=state,
+                    session_id=session_id,
+                    cycle_id=cycle_id,
+                    progress_callback=progress_callback,
+                    cycle_trace=cycle_trace,
+                    outer_tool_name=outer_tool_name,
+                    effective_tool_name=effective_tool_name,
+                    severity="success",
+                    visibility="internal",
+                )
+
+        visible_payload = stored_ref.model_dump()
+        self._trace_event(
+            cycle_trace,
+            "tool_result_stored",
+            tool_name=effective_tool_name,
+            manager_tool_name=outer_tool_name,
+            tool_call_id=tool_call_id,
+            result_ref=visible_payload,
+            runtime_override=decision.runtime_override,
+            decision_reason=decision.reason,
+        )
+        messages_for_llm.append({
+            "role": "tool",
+            "tool_call_id": tool_call_id,
+            "content": dumps_json(visible_payload),
+        })
+        logger.info(
+            "Tool result processed: outer_tool=%s tool=%s call_id=%s "
+            "chars=%s bytes=%s tokens=%s handling=%s representation=%s "
+            "result_id=%s content_id=%s runtime_override=%s",
+            outer_tool_name,
+            effective_tool_name,
+            tool_call_id,
+            result_size_chars,
+            result_size_bytes,
+            result_tokens,
+            result_handling.value,
+            decision.representation,
+            result_id,
+            content_ref.content_id,
+            decision.runtime_override,
+        )
+        return ResultProcessingOutcome(
+            decision=decision,
+            visible_payload=visible_payload,
+            content_ref=content_ref,
+            stored_result_ref=stored_ref,
+            summary_failed=summary_failed,
+        )
+
     def _try_parse_textual_tool_call(
         self,
         content: str,
@@ -2512,19 +3234,30 @@ class MCPClient:
                         message=assistant_message,
                     )
                     
-                    tool_results = []
+                    tool_result_count = 0
                     for tool_call in tool_calls:
                         function = tool_call.get("function", {})
                         tool_name = function.get("name", "")
                         tool_call_id = tool_call.get("id", "")
                         manager_tool_name = tool_name
                         target_tool_name = None
+                        effective_tool_name = tool_name
+                        effective_arguments: dict[str, Any] = {}
+                        result_handling = ResultHandling.AUTO
                         
                         logger.info(f"Вызов инструмента: {tool_name}")
                         
                         try:
                             # Парсим аргументы
                             arguments = json.loads(function.get("arguments", "{}"))
+                            (
+                                effective_tool_name,
+                                effective_arguments,
+                                result_handling,
+                            ) = self._resolve_effective_tool_context(
+                                tool_name,
+                                arguments,
+                            )
                             manager_tool_name, target_tool_name = (
                                 self._resolve_progress_tool_names(tool_name, arguments)
                             )
@@ -2567,34 +3300,25 @@ class MCPClient:
                             
                             # Преобразуем результат в текст
                             tool_result = self._format_tool_result(result.content)
-                            r = {
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": tool_result
-                            }
-                            logger.debug(f"Результат инструмента: {r}")
-                            logger.info(f"Результат инструмента {tool_name}: {tool_result}")
-                            
-                            tool_results.append(tool_result)
-                            
-                            # Добавляем результат в сообщения
                             tool_payload = self._tool_result_payload(tool_name, tool_result)
-                            self._trace_event(
-                                cycle_trace,
-                                "tool_result_full",
-                                tool_name=tool_name,
+                            await self._process_tool_result_for_context(
+                                outer_tool_name=tool_name,
+                                effective_tool_name=effective_tool_name,
                                 tool_call_id=tool_call_id,
-                                result=tool_payload,
+                                outer_arguments=arguments,
+                                effective_arguments=effective_arguments,
+                                raw_tool_result_text=tool_result,
+                                tool_payload=tool_payload,
+                                result_handling=result_handling,
+                                messages_for_llm=messages_for_llm,
+                                original_user_request=original_user_request,
+                                session_id=session_id,
+                                cycle_id=cycle_id,
+                                state=state,
+                                cycle_trace=cycle_trace,
+                                progress_callback=progress_callback,
                             )
-                            tool_payload_for_llm = self._compact_large_tool_payload(
-                                tool_payload
-                            )
-
-                            messages.append({
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": dumps_json(tool_payload_for_llm),
-                            })
+                            tool_result_count += 1
 
                             # Отслеживание прогресса
                             await self._emit_progress_event(
@@ -2618,7 +3342,7 @@ class MCPClient:
                         except asyncio.TimeoutError:  # Обработка таймаута
                             error_message = f"Таймаут при вызове инструмента {tool_name}"
                             logger.error(error_message)
-                            tool_results.append(error_message)
+                            tool_result_count += 1
                             
                             # Добавляем сообщение об ошибке
                             error_payload = {
@@ -2666,7 +3390,7 @@ class MCPClient:
                                 f"Ошибка при вызове инструмента {tool_name}: {str(e)}"
                             )
                             logger.error(error_message)
-                            tool_results.append(error_message)
+                            tool_result_count += 1
                             
                             # Добавляем сообщение об ошибке
                             error_payload = {
@@ -2712,7 +3436,7 @@ class MCPClient:
                             )
                                                 
                     # Если последняя итерация и были вызовы, получаем финальный ответ
-                    if i == self.max_iterations - 1 and tool_results:
+                    if i == self.max_iterations - 1 and tool_result_count:
                         try:
                             messages_for_llm = await self._compact_context_if_needed(
                                 messages_for_llm=messages_for_llm,
@@ -3473,6 +4197,7 @@ class MCPClient:
         self,
         arguments: Dict[str, Any],
     ) -> Dict[str, Any]:
+        self._parse_result_handling(arguments)
         target_tool_name = arguments["tool_name"]
         target_arguments = arguments.get("arguments") or {}
 
@@ -3627,9 +4352,13 @@ class MCPClient:
         return min(delay, self.llm_retry_max_delay)
 
     async def _call_llm(
-        self, 
-        messages: List[Dict[str, Any]], 
-        tools: List[Dict[str, Any]]
+        self,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        *,
+        max_tokens_override: int | None = None,
+        temperature_override: float | None = None,
+        top_p_override: float | None = None,
     ) -> Dict[str, Any]:
         """
         Description:
@@ -3652,13 +4381,29 @@ class MCPClient:
         try:
             logger.debug("Отправка запроса к LLM")
             
+            max_tokens = (
+                max_tokens_override
+                if max_tokens_override is not None
+                else self.llm_config.max_tokens
+            )
+            temperature = (
+                temperature_override
+                if temperature_override is not None
+                else self.llm_config.temperature
+            )
+            top_p = (
+                top_p_override
+                if top_p_override is not None
+                else self.llm_config.top_p
+            )
+
             # Формируем запрос в зависимости от типа API
             if self.llm_config.is_openai_compatible:
                 payload = {
                     "model": self.llm_config.model,
                     "messages": messages,
-                    "temperature": self.llm_config.temperature,
-                    "max_tokens": self.llm_config.max_tokens
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
                 }
                 if tools:
                     payload["tools"] = tools
@@ -3669,12 +4414,12 @@ class MCPClient:
                     "model": self.llm_config.model,
                     "prompt": self._format_messages_for_custom_llm(messages),
                     "tools": tools,
-                    "temperature": self.llm_config.temperature,
-                    "max_tokens": self.llm_config.max_tokens
+                    "temperature": temperature,
+                    "max_tokens": max_tokens,
                 }
             
-            if self.llm_config.top_p is not None:
-                payload["top_p"] = self.llm_config.top_p
+            if top_p is not None:
+                payload["top_p"] = top_p
             
             # Используем таймаут из конфигурации (изменено)
             response = await self.http_client.post(
@@ -3732,21 +4477,37 @@ class MCPClient:
         cycle_id: str | None = None,
         progress_callback=None,
         cycle_trace: list[dict[str, Any]] | None = None,
+        max_tokens_override: int | None = None,
+        temperature_override: float | None = None,
+        top_p_override: float | None = None,
+        redact_error_details: bool = False,
     ) -> Dict[str, Any]:
         max_attempts = self.llm_max_retries + 1
 
+        def safe_error_repr(error: BaseException) -> str:
+            if redact_error_details:
+                return f"{type(error).__name__}(details omitted)"
+            return repr(error)
+
         for attempt in range(1, max_attempts + 1):
             try:
-                return await self._call_llm(messages, tools)
+                return await self._call_llm(
+                    messages,
+                    tools,
+                    max_tokens_override=max_tokens_override,
+                    temperature_override=temperature_override,
+                    top_p_override=top_p_override,
+                )
 
             except LLMHTTPError as e:
+                error_repr = safe_error_repr(e)
                 can_retry = e.status_code in self.llm_retryable_http_statuses
 
                 if not can_retry:
                     logger.error(
                         f"{context}: LLM HTTP {e.status_code} не подходит "
                         f"для retry; attempt={attempt}/{max_attempts}; "
-                        f"retry_after={e.retry_after!r}; error={e!r}"
+                        f"retry_after={e.retry_after!r}; error={error_repr}"
                     )
                     await self._emit_llm_retry_progress(
                         state=state,
@@ -3765,7 +4526,7 @@ class MCPClient:
                             "retry_after": e.retry_after,
                             "delay": 0,
                             "error_type": type(e).__name__,
-                            "error_repr": repr(e),
+                            "error_repr": error_repr,
                         },
                     )
                     raise
@@ -3774,7 +4535,7 @@ class MCPClient:
                     logger.error(
                         f"{context}: LLM HTTP {e.status_code} без дальнейших "
                         f"повторов; attempt={attempt}/{max_attempts}; "
-                        f"retry_after={e.retry_after!r}; error={e!r}"
+                        f"retry_after={e.retry_after!r}; error={error_repr}"
                     )
                     await self._emit_llm_retry_progress(
                         state=state,
@@ -3793,7 +4554,7 @@ class MCPClient:
                             "retry_after": e.retry_after,
                             "delay": 0,
                             "error_type": type(e).__name__,
-                            "error_repr": repr(e),
+                            "error_repr": error_repr,
                         },
                     )
                     raise
@@ -3804,7 +4565,7 @@ class MCPClient:
                     f"{context}: LLM HTTP {e.status_code}. "
                     f"Повтор через {delay:.1f} сек. "
                     f"Попытка {attempt}/{max_attempts}; "
-                    f"retry_after={e.retry_after!r}; error={e!r}"
+                    f"retry_after={e.retry_after!r}; error={error_repr}"
                 )
                 await self._emit_llm_retry_progress(
                     state=state,
@@ -3823,17 +4584,18 @@ class MCPClient:
                         "retry_after": e.retry_after,
                         "delay": delay,
                         "error_type": type(e).__name__,
-                        "error_repr": repr(e),
+                        "error_repr": error_repr,
                     },
                 )
 
                 await asyncio.sleep(delay)
 
             except LLMTimeoutError as e:
+                error_repr = safe_error_repr(e)
                 if attempt >= max_attempts:
                     logger.error(
                         f"{context}: LLM timeout без дальнейших повторов; "
-                        f"attempt={attempt}/{max_attempts}; error={e!r}"
+                        f"attempt={attempt}/{max_attempts}; error={error_repr}"
                     )
                     await self._emit_llm_retry_progress(
                         state=state,
@@ -3850,7 +4612,7 @@ class MCPClient:
                             "max_attempts": max_attempts,
                             "delay": 0,
                             "error_type": type(e).__name__,
-                            "error_repr": repr(e),
+                            "error_repr": error_repr,
                         },
                     )
                     raise
@@ -3860,7 +4622,7 @@ class MCPClient:
                 logger.warning(
                     f"{context}: LLM timeout. "
                     f"Повтор через {delay:.1f} сек. "
-                    f"Попытка {attempt}/{max_attempts}; error={e!r}"
+                    f"Попытка {attempt}/{max_attempts}; error={error_repr}"
                 )
                 await self._emit_llm_retry_progress(
                     state=state,
@@ -3877,17 +4639,18 @@ class MCPClient:
                         "max_attempts": max_attempts,
                         "delay": delay,
                         "error_type": type(e).__name__,
-                        "error_repr": repr(e),
+                        "error_repr": error_repr,
                     },
                 )
 
                 await asyncio.sleep(delay)
 
             except LLMTransportError as e:
+                error_repr = safe_error_repr(e)
                 if attempt >= max_attempts:
                     logger.error(
                         f"{context}: LLM transport error без дальнейших повторов; "
-                        f"attempt={attempt}/{max_attempts}; error={e!r}"
+                        f"attempt={attempt}/{max_attempts}; error={error_repr}"
                     )
                     await self._emit_llm_retry_progress(
                         state=state,
@@ -3904,7 +4667,7 @@ class MCPClient:
                             "max_attempts": max_attempts,
                             "delay": 0,
                             "error_type": type(e).__name__,
-                            "error_repr": repr(e),
+                            "error_repr": error_repr,
                         },
                     )
                     raise
@@ -3914,7 +4677,7 @@ class MCPClient:
                 logger.warning(
                     f"{context}: LLM transport error. "
                     f"Повтор через {delay:.1f} сек. "
-                    f"Попытка {attempt}/{max_attempts}; error={e!r}"
+                    f"Попытка {attempt}/{max_attempts}; error={error_repr}"
                 )
                 await self._emit_llm_retry_progress(
                     state=state,
@@ -3931,7 +4694,7 @@ class MCPClient:
                         "max_attempts": max_attempts,
                         "delay": delay,
                         "error_type": type(e).__name__,
-                        "error_repr": repr(e),
+                        "error_repr": error_repr,
                     },
                 )
 
@@ -4439,19 +5202,17 @@ class MCPClient:
         cycle_id: str,
     ) -> List[Dict[str, Any]]:
         """
-        TODO v0.4: Реальная context compaction.
+        TODO v0.4-cycle-compaction: compaction истории agent cycle.
 
         Сейчас:
         - оценивает размер контекста;
         - если лимит превышен, логирует warning;
         - возвращает messages_for_llm без изменений.
 
-        В будущем:
-        - Level 1: сжимать большие tool_result до preview/archive_ref;
-        - Level 2: заменять старые внутренние шаги цикла на
-          compacted_cycle_segment;
-        - Level 3: вызывать LLM compact-запрос для
-          working_summary/working_state.
+        Result compaction выполняется отдельно сразу после завершения
+        каждого tool call. Этот метод в будущем будет заменять старые
+        закрытые части истории цикла на working_summary/working_state,
+        не разрывая assistant tool_calls и соответствующие role=tool.
         """
 
         tokens = self._estimate_messages_tokens(messages_for_llm)
@@ -4485,32 +5246,6 @@ class MCPClient:
         )
 
         return messages_for_llm
-
-    def _compact_large_tool_payload(
-        self,
-        payload: Dict[str, Any],
-        *,
-        max_content_chars: int = 12_000,
-    ) -> Dict[str, Any]:
-        if payload.get("type") != "tool_result":
-            return payload
-
-        content = payload.get("content")
-
-        if not isinstance(content, str):
-            return payload
-
-        if len(content) <= max_content_chars:
-            return payload
-
-        compact = dict(payload)
-        compact["content_full_chars"] = len(content)
-        compact["content"] = (
-            content[:max_content_chars]
-            + "\n\n[TRUNCATED: полный результат сохранён в archival_logs/cycle_trace]"
-        )
-
-        return compact
 
     def _get_or_create_state(self, session_id: str) -> SessionState:
         """
@@ -4579,7 +5314,12 @@ class MCPClient:
 
 def load_config(
     config_path: str,
-) -> Tuple[List[ServerConfigType], LLMConfigType, StorageConfigType]:
+) -> Tuple[
+    List[ServerConfigType],
+    LLMConfigType,
+    StorageConfigType,
+    MemoryConfigType,
+]:
     """
     Description:
     ---------------
@@ -4591,8 +5331,7 @@ def load_config(
         
     Returns:
     ---------------
-        Tuple[List[ServerConfigType], LLMConfigType, StorageConfigType]:
-        Конфигурации серверов, LLM и storage
+        Конфигурации серверов, LLM, storage и memory
         
     Raises:
         ImportError: Если требуется YAML, но библиотека не установлена
@@ -4600,7 +5339,7 @@ def load_config(
         Exception: При ошибке загрузки конфигурации
         
     Examples:
-        >>> server_configs, llm_config, storage_config = load_config("config.json")
+        >>> server_configs, llm_config, storage_config, memory_config = load_config("config.json")
     """
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -4720,7 +5459,15 @@ def load_config(
         except ValidationError as error:
             raise StorageValidationError("Invalid storage configuration") from error
 
-        return server_configs, llm_config, storage_config
+        memory_data = config.get("memory", {})
+        try:
+            memory_config = MemoryConfigType.model_validate(memory_data)
+        except ValidationError as error:
+            raise MemoryConfigValidationError(
+                "Invalid memory configuration"
+            ) from error
+
+        return server_configs, llm_config, storage_config, memory_config
 
     except Exception as e:
         logger.error(f"Ошибка при загрузке конфигурации: {type(e).__name__}: {e!r}")

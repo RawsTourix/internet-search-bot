@@ -9,6 +9,7 @@ from .config import (
     HTTP_PROXY,
     HTTPS_PROXY,
     safe_llm_config_summary,
+    safe_memory_config_summary,
     safe_mcp_server_config_summary,
 )
 from ..mcp.mcp_client import MCPClient, load_config
@@ -52,11 +53,14 @@ class Api:
         """Инициализация Api"""
         try:
             # Загрузка конфигурации
-            logger.info("Загрузка конфигурации MCP-серверов, LLM и storage")
+            logger.info(
+                "Загрузка конфигурации MCP-серверов, LLM, storage и memory"
+            )
             (
                 self.server_configs,
                 self.llm_config,
                 self.storage_config,
+                self.memory_config,
             ) = load_config(config_path)
 
             # Логируем только безопасную сводку: конфигурация также содержит
@@ -88,6 +92,10 @@ class Api:
                 self.storage_config.verify_content_hash,
                 self.storage_config.max_in_memory_content_bytes,
             )
+            logger.info(
+                "Memory result compaction: %s",
+                safe_memory_config_summary(self.memory_config),
+            )
 
             self.storage_services = create_storage_services(self.storage_config)
 
@@ -96,6 +104,7 @@ class Api:
             self.mcp_client = MCPClient(
                 self.llm_config,
                 storage_services=self.storage_services,
+                memory_config=self.memory_config,
             )
         except Exception as e:
             raise APIError(f"Ошибка инициализации Api: {repr(e)}") from e

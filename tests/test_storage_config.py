@@ -42,12 +42,12 @@ class StorageConfigTests(unittest.IsolatedAsyncioTestCase):
         return path
 
     def test_config_without_storage_uses_defaults(self):
-        _, _, storage = load_config(str(self._write_config()))
+        _, _, storage, _ = load_config(str(self._write_config()))
 
         self.assertEqual(storage, StorageConfigType())
 
     def test_full_storage_config_is_loaded(self):
-        _, _, storage = load_config(
+        _, _, storage, _ = load_config(
             str(
                 self._write_config(
                     {
@@ -102,6 +102,7 @@ class StorageConfigTests(unittest.IsolatedAsyncioTestCase):
         fake_content_store = SimpleNamespace(name="content")
         fake_artifact_store = SimpleNamespace(name="artifact")
         services = StorageServices(
+            config=StorageConfigType(root_dir=str(self.root / "storage")),
             content_store=fake_content_store,
             artifact_store=fake_artifact_store,
         )

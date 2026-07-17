@@ -57,6 +57,17 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "cycle_done": "✅ Задача завершена.",
         "cycle_error": "⚠️ Задача завершилась с ошибкой.",
         "context_warning": "⚠️ Контекст задачи стал большим.",
+        "result_persist_started": "💾 Сохраняю большой результат…",
+        "result_persist_done": "✅ Большой результат сохранён.",
+        "result_persist_failed": "⚠️ Не удалось сохранить большой результат.",
+        "result_compaction_started": "🧩 Сжимаю большой результат…",
+        "result_compaction_done": "✅ Большой результат сжат.",
+        "result_compaction_failed": (
+            "⚠️ Не удалось создать краткое описание результата."
+        ),
+        "oversized_result_stored": (
+            "📦 Результат сохранён для последующей обработки."
+        ),
     },
     "en": {
         "cycle_started": "🧭 Starting task processing…",
@@ -113,6 +124,17 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "cycle_done": "✅ Task completed.",
         "cycle_error": "⚠️ Task failed.",
         "context_warning": "⚠️ Task context is getting large.",
+        "result_persist_started": "💾 Saving the large result…",
+        "result_persist_done": "✅ Large result saved.",
+        "result_persist_failed": "⚠️ Failed to save the large result.",
+        "result_compaction_started": "🧩 Compacting the large result…",
+        "result_compaction_done": "✅ Large result compacted.",
+        "result_compaction_failed": (
+            "⚠️ Failed to create a summary of the result."
+        ),
+        "oversized_result_stored": (
+            "📦 Result saved for later processing."
+        ),
     },
 }
 

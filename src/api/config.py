@@ -37,3 +37,16 @@ def safe_mcp_server_config_summary(configs: Iterable[Any]) -> list[dict[str, Any
         }
         for item in configs
     ]
+
+
+def safe_memory_config_summary(config: Any) -> dict[str, Any]:
+    """Return the explicit non-sensitive memory settings used by runtime."""
+    return {
+        "enable_result_compaction": config.enable_result_compaction,
+        "inline_result_max_input_ratio": config.inline_result_max_input_ratio,
+        "single_pass_summary_max_input_ratio": (
+            config.single_pass_summary_max_input_ratio
+        ),
+        "result_summary_target_ratio": config.result_summary_target_ratio,
+        "result_preview_max_chars": config.result_preview_max_chars,
+    }
