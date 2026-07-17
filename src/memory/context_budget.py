@@ -5,6 +5,22 @@ from typing import Literal
 from .models import ResultBudgetDecision, ResultHandling
 
 
+def estimate_untrusted_result_tokens(
+    text: str,
+    *,
+    utf8_size_bytes: int | None = None,
+) -> int:
+    """Conservatively estimate tokens for arbitrary untrusted tool output."""
+    chars_estimate = len(text)
+    byte_count = (
+        len(text.encode("utf-8"))
+        if utf8_size_bytes is None
+        else max(0, utf8_size_bytes)
+    )
+    utf8_bytes_estimate = (byte_count + 1) // 2
+    return max(1, chars_estimate, utf8_bytes_estimate)
+
+
 class ResultContextBudgetPolicy:
     """Choose a safe visible representation without performing I/O."""
 

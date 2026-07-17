@@ -15,6 +15,10 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "tool_done": "✅ Инструмент {tool_name} завершил работу.",
         "tool_error": "⚠️ Инструмент {tool_name} завершился с ошибкой.",
         "tool_timeout": "⚠️ Инструмент {tool_name} завершился по таймауту.",
+        "tool_result_unavailable": (
+            "⚠️ Результат инструмента «{tool_name}» недоступен "
+            "для дальнейшей обработки."
+        ),
         "llm_http_retry": (
             "⚠️ LLM HTTP {status_code}. Повтор через {delay:.0f} сек. "
             "Попытка {attempt}/{max_attempts}…"
@@ -85,6 +89,10 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "tool_done": "✅ Tool {tool_name} finished.",
         "tool_error": "⚠️ Tool {tool_name} failed.",
         "tool_timeout": "⚠️ Tool {tool_name} timed out.",
+        "tool_result_unavailable": (
+            "⚠️ The result from tool {tool_name} is unavailable "
+            "for further processing."
+        ),
         "llm_http_retry": (
             "⚠️ LLM HTTP {status_code}. Retrying in {delay:.0f}s. "
             "Attempt {attempt}/{max_attempts}…"
@@ -180,6 +188,12 @@ PROGRESS_MESSAGE_DEFAULT_KWARGS: dict[str, dict[str, dict[str, str]]] = {
         "tool_name": {
             "ru": "инструмент",
             "en": "tool",
+        },
+    },
+    "tool_result_unavailable": {
+        "tool_name": {
+            "ru": "неизвестный",
+            "en": "unknown",
         },
     },
 }

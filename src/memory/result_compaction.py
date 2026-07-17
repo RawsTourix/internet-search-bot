@@ -67,6 +67,8 @@ def build_result_compaction_system_prompt() -> str:
 class ResultCompactionService:
     """Store canonical results and build path-free visible references."""
 
+    JSON_MIME_PARSE_MAX_CHARS = 1_000_000
+
     def __init__(
         self,
         *,
@@ -248,15 +250,27 @@ class ResultCompactionService:
 
     @staticmethod
     def _detect_mime_type(raw_result: str) -> str:
-        try:
-            parsed = json.loads(raw_result)
-        except (TypeError, ValueError):
-            return "text/plain"
-        return (
-            "application/json"
-            if isinstance(parsed, (dict, list))
-            else "text/plain"
-        )
+        if len(raw_result) <= ResultCompactionService.JSON_MIME_PARSE_MAX_CHARS:
+            try:
+                parsed = json.loads(raw_result)
+            except (TypeError, ValueError):
+                return "text/plain"
+            return (
+                "application/json"
+                if isinstance(parsed, (dict, list))
+                else "text/plain"
+            )
+
+        for character in raw_result:
+            if character.isspace():
+                continue
+            return (
+                "application/json"
+                if character in {"{", "["}
+                else "text/plain"
+            )
+
+        return "text/plain"
 
     @staticmethod
     def _base_ref_values(

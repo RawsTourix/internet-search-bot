@@ -585,6 +585,141 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "tool_done",
         ])
 
+    async def test_process_query_keeps_tool_done_when_only_summary_fails(self):
+        raw = "STORED_RAW_SENTINEL_" + "x" * 2_000
+        tool_call = {
+            "id": "call-summary-failed",
+            "type": "function",
+            "function": {
+                "name": "mcp_call_tool",
+                "arguments": dumps_json({
+                    "tool_name": "web_search",
+                    "arguments": {"query": "python"},
+                    "result_handling": "compact",
+                }),
+            },
+        }
+        final_response = {
+            "content": dumps_json({
+                "type": "agent_action",
+                "status": "done",
+                "action": "answer",
+                "agent_request": None,
+                "final_answer": "Finished from stored reference",
+                "question_to_user": None,
+                "error_message": None,
+            })
+        }
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            {"content": None, "tool_calls": [tool_call]},
+            RuntimeError("summary unavailable"),
+            final_response,
+        ])
+        self.client._call_registered_tool = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(text=raw)]
+            )
+        )
+        self.client._archive_agent_cycle = Mock()
+
+        result = await self.client.process_query(
+            "research python",
+            session_id="summary-failed-session",
+            progress_locale="en",
+        )
+
+        self.assertEqual(
+            result.content,
+            "Finished from stored reference",
+        )
+        progress_types = [event["type"] for event in result.progress_events]
+        self.assertIn("result_persist_done", progress_types)
+        self.assertIn("result_compaction_failed", progress_types)
+        self.assertIn("tool_done", progress_types)
+        self.assertNotIn("tool_error", progress_types)
+
+        archive_trace = (
+            self.client._archive_agent_cycle.call_args.kwargs["cycle_trace"]
+        )
+        self.assertIn(
+            "tool_result_stored",
+            [event["type"] for event in archive_trace],
+        )
+        self.assertNotIn(
+            raw,
+            json.dumps(archive_trace, ensure_ascii=False),
+        )
+
+    async def test_process_query_marks_unavailable_result_as_tool_error(self):
+        raw = "LOST_RAW_SENTINEL_" + "x" * 2_000
+        tool_call = {
+            "id": "call-lost",
+            "type": "function",
+            "function": {
+                "name": "mcp_call_tool",
+                "arguments": dumps_json({
+                    "tool_name": "web_search",
+                    "arguments": {"query": "python"},
+                    "result_handling": "compact",
+                }),
+            },
+        }
+        final_response = {
+            "content": dumps_json({
+                "type": "agent_action",
+                "status": "done",
+                "action": "answer",
+                "agent_request": None,
+                "final_answer": "Finished with limitation",
+                "question_to_user": None,
+                "error_message": None,
+            })
+        }
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            {"content": None, "tool_calls": [tool_call]},
+            final_response,
+        ])
+        self.client._call_registered_tool = AsyncMock(
+            return_value=SimpleNamespace(
+                content=[SimpleNamespace(text=raw)]
+            )
+        )
+        self.client.result_compaction_service.persist_result = AsyncMock(
+            side_effect=StorageError("disk unavailable")
+        )
+        self.client._archive_agent_cycle = Mock()
+
+        result = await self.client.process_query(
+            "research python",
+            session_id="lost-session",
+            progress_locale="en",
+        )
+
+        self.assertEqual(result.content, "Finished with limitation")
+        progress_types = [event["type"] for event in result.progress_events]
+        self.assertIn("result_persist_failed", progress_types)
+        self.assertIn("tool_error", progress_types)
+        self.assertNotIn("tool_done", progress_types)
+        tool_error = next(
+            event
+            for event in result.progress_events
+            if event["type"] == "tool_error"
+        )
+        self.assertIn("unavailable", tool_error["message"])
+        self.assertFalse(tool_error["data"]["result_available"])
+
+        archive_trace = (
+            self.client._archive_agent_cycle.call_args.kwargs["cycle_trace"]
+        )
+        self.assertIn(
+            "tool_result_processing_error",
+            [event["type"] for event in archive_trace],
+        )
+        self.assertNotIn(
+            raw,
+            json.dumps(archive_trace, ensure_ascii=False),
+        )
+
     async def test_persistence_failure_uses_safe_inline_or_bounded_error(self):
         self.client.result_compaction_service.persist_result = AsyncMock(
             side_effect=StorageError("disk unavailable")
@@ -598,6 +733,11 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "x" * 12_000,
             handling=ResultHandling.AUTO,
             tool_call_id="call-2",
+        )
+        store_only, store_only_messages, _, _ = await self._process(
+            "small but explicitly stored",
+            handling=ResultHandling.STORE_ONLY,
+            tool_call_id="call-3",
         )
 
         self.assertTrue(safe.persistence_failed)
@@ -617,6 +757,16 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "tool_result_processing_error",
         )
         self.assertFalse(unsafe_payload["retry_recommended"])
+        self.assertTrue(store_only.persistence_failed)
+        store_only_payload = json.loads(
+            store_only_messages[-1]["content"]
+        )
+        self.assertEqual(
+            store_only_payload["type"],
+            "tool_result_processing_error",
+        )
+        self.assertFalse(store_only_payload["result_available"])
+        self.assertEqual(store_only.decision.representation, "store_only")
         self.assertNotIn(
             "x" * 100,
             json.dumps(unsafe_trace, ensure_ascii=False),

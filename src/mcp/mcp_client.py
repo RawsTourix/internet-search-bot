@@ -45,6 +45,7 @@ from ..memory import (
     ResultHandling,
     ResultProcessingOutcome,
     build_result_compaction_system_prompt,
+    estimate_untrusted_result_tokens,
 )
 from ..storage.models import new_result_id
 
@@ -1209,7 +1210,13 @@ class MCPClient:
         self,
         cycle_trace: list[dict[str, Any]],
     ) -> bool:
-        return any(event.get("type") == "tool_error" for event in cycle_trace)
+        return any(
+            event.get("type") in {
+                "tool_error",
+                "tool_result_processing_error",
+            }
+            for event in cycle_trace
+        )
 
     def _final_processing_progress_key(
         self,
@@ -1348,6 +1355,22 @@ class MCPClient:
                 evidence["tool_errors"].append(dict(event))
                 continue
 
+            if event_type == "tool_result_processing_error":
+                evidence["tool_errors"].append(dict(event))
+                evidence["limitations"].append({
+                    "type": "tool_result_unavailable",
+                    "tool_name": event.get("tool_name"),
+                    "tool_call_id": event.get("tool_call_id"),
+                    "message": (
+                        event.get("error")
+                        or (
+                            "Результат инструмента был получен, но не сохранён "
+                            "и недоступен агенту."
+                        )
+                    ),
+                })
+                continue
+
             if event_type in {
                 "max_iterations_reached",
                 "max_iterations_forced_final_answer",
@@ -1357,7 +1380,10 @@ class MCPClient:
         if evidence["tool_errors"]:
             evidence["limitations"].append({
                 "type": "tool_errors_present",
-                "message": "Некоторые инструменты вернули ошибки.",
+                "message": (
+                    "Некоторые вызовы инструментов или этапы обработки "
+                    "их результатов завершились с ошибками."
+                ),
             })
 
         return evidence
@@ -2548,7 +2574,10 @@ class MCPClient:
         )
         result_size_bytes = len(canonical_result.encode("utf-8"))
         result_size_chars = len(canonical_result)
-        result_tokens = self._estimate_tokens_rough(canonical_result)
+        result_tokens = estimate_untrusted_result_tokens(
+            canonical_result,
+            utf8_size_bytes=result_size_bytes,
+        )
         current_context_tokens = self._estimate_messages_tokens(
             messages_for_llm
         )
@@ -2667,14 +2696,19 @@ class MCPClient:
                 type(error).__name__,
             )
 
-            inline_fallback = self.result_compaction_service.decide(
-                handling=ResultHandling.PREFER_INLINE,
-                current_context_tokens=current_context_tokens,
-                result_tokens=result_tokens,
-                result_size_bytes=result_size_bytes,
-                summary_request_overhead_tokens=summary_overhead_tokens,
-            )
-            if inline_fallback.representation == "inline":
+            inline_fallback = None
+            if result_handling != ResultHandling.STORE_ONLY:
+                inline_fallback = self.result_compaction_service.decide(
+                    handling=ResultHandling.PREFER_INLINE,
+                    current_context_tokens=current_context_tokens,
+                    result_tokens=result_tokens,
+                    result_size_bytes=result_size_bytes,
+                    summary_request_overhead_tokens=summary_overhead_tokens,
+                )
+            if (
+                inline_fallback is not None
+                and inline_fallback.representation == "inline"
+            ):
                 fallback_decision = replace(
                     inline_fallback,
                     reason="persistence_failed_safe_inline_fallback",
@@ -2706,14 +2740,15 @@ class MCPClient:
                     persistence_failed=True,
                 )
 
+            processing_error_message = (
+                "Инструмент завершился, но большой результат не удалось "
+                "безопасно сохранить."
+            )
             error_payload = {
                 "type": "tool_result_processing_error",
                 "trusted": False,
                 "tool_name": effective_tool_name,
-                "error": (
-                    "Инструмент завершился, но большой результат не удалось "
-                    "безопасно сохранить."
-                ),
+                "error": processing_error_message,
                 "result_available": False,
                 "retry_recommended": False,
                 "security_note": (
@@ -2727,6 +2762,7 @@ class MCPClient:
                 tool_name=effective_tool_name,
                 tool_call_id=tool_call_id,
                 error_type=type(error).__name__,
+                error=processing_error_message,
                 result_available=False,
                 retry_recommended=False,
             )
@@ -3443,43 +3479,85 @@ class MCPClient:
                             # Преобразуем результат в текст
                             tool_result = self._format_tool_result(result.content)
                             tool_payload = self._tool_result_payload(tool_name, tool_result)
-                            await self._process_tool_result_for_context(
-                                outer_tool_name=tool_name,
-                                effective_tool_name=effective_tool_name,
-                                tool_call_id=tool_call_id,
-                                outer_arguments=arguments,
-                                effective_arguments=effective_arguments,
-                                raw_tool_result_text=tool_result,
-                                tool_payload=tool_payload,
-                                result_handling=result_handling,
-                                messages_for_llm=messages_for_llm,
-                                original_user_request=original_user_request,
-                                session_id=session_id,
-                                cycle_id=cycle_id,
-                                state=state,
-                                cycle_trace=cycle_trace,
-                                progress_callback=progress_callback,
+                            processing_outcome = (
+                                await self._process_tool_result_for_context(
+                                    outer_tool_name=tool_name,
+                                    effective_tool_name=effective_tool_name,
+                                    tool_call_id=tool_call_id,
+                                    outer_arguments=arguments,
+                                    effective_arguments=effective_arguments,
+                                    raw_tool_result_text=tool_result,
+                                    tool_payload=tool_payload,
+                                    result_handling=result_handling,
+                                    messages_for_llm=messages_for_llm,
+                                    original_user_request=(
+                                        original_user_request
+                                    ),
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    state=state,
+                                    cycle_trace=cycle_trace,
+                                    progress_callback=progress_callback,
+                                )
                             )
                             tool_result_count += 1
 
-                            # Отслеживание прогресса
-                            await self._emit_progress_event(
-                                state=state,
-                                session_id=session_id,
-                                cycle_id=cycle_id,
-                                progress_callback=progress_callback,
-                                cycle_trace=cycle_trace,
-                                event_type="tool_done",
-                                message_kwargs={
-                                    "tool_name": target_tool_name or tool_name,
-                                },
-                                tool_name=manager_tool_name,
-                                target_tool_name=target_tool_name,
-                                server_name=self._resolve_progress_server_name(
-                                    target_tool_name
-                                ),
-                                severity="success",
+                            result_unavailable = (
+                                processing_outcome.persistence_failed
+                                and processing_outcome.visible_payload.get("type")
+                                == "tool_result_processing_error"
                             )
+
+                            if result_unavailable:
+                                await self._emit_progress_event(
+                                    state=state,
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    progress_callback=progress_callback,
+                                    cycle_trace=cycle_trace,
+                                    event_type="tool_error",
+                                    message_key="tool_result_unavailable",
+                                    message_kwargs={
+                                        "tool_name": (
+                                            target_tool_name or tool_name
+                                        ),
+                                    },
+                                    tool_name=manager_tool_name,
+                                    target_tool_name=target_tool_name,
+                                    server_name=(
+                                        self._resolve_progress_server_name(
+                                            target_tool_name
+                                        )
+                                    ),
+                                    severity="error",
+                                    data={
+                                        "result_available": False,
+                                        "retry_recommended": False,
+                                    },
+                                )
+                            else:
+                                # Отслеживание прогресса
+                                await self._emit_progress_event(
+                                    state=state,
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    progress_callback=progress_callback,
+                                    cycle_trace=cycle_trace,
+                                    event_type="tool_done",
+                                    message_kwargs={
+                                        "tool_name": (
+                                            target_tool_name or tool_name
+                                        ),
+                                    },
+                                    tool_name=manager_tool_name,
+                                    target_tool_name=target_tool_name,
+                                    server_name=(
+                                        self._resolve_progress_server_name(
+                                            target_tool_name
+                                        )
+                                    ),
+                                    severity="success",
+                                )
                             
                         except asyncio.TimeoutError:  # Обработка таймаута
                             error_message = f"Таймаут при вызове инструмента {tool_name}"

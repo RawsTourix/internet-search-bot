@@ -1,6 +1,7 @@
 import hashlib
 import unittest
 from datetime import datetime, timezone
+from unittest.mock import patch
 
 from src.memory import (
     MemoryConfigType,
@@ -102,6 +103,38 @@ class ResultCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(self.store.calls[0][1]["mime_type"], "text/plain")
+
+    def test_small_mime_detection_validates_json(self):
+        self.assertEqual(
+            self.service._detect_mime_type('{"items":[1,2]}'),
+            "application/json",
+        )
+        self.assertEqual(
+            self.service._detect_mime_type("{not valid json}"),
+            "text/plain",
+        )
+        self.assertEqual(
+            self.service._detect_mime_type('"json scalar"'),
+            "text/plain",
+        )
+
+    def test_large_mime_detection_does_not_parse_full_json(self):
+        padding = "x" * (
+            self.service.JSON_MIME_PARSE_MAX_CHARS + 1
+        )
+
+        with patch(
+            "src.memory.result_compaction.json.loads",
+            side_effect=AssertionError("large payload must not be parsed"),
+        ):
+            self.assertEqual(
+                self.service._detect_mime_type(" \n{" + padding),
+                "application/json",
+            )
+            self.assertEqual(
+                self.service._detect_mime_type("plain " + padding),
+                "text/plain",
+            )
 
     def test_preview_is_bounded_and_unicode_safe(self):
         short = "Привет"

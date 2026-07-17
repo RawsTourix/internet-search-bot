@@ -107,6 +107,55 @@ class ResultCompactionEvidenceTests(unittest.TestCase):
         )
         self.assertEqual(len(evidence["limitations"]), 3)
 
+    def test_processing_error_is_risk_evidence_with_explicit_limitation(self):
+        trace = [{
+            "type": "tool_result_processing_error",
+            "tool_name": "search",
+            "tool_call_id": "call-1",
+            "error_type": "StorageError",
+            "error": (
+                "Результат инструмента был получен, но не сохранён "
+                "и недоступен агенту."
+            ),
+            "result_available": False,
+            "retry_recommended": False,
+        }]
+
+        evidence = self._build(trace)
+
+        self.assertTrue(self.client._trace_has_tool_errors(trace))
+        self.assertEqual(len(evidence["tool_errors"]), 1)
+        self.assertEqual(
+            evidence["tool_errors"][0]["type"],
+            "tool_result_processing_error",
+        )
+        limitation = next(
+            item
+            for item in evidence["limitations"]
+            if item["type"] == "tool_result_unavailable"
+        )
+        self.assertEqual(limitation["tool_name"], "search")
+        self.assertEqual(limitation["tool_call_id"], "call-1")
+        self.assertIn("недоступен агенту", limitation["message"])
+
+    def test_processing_error_selects_strict_final_processing(self):
+        self.client.llm_config = SimpleNamespace(final_audit=True)
+        trace = [{
+            "type": "tool_result_processing_error",
+            "tool_name": "search",
+            "tool_call_id": "call-1",
+            "result_available": False,
+        }]
+
+        decision = self.client._select_final_processing_mode(
+            result_text="draft",
+            state=self.state,
+            cycle_trace=trace,
+        )
+
+        self.assertEqual(decision.mode.value, "strict_grounded")
+        self.assertEqual(decision.reason, "risky_tool_workflow")
+
 
 if __name__ == "__main__":
     unittest.main()

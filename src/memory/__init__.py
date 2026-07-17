@@ -1,7 +1,10 @@
 """Public API for result-compaction memory services."""
 
 from .config import MemoryConfigType
-from .context_budget import ResultContextBudgetPolicy
+from .context_budget import (
+    ResultContextBudgetPolicy,
+    estimate_untrusted_result_tokens,
+)
 from .errors import (
     InvalidResultHandlingError,
     MemoryConfigValidationError,
@@ -36,4 +39,5 @@ __all__ = [
     "ResultProcessingOutcome",
     "RESULT_COMPACTION_SYSTEM_PROMPT",
     "build_result_compaction_system_prompt",
+    "estimate_untrusted_result_tokens",
 ]

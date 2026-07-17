@@ -1,6 +1,52 @@
+import json
 import unittest
 
-from src.memory import ResultContextBudgetPolicy, ResultHandling
+from src.memory import (
+    ResultContextBudgetPolicy,
+    ResultHandling,
+    estimate_untrusted_result_tokens,
+)
+
+
+class UntrustedResultTokenEstimatorTests(unittest.TestCase):
+    def test_estimator_is_conservative_for_representative_payloads(self):
+        samples = {
+            "cyrillic": "Результат поиска и несколько фактов",
+            "ascii": "plain ASCII result with identifiers 12345",
+            "cjk": "検索結果東京天气预报",
+            "emoji": "🔎🧩✅⚠️🚀",
+            "minified_json": json.dumps(
+                {"items": [{"id": index, "ok": True} for index in range(20)]},
+                separators=(",", ":"),
+            ),
+            "escaped": "\\\\\\\"quoted\\\"\\\\path" * 20,
+        }
+
+        for name, text in samples.items():
+            with self.subTest(name=name):
+                expected = max(
+                    1,
+                    len(text),
+                    (len(text.encode("utf-8")) + 1) // 2,
+                )
+                self.assertEqual(
+                    estimate_untrusted_result_tokens(text),
+                    expected,
+                )
+
+    def test_empty_result_still_uses_one_token(self):
+        self.assertEqual(estimate_untrusted_result_tokens(""), 1)
+
+    def test_precomputed_utf8_size_avoids_changing_estimate(self):
+        text = "Результат 🔎"
+
+        self.assertEqual(
+            estimate_untrusted_result_tokens(
+                text,
+                utf8_size_bytes=len(text.encode("utf-8")),
+            ),
+            estimate_untrusted_result_tokens(text),
+        )
 
 
 class ResultContextBudgetPolicyTests(unittest.TestCase):
