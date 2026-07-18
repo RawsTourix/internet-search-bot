@@ -23,6 +23,7 @@ from ..storage.models import (
 
 
 _MAX_WORKING_STATE_ITEMS = 100
+_MAX_RESULT_SUMMARY_ITEMS = 50
 
 
 def _normalize_string_collection(
@@ -62,9 +63,18 @@ class ResultCompactionSummary(BaseModel):
 
     type: Literal["result_compaction"] = "result_compaction"
     summary: str
-    key_facts: list[str] = Field(default_factory=list)
-    limitations: list[str] = Field(default_factory=list)
-    suggested_follow_up: list[str] = Field(default_factory=list)
+    key_facts: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_RESULT_SUMMARY_ITEMS,
+    )
+    limitations: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_RESULT_SUMMARY_ITEMS,
+    )
+    suggested_follow_up: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_RESULT_SUMMARY_ITEMS,
+    )
     needs_original_content: bool = False
 
     @field_validator("summary")
@@ -97,7 +107,7 @@ class ResultCompactionSummary(BaseModel):
             if item and item not in seen:
                 result.append(item)
                 seen.add(item)
-            if len(result) >= 50:
+            if len(result) >= _MAX_RESULT_SUMMARY_ITEMS:
                 break
         return result
 
@@ -138,6 +148,7 @@ class ResultBudgetDecision:
     inline_limit_tokens: int
     single_pass_limit_tokens: int
     summary_target_tokens: int
+    compactor_output_tokens: int
 
 
 @dataclass(slots=True)
@@ -168,22 +179,49 @@ class CycleMessageRange(_CycleModel):
 class CycleWorkingState(_CycleModel):
     current_goal: str
 
-    completed_actions: list[str] = Field(default_factory=list)
-    confirmed_actions: list[str] = Field(default_factory=list)
-    rejected_actions: list[str] = Field(default_factory=list)
+    completed_actions: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
+    confirmed_actions: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
+    rejected_actions: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
 
-    important_results: list[str] = Field(default_factory=list)
-    important_decisions: list[str] = Field(default_factory=list)
-    modified_files: list[str] = Field(default_factory=list)
+    important_results: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
+    important_decisions: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
+    modified_files: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
 
     pending_confirmation: str | None = None
-    errors_affecting_continuation: list[str] = Field(default_factory=list)
+    errors_affecting_continuation: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
 
     active_plan_id: str | None = None
     active_plan_node_id: str | None = None
 
-    result_refs: list[str] = Field(default_factory=list)
-    artifact_refs: list[str] = Field(default_factory=list)
+    result_refs: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
+    artifact_refs: list[str] = Field(
+        default_factory=list,
+        max_length=_MAX_WORKING_STATE_ITEMS,
+    )
 
     @field_validator("current_goal")
     @classmethod

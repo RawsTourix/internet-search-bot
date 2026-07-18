@@ -2880,11 +2880,18 @@ available_before_trigger = max(
   "memory": {
     "inline_result_max_input_ratio": 0.10,
     "single_pass_summary_max_input_ratio": 0.60,
-    "result_summary_target_ratio": 0.01,
+    "result_summary_target_tokens": 256,
+    "result_compaction_max_output_tokens": 2048,
     "enable_result_compaction": true
   }
 }
 ```
+
+Входные safety-пороги остаются относительными к context window.
+Размер создаваемого compact-артефакта задаётся абсолютными параметрами:
+`result_summary_target_tokens` относится только к полю `summary`, а
+`result_compaction_max_output_tokens` ограничивает весь
+`ResultCompactionSummary JSON`.
 
 Результат можно оставить inline, только если он:
 
@@ -3298,6 +3305,22 @@ previous working memory
 ```
 
 LLM не должна удалять refs, добавлять факты, менять пользовательские подтверждения или считать незавершённое действие завершённым.
+
+Размер cycle compact-артефакта задаётся независимо от context window:
+
+```json
+{
+  "memory": {
+    "cycle_compaction_summary_target_tokens": 512,
+    "cycle_compaction_max_output_tokens": 2048
+  }
+}
+```
+
+`cycle_compaction_summary_target_tokens` относится только к полю `summary`.
+Полный `CycleCompactionResult JSON`, включая `working_state`, ограничивается
+`cycle_compaction_max_output_tokens`. При выборе сегмента runtime использует
+полный output budget как верхнюю оценку размера замены.
 
 ---
 

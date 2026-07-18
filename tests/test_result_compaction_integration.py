@@ -39,7 +39,8 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             memory_config=MemoryConfigType(
                 inline_result_max_input_ratio=0.1,
                 single_pass_summary_max_input_ratio=0.6,
-                result_summary_target_ratio=0.01,
+                result_summary_target_tokens=128,
+                result_compaction_max_output_tokens=500,
                 result_preview_max_chars=80,
             ),
         )
@@ -319,8 +320,10 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call_args.kwargs["temperature_override"], 0.1)
         self.assertEqual(
             call_args.kwargs["max_tokens_override"],
-            outcome.decision.summary_target_tokens,
+            outcome.decision.compactor_output_tokens,
         )
+        self.assertEqual(outcome.decision.summary_target_tokens, 128)
+        self.assertEqual(outcome.decision.compactor_output_tokens, 500)
         summary_messages = call_args.args[0]
         self.assertIn("prompt injection", summary_messages[0]["content"])
         self.assertIn(
@@ -332,11 +335,21 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             summary_messages[0]["content"],
         )
         self.assertIn(
+            '"maxItems":50',
+            summary_messages[0]["content"],
+        )
+        self.assertIn(
+            "summary_target_tokens задаёт целевой размер только",
+            summary_messages[0]["content"],
+        )
+        self.assertIn(
             '"type":"result_compaction"',
             summary_messages[0]["content"],
         )
         self.assertNotIn(sentinel, summary_messages[1]["content"])
         self.assertIn(sentinel, summary_messages[2]["content"])
+        request = json.loads(summary_messages[1]["content"])
+        self.assertEqual(request["summary_target_tokens"], 128)
 
         visible = json.loads(messages[-1]["content"])
         self.assertEqual(visible["type"], "stored_result_ref")
@@ -460,10 +473,19 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.stored_result_ref.summary, "summary")
         self.client._call_llm_with_retries.assert_awaited_once()
 
-    async def test_invalid_summary_is_retried_once_with_larger_budget(self):
+    async def test_truncated_summary_is_retried_with_same_output_budget(self):
         raw = "x" * 2_000
         self.client._call_llm_with_retries = AsyncMock(side_effect=[
-            {"content": "not-json"},
+            {
+                "content": "",
+                self.client.LLM_RUNTIME_METADATA_KEY: {
+                    "content_chars": 0,
+                    "finish_reason": "length",
+                    "prompt_tokens": 1_000,
+                    "completion_tokens": 500,
+                    "total_tokens": 1_500,
+                },
+            },
             {
                 "content": dumps_json({
                     "type": "result_compaction",
@@ -489,16 +511,19 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         repair_call = self.client._call_llm_with_retries.await_args_list[1]
         self.assertEqual(
             repair_call.kwargs["max_tokens_override"],
-            self.client.llm_config.max_tokens,
+            outcome.decision.compactor_output_tokens,
         )
         self.assertEqual(
             repair_call.kwargs["temperature_override"],
             0.0,
         )
-        self.assertIn(
-            "result_compaction_retry",
-            [event["type"] for event in trace],
+        retry = next(
+            event
+            for event in trace
+            if event["type"] == "result_compaction_retry"
         )
+        self.assertEqual(retry["reason"], "output_budget_exhausted")
+        self.assertEqual(retry["max_tokens"], 500)
 
     async def test_invalid_summary_falls_back_without_losing_original(self):
         raw = "x" * 2_000

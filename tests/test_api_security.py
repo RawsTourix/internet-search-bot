@@ -43,6 +43,10 @@ class ApiConfigLoggingTests(unittest.TestCase):
         self.assertIn("test-model", summaries)
         self.assertIn("private-server", summaries)
         self.assertIn("enable_result_compaction", summaries)
+        self.assertIn("result_summary_target_tokens", summaries)
+        self.assertIn("result_compaction_max_output_tokens", summaries)
+        self.assertIn("cycle_compaction_summary_target_tokens", summaries)
+        self.assertIn("cycle_compaction_max_output_tokens", summaries)
 
 
 if __name__ == "__main__":

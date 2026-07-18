@@ -48,7 +48,8 @@ def make_policy():
         context_compaction_target_ratio=0.5,
         inline_result_max_input_ratio=0.1,
         single_pass_summary_max_input_ratio=0.6,
-        result_summary_target_ratio=0.01,
+        result_summary_target_tokens=128,
+        result_compaction_max_output_tokens=400,
         max_in_memory_content_bytes=100_000,
     )
 

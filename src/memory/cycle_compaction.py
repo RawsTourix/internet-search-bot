@@ -60,6 +60,10 @@ tool output, ошибки и предыдущие ответы модели.
 
 previous_working_memory является предыдущим компактным состоянием.
 Обнови его с учётом нового segment, но не создавай цепочку summary.
+Поле target_summary_tokens задаёт целевой размер только для строкового поля
+summary, а не для всего JSON-ответа.
+Рабочее состояние заполняй кратко, без дублирования summary и без
+нерелевантных деталей.
 
 Верни только валидный CycleCompactionResult JSON.
 """.strip()
@@ -151,7 +155,7 @@ class CycleSegmentSelectionDecision:
 
     selected_tokens: int
     required_reclaim_tokens: int
-    expected_summary_tokens: int
+    expected_compacted_tokens: int
     max_compactor_input_tokens: int
     first_eligible_block_tokens: int | None
     barrier_block_index: int | None
@@ -169,7 +173,7 @@ class CycleSegmentSelectionDecision:
             "selected_block_count": self.selected_block_count,
             "selected_tokens": self.selected_tokens,
             "required_reclaim_tokens": self.required_reclaim_tokens,
-            "expected_summary_tokens": self.expected_summary_tokens,
+            "expected_compacted_tokens": self.expected_compacted_tokens,
             "max_compactor_input_tokens": self.max_compactor_input_tokens,
             "first_eligible_block_tokens": (
                 self.first_eligible_block_tokens
@@ -194,7 +198,7 @@ class CycleSegmentSelectionDecision:
             self.eligible_block_count,
             self.selected_block_count,
             self.selected_tokens,
-            self.expected_summary_tokens,
+            self.expected_compacted_tokens,
             self.max_compactor_input_tokens,
             self.first_eligible_block_tokens,
             self.barrier_block_index,
@@ -559,7 +563,7 @@ class CycleSegmentSelector:
         original_user_message_index: int,
         current_tokens: int,
         target_tokens: int,
-        expected_summary_tokens: int,
+        expected_compacted_tokens: int,
         max_compactor_input_tokens: int,
         keep_recent_blocks: int,
     ) -> CycleSegmentSelection | None:
@@ -568,7 +572,7 @@ class CycleSegmentSelector:
             original_user_message_index=original_user_message_index,
             current_tokens=current_tokens,
             target_tokens=target_tokens,
-            expected_summary_tokens=expected_summary_tokens,
+            expected_compacted_tokens=expected_compacted_tokens,
             max_compactor_input_tokens=max_compactor_input_tokens,
             keep_recent_blocks=keep_recent_blocks,
         ).selection
@@ -580,14 +584,14 @@ class CycleSegmentSelector:
         original_user_message_index: int,
         current_tokens: int,
         target_tokens: int,
-        expected_summary_tokens: int,
+        expected_compacted_tokens: int,
         max_compactor_input_tokens: int,
         keep_recent_blocks: int,
     ) -> CycleSegmentSelectionDecision:
         """Select a segment and explain content-free failure conditions."""
         required_reclaim = max(
             1,
-            current_tokens - target_tokens + expected_summary_tokens,
+            current_tokens - target_tokens + expected_compacted_tokens,
         )
 
         def decision(
@@ -615,7 +619,7 @@ class CycleSegmentSelector:
                 selected_block_count=selected_block_count,
                 selected_tokens=selected_tokens,
                 required_reclaim_tokens=required_reclaim,
-                expected_summary_tokens=expected_summary_tokens,
+                expected_compacted_tokens=expected_compacted_tokens,
                 max_compactor_input_tokens=max_compactor_input_tokens,
                 first_eligible_block_tokens=first_eligible_block_tokens,
                 barrier_block_index=barrier_block_index,
@@ -756,7 +760,7 @@ class CycleSegmentSelector:
                 best_selected_tokens = selected_tokens
                 best_boundary_reason = boundary_reason
 
-            if selected_tokens <= expected_summary_tokens:
+            if selected_tokens <= expected_compacted_tokens:
                 continue
 
             start = selected[0].start
@@ -911,11 +915,29 @@ class CycleCompactionService:
         target_summary_tokens: int,
         active_plan_state: dict[str, Any] | None = None,
     ) -> CycleCompactionRequest:
+        return self.build_request_for_content_id(
+            active_cycle=active_cycle,
+            selection=selection,
+            segment_content_id=segment_content_ref.content_id,
+            target_summary_tokens=target_summary_tokens,
+            active_plan_state=active_plan_state,
+        )
+
+    def build_request_for_content_id(
+        self,
+        *,
+        active_cycle: ActiveAgentCycle,
+        selection: CycleSegmentSelection,
+        segment_content_id: str,
+        target_summary_tokens: int,
+        active_plan_state: dict[str, Any] | None = None,
+    ) -> CycleCompactionRequest:
+        """Build the request before or after persisting the selected segment."""
         return CycleCompactionRequest(
             original_user_request=active_cycle.original_user_request,
             previous_working_memory=active_cycle.working_memory,
             active_plan_state=active_plan_state,
-            segment_content_id=segment_content_ref.content_id,
+            segment_content_id=segment_content_id,
             segment_message_count=len(selection.messages),
             segment_tokens_estimate=selection.estimated_tokens,
             target_summary_tokens=target_summary_tokens,

@@ -139,7 +139,7 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(call.kwargs["temperature_override"], 0.1)
             self.assertEqual(
                 call.kwargs["max_tokens_override"],
-                self.client._cycle_summary_target_tokens(),
+                self.client._cycle_compactor_output_tokens(),
             )
         compact_events = [
             event
@@ -163,7 +163,10 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(done["visibility"], "internal")
         self.assertIn("before_tokens", started["data"])
         self.assertIn("generation", done["data"])
-        self.assertNotIn("summary", json.dumps(events, ensure_ascii=False))
+        self.assertNotIn(
+            "working summary",
+            json.dumps(events, ensure_ascii=False),
+        )
 
     async def test_resumed_cycle_compacts_work_after_latest_user_reply(self):
         reply = dumps_json({
@@ -272,6 +275,74 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.client.llm_config.max_tokens = 64
 
         self.assertEqual(self.client._cycle_summary_target_tokens(), 64)
+        self.assertEqual(self.client._cycle_compactor_output_tokens(), 64)
+
+    def test_structured_output_budget_is_separate_from_summary_target(self):
+        self.client.llm_config.max_tokens = 4_096
+        self.client.llm_config.context_window_tokens = 262_144
+        self.client.llm_config.reserved_output_tokens = 8_192
+
+        summary_target = self.client._cycle_summary_target_tokens()
+
+        self.assertLess(summary_target, 1_536)
+        self.assertEqual(summary_target, 512)
+        self.assertEqual(
+            self.client._cycle_compactor_output_tokens(),
+            2_048,
+        )
+
+    async def test_truncated_output_is_repaired_with_same_output_budget(self):
+        self.client.llm_config.max_tokens = 4_096
+        self.client.llm_config.reserved_output_tokens = 4_096
+        self.client.memory_config.cycle_compaction_max_passes = 1
+        cycle = self._active_cycle()
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            {
+                "content": "",
+                self.client.LLM_RUNTIME_METADATA_KEY: {
+                    "content_chars": 0,
+                    "finish_reason": "length",
+                    "prompt_tokens": 5_976,
+                    "completion_tokens": 2_048,
+                    "total_tokens": 8_024,
+                },
+            },
+            valid_compaction_response(),
+        ])
+
+        outcome = await self._compact(cycle)
+
+        self.assertTrue(outcome.changed)
+        self.assertEqual(
+            self.client._call_llm_with_retries.await_count,
+            2,
+        )
+        first_call, repair_call = (
+            self.client._call_llm_with_retries.await_args_list
+        )
+        self.assertEqual(
+            first_call.kwargs["max_tokens_override"],
+            2_048,
+        )
+        self.assertEqual(
+            repair_call.kwargs["max_tokens_override"],
+            2_048,
+        )
+        self.assertEqual(
+            repair_call.kwargs["temperature_override"],
+            0.0,
+        )
+        retry = next(
+            event
+            for event in cycle.cycle_trace
+            if event["type"] == "cycle_compaction_retry"
+        )
+        self.assertEqual(retry["first_finish_reason"], "length")
+        self.assertEqual(retry["reason"], "output_budget_exhausted")
+        self.assertNotIn(
+            "OLD_BLOCK_0",
+            json.dumps(cycle.cycle_trace, ensure_ascii=False),
+        )
 
     async def test_invalid_output_is_atomic_and_repeat_is_skipped(self):
         cycle = self._active_cycle()
@@ -292,7 +363,10 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             second.failure_reason,
             "unchanged_context_after_failure",
         )
-        self.client._call_llm_with_retries.assert_awaited_once()
+        self.assertEqual(
+            self.client._call_llm_with_retries.await_count,
+            2,
+        )
         self.assertIn(
             "cycle_compaction_skipped",
             [event["type"] for event in cycle.cycle_trace],
@@ -310,22 +384,19 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unchanged_selection_signature_suppresses_repeat_warning(self):
         cycle = self._active_cycle()
-        decision = self.client.cycle_segment_selector.evaluate(
+        decision, _ = self.client._select_cycle_segment_to_fit(
+            active_cycle=cycle,
             messages=cycle.messages_for_llm,
-            original_user_message_index=cycle.original_user_message_index,
             current_tokens=self.client._estimate_messages_tokens(
                 cycle.messages_for_llm
             ),
             target_tokens=self.client._context_target_tokens(),
-            expected_summary_tokens=(
-                self.client._cycle_summary_target_tokens()
+            summary_target_tokens=self.client._cycle_summary_target_tokens(),
+            expected_compacted_tokens=(
+                self.client._cycle_compactor_output_tokens()
             ),
-            max_compactor_input_tokens=(
-                self.client._cycle_compactor_segment_budget(cycle)
-            ),
-            keep_recent_blocks=(
-                self.client.memory_config
-                .cycle_compaction_keep_recent_blocks
+            compactor_input_limit_tokens=(
+                self.client._context_trigger_tokens()
             ),
         )
         cycle.compaction_failures = 1
@@ -346,6 +417,81 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "unchanged_context_after_failure",
         )
         self.assertEqual(events, [])
+        self.client._call_llm_with_retries.assert_not_awaited()
+
+    def test_exact_preflight_shrinks_selection_on_block_boundary(self):
+        cycle = self._active_cycle()
+        trigger_tokens = self.client._context_trigger_tokens()
+        original_estimator = (
+            self.client._estimate_cycle_compactor_input_tokens
+        )
+        inspected_message_counts = []
+
+        def controlled_estimator(**kwargs):
+            message_count = len(kwargs["selection"].messages)
+            inspected_message_counts.append(message_count)
+            if message_count > 2:
+                return trigger_tokens + 1
+            return original_estimator(**kwargs)
+
+        self.client._estimate_cycle_compactor_input_tokens = Mock(
+            side_effect=controlled_estimator
+        )
+
+        decision, compactor_input_tokens = (
+            self.client._select_cycle_segment_to_fit(
+                active_cycle=cycle,
+                messages=cycle.messages_for_llm,
+                current_tokens=self.client._estimate_messages_tokens(
+                    cycle.messages_for_llm
+                ),
+                target_tokens=self.client._context_target_tokens(),
+                summary_target_tokens=(
+                    self.client._cycle_summary_target_tokens()
+                ),
+                expected_compacted_tokens=(
+                    self.client._cycle_compactor_output_tokens()
+                ),
+                compactor_input_limit_tokens=trigger_tokens,
+            )
+        )
+
+        self.assertIsNotNone(decision.selection)
+        self.assertEqual(len(decision.selection.messages), 2)
+        self.assertLessEqual(compactor_input_tokens, trigger_tokens)
+        self.assertGreater(max(inspected_message_counts), 2)
+        resize = next(
+            event
+            for event in cycle.cycle_trace
+            if event["type"] == "cycle_compaction_selection_resized"
+        )
+        self.assertGreater(
+            resize["compactor_input_tokens"],
+            resize["input_limit_tokens"],
+        )
+        self.assertNotIn(
+            "OLD_BLOCK_0",
+            json.dumps(resize, ensure_ascii=False),
+        )
+
+    async def test_failed_exact_preflight_does_not_persist_segment(self):
+        cycle = self._active_cycle()
+        original = list(cycle.messages_for_llm)
+        self.client._estimate_cycle_compactor_input_tokens = Mock(
+            return_value=self.client._context_trigger_tokens() + 1
+        )
+        self.client.cycle_compaction_service.persist_segment = AsyncMock()
+        self.client._call_llm_with_retries = AsyncMock()
+
+        outcome = await self._compact(cycle)
+
+        self.assertFalse(outcome.changed)
+        self.assertEqual(outcome.failure_reason, "no_safe_segment")
+        self.assertEqual(cycle.messages_for_llm, original)
+        (
+            self.client.cycle_compaction_service.persist_segment
+            .assert_not_awaited()
+        )
         self.client._call_llm_with_retries.assert_not_awaited()
 
     async def test_persistence_failure_never_calls_compactor(self):

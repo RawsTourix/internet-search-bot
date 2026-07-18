@@ -47,10 +47,18 @@ def safe_memory_config_summary(config: Any) -> dict[str, Any]:
         "single_pass_summary_max_input_ratio": (
             config.single_pass_summary_max_input_ratio
         ),
-        "result_summary_target_ratio": config.result_summary_target_ratio,
+        "result_summary_target_tokens": (
+            config.result_summary_target_tokens
+        ),
+        "result_compaction_max_output_tokens": (
+            config.result_compaction_max_output_tokens
+        ),
         "result_preview_max_chars": config.result_preview_max_chars,
-        "cycle_compaction_summary_target_ratio": (
-            config.cycle_compaction_summary_target_ratio
+        "cycle_compaction_summary_target_tokens": (
+            config.cycle_compaction_summary_target_tokens
+        ),
+        "cycle_compaction_max_output_tokens": (
+            config.cycle_compaction_max_output_tokens
         ),
         "cycle_compaction_keep_recent_blocks": (
             config.cycle_compaction_keep_recent_blocks

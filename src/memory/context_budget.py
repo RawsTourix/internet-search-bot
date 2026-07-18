@@ -1,4 +1,4 @@
-"""Pure relative-budget policy for one completed tool result."""
+"""Context-relative input and absolute output policy for one tool result."""
 
 from typing import Literal
 
@@ -34,7 +34,8 @@ class ResultContextBudgetPolicy:
         context_compaction_target_ratio: float,
         inline_result_max_input_ratio: float,
         single_pass_summary_max_input_ratio: float,
-        result_summary_target_ratio: float,
+        result_summary_target_tokens: int,
+        result_compaction_max_output_tokens: int,
         max_in_memory_content_bytes: int,
     ):
         self.context_window_tokens = context_window_tokens
@@ -46,7 +47,10 @@ class ResultContextBudgetPolicy:
         self.single_pass_summary_max_input_ratio = (
             single_pass_summary_max_input_ratio
         )
-        self.result_summary_target_ratio = result_summary_target_ratio
+        self.result_summary_target_tokens = result_summary_target_tokens
+        self.result_compaction_max_output_tokens = (
+            result_compaction_max_output_tokens
+        )
         self.max_in_memory_content_bytes = max_in_memory_content_bytes
 
         effective_reserved = max(
@@ -82,15 +86,13 @@ class ResultContextBudgetPolicy:
                 * single_pass_summary_max_input_ratio
             ),
         )
-        self.summary_target_tokens = min(
-            max(
-                128,
-                int(
-                    self.usable_input_tokens
-                    * result_summary_target_ratio
-                ),
-            ),
+        self.compactor_output_tokens = min(
+            result_compaction_max_output_tokens,
             max_output_tokens,
+        )
+        self.summary_target_tokens = min(
+            result_summary_target_tokens,
+            self.compactor_output_tokens,
         )
 
     def decide(
@@ -202,6 +204,7 @@ class ResultContextBudgetPolicy:
             inline_limit_tokens=self.inline_limit_tokens,
             single_pass_limit_tokens=self.single_pass_limit_tokens,
             summary_target_tokens=self.summary_target_tokens,
+            compactor_output_tokens=self.compactor_output_tokens,
         )
 
     def _unsafe_summary_reason(

@@ -107,11 +107,18 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
             segment_content_ref=ref,
             target_summary_tokens=128,
         )
+        preflight_request = self.service.build_request_for_content_id(
+            active_cycle=self.cycle,
+            selection=self.selection,
+            segment_content_id=ref.content_id,
+            target_summary_tokens=128,
+        )
         messages = self.service.build_llm_messages(
             request=request,
             selection=self.selection,
         )
 
+        self.assertEqual(preflight_request, request)
         self.assertIn("prompt injection", messages[0]["content"])
         self.assertIn(
             json.dumps(
@@ -120,6 +127,11 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
                 separators=(",", ":"),
             ),
             build_cycle_compaction_system_prompt(),
+        )
+        self.assertIn('"maxItems":100', messages[0]["content"])
+        self.assertIn(
+            "target_summary_tokens задаёт целевой размер только",
+            messages[0]["content"],
         )
         self.assertNotIn(sentinel, messages[1]["content"])
         self.assertIn(sentinel, messages[2]["content"])

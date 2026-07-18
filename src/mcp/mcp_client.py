@@ -39,6 +39,8 @@ from ..memory import (
     CycleCompactionOutputError,
     CycleCompactionService,
     CycleContextLimitError,
+    CycleSegmentSelection,
+    CycleSegmentSelectionDecision,
     CycleSegmentSelectionError,
     CycleSegmentSelector,
     CycleWorkingMemory,
@@ -52,7 +54,6 @@ from ..memory import (
     ResultContextBudgetPolicy,
     ResultHandling,
     ResultProcessingOutcome,
-    build_cycle_compaction_system_prompt,
     build_cycle_working_memory_message,
     extract_cycle_refs,
     parse_cycle_working_memory_message,
@@ -490,8 +491,11 @@ class MCPClient:
             single_pass_summary_max_input_ratio=(
                 self.memory_config.single_pass_summary_max_input_ratio
             ),
-            result_summary_target_ratio=(
-                self.memory_config.result_summary_target_ratio
+            result_summary_target_tokens=(
+                self.memory_config.result_summary_target_tokens
+            ),
+            result_compaction_max_output_tokens=(
+                self.memory_config.result_compaction_max_output_tokens
             ),
             max_in_memory_content_bytes=(
                 storage_services.config.max_in_memory_content_bytes
@@ -2674,6 +2678,41 @@ class MCPClient:
         )
         return diagnostics
 
+    def _log_valid_result_compaction_response(
+        self,
+        *,
+        effective_tool_name: str,
+        attempt: int,
+        response: dict[str, Any],
+        summary: ResultCompactionSummary,
+        summary_target_tokens: int,
+        compactor_output_tokens: int,
+    ) -> None:
+        diagnostics = self._safe_llm_response_diagnostics(response)
+        summary_tokens_estimate = self._estimate_tokens_rough(
+            summary.summary
+        )
+        logger.info(
+            "Result compaction output valid: tool=%s attempt=%s/2 "
+            "summary_chars=%s summary_tokens_estimate=%s "
+            "summary_target_tokens=%s key_fact_count=%s "
+            "limitation_count=%s follow_up_count=%s "
+            "content_chars=%s max_output_tokens=%s finish_reason=%s "
+            "completion_tokens=%s",
+            effective_tool_name,
+            attempt,
+            len(summary.summary),
+            summary_tokens_estimate,
+            summary_target_tokens,
+            len(summary.key_facts),
+            len(summary.limitations),
+            len(summary.suggested_follow_up),
+            diagnostics["content_chars"],
+            compactor_output_tokens,
+            diagnostics["finish_reason"],
+            diagnostics["completion_tokens"],
+        )
+
     @staticmethod
     def _harden_result_summary_fidelity(
         *,
@@ -2735,7 +2774,10 @@ class MCPClient:
         )
         limitations = list(summary.limitations)
         if limitation not in limitations:
-            limitations.append(limitation)
+            if len(limitations) >= 50:
+                limitations[-1] = limitation
+            else:
+                limitations.append(limitation)
         return summary.model_copy(update={
             "limitations": limitations,
             "needs_original_content": True,
@@ -2781,7 +2823,7 @@ class MCPClient:
             cycle_id=cycle_id,
             progress_callback=progress_callback,
             cycle_trace=cycle_trace,
-            max_tokens_override=decision.summary_target_tokens,
+            max_tokens_override=decision.compactor_output_tokens,
             temperature_override=0.1,
             redact_error_details=True,
         )
@@ -2799,24 +2841,35 @@ class MCPClient:
                 error=error,
             )
         else:
-            return self._harden_result_summary_fidelity(
+            summary = self._harden_result_summary_fidelity(
                 request=request,
                 raw_result=raw_result,
                 summary=summary,
             )
+            self._log_valid_result_compaction_response(
+                effective_tool_name=effective_tool_name,
+                attempt=1,
+                response=response,
+                summary=summary,
+                summary_target_tokens=decision.summary_target_tokens,
+                compactor_output_tokens=decision.compactor_output_tokens,
+            )
+            return summary
 
-        repair_max_tokens = min(
-            self.llm_config.max_tokens,
-            max(decision.summary_target_tokens * 2, 1024),
-        )
+        repair_max_tokens = decision.compactor_output_tokens
         self._trace_event(
             cycle_trace,
             "result_compaction_retry",
             tool_name=effective_tool_name,
             attempt=2,
-            reason="invalid_structured_output",
+            reason=(
+                "output_budget_exhausted"
+                if diagnostics["finish_reason"] == "length"
+                else "invalid_structured_output"
+            ),
             first_content_chars=diagnostics["content_chars"],
             first_finish_reason=diagnostics["finish_reason"],
+            first_completion_tokens=diagnostics["completion_tokens"],
             max_tokens=repair_max_tokens,
         )
         repair_messages = [
@@ -2861,22 +2914,20 @@ class MCPClient:
             )
             raise
 
-        repair_diagnostics = self._safe_llm_response_diagnostics(
-            repair_response
-        )
-        logger.info(
-            "Result compaction output repaired: tool=%s content_chars=%s "
-            "finish_reason=%s completion_tokens=%s",
-            effective_tool_name,
-            repair_diagnostics["content_chars"],
-            repair_diagnostics["finish_reason"],
-            repair_diagnostics["completion_tokens"],
-        )
-        return self._harden_result_summary_fidelity(
+        summary = self._harden_result_summary_fidelity(
             request=request,
             raw_result=raw_result,
             summary=summary,
         )
+        self._log_valid_result_compaction_response(
+            effective_tool_name=effective_tool_name,
+            attempt=2,
+            response=repair_response,
+            summary=summary,
+            summary_target_tokens=decision.summary_target_tokens,
+            compactor_output_tokens=decision.compactor_output_tokens,
+        )
+        return summary
 
     async def _record_result_stage(
         self,
@@ -3286,6 +3337,9 @@ class MCPClient:
                     **stage_data,
                     "content_id": content_ref.content_id,
                     "summary_target_tokens": decision.summary_target_tokens,
+                    "compactor_output_tokens": (
+                        decision.compactor_output_tokens
+                    ),
                 },
                 state=state,
                 session_id=session_id,
@@ -3381,7 +3435,14 @@ class MCPClient:
                         "content_id": content_ref.content_id,
                         "summary_status": "summarized",
                         "summary_chars": len(summary.summary),
+                        "summary_tokens_estimate": (
+                            self._estimate_tokens_rough(summary.summary)
+                        ),
                         "key_fact_count": len(summary.key_facts),
+                        "limitation_count": len(summary.limitations),
+                        "follow_up_count": len(
+                            summary.suggested_follow_up
+                        ),
                         "needs_retrieval": (
                             summary.needs_original_content
                         ),
@@ -6108,59 +6169,129 @@ class MCPClient:
     def _cycle_summary_target_tokens(self) -> int:
         return min(
             self.llm_config.max_tokens,
-            max(
-                128,
-                int(
-                    self._context_usable_input_tokens()
-                    * self.memory_config
-                    .cycle_compaction_summary_target_ratio
-                ),
-            ),
+            self.memory_config.cycle_compaction_summary_target_tokens,
         )
 
-    def _cycle_compactor_segment_budget(
-        self,
-        active_cycle: ActiveAgentCycle,
-    ) -> int:
-        metadata_without_segment = {
-            "type": "cycle_compaction_request",
-            "original_user_request": active_cycle.original_user_request,
-            "previous_working_memory": (
-                active_cycle.working_memory.model_dump()
-                if active_cycle.working_memory is not None
-                else None
-            ),
-            "active_plan_state": None,
-            "segment_content_id": "cnt_" + "0" * 32,
-            "segment_message_count": 1,
-            "segment_tokens_estimate": 1,
-            "target_summary_tokens": self._cycle_summary_target_tokens(),
-            "preserve_rules": [
-                "Preserve runtime-known opaque references.",
-            ],
-        }
-        overhead_messages = [
-            {
-                "role": "system",
-                "content": build_cycle_compaction_system_prompt(),
-            },
-            {
-                "role": "user",
-                "content": dumps_json(metadata_without_segment),
-            },
-            {
-                "role": "user",
-                "content": (
-                    "BEGIN_UNTRUSTED_CYCLE_SEGMENT\n"
-                    "\nEND_UNTRUSTED_CYCLE_SEGMENT"
-                ),
-            },
-        ]
-        return max(
-            1,
-            self._context_trigger_tokens()
-            - self._estimate_messages_tokens(overhead_messages),
+    def _cycle_compactor_output_tokens(self) -> int:
+        return min(
+            self.llm_config.max_tokens,
+            self.memory_config.cycle_compaction_max_output_tokens,
         )
+
+    def _build_cycle_compactor_messages(
+        self,
+        *,
+        active_cycle: ActiveAgentCycle,
+        selection: CycleSegmentSelection,
+        segment_content_id: str,
+        summary_target_tokens: int,
+    ) -> list[dict[str, Any]]:
+        request = (
+            self.cycle_compaction_service.build_request_for_content_id(
+                active_cycle=active_cycle,
+                selection=selection,
+                segment_content_id=segment_content_id,
+                target_summary_tokens=summary_target_tokens,
+            )
+        )
+        return self.cycle_compaction_service.build_llm_messages(
+            request=request,
+            selection=selection,
+        )
+
+    def _estimate_cycle_compactor_input_tokens(
+        self,
+        *,
+        active_cycle: ActiveAgentCycle,
+        selection: CycleSegmentSelection,
+        summary_target_tokens: int,
+    ) -> int:
+        messages = self._build_cycle_compactor_messages(
+            active_cycle=active_cycle,
+            selection=selection,
+            segment_content_id="cnt_" + "0" * 32,
+            summary_target_tokens=summary_target_tokens,
+        )
+        return self._estimate_messages_tokens(messages)
+
+    def _select_cycle_segment_to_fit(
+        self,
+        *,
+        active_cycle: ActiveAgentCycle,
+        messages: list[dict[str, Any]],
+        current_tokens: int,
+        target_tokens: int,
+        summary_target_tokens: int,
+        expected_compacted_tokens: int,
+        compactor_input_limit_tokens: int,
+    ) -> tuple[CycleSegmentSelectionDecision, int | None]:
+        if compactor_input_limit_tokens < 1:
+            raise CycleSegmentSelectionError(
+                "invalid_compactor_input_limit"
+            )
+
+        decision: CycleSegmentSelectionDecision | None = None
+        segment_budget = compactor_input_limit_tokens
+        while segment_budget > 0:
+            decision = self.cycle_segment_selector.evaluate(
+                messages=messages,
+                original_user_message_index=(
+                    active_cycle.original_user_message_index
+                ),
+                current_tokens=current_tokens,
+                target_tokens=target_tokens,
+                expected_compacted_tokens=expected_compacted_tokens,
+                max_compactor_input_tokens=segment_budget,
+                keep_recent_blocks=(
+                    self.memory_config.cycle_compaction_keep_recent_blocks
+                ),
+            )
+            selection = decision.selection
+            if selection is None:
+                return decision, None
+
+            compactor_input_tokens = (
+                self._estimate_cycle_compactor_input_tokens(
+                    active_cycle=active_cycle,
+                    selection=selection,
+                    summary_target_tokens=summary_target_tokens,
+                )
+            )
+            if compactor_input_tokens <= compactor_input_limit_tokens:
+                return decision, compactor_input_tokens
+
+            next_budget = selection.estimated_tokens - 1
+            resize_data = {
+                "selected_tokens": selection.estimated_tokens,
+                "compactor_input_tokens": compactor_input_tokens,
+                "input_limit_tokens": compactor_input_limit_tokens,
+                "selected_block_count": selection.selected_block_count,
+                "next_segment_budget": max(0, next_budget),
+            }
+            self._trace_event(
+                active_cycle.cycle_trace,
+                "cycle_compaction_selection_resized",
+                **resize_data,
+            )
+            logger.info(
+                "Cycle compaction selection exceeds exact input limit: "
+                "cycle_id=%s selected_tokens=%s compactor_input_tokens=%s "
+                "input_limit_tokens=%s selected_block_count=%s "
+                "next_segment_budget=%s",
+                active_cycle.cycle_id,
+                resize_data["selected_tokens"],
+                resize_data["compactor_input_tokens"],
+                resize_data["input_limit_tokens"],
+                resize_data["selected_block_count"],
+                resize_data["next_segment_budget"],
+            )
+            segment_budget = next_budget
+
+        if decision is None:
+            raise CycleSegmentSelectionError(
+                "cycle_segment_selection_not_attempted"
+            )
+        return decision, None
 
     async def _compact_context_if_needed(
         self,
@@ -6309,20 +6440,18 @@ class MCPClient:
 
         max_passes = self.memory_config.cycle_compaction_max_passes
         summary_target_tokens = self._cycle_summary_target_tokens()
-        first_selection_decision = self.cycle_segment_selector.evaluate(
+        compactor_output_tokens = self._cycle_compactor_output_tokens()
+        (
+            first_selection_decision,
+            first_compactor_input_tokens,
+        ) = self._select_cycle_segment_to_fit(
+            active_cycle=active_cycle,
             messages=messages_for_llm,
-            original_user_message_index=(
-                active_cycle.original_user_message_index
-            ),
             current_tokens=before_tokens,
             target_tokens=target_tokens,
-            expected_summary_tokens=summary_target_tokens,
-            max_compactor_input_tokens=(
-                self._cycle_compactor_segment_budget(active_cycle)
-            ),
-            keep_recent_blocks=(
-                self.memory_config.cycle_compaction_keep_recent_blocks
-            ),
+            summary_target_tokens=summary_target_tokens,
+            expected_compacted_tokens=compactor_output_tokens,
+            compactor_input_limit_tokens=trigger_tokens,
         )
         first_failure_signature = first_selection_decision.retry_signature()
         unchanged_failed_selection = (
@@ -6363,6 +6492,8 @@ class MCPClient:
             "before_tokens": before_tokens,
             "trigger_tokens": trigger_tokens,
             "target_tokens": target_tokens,
+            "summary_target_tokens": summary_target_tokens,
+            "compactor_output_tokens": compactor_output_tokens,
             "current_generation": current_generation,
             "max_passes": (
                 max_passes
@@ -6391,22 +6522,19 @@ class MCPClient:
         for pass_index in range(1, max_passes + 1):
             if pass_index == 1:
                 selection_decision = first_selection_decision
+                compactor_input_tokens = first_compactor_input_tokens
             else:
-                selection_decision = self.cycle_segment_selector.evaluate(
+                (
+                    selection_decision,
+                    compactor_input_tokens,
+                ) = self._select_cycle_segment_to_fit(
+                    active_cycle=active_cycle,
                     messages=messages_for_llm,
-                    original_user_message_index=(
-                        active_cycle.original_user_message_index
-                    ),
                     current_tokens=current_tokens,
                     target_tokens=target_tokens,
-                    expected_summary_tokens=summary_target_tokens,
-                    max_compactor_input_tokens=(
-                        self._cycle_compactor_segment_budget(active_cycle)
-                    ),
-                    keep_recent_blocks=(
-                        self.memory_config
-                        .cycle_compaction_keep_recent_blocks
-                    ),
+                    summary_target_tokens=summary_target_tokens,
+                    expected_compacted_tokens=compactor_output_tokens,
+                    compactor_input_limit_tokens=trigger_tokens,
                 )
             attempt_failure_signature = (
                 selection_decision.retry_signature()
@@ -6446,6 +6574,15 @@ class MCPClient:
                     )
                 break
 
+            if compactor_input_tokens is None:
+                return await emit_failure(
+                    reason="compactor_input_limit_exceeded",
+                    error_type="CycleSegmentSelectionError",
+                    current_tokens=current_tokens,
+                    passes_completed=passes_completed,
+                    logical_failure=True,
+                )
+
             generation_candidate = (
                 active_cycle.working_memory.generation + 1
                 if active_cycle.working_memory is not None
@@ -6477,6 +6614,8 @@ class MCPClient:
                 "message_end_exclusive": selection.end_exclusive,
                 "message_count": len(selection.messages),
                 "segment_tokens_estimate": selection.estimated_tokens,
+                "compactor_input_tokens": compactor_input_tokens,
+                "compactor_output_tokens": compactor_output_tokens,
             }
             self._trace_event(
                 cycle_trace,
@@ -6484,23 +6623,29 @@ class MCPClient:
                 **segment_saved_data,
             )
 
-            request = self.cycle_compaction_service.build_request(
+            extracted_refs = extract_cycle_refs(selection.messages)
+            compactor_messages = self._build_cycle_compactor_messages(
                 active_cycle=active_cycle,
                 selection=selection,
-                segment_content_ref=segment_content_ref,
-                target_summary_tokens=summary_target_tokens,
+                segment_content_id=segment_content_ref.content_id,
+                summary_target_tokens=summary_target_tokens,
             )
-            extracted_refs = extract_cycle_refs(selection.messages)
-            compactor_messages = (
-                self.cycle_compaction_service.build_llm_messages(
-                    request=request,
-                    selection=selection,
-                )
-            )
-            if (
+            actual_compactor_input_tokens = (
                 self._estimate_messages_tokens(compactor_messages)
-                > trigger_tokens
-            ):
+            )
+            if actual_compactor_input_tokens > trigger_tokens:
+                logger.error(
+                    "Cycle compaction exact preflight invariant failed: "
+                    "cycle_id=%s selected_tokens=%s "
+                    "preflight_input_tokens=%s actual_input_tokens=%s "
+                    "input_limit_tokens=%s selected_block_count=%s",
+                    active_cycle.cycle_id,
+                    selection.estimated_tokens,
+                    compactor_input_tokens,
+                    actual_compactor_input_tokens,
+                    trigger_tokens,
+                    selection.selected_block_count,
+                )
                 return await emit_failure(
                     reason="compactor_input_limit_exceeded",
                     error_type="CycleSegmentSelectionError",
@@ -6523,14 +6668,155 @@ class MCPClient:
                     cycle_id=active_cycle.cycle_id,
                     progress_callback=progress_callback,
                     cycle_trace=cycle_trace,
-                    max_tokens_override=summary_target_tokens,
+                    max_tokens_override=compactor_output_tokens,
                     temperature_override=0.1,
                     redact_error_details=True,
                 )
-                compaction_result = (
-                    self.cycle_compaction_service.parse_compaction_result(
-                        response.get("content", "") or ""
+                validated_response = response
+                validated_attempt = 1
+                try:
+                    compaction_result = (
+                        self.cycle_compaction_service
+                        .parse_compaction_result(
+                            response.get("content", "") or ""
+                        )
                     )
+                except CycleCompactionOutputError:
+                    diagnostics = self._safe_llm_response_diagnostics(
+                        response
+                    )
+                    logger.warning(
+                        "Cycle compaction output invalid: cycle_id=%s "
+                        "generation=%s attempt=1/2 content_chars=%s "
+                        "finish_reason=%s prompt_tokens=%s "
+                        "completion_tokens=%s total_tokens=%s",
+                        active_cycle.cycle_id,
+                        generation_candidate,
+                        diagnostics["content_chars"],
+                        diagnostics["finish_reason"],
+                        diagnostics["prompt_tokens"],
+                        diagnostics["completion_tokens"],
+                        diagnostics["total_tokens"],
+                    )
+                    repair_max_tokens = compactor_output_tokens
+                    self._trace_event(
+                        cycle_trace,
+                        "cycle_compaction_retry",
+                        generation_candidate=generation_candidate,
+                        pass_index=pass_index,
+                        reason=(
+                            "output_budget_exhausted"
+                            if diagnostics["finish_reason"] == "length"
+                            else "invalid_structured_output"
+                        ),
+                        first_content_chars=diagnostics["content_chars"],
+                        first_finish_reason=diagnostics["finish_reason"],
+                        first_completion_tokens=(
+                            diagnostics["completion_tokens"]
+                        ),
+                        max_tokens=repair_max_tokens,
+                    )
+                    repair_messages = [
+                        *compactor_messages,
+                        {
+                            "role": "user",
+                            "content": (
+                                "The previous response did not pass the "
+                                "CycleCompactionResult JSON Schema. Repeat "
+                                "the original task on the same source data. "
+                                "Return exactly one valid "
+                                "CycleCompactionResult JSON object without "
+                                "Markdown, explanations, or extra fields."
+                            ),
+                        },
+                    ]
+                    repair_response = await self._call_llm_with_retries(
+                        repair_messages,
+                        [],
+                        context=(
+                            "Cycle compaction repair: generation "
+                            f"{generation_candidate}"
+                        ),
+                        state=state,
+                        session_id=session_id,
+                        cycle_id=active_cycle.cycle_id,
+                        progress_callback=progress_callback,
+                        cycle_trace=cycle_trace,
+                        max_tokens_override=repair_max_tokens,
+                        temperature_override=0.0,
+                        redact_error_details=True,
+                    )
+                    try:
+                        compaction_result = (
+                            self.cycle_compaction_service
+                            .parse_compaction_result(
+                                repair_response.get("content", "") or ""
+                            )
+                        )
+                    except CycleCompactionOutputError:
+                        repair_diagnostics = (
+                            self._safe_llm_response_diagnostics(
+                                repair_response
+                            )
+                        )
+                        logger.warning(
+                            "Cycle compaction output invalid: cycle_id=%s "
+                            "generation=%s attempt=2/2 content_chars=%s "
+                            "finish_reason=%s prompt_tokens=%s "
+                            "completion_tokens=%s total_tokens=%s",
+                            active_cycle.cycle_id,
+                            generation_candidate,
+                            repair_diagnostics["content_chars"],
+                            repair_diagnostics["finish_reason"],
+                            repair_diagnostics["prompt_tokens"],
+                            repair_diagnostics["completion_tokens"],
+                            repair_diagnostics["total_tokens"],
+                        )
+                        raise
+
+                    validated_response = repair_response
+                    validated_attempt = 2
+
+                validated_diagnostics = (
+                    self._safe_llm_response_diagnostics(
+                        validated_response
+                    )
+                )
+                working_state = compaction_result.working_state
+                working_item_count = sum(
+                    len(getattr(working_state, field_name))
+                    for field_name in (
+                        "completed_actions",
+                        "confirmed_actions",
+                        "rejected_actions",
+                        "important_results",
+                        "important_decisions",
+                        "modified_files",
+                        "errors_affecting_continuation",
+                        "result_refs",
+                        "artifact_refs",
+                    )
+                )
+                logger.info(
+                    "Cycle compaction output valid: cycle_id=%s "
+                    "generation=%s attempt=%s/2 summary_chars=%s "
+                    "summary_tokens_estimate=%s "
+                    "summary_target_tokens=%s working_item_count=%s "
+                    "content_chars=%s max_output_tokens=%s "
+                    "finish_reason=%s completion_tokens=%s",
+                    active_cycle.cycle_id,
+                    generation_candidate,
+                    validated_attempt,
+                    len(compaction_result.summary),
+                    self._estimate_tokens_rough(
+                        compaction_result.summary
+                    ),
+                    summary_target_tokens,
+                    working_item_count,
+                    validated_diagnostics["content_chars"],
+                    compactor_output_tokens,
+                    validated_diagnostics["finish_reason"],
+                    validated_diagnostics["completion_tokens"],
                 )
             except (
                 LLMTimeoutError,

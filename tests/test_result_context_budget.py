@@ -59,7 +59,8 @@ class ResultContextBudgetPolicyTests(unittest.TestCase):
             context_compaction_target_ratio=0.5,
             inline_result_max_input_ratio=0.1,
             single_pass_summary_max_input_ratio=0.6,
-            result_summary_target_ratio=0.01,
+            result_summary_target_tokens=128,
+            result_compaction_max_output_tokens=400,
             max_in_memory_content_bytes=10_000,
         )
 
@@ -89,6 +90,24 @@ class ResultContextBudgetPolicyTests(unittest.TestCase):
         self.assertEqual(self.policy.inline_limit_tokens, 900)
         self.assertEqual(self.policy.single_pass_limit_tokens, 5_400)
         self.assertEqual(self.policy.summary_target_tokens, 128)
+        self.assertEqual(self.policy.compactor_output_tokens, 400)
+
+    def test_output_budgets_do_not_grow_with_context_window(self):
+        large_context_policy = ResultContextBudgetPolicy(
+            context_window_tokens=262_144,
+            reserved_output_tokens=8_192,
+            max_output_tokens=4_096,
+            context_safety_ratio=0.8,
+            context_compaction_target_ratio=0.5,
+            inline_result_max_input_ratio=0.1,
+            single_pass_summary_max_input_ratio=0.6,
+            result_summary_target_tokens=128,
+            result_compaction_max_output_tokens=400,
+            max_in_memory_content_bytes=10_000,
+        )
+
+        self.assertEqual(large_context_policy.summary_target_tokens, 128)
+        self.assertEqual(large_context_policy.compactor_output_tokens, 400)
 
     def test_small_auto_and_prefer_inline_are_inline(self):
         auto = self.decide()

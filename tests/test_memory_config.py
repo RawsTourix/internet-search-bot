@@ -53,9 +53,11 @@ class MemoryConfigTests(unittest.TestCase):
                     "enable_result_compaction": False,
                     "inline_result_max_input_ratio": 0.2,
                     "single_pass_summary_max_input_ratio": 0.8,
-                    "result_summary_target_ratio": 0.05,
+                    "result_summary_target_tokens": 300,
+                    "result_compaction_max_output_tokens": 1200,
                     "result_preview_max_chars": 123,
-                    "cycle_compaction_summary_target_ratio": 0.03,
+                    "cycle_compaction_summary_target_tokens": 600,
+                    "cycle_compaction_max_output_tokens": 2400,
                     "cycle_compaction_keep_recent_blocks": 4,
                     "cycle_compaction_max_passes": 5,
                 })
@@ -65,11 +67,16 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertFalse(memory.enable_result_compaction)
         self.assertEqual(memory.inline_result_max_input_ratio, 0.2)
         self.assertEqual(memory.single_pass_summary_max_input_ratio, 0.8)
-        self.assertEqual(memory.result_summary_target_ratio, 0.05)
+        self.assertEqual(memory.result_summary_target_tokens, 300)
+        self.assertEqual(memory.result_compaction_max_output_tokens, 1200)
         self.assertEqual(memory.result_preview_max_chars, 123)
         self.assertEqual(
-            memory.cycle_compaction_summary_target_ratio,
-            0.03,
+            memory.cycle_compaction_summary_target_tokens,
+            600,
+        )
+        self.assertEqual(
+            memory.cycle_compaction_max_output_tokens,
+            2400,
         )
         self.assertEqual(memory.cycle_compaction_keep_recent_blocks, 4)
         self.assertEqual(memory.cycle_compaction_max_passes, 5)
@@ -83,14 +90,21 @@ class MemoryConfigTests(unittest.TestCase):
                 "single_pass_summary_max_input_ratio": 0.6,
             },
             {
-                "single_pass_summary_max_input_ratio": 0.6,
-                "result_summary_target_ratio": 0.6,
+                "result_summary_target_tokens": 1000,
+                "result_compaction_max_output_tokens": 1000,
             },
             {"result_preview_max_chars": 0},
-            {"cycle_compaction_summary_target_ratio": 0},
+            {"result_compaction_max_output_tokens": 0},
+            {"cycle_compaction_summary_target_tokens": 0},
+            {
+                "cycle_compaction_summary_target_tokens": 2000,
+                "cycle_compaction_max_output_tokens": 2000,
+            },
             {"cycle_compaction_keep_recent_blocks": 0},
             {"cycle_compaction_max_passes": 0},
             {"cycle_compaction_max_passes": 11},
+            {"result_summary_target_ratio": 0.01},
+            {"cycle_compaction_summary_target_ratio": 0.02},
             {"extra": True},
         )
 
@@ -102,9 +116,10 @@ class MemoryConfigTests(unittest.TestCase):
     def test_direct_model_validation_rejects_invalid_values(self):
         for kwargs in (
             {"single_pass_summary_max_input_ratio": 0},
-            {"result_summary_target_ratio": 2},
+            {"result_summary_target_tokens": 0},
+            {"result_compaction_max_output_tokens": -1},
             {"result_preview_max_chars": -1},
-            {"cycle_compaction_summary_target_ratio": 1.1},
+            {"cycle_compaction_max_output_tokens": 0},
             {"cycle_compaction_keep_recent_blocks": -1},
             {"cycle_compaction_max_passes": 11},
         ):

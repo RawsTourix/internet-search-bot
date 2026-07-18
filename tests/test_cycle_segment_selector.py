@@ -111,7 +111,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
             original_user_message_index=2,
             current_tokens=1_000,
             target_tokens=400,
-            expected_summary_tokens=20,
+            expected_compacted_tokens=20,
             max_compactor_input_tokens=2_000,
             keep_recent_blocks=1,
         )
@@ -151,7 +151,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
             original_user_message_index=2,
             current_tokens=1_000,
             target_tokens=400,
-            expected_summary_tokens=10,
+            expected_compacted_tokens=10,
             max_compactor_input_tokens=2_000,
             keep_recent_blocks=1,
         )
@@ -167,7 +167,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
             original_user_message_index=2,
             current_tokens=1_000,
             target_tokens=400,
-            expected_summary_tokens=10,
+            expected_compacted_tokens=10,
             max_compactor_input_tokens=50,
             keep_recent_blocks=1,
         )
@@ -190,7 +190,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
             original_user_message_index=1,
             current_tokens=1_000,
             target_tokens=400,
-            expected_summary_tokens=100,
+            expected_compacted_tokens=100,
             max_compactor_input_tokens=2_000,
             keep_recent_blocks=3,
         )
@@ -204,7 +204,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
         self.assertEqual(decision.selected_block_count, 1)
         self.assertLessEqual(
             decision.selected_tokens,
-            decision.expected_summary_tokens,
+            decision.expected_compacted_tokens,
         )
         diagnostics = decision.safe_log_data()
         self.assertNotIn("messages", diagnostics)
@@ -250,7 +250,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
             original_user_message_index=1,
             current_tokens=3_000,
             target_tokens=500,
-            expected_summary_tokens=100,
+            expected_compacted_tokens=100,
             max_compactor_input_tokens=5_000,
             keep_recent_blocks=1,
         )
