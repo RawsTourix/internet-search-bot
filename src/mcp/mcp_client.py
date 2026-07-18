@@ -438,6 +438,13 @@ class MCPClient:
         "api_key", "apikey", "token", "password", "secret",
         "authorization", "cookie", "set-cookie",
     }
+    CONTROL_PLANE_MANAGER_TOOLS = frozenset({
+        "mcp_list_servers",
+        "mcp_list_tools",
+        "mcp_get_tool_schema",
+        "mcp_get_runtime_context",
+    })
+    LLM_RUNTIME_METADATA_KEY = "_runtime_llm_metadata"
 
     def __init__(
         self,
@@ -589,11 +596,13 @@ class MCPClient:
                         },
                         "include_schemas": {
                             "type": "boolean",
+                            "const": False,
                             "default": False,
                             "description": (
-                                "Вернуть ли полные input schemas. Обычно false; "
-                                "для полной схемы лучше использовать "
-                                "mcp_get_tool_schema."
+                                "Должно быть false. Полные схемы всех "
+                                "инструментов одним ответом не возвращаются; "
+                                "используй mcp_get_tool_schema для одного "
+                                "выбранного инструмента."
                             ),
                         },
                     },
@@ -2543,6 +2552,57 @@ class MCPClient:
         )
         return match.group(1).strip() if match else content
 
+    def _safe_llm_response_diagnostics(
+        self,
+        response: dict[str, Any],
+    ) -> dict[str, Any]:
+        content = response.get("content")
+        diagnostics: dict[str, Any] = {
+            "content_chars": len(content) if isinstance(content, str) else 0,
+            "finish_reason": None,
+            "prompt_tokens": None,
+            "completion_tokens": None,
+            "total_tokens": None,
+        }
+        metadata = response.get(self.LLM_RUNTIME_METADATA_KEY)
+        if not isinstance(metadata, dict):
+            return diagnostics
+
+        for key in diagnostics:
+            value = metadata.get(key)
+            if key == "finish_reason":
+                if value is None or isinstance(value, str):
+                    diagnostics[key] = value
+            elif isinstance(value, int) and value >= 0:
+                diagnostics[key] = value
+        return diagnostics
+
+    def _log_invalid_result_compaction_response(
+        self,
+        *,
+        effective_tool_name: str,
+        attempt: int,
+        response: dict[str, Any],
+        error: ValidationError,
+    ) -> dict[str, Any]:
+        diagnostics = self._safe_llm_response_diagnostics(response)
+        logger.warning(
+            "Result compaction output invalid: tool=%s attempt=%s/2 "
+            "error_type=%s validation_issue_count=%s content_chars=%s "
+            "finish_reason=%s prompt_tokens=%s completion_tokens=%s "
+            "total_tokens=%s",
+            effective_tool_name,
+            attempt,
+            type(error).__name__,
+            error.error_count(),
+            diagnostics["content_chars"],
+            diagnostics["finish_reason"],
+            diagnostics["prompt_tokens"],
+            diagnostics["completion_tokens"],
+            diagnostics["total_tokens"],
+        )
+        return diagnostics
+
     async def _summarize_tool_result(
         self,
         *,
@@ -2587,10 +2647,88 @@ class MCPClient:
             temperature_override=0.1,
             redact_error_details=True,
         )
-        content = response.get("content", "") or ""
-        return ResultCompactionSummary.model_validate_json(
-            self._strip_single_markdown_fence(content)
+        content = response.get("content")
+        content = content if isinstance(content, str) else ""
+        try:
+            return ResultCompactionSummary.model_validate_json(
+                self._strip_single_markdown_fence(content)
+            )
+        except ValidationError as error:
+            diagnostics = self._log_invalid_result_compaction_response(
+                effective_tool_name=effective_tool_name,
+                attempt=1,
+                response=response,
+                error=error,
+            )
+
+        repair_max_tokens = min(
+            self.llm_config.max_tokens,
+            max(decision.summary_target_tokens * 2, 1024),
         )
+        self._trace_event(
+            cycle_trace,
+            "result_compaction_retry",
+            tool_name=effective_tool_name,
+            attempt=2,
+            reason="invalid_structured_output",
+            first_content_chars=diagnostics["content_chars"],
+            first_finish_reason=diagnostics["finish_reason"],
+            max_tokens=repair_max_tokens,
+        )
+        repair_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": (
+                    "Предыдущий ответ не прошёл проверку JSON Schema. "
+                    "Повтори исходную задачу по тем же данным. Верни ровно "
+                    "один валидный ResultCompactionSummary JSON без Markdown, "
+                    "пояснений и дополнительных полей."
+                ),
+            },
+        ]
+        repair_response = await self._call_llm_with_retries(
+            repair_messages,
+            [],
+            context=f"Result compaction repair: {effective_tool_name}",
+            state=state,
+            session_id=session_id,
+            cycle_id=cycle_id,
+            progress_callback=progress_callback,
+            cycle_trace=cycle_trace,
+            max_tokens_override=repair_max_tokens,
+            temperature_override=0.0,
+            redact_error_details=True,
+        )
+        repair_content = repair_response.get("content")
+        repair_content = (
+            repair_content if isinstance(repair_content, str) else ""
+        )
+        try:
+            summary = ResultCompactionSummary.model_validate_json(
+                self._strip_single_markdown_fence(repair_content)
+            )
+        except ValidationError as error:
+            self._log_invalid_result_compaction_response(
+                effective_tool_name=effective_tool_name,
+                attempt=2,
+                response=repair_response,
+                error=error,
+            )
+            raise
+
+        repair_diagnostics = self._safe_llm_response_diagnostics(
+            repair_response
+        )
+        logger.info(
+            "Result compaction output repaired: tool=%s content_chars=%s "
+            "finish_reason=%s completion_tokens=%s",
+            effective_tool_name,
+            repair_diagnostics["content_chars"],
+            repair_diagnostics["finish_reason"],
+            repair_diagnostics["completion_tokens"],
+        )
+        return summary
 
     async def _record_result_stage(
         self,
@@ -2678,6 +2816,78 @@ class MCPClient:
             result_size_bytes=result_size_bytes,
             summary_request_overhead_tokens=summary_overhead_tokens,
         )
+
+        if self._is_control_plane_manager_tool(outer_tool_name):
+            hard_inline_safe = (
+                decision.candidate_context_tokens
+                < decision.usable_input_tokens
+                and result_size_bytes
+                <= self.storage_services.config.max_in_memory_content_bytes
+            )
+            if hard_inline_safe:
+                decision = replace(
+                    decision,
+                    representation="inline",
+                    reason="control_plane_required_inline",
+                    runtime_override=(
+                        decision.representation != "inline"
+                    ),
+                )
+            else:
+                decision = replace(
+                    decision,
+                    representation="inline",
+                    reason="control_plane_result_exceeds_hard_context",
+                    runtime_override=True,
+                )
+                processing_error_message = (
+                    "Служебный результат не помещается в безопасный "
+                    "контекст. Сузь запрос вместо повторения того же вызова."
+                )
+                error_payload = {
+                    "type": "tool_result_processing_error",
+                    "trusted": False,
+                    "tool_name": effective_tool_name,
+                    "error": processing_error_message,
+                    "result_available": False,
+                    "retry_recommended": False,
+                    "reason": decision.reason,
+                    "size_tokens_estimate": result_tokens,
+                    "security_note": (
+                        "Raw control-plane result omitted for context safety."
+                    ),
+                }
+                self._trace_event(
+                    cycle_trace,
+                    "tool_result_processing_error",
+                    tool_name=effective_tool_name,
+                    tool_call_id=tool_call_id,
+                    error=processing_error_message,
+                    result_available=False,
+                    retry_recommended=False,
+                    reason=decision.reason,
+                    size_tokens_estimate=result_tokens,
+                )
+                messages_for_llm.append({
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": dumps_json(error_payload),
+                })
+                logger.warning(
+                    "Control-plane result rejected before compaction: "
+                    "tool=%s call_id=%s tokens=%s candidate_context=%s "
+                    "usable_input=%s",
+                    effective_tool_name,
+                    tool_call_id,
+                    result_tokens,
+                    decision.candidate_context_tokens,
+                    decision.usable_input_tokens,
+                )
+                return ResultProcessingOutcome(
+                    decision=decision,
+                    visible_payload=error_payload,
+                    persistence_failed=True,
+                )
 
         if decision.representation == "inline":
             self._trace_event(
@@ -4526,6 +4736,9 @@ class MCPClient:
     def _is_manager_tool(self, tool_name: str) -> bool:
         return tool_name in self.manager_tools
 
+    def _is_control_plane_manager_tool(self, tool_name: str) -> bool:
+        return tool_name in self.CONTROL_PLANE_MANAGER_TOOLS
+
     def _record_tool_used(
         self,
         state: SessionState,
@@ -4561,11 +4774,18 @@ class MCPClient:
         self,
         arguments: Dict[str, Any],
     ) -> Dict[str, Any]:
+        if bool(arguments.get("include_schemas", False)):
+            raise ValueError(
+                "mcp_list_tools does not support include_schemas=true. "
+                "Request the short list first, then call "
+                "mcp_get_tool_schema for one selected tool."
+            )
+
         return {
             "type": "mcp_tools",
             "tools": self.server_manager.list_tools(
                 server_names=arguments.get("server_names"),
-                include_schemas=bool(arguments.get("include_schemas", False)),
+                include_schemas=False,
             ),
         }
 
@@ -4817,18 +5037,96 @@ class MCPClient:
             
             if response.status_code == 200:
                 result = response.json()
-                logger.debug("Получен успешный ответ от LLM")
                 
                 # Обработка ответа в зависимости от типа API
                 if self.llm_config.is_openai_compatible:
                     choices = result.get("choices", [])
                     if choices:
-                        message = choices[0].get("message", {})
+                        choice = choices[0]
+                        message = dict(choice.get("message", {}))
+                        raw_finish_reason = choice.get("finish_reason")
+                        allowed_finish_reasons = {
+                            "stop",
+                            "length",
+                            "tool_calls",
+                            "function_call",
+                            "content_filter",
+                        }
+                        finish_reason = (
+                            raw_finish_reason
+                            if raw_finish_reason in allowed_finish_reasons
+                            else (
+                                "other"
+                                if raw_finish_reason is not None
+                                else None
+                            )
+                        )
+                        usage = result.get("usage")
+                        usage = usage if isinstance(usage, dict) else {}
+                        content = message.get("content")
+                        content_chars = (
+                            len(content)
+                            if isinstance(content, str)
+                            else 0
+                        )
+                        tool_calls = message.get("tool_calls")
+                        tool_call_count = (
+                            len(tool_calls)
+                            if isinstance(tool_calls, list)
+                            else 0
+                        )
+                        runtime_metadata = {
+                            "content_chars": content_chars,
+                            "finish_reason": finish_reason,
+                            "prompt_tokens": (
+                                usage.get("prompt_tokens")
+                                if isinstance(
+                                    usage.get("prompt_tokens"),
+                                    int,
+                                )
+                                else None
+                            ),
+                            "completion_tokens": (
+                                usage.get("completion_tokens")
+                                if isinstance(
+                                    usage.get("completion_tokens"),
+                                    int,
+                                )
+                                else None
+                            ),
+                            "total_tokens": (
+                                usage.get("total_tokens")
+                                if isinstance(
+                                    usage.get("total_tokens"),
+                                    int,
+                                )
+                                else None
+                            ),
+                        }
+                        message[self.LLM_RUNTIME_METADATA_KEY] = (
+                            runtime_metadata
+                        )
+                        logger.debug(
+                            "Получен успешный ответ от LLM: "
+                            "content_chars=%s tool_calls=%s "
+                            "finish_reason=%s prompt_tokens=%s "
+                            "completion_tokens=%s total_tokens=%s",
+                            content_chars,
+                            tool_call_count,
+                            finish_reason,
+                            runtime_metadata["prompt_tokens"],
+                            runtime_metadata["completion_tokens"],
+                            runtime_metadata["total_tokens"],
+                        )
                         return message
                     
+                    logger.debug(
+                        "Получен успешный ответ от LLM без choices"
+                    )
                     return {"content": "Получен пустой ответ от LLM"}
 
                 # Для API, не совместимых с OpenAI
+                logger.debug("Получен успешный ответ от custom LLM")
                 return self._parse_custom_llm_response(result)
             
             retry_after = self._parse_retry_after(

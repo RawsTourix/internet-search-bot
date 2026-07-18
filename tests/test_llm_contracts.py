@@ -1,5 +1,6 @@
 import json
 import unittest
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 from src.agent.prompts import AGENT_SYSTEM_PROTOCOL
@@ -135,6 +136,48 @@ class LLMErrorSafetyTests(unittest.IsolatedAsyncioTestCase):
             "LLMError(details omitted)",
         )
 
+    async def test_success_response_exposes_only_safe_runtime_diagnostics(self):
+        finish_reason_sentinel = "PRIVATE_PROVIDER_FINISH_REASON"
+        self.client.llm_config = SimpleNamespace(
+            is_openai_compatible=True,
+            model="model",
+            max_tokens=500,
+            temperature=0.1,
+            top_p=1.0,
+            api_url="https://example.invalid/v1/chat/completions",
+        )
+        self.client.llm_call_timeout = 10
+        response = SimpleNamespace(
+            status_code=200,
+            json=lambda: {
+                "choices": [{
+                    "message": {"content": "ok"},
+                    "finish_reason": finish_reason_sentinel,
+                }],
+                "usage": {
+                    "prompt_tokens": 10,
+                    "completion_tokens": 2,
+                    "total_tokens": 12,
+                },
+            },
+        )
+        self.client.http_client = SimpleNamespace(
+            post=AsyncMock(return_value=response)
+        )
+
+        result = await self.client._call_llm([], [])
+
+        metadata = result[self.client.LLM_RUNTIME_METADATA_KEY]
+        self.assertEqual(metadata["content_chars"], 2)
+        self.assertEqual(metadata["finish_reason"], "other")
+        self.assertEqual(metadata["prompt_tokens"], 10)
+        self.assertEqual(metadata["completion_tokens"], 2)
+        self.assertEqual(metadata["total_tokens"], 12)
+        self.assertNotIn(
+            finish_reason_sentinel,
+            json.dumps(result),
+        )
+
 
 class InternalLLMContextTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
@@ -164,4 +207,3 @@ class InternalLLMContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(call.kwargs["session_id"], "session-1")
         self.assertEqual(call.kwargs["cycle_id"], "cycle-1")
         self.assertIs(call.kwargs["cycle_trace"], cycle_trace)
-

@@ -155,6 +155,100 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
         self.client.server_manager.call_tool.assert_not_awaited()
 
+    async def test_list_tools_rejects_aggregate_schemas(self):
+        schema = next(
+            item
+            for item in self.client._format_tools_for_llm()
+            if item["function"]["name"] == "mcp_list_tools"
+        )["function"]["parameters"]
+        include_schemas = schema["properties"]["include_schemas"]
+        self.assertFalse(include_schemas["const"])
+
+        self.client.server_manager = SimpleNamespace(
+            list_tools=Mock()
+        )
+        with self.assertRaisesRegex(
+            ValueError,
+            "mcp_get_tool_schema",
+        ):
+            await self.client._manager_list_tools({
+                "include_schemas": True,
+            })
+        self.client.server_manager.list_tools.assert_not_called()
+
+    async def test_control_plane_schema_bypasses_llm_compaction(self):
+        raw = dumps_json({
+            "type": "mcp_tool_schema",
+            "tool": {
+                "name": "find_events",
+                "description": "x" * 2_000,
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "place": {"type": "string"},
+                    },
+                },
+            },
+        })
+        self.client.result_compaction_service.persist_result = AsyncMock()
+        self.client._call_llm_with_retries = AsyncMock()
+
+        outcome, messages, trace, _ = await self._process(
+            raw,
+            outer_tool_name="mcp_get_tool_schema",
+            effective_tool_name="mcp_get_tool_schema",
+            effective_arguments={"tool_name": "find_events"},
+        )
+
+        self.assertEqual(outcome.decision.representation, "inline")
+        self.assertEqual(
+            outcome.decision.reason,
+            "control_plane_required_inline",
+        )
+        self.assertTrue(outcome.decision.runtime_override)
+        self.client.result_compaction_service.persist_result.assert_not_awaited()
+        self.client._call_llm_with_retries.assert_not_awaited()
+        self.assertEqual(
+            json.loads(messages[-1]["content"])["tool"]["name"],
+            "find_events",
+        )
+        self.assertIn(
+            "tool_result_full",
+            [event["type"] for event in trace],
+        )
+
+    async def test_unsafe_control_plane_result_is_not_llm_compacted(self):
+        raw = dumps_json({
+            "type": "mcp_tools",
+            "tools": [{"description": "x" * 12_000}],
+        })
+        self.client.result_compaction_service.persist_result = AsyncMock()
+        self.client._call_llm_with_retries = AsyncMock()
+
+        outcome, messages, trace, _ = await self._process(
+            raw,
+            outer_tool_name="mcp_list_tools",
+            effective_tool_name="mcp_list_tools",
+        )
+
+        visible = json.loads(messages[-1]["content"])
+        self.assertTrue(outcome.persistence_failed)
+        self.assertEqual(
+            outcome.decision.reason,
+            "control_plane_result_exceeds_hard_context",
+        )
+        self.assertEqual(
+            visible["type"],
+            "tool_result_processing_error",
+        )
+        self.assertFalse(visible["retry_recommended"])
+        self.client.result_compaction_service.persist_result.assert_not_awaited()
+        self.client._call_llm_with_retries.assert_not_awaited()
+        self.assertIn(
+            "tool_result_processing_error",
+            [event["type"] for event in trace],
+        )
+
     async def test_inline_result_is_not_persisted_or_summarized(self):
         self.client.result_compaction_service.persist_result = AsyncMock()
         self.client._call_llm_with_retries = AsyncMock()
@@ -280,6 +374,46 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.stored_result_ref.summary, "summary")
         self.client._call_llm_with_retries.assert_awaited_once()
 
+    async def test_invalid_summary_is_retried_once_with_larger_budget(self):
+        raw = "x" * 2_000
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            {"content": "not-json"},
+            {
+                "content": dumps_json({
+                    "type": "result_compaction",
+                    "summary": "repaired summary",
+                }),
+            },
+        ])
+
+        outcome, _, trace, _ = await self._process(
+            raw,
+            handling=ResultHandling.COMPACT,
+        )
+
+        self.assertFalse(outcome.summary_failed)
+        self.assertEqual(
+            outcome.stored_result_ref.summary,
+            "repaired summary",
+        )
+        self.assertEqual(
+            self.client._call_llm_with_retries.await_count,
+            2,
+        )
+        repair_call = self.client._call_llm_with_retries.await_args_list[1]
+        self.assertEqual(
+            repair_call.kwargs["max_tokens_override"],
+            self.client.llm_config.max_tokens,
+        )
+        self.assertEqual(
+            repair_call.kwargs["temperature_override"],
+            0.0,
+        )
+        self.assertIn(
+            "result_compaction_retry",
+            [event["type"] for event in trace],
+        )
+
     async def test_invalid_summary_falls_back_without_losing_original(self):
         raw = "x" * 2_000
         self.client._call_llm_with_retries = AsyncMock(
@@ -315,7 +449,10 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             failed_event["data"]["validation_issues"],
             [{"type": "json_invalid", "location": ["$"]}],
         )
-        self.client._call_llm_with_retries.assert_awaited_once()
+        self.assertEqual(
+            self.client._call_llm_with_retries.await_count,
+            2,
+        )
 
     async def test_validation_diagnostics_redact_untrusted_field_names(self):
         raw = "x" * 2_000

@@ -2932,6 +2932,32 @@ agent выбрал prefer_inline
 → inline запрещён
 ```
 
+Control-plane manager results обрабатываются отдельно:
+
+```text
+mcp_list_servers
+mcp_list_tools(include_schemas=false)
+mcp_get_tool_schema
+mcp_get_runtime_context
+→ runtime-generated control-plane payload
+→ inline до hard input limit
+→ без ContentStore и без LLM-summary
+```
+
+Эти данные нужны агенту для выбора и корректного вызова следующего
+инструмента. Замена списка или одиночной схемы на недоступный stored ref
+ломает discovery loop и провоцирует повторные manager calls.
+
+`mcp_list_tools(include_schemas=true)` запрещён: агрегат всех схем не имеет
+надёжной верхней границы. Агент сначала получает краткий список, затем
+запрашивает одну выбранную схему через `mcp_get_tool_schema`.
+
+Если control-plane payload не помещается даже в hard input budget, runtime
+возвращает явный `tool_result_processing_error` с
+`retry_recommended=false`, не запускает LLM-summary и не предлагает повторять
+тот же вызов. Обычные результаты `mcp_call_tool` по-прежнему проходят через
+общую result-compaction policy.
+
 DAG помогает агенту выбрать стратегию, но не является механизмом безопасности.
 
 ---
@@ -2972,6 +2998,16 @@ DAG помогает агенту выбрать стратегию, но не �
 Summary должно сохранять ключевые факты, ID, ссылки, имена, ошибки и ограничения, не добавляя сведения из собственных знаний модели.
 
 Summary не заменяет оригинал и всегда связано с `result_id/content_id`.
+
+Если первый ответ не проходит `ResultCompactionSummary` validation, runtime
+делает максимум один повторный structured-output запрос с тем же raw result,
+более явной инструкцией и увеличенным, но ограниченным output budget.
+Повторный отказ приводит к обычному `summary_status=failed`; оригинал остаётся
+в `ContentStore`.
+
+В логах internal LLM calls фиксируются только безопасные diagnostics:
+`content_chars`, нормализованный `finish_reason` и числовой token usage.
+Содержимое ответа и произвольные provider fields в diagnostics не попадают.
 
 ---
 
