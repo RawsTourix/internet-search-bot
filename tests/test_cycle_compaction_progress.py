@@ -46,6 +46,25 @@ class CycleCompactionProgressTests(unittest.TestCase):
                 self.assertNotIn("raw segment", serialized)
                 self.assertNotIn("summary", serialized)
 
+    def test_context_limit_interruption_has_dedicated_progress_type(self):
+        ru = progress_text(
+            "context_limit_interruption",
+            locale_name="ru",
+        )
+        en = progress_text(
+            "context_limit_interruption",
+            locale_name="en",
+        )
+        event = ProgressEvent(
+            type="context_limit_interruption",
+            message=en,
+        )
+
+        self.assertEqual(event.type, "context_limit_interruption")
+        self.assertIn("контекст", ru)
+        self.assertIn("context", en)
+        self.assertNotIn("Infrastructure", en)
+
 
 if __name__ == "__main__":
     unittest.main()

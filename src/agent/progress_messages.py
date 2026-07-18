@@ -52,6 +52,10 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "infrastructure_interruption": (
             "⚠️ Инфраструктурная ошибка. Состояние задачи сохранено."
         ),
+        "context_limit_interruption": (
+            "⚠️ Рабочий контекст достиг предельного размера. "
+            "Состояние задачи сохранено."
+        ),
         "final_processing_started": "✍️ Готовлю финальный ответ…",
         "final_processing_format_only": "🪄 Оформляю финальный ответ…",
         "final_processing_grounded": (
@@ -130,6 +134,10 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         ),
         "infrastructure_interruption": (
             "⚠️ Infrastructure error. Task state has been saved."
+        ),
+        "context_limit_interruption": (
+            "⚠️ The working context reached its limit. "
+            "Task state has been saved."
         ),
         "final_processing_started": "✍️ Preparing the final answer…",
         "final_processing_format_only": "🪄 Polishing the final answer…",

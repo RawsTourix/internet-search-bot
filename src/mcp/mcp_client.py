@@ -4564,14 +4564,24 @@ class MCPClient:
                     data={"error": state.last_error},
                 )
                 if preserve_context_on_error:
+                    interruption_event_type = (
+                        "context_limit_interruption"
+                        if error_kind == "context_limit_interruption"
+                        else "infrastructure_error"
+                    )
+                    interruption_message_key = (
+                        "context_limit_interruption"
+                        if error_kind == "context_limit_interruption"
+                        else "infrastructure_interruption"
+                    )
                     await self._emit_progress_event(
                         state=state,
                         session_id=session_id,
                         cycle_id=cycle_id,
                         progress_callback=progress_callback,
                         cycle_trace=cycle_trace,
-                        event_type="infrastructure_error",
-                        message_key="infrastructure_interruption",
+                        event_type=interruption_event_type,
+                        message_key=interruption_message_key,
                         severity="error",
                         data={"error": state.last_error},
                     )
@@ -4710,14 +4720,24 @@ class MCPClient:
                     else "critical_error"
                 )
             if can_resume:
+                interruption_event_type = (
+                    "context_limit_interruption"
+                    if outer_error_kind == "context_limit_interruption"
+                    else "infrastructure_error"
+                )
+                interruption_message_key = (
+                    "context_limit_interruption"
+                    if outer_error_kind == "context_limit_interruption"
+                    else "infrastructure_interruption"
+                )
                 await self._emit_progress_event(
                     state=state,
                     session_id=session_id,
                     cycle_id=cycle_id,
                     progress_callback=progress_callback,
                     cycle_trace=cycle_trace,
-                    event_type="infrastructure_error",
-                    message_key="infrastructure_interruption",
+                    event_type=interruption_event_type,
+                    message_key=interruption_message_key,
                     severity="error",
                     data={"error": error_message},
                 )
@@ -6161,6 +6181,7 @@ class MCPClient:
             if active_cycle.working_memory is not None
             else 0
         )
+        attempt_failure_signature: tuple[object, ...] | None = None
 
         def outcome(
             *,
@@ -6194,6 +6215,9 @@ class MCPClient:
                 active_cycle.compaction_failures += 1
                 active_cycle.last_compaction_message_count = len(
                     messages_for_llm
+                )
+                active_cycle.last_compaction_failure_signature = (
+                    attempt_failure_signature
                 )
             failure_data = {
                 "error_type": error_type,
@@ -6283,11 +6307,37 @@ class MCPClient:
                 failure_reason="compaction_disabled",
             )
 
-        if (
+        max_passes = self.memory_config.cycle_compaction_max_passes
+        summary_target_tokens = self._cycle_summary_target_tokens()
+        first_selection_decision = self.cycle_segment_selector.evaluate(
+            messages=messages_for_llm,
+            original_user_message_index=(
+                active_cycle.original_user_message_index
+            ),
+            current_tokens=before_tokens,
+            target_tokens=target_tokens,
+            expected_summary_tokens=summary_target_tokens,
+            max_compactor_input_tokens=(
+                self._cycle_compactor_segment_budget(active_cycle)
+            ),
+            keep_recent_blocks=(
+                self.memory_config.cycle_compaction_keep_recent_blocks
+            ),
+        )
+        first_failure_signature = first_selection_decision.retry_signature()
+        unchanged_failed_selection = (
             active_cycle.compaction_failures > 0
-            and active_cycle.last_compaction_message_count
-            == len(messages_for_llm)
-        ):
+            and (
+                active_cycle.last_compaction_failure_signature
+                == first_failure_signature
+                or (
+                    active_cycle.last_compaction_failure_signature is None
+                    and active_cycle.last_compaction_message_count
+                    == len(messages_for_llm)
+                )
+            )
+        )
+        if unchanged_failed_selection:
             self._trace_event(
                 cycle_trace,
                 "cycle_compaction_skipped",
@@ -6295,6 +6345,7 @@ class MCPClient:
                 before_tokens=before_tokens,
                 generation=current_generation,
                 message_count=len(messages_for_llm),
+                selection_unchanged=True,
             )
             if before_tokens >= usable_input_tokens:
                 raise CycleContextLimitError(
@@ -6314,7 +6365,7 @@ class MCPClient:
             "target_tokens": target_tokens,
             "current_generation": current_generation,
             "max_passes": (
-                self.memory_config.cycle_compaction_max_passes
+                max_passes
             ),
         }
         self._trace_event(
@@ -6336,24 +6387,29 @@ class MCPClient:
 
         current_tokens = before_tokens
         passes_completed = 0
-        max_passes = self.memory_config.cycle_compaction_max_passes
-        summary_target_tokens = self._cycle_summary_target_tokens()
 
         for pass_index in range(1, max_passes + 1):
-            selection_decision = self.cycle_segment_selector.evaluate(
-                messages=messages_for_llm,
-                original_user_message_index=(
-                    active_cycle.original_user_message_index
-                ),
-                current_tokens=current_tokens,
-                target_tokens=target_tokens,
-                expected_summary_tokens=summary_target_tokens,
-                max_compactor_input_tokens=(
-                    self._cycle_compactor_segment_budget(active_cycle)
-                ),
-                keep_recent_blocks=(
-                    self.memory_config.cycle_compaction_keep_recent_blocks
-                ),
+            if pass_index == 1:
+                selection_decision = first_selection_decision
+            else:
+                selection_decision = self.cycle_segment_selector.evaluate(
+                    messages=messages_for_llm,
+                    original_user_message_index=(
+                        active_cycle.original_user_message_index
+                    ),
+                    current_tokens=current_tokens,
+                    target_tokens=target_tokens,
+                    expected_summary_tokens=summary_target_tokens,
+                    max_compactor_input_tokens=(
+                        self._cycle_compactor_segment_budget(active_cycle)
+                    ),
+                    keep_recent_blocks=(
+                        self.memory_config
+                        .cycle_compaction_keep_recent_blocks
+                    ),
+                )
+            attempt_failure_signature = (
+                selection_decision.retry_signature()
             )
             selection = selection_decision.selection
             if selection is None:
@@ -6559,6 +6615,7 @@ class MCPClient:
             active_cycle.updated_at = time.time()
             active_cycle.compaction_failures = 0
             active_cycle.last_compaction_message_count = None
+            active_cycle.last_compaction_failure_signature = None
             passes_completed += 1
 
             pass_data = {

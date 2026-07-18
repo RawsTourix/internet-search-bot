@@ -36,6 +36,7 @@ class ActiveAgentCycle:
 
     compaction_failures: int = 0
     last_compaction_message_count: int | None = None
+    last_compaction_failure_signature: tuple[Any, ...] | None = None
 
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)

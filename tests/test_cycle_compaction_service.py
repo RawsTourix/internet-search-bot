@@ -187,6 +187,77 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.selection.messages[0], candidate)
         self.assertEqual(candidate[-1]["content"], "fresh")
 
+    async def test_working_memory_replaces_later_segment_chronologically(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            {
+                "role": "user",
+                "content": dumps_json({
+                    "type": "user_request",
+                    "user_request": "goal",
+                }),
+            },
+            {"role": "assistant", "content": "question"},
+            {
+                "role": "user",
+                "content": dumps_json({
+                    "type": "user_reply",
+                    "reply": "confirmed",
+                }),
+            },
+            {"role": "assistant", "content": "completed old work"},
+            {"role": "assistant", "content": "fresh"},
+        ]
+        cycle = ActiveAgentCycle(
+            cycle_id="cycle-resumed",
+            session_id="session-resumed",
+            original_user_request="goal",
+            messages_for_llm=messages,
+            cycle_trace=[],
+            original_user_message_index=1,
+        )
+        selection = CycleSegmentSelection(
+            start=4,
+            end_exclusive=5,
+            messages=[messages[4]],
+            estimated_tokens=20,
+            selected_block_count=1,
+            eligible_block_count=1,
+            reason="protected_boundary",
+        )
+        ref = await self.service.persist_segment(
+            active_cycle=cycle,
+            selection=selection,
+            generation=1,
+            tokens_estimate=20,
+        )
+        memory = self.service.build_working_memory(
+            active_cycle=cycle,
+            selection=selection,
+            segment_content_ref=ref,
+            compaction_result=CycleCompactionResult(
+                summary="completed old work",
+                working_state=CycleWorkingState(current_goal="goal"),
+            ),
+            extracted_refs=extract_cycle_refs(selection.messages),
+        )
+
+        candidate = self.service.build_candidate_messages(
+            active_cycle=cycle,
+            selection=selection,
+            working_memory=memory,
+        )
+        memory_index = next(
+            index
+            for index, message in enumerate(candidate)
+            if parse_cycle_working_memory_message(message) is not None
+        )
+
+        self.assertEqual(candidate[3], messages[3])
+        self.assertEqual(memory_index, 4)
+        self.assertEqual(candidate[5], messages[5])
+        validate_openai_tool_sequence(candidate)
+
     async def test_second_generation_replaces_memory_without_tree(self):
         first_ref = await self.service.persist_segment(
             active_cycle=self.cycle,

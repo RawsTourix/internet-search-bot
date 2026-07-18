@@ -751,6 +751,23 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("LLMTransportError / ConnectError", text)
         self.assertIn("Итерация: 16", text)
 
+    def test_context_limit_is_not_rendered_as_infrastructure_error(self):
+        text = telegram_server.format_agent_error_for_telegram(
+            "context exhausted",
+            {
+                "agent_status": "error",
+                "error": "CycleContextLimitError: context exhausted",
+                "error_kind": "context_limit_interruption",
+                "iterations": 12,
+                "can_resume": True,
+            },
+            locale_name="en",
+        )
+
+        self.assertIn("working context reached its limit", text)
+        self.assertIn("Iteration: 12", text)
+        self.assertNotIn("infrastructure error", text)
+
     def test_http_429_error_type_is_preserved(self):
         summary = telegram_server.extract_error_type_summary(
             "HTTP-ошибка LLM: Ошибка LLM API: 429 - rate limited"

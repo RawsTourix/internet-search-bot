@@ -165,6 +165,70 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("generation", done["data"])
         self.assertNotIn("summary", json.dumps(events, ensure_ascii=False))
 
+    async def test_resumed_cycle_compacts_work_after_latest_user_reply(self):
+        reply = dumps_json({
+            "type": "user_reply",
+            "reply": "confirmed",
+        })
+        messages = [
+            {"role": "system", "content": "system"},
+            {
+                "role": "user",
+                "content": dumps_json({
+                    "type": "user_request",
+                    "user_request": "complete the task",
+                }),
+            },
+            {"role": "assistant", "content": "Should I continue?"},
+            {"role": "user", "content": reply},
+        ]
+        messages.extend(
+            {
+                "role": "assistant",
+                "content": f"POST_REPLY_BLOCK_{index}_" + "x" * 3_000,
+            }
+            for index in range(8)
+        )
+        cycle = ActiveAgentCycle(
+            cycle_id="cycle-resumed",
+            session_id="session-1",
+            original_user_request="complete the task",
+            messages_for_llm=messages,
+            cycle_trace=[],
+            original_user_message_index=1,
+        )
+        self.client._call_llm_with_retries = AsyncMock(
+            return_value=valid_compaction_response()
+        )
+
+        outcome = await self._compact(cycle)
+
+        self.assertTrue(outcome.changed)
+        reply_index = next(
+            index
+            for index, message in enumerate(cycle.messages_for_llm)
+            if message.get("content") == reply
+        )
+        memory_index = next(
+            index
+            for index, message in enumerate(cycle.messages_for_llm)
+            if parse_cycle_working_memory_message(message) is not None
+        )
+        self.assertGreater(memory_index, reply_index)
+        self.assertEqual(
+            cycle.messages_for_llm[reply_index],
+            {"role": "user", "content": reply},
+        )
+        self.assertNotIn(
+            "POST_REPLY_BLOCK_0",
+            json.dumps(cycle.messages_for_llm, ensure_ascii=False),
+        )
+        self.assertIn(
+            "POST_REPLY_BLOCK_7",
+            json.dumps(cycle.messages_for_llm, ensure_ascii=False),
+        )
+        self.client._call_llm_with_retries.assert_awaited()
+
     async def test_below_trigger_is_noop_without_progress(self):
         cycle = self._active_cycle(block_count=1, block_chars=100)
         events = []
@@ -243,6 +307,46 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("generation", failed["data"])
         self.assertNotIn("segment_content_id", failed["data"])
         self.assertNotIn("not-json", json.dumps(failed, ensure_ascii=False))
+
+    async def test_unchanged_selection_signature_suppresses_repeat_warning(self):
+        cycle = self._active_cycle()
+        decision = self.client.cycle_segment_selector.evaluate(
+            messages=cycle.messages_for_llm,
+            original_user_message_index=cycle.original_user_message_index,
+            current_tokens=self.client._estimate_messages_tokens(
+                cycle.messages_for_llm
+            ),
+            target_tokens=self.client._context_target_tokens(),
+            expected_summary_tokens=(
+                self.client._cycle_summary_target_tokens()
+            ),
+            max_compactor_input_tokens=(
+                self.client._cycle_compactor_segment_budget(cycle)
+            ),
+            keep_recent_blocks=(
+                self.client.memory_config
+                .cycle_compaction_keep_recent_blocks
+            ),
+        )
+        cycle.compaction_failures = 1
+        cycle.last_compaction_message_count = (
+            len(cycle.messages_for_llm) - 1
+        )
+        cycle.last_compaction_failure_signature = (
+            decision.retry_signature()
+        )
+        events = []
+        self.client._call_llm_with_retries = AsyncMock()
+
+        outcome = await self._compact(cycle, events)
+
+        self.assertFalse(outcome.changed)
+        self.assertEqual(
+            outcome.failure_reason,
+            "unchanged_context_after_failure",
+        )
+        self.assertEqual(events, [])
+        self.client._call_llm_with_retries.assert_not_awaited()
 
     async def test_persistence_failure_never_calls_compactor(self):
         cycle = self._active_cycle()

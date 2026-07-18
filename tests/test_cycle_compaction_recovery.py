@@ -172,6 +172,12 @@ class CycleCompactionRecoveryTests(unittest.IsolatedAsyncioTestCase):
                 for event in result.progress_events
             )
         )
+        progress_types = [
+            event["type"]
+            for event in result.progress_events
+        ]
+        self.assertIn("context_limit_interruption", progress_types)
+        self.assertNotIn("infrastructure_error", progress_types)
 
     async def test_process_query_transport_interruption_can_retry_compaction(self):
         cycle = self._large_cycle()

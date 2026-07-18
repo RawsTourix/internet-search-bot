@@ -74,6 +74,13 @@ FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
             "Итерация: {iteration}\n"
             "Состояние задачи сохранено, её можно продолжить позже."
         ),
+        "context_limit_interruption": (
+            "⚠️ Задача приостановлена: рабочий контекст достиг "
+            "предельного размера.\n\n"
+            "Тип: {error_type}\n"
+            "Итерация: {iteration}\n"
+            "Состояние задачи сохранено для продолжения."
+        ),
         "llm_configuration_error": (
             "⚠️ Задача остановлена из-за ошибки конфигурации LLM.\n\n"
             "Тип: {error_type}\n"
@@ -93,6 +100,13 @@ FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
             "Type: {error_type}\n"
             "Iteration: {iteration}\n"
             "The task state has been saved and can be resumed later."
+        ),
+        "context_limit_interruption": (
+            "⚠️ The task was paused because the working context reached "
+            "its limit.\n\n"
+            "Type: {error_type}\n"
+            "Iteration: {iteration}\n"
+            "The task state has been saved for continuation."
         ),
         "llm_configuration_error": (
             "⚠️ The task stopped because of an LLM configuration error.\n\n"
@@ -226,7 +240,9 @@ def format_agent_error_for_telegram(
     error_type = extract_error_type_summary(error_message)
     llm_http_status = extract_llm_http_status(error_type)
 
-    if error_kind == "llm_configuration_error":
+    if error_kind == "context_limit_interruption":
+        key = "context_limit_interruption"
+    elif error_kind == "llm_configuration_error":
         key = "llm_configuration_error"
     elif (
         error_kind != "infrastructure_interruption"

@@ -82,6 +82,7 @@ class ProgressEvent(BaseModel):
         "llm_retry",
         "llm_error",
         "infrastructure_error",
+        "context_limit_interruption",
         "context_warning",
         "context_compaction_started",
         "context_compaction_done",

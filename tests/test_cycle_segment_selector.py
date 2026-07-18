@@ -192,14 +192,14 @@ class CycleSegmentSelectorTests(unittest.TestCase):
             target_tokens=400,
             expected_summary_tokens=100,
             max_compactor_input_tokens=2_000,
-            keep_recent_blocks=2,
+            keep_recent_blocks=3,
         )
 
         self.assertIsNone(decision.selection)
         self.assertEqual(decision.reason, "insufficient_summary_gain")
         self.assertEqual(decision.boundary_reason, "protected_boundary")
-        self.assertEqual(decision.block_count, 3)
-        self.assertEqual(decision.protected_block_count, 2)
+        self.assertEqual(decision.block_count, 4)
+        self.assertEqual(decision.protected_block_count, 3)
         self.assertEqual(decision.eligible_block_count, 1)
         self.assertEqual(decision.selected_block_count, 1)
         self.assertLessEqual(
@@ -209,6 +209,58 @@ class CycleSegmentSelectorTests(unittest.TestCase):
         diagnostics = decision.safe_log_data()
         self.assertNotIn("messages", diagnostics)
         self.assertNotIn("content", diagnostics)
+
+    def test_selector_compacts_actions_after_latest_user_anchor(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            user_payload("user_request", user_request="goal"),
+            {"role": "assistant", "content": "short question"},
+            user_payload("user_reply", reply="confirmed"),
+            assistant_tool("call-after-reply"),
+            tool_result("call-after-reply"),
+            {
+                "role": "assistant",
+                "content": "completed follow-up " + "x" * 500,
+            },
+            {"role": "assistant", "content": "fresh tail"},
+        ]
+
+        blocks = self.selector.build_blocks(
+            messages=messages,
+            original_user_message_index=1,
+        )
+        latest_user_block = next(
+            block
+            for block in blocks
+            if block.start == 3
+        )
+        tool_block = next(
+            block
+            for block in blocks
+            if block.start == 4
+        )
+
+        self.assertEqual(latest_user_block.end_exclusive, 4)
+        self.assertTrue(latest_user_block.contains_user_message)
+        self.assertEqual(tool_block.end_exclusive, 6)
+        self.assertTrue(tool_block.closed)
+
+        decision = self.selector.evaluate(
+            messages=messages,
+            original_user_message_index=1,
+            current_tokens=3_000,
+            target_tokens=500,
+            expected_summary_tokens=100,
+            max_compactor_input_tokens=5_000,
+            keep_recent_blocks=1,
+        )
+
+        self.assertIsNotNone(decision.selection)
+        self.assertEqual(decision.selection.start, 4)
+        self.assertNotIn(messages[3], decision.selection.messages)
+        self.assertIn(messages[4], decision.selection.messages)
+        self.assertIn(messages[5], decision.selection.messages)
+        self.assertEqual(decision.boundary_reason, "protected_boundary")
 
 
 if __name__ == "__main__":

@@ -178,6 +178,30 @@ class CycleSegmentSelectionDecision:
             "keep_recent_blocks": self.keep_recent_blocks,
         }
 
+    def retry_signature(self) -> tuple[object, ...]:
+        """Return a content-free signature for retry suppression."""
+        selection_range = (
+            None
+            if self.selection is None
+            else (self.selection.start, self.selection.end_exclusive)
+        )
+        return (
+            self.reason,
+            self.boundary_reason,
+            self.block_count,
+            self.candidate_block_count,
+            self.protected_block_count,
+            self.eligible_block_count,
+            self.selected_block_count,
+            self.selected_tokens,
+            self.expected_summary_tokens,
+            self.max_compactor_input_tokens,
+            self.first_eligible_block_tokens,
+            self.barrier_block_index,
+            self.keep_recent_blocks,
+            selection_range,
+        )
+
 
 @dataclass(slots=True)
 class CycleCompactionOutcome:
@@ -473,13 +497,21 @@ class CycleSegmentSelector:
             messages,
             start=original_user_message_index + 1,
         )
+        latest_user_unit_index = next(
+            (
+                index
+                for index in range(len(units) - 1, -1, -1)
+                if units[index].kind == "user"
+            ),
+            None,
+        )
         blocks: list[CycleMessageBlock] = []
         unit_index = 0
         while unit_index < len(units):
             unit = units[unit_index]
             end_unit_index = unit_index + 1
 
-            if unit.kind == "user":
+            if unit.kind == "user" and unit_index != latest_user_unit_index:
                 while end_unit_index < len(units):
                     following = units[end_unit_index]
                     if following.kind in {"user", "working_memory"}:
@@ -658,49 +690,95 @@ class CycleSegmentSelector:
                 barrier_block_index=barrier_block_index,
             )
 
-        first_index = eligible_indexes[0]
-        first_block = candidate_blocks[first_index]
-        if first_block.estimated_tokens > max_compactor_input_tokens:
-            return decision(
-                reason="first_eligible_block_over_budget",
-                block_count=len(blocks),
-                candidate_block_count=len(candidate_blocks),
-                protected_block_count=len(protected_indexes),
-                eligible_block_count=len(eligible_indexes),
-                first_eligible_block_tokens=first_block.estimated_tokens,
-                barrier_block_index=barrier_block_index,
+        first_block = candidate_blocks[eligible_indexes[0]]
+        eligible_index_set = set(eligible_indexes)
+        eligible_runs: list[list[int]] = []
+        current_run: list[int] = []
+        for index, block in enumerate(candidate_blocks):
+            is_contiguous = (
+                not current_run
+                or candidate_blocks[current_run[-1]].end_exclusive
+                == block.start
             )
+            if index in eligible_index_set and is_contiguous:
+                current_run.append(index)
+                continue
+            if current_run:
+                eligible_runs.append(current_run)
+                current_run = []
+            if index in eligible_index_set:
+                current_run = [index]
+        if current_run:
+            eligible_runs.append(current_run)
 
-        selected: list[CycleMessageBlock] = []
-        selected_tokens = 0
-        expected_start = first_block.start
-        reason = "target_reclaim"
+        best_selected: list[CycleMessageBlock] = []
+        best_selected_tokens = 0
+        best_boundary_reason = "protected_boundary"
+        over_budget_run_count = 0
 
-        for index in range(first_index, len(candidate_blocks)):
-            block = candidate_blocks[index]
-            if index in protected_indexes:
-                reason = "protected_boundary"
-                break
-            if block.start != expected_start:
-                reason = "non_contiguous_boundary"
-                break
-            if (
-                selected_tokens + block.estimated_tokens
-                > max_compactor_input_tokens
-            ):
-                reason = "compactor_input_budget"
-                break
+        for run_indexes in eligible_runs:
+            run_first_block = candidate_blocks[run_indexes[0]]
+            if run_first_block.estimated_tokens > max_compactor_input_tokens:
+                over_budget_run_count += 1
+                continue
 
-            selected.append(block)
-            selected_tokens += block.estimated_tokens
-            expected_start = block.end_exclusive
-            if selected_tokens >= required_reclaim:
-                break
+            selected: list[CycleMessageBlock] = []
+            selected_tokens = 0
+            boundary_reason = "target_reclaim"
+            reached_target = False
+            for index in run_indexes:
+                block = candidate_blocks[index]
+                if (
+                    selected_tokens + block.estimated_tokens
+                    > max_compactor_input_tokens
+                ):
+                    boundary_reason = "compactor_input_budget"
+                    break
+                selected.append(block)
+                selected_tokens += block.estimated_tokens
+                if selected_tokens >= required_reclaim:
+                    reached_target = True
+                    break
+            else:
+                next_index = run_indexes[-1] + 1
+                if next_index >= len(candidate_blocks):
+                    boundary_reason = "candidate_tail"
+                elif next_index in protected_indexes:
+                    boundary_reason = "protected_boundary"
+                else:
+                    boundary_reason = "non_contiguous_boundary"
 
-        if not selected or selected_tokens <= expected_summary_tokens:
+            if reached_target:
+                boundary_reason = "target_reclaim"
+
+            if selected_tokens > best_selected_tokens:
+                best_selected = selected
+                best_selected_tokens = selected_tokens
+                best_boundary_reason = boundary_reason
+
+            if selected_tokens <= expected_summary_tokens:
+                continue
+
+            start = selected[0].start
+            end_exclusive = selected[-1].end_exclusive
+            selection = CycleSegmentSelection(
+                start=start,
+                end_exclusive=end_exclusive,
+                messages=copy.deepcopy(messages[start:end_exclusive]),
+                estimated_tokens=max(
+                    1,
+                    self._estimate_messages_tokens(
+                        messages[start:end_exclusive]
+                    ),
+                ),
+                selected_block_count=len(selected),
+                eligible_block_count=len(eligible_indexes),
+                reason=boundary_reason,
+            )
             return decision(
-                reason="insufficient_summary_gain",
-                boundary_reason=reason,
+                selection=selection,
+                reason="selected",
+                boundary_reason=boundary_reason,
                 block_count=len(blocks),
                 candidate_block_count=len(candidate_blocks),
                 protected_block_count=len(protected_indexes),
@@ -711,32 +789,27 @@ class CycleSegmentSelector:
                 barrier_block_index=barrier_block_index,
             )
 
-        start = selected[0].start
-        end_exclusive = selected[-1].end_exclusive
-        selection = CycleSegmentSelection(
-            start=start,
-            end_exclusive=end_exclusive,
-            messages=copy.deepcopy(messages[start:end_exclusive]),
-            estimated_tokens=max(
-                1,
-                self._estimate_messages_tokens(
-                    messages[start:end_exclusive]
-                ),
-            ),
-            selected_block_count=len(selected),
-            eligible_block_count=len(eligible_indexes),
-            reason=reason,
+        all_runs_over_budget = (
+            bool(eligible_runs)
+            and over_budget_run_count == len(eligible_runs)
         )
         return decision(
-            selection=selection,
-            reason="selected",
-            boundary_reason=reason,
+            reason=(
+                "first_eligible_block_over_budget"
+                if all_runs_over_budget
+                else "insufficient_summary_gain"
+            ),
+            boundary_reason=(
+                "compactor_input_budget"
+                if all_runs_over_budget
+                else best_boundary_reason
+            ),
             block_count=len(blocks),
             candidate_block_count=len(candidate_blocks),
             protected_block_count=len(protected_indexes),
             eligible_block_count=len(eligible_indexes),
-            selected_block_count=len(selected),
-            selected_tokens=selected_tokens,
+            selected_block_count=len(best_selected),
+            selected_tokens=best_selected_tokens,
             first_eligible_block_tokens=first_block.estimated_tokens,
             barrier_block_index=barrier_block_index,
         )
@@ -957,14 +1030,17 @@ class CycleCompactionService:
         working_memory: CycleWorkingMemory,
     ) -> list[dict[str, Any]]:
         candidate: list[dict[str, Any]] = []
+        insert_index = 0
         for index, message in enumerate(active_cycle.messages_for_llm):
+            retained_before_selection = index < selection.start
             if selection.start <= index < selection.end_exclusive:
                 continue
             if parse_cycle_working_memory_message(message) is not None:
                 continue
+            if retained_before_selection:
+                insert_index += 1
             candidate.append(copy.deepcopy(message))
 
-        insert_index = active_cycle.original_user_message_index + 1
         if insert_index > len(candidate):
             raise CycleSegmentSelectionError(
                 "working_memory_insert_index_out_of_range"
