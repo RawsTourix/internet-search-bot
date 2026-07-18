@@ -1173,6 +1173,7 @@ class MCPClient:
             state.iterations >= 6
             or self._trace_has_tool_errors(cycle_trace)
             or self._trace_has_empty_tool_results(cycle_trace)
+            or self._trace_needs_original_tool_content(cycle_trace)
         )
 
         if risky:
@@ -1247,6 +1248,21 @@ class MCPClient:
 
         return False
 
+    def _trace_needs_original_tool_content(
+        self,
+        cycle_trace: list[dict[str, Any]],
+    ) -> bool:
+        for event in cycle_trace:
+            if event.get("type") != "tool_result_stored":
+                continue
+            result_ref = event.get("result_ref")
+            if (
+                isinstance(result_ref, dict)
+                and result_ref.get("needs_retrieval") is True
+            ):
+                return True
+        return False
+
     def _build_final_evidence_pack(
         self,
         *,
@@ -1316,6 +1332,12 @@ class MCPClient:
                     limitation_message = (
                         "Оригинал сохранён, но краткое описание не было "
                         "создано."
+                    )
+                elif result_ref.get("needs_retrieval") is True:
+                    limitation_message = (
+                        "Краткое описание не сохраняет все важные детали; "
+                        "для точных утверждений требуется проверка "
+                        "сохранённого оригинала."
                     )
 
                 if limitation_message is not None:
@@ -2448,6 +2470,7 @@ class MCPClient:
         *,
         result_id: str,
         original_user_request: str,
+        current_goal: str,
         effective_tool_name: str,
         effective_arguments: dict[str, Any],
         size_bytes: int,
@@ -2457,7 +2480,7 @@ class MCPClient:
     ) -> ResultCompactionRequest:
         return ResultCompactionRequest(
             original_user_request=original_user_request,
-            current_goal=original_user_request,
+            current_goal=current_goal,
             agent_activity=None,
             active_plan_node=None,
             result_id=result_id,
@@ -2469,10 +2492,57 @@ class MCPClient:
             summary_target_tokens=summary_target_tokens,
         )
 
+    @staticmethod
+    def _result_compaction_current_goal(
+        *,
+        original_user_request: str,
+        messages_for_llm: list[dict[str, Any]],
+    ) -> str:
+        """Add bounded, structured user clarifications to compactor context."""
+        clarifications: list[str] = []
+        accepted_types = {
+            "user_reply",
+            "user_reply_during_waiting_user",
+            "user_resume_interrupted_cycle",
+        }
+        for message in messages_for_llm:
+            if message.get("role") != "user":
+                continue
+            content = message.get("content")
+            if not isinstance(content, str):
+                continue
+            try:
+                payload = json.loads(content)
+            except Exception:
+                continue
+            if (
+                not isinstance(payload, dict)
+                or payload.get("type") not in accepted_types
+            ):
+                continue
+            reply = payload.get("reply")
+            if not isinstance(reply, str):
+                continue
+            reply = reply.strip()
+            if reply:
+                clarifications.append(reply[:2_000])
+
+        if not clarifications:
+            return original_user_request
+
+        bounded = clarifications[-4:]
+        goal = (
+            original_user_request.strip()
+            + "\n\nПоследние уточнения пользователя, по порядку:\n"
+            + "\n".join(f"- {value}" for value in bounded)
+        )
+        return goal[:6_000]
+
     def _result_summary_request_overhead_tokens(
         self,
         *,
         original_user_request: str,
+        current_goal: str,
         effective_tool_name: str,
         effective_arguments: dict[str, Any],
         size_bytes: int,
@@ -2482,6 +2552,7 @@ class MCPClient:
         request = self._result_summary_request(
             result_id="res_" + "0" * 32,
             original_user_request=original_user_request,
+            current_goal=current_goal,
             effective_tool_name=effective_tool_name,
             effective_arguments=effective_arguments,
             size_bytes=size_bytes,
@@ -2603,6 +2674,73 @@ class MCPClient:
         )
         return diagnostics
 
+    @staticmethod
+    def _harden_result_summary_fidelity(
+        *,
+        request: ResultCompactionRequest,
+        raw_result: str,
+        summary: ResultCompactionSummary,
+    ) -> ResultCompactionSummary:
+        """Conservatively flag multi-item results with exact constraints."""
+        goal = " ".join(filter(None, (
+            request.original_user_request,
+            request.current_goal,
+        ))).lower()
+        constraint_patterns = {
+            "time": (
+                r"\b(?:сегодня|завтра|послезавтра|утром|дн[её]м|"
+                r"вечером|ночью|morning|afternoon|evening|tonight|"
+                r"tomorrow)\b|(?:^|\D)\d{1,2}[:.]\d{2}(?:\D|$)"
+            ),
+            "transport": (
+                r"\b(?:мцд|метро|маршрут|транспорт|автобус|"
+                r"электричк\w*|metro|route|transit|transport|"
+                r"departure|arrival)\b"
+            ),
+        }
+        active_constraints = [
+            name
+            for name, pattern in constraint_patterns.items()
+            if re.search(pattern, goal, flags=re.IGNORECASE)
+        ]
+        if not active_constraints:
+            return summary
+
+        has_structured_candidate_details = any(
+            marker in raw_result
+            for marker in (
+                '"matching_dates"',
+                '"schedules"',
+                '"site_url"',
+                '"route_verified"',
+                '"departure_time"',
+                '"arrival_time"',
+            )
+        )
+        returned_match = re.search(
+            r'"returned"\s*:\s*(\d+)',
+            raw_result,
+        )
+        multiple_candidates = (
+            returned_match is not None
+            and int(returned_match.group(1)) > 1
+        )
+        if not (has_structured_candidate_details and multiple_candidates):
+            return summary
+
+        limitation = (
+            "Точные ограничения пользователя по времени или транспорту "
+            "нужно сверить с сохранённым оригиналом отдельно для каждого "
+            "кандидата; краткое описание не подтверждает их автоматически."
+        )
+        limitations = list(summary.limitations)
+        if limitation not in limitations:
+            limitations.append(limitation)
+        return summary.model_copy(update={
+            "limitations": limitations,
+            "needs_original_content": True,
+        })
+
     async def _summarize_tool_result(
         self,
         *,
@@ -2650,7 +2788,7 @@ class MCPClient:
         content = response.get("content")
         content = content if isinstance(content, str) else ""
         try:
-            return ResultCompactionSummary.model_validate_json(
+            summary = ResultCompactionSummary.model_validate_json(
                 self._strip_single_markdown_fence(content)
             )
         except ValidationError as error:
@@ -2659,6 +2797,12 @@ class MCPClient:
                 attempt=1,
                 response=response,
                 error=error,
+            )
+        else:
+            return self._harden_result_summary_fidelity(
+                request=request,
+                raw_result=raw_result,
+                summary=summary,
             )
 
         repair_max_tokens = min(
@@ -2728,7 +2872,11 @@ class MCPClient:
             repair_diagnostics["finish_reason"],
             repair_diagnostics["completion_tokens"],
         )
-        return summary
+        return self._harden_result_summary_fidelity(
+            request=request,
+            raw_result=raw_result,
+            summary=summary,
+        )
 
     async def _record_result_stage(
         self,
@@ -2796,12 +2944,17 @@ class MCPClient:
             canonical_result,
             utf8_size_bytes=result_size_bytes,
         )
+        current_goal = self._result_compaction_current_goal(
+            original_user_request=original_user_request,
+            messages_for_llm=messages_for_llm,
+        )
         current_context_tokens = self._estimate_messages_tokens(
             messages_for_llm
         )
         summary_overhead_tokens = (
             self._result_summary_request_overhead_tokens(
                 original_user_request=original_user_request,
+                current_goal=current_goal,
                 effective_tool_name=effective_tool_name,
                 effective_arguments=effective_arguments,
                 size_bytes=result_size_bytes,
@@ -3145,6 +3298,7 @@ class MCPClient:
             request = self._result_summary_request(
                 result_id=result_id,
                 original_user_request=original_user_request,
+                current_goal=current_goal,
                 effective_tool_name=effective_tool_name,
                 effective_arguments=effective_arguments,
                 size_bytes=result_size_bytes,
@@ -6186,7 +6340,7 @@ class MCPClient:
         summary_target_tokens = self._cycle_summary_target_tokens()
 
         for pass_index in range(1, max_passes + 1):
-            selection = self.cycle_segment_selector.select(
+            selection_decision = self.cycle_segment_selector.evaluate(
                 messages=messages_for_llm,
                 original_user_message_index=(
                     active_cycle.original_user_message_index
@@ -6201,7 +6355,11 @@ class MCPClient:
                     self.memory_config.cycle_compaction_keep_recent_blocks
                 ),
             )
+            selection = selection_decision.selection
             if selection is None:
+                selection_diagnostics = (
+                    selection_decision.safe_log_data()
+                )
                 self._trace_event(
                     cycle_trace,
                     "cycle_compaction_skipped",
@@ -6213,6 +6371,14 @@ class MCPClient:
                         else 0
                     ),
                     pass_index=pass_index,
+                    **selection_diagnostics,
+                )
+                logger.warning(
+                    "Cycle compaction selector found no safe segment: "
+                    "cycle_id=%s pass_index=%s diagnostics=%s",
+                    active_cycle.cycle_id,
+                    pass_index,
+                    selection_diagnostics,
                 )
                 if passes_completed == 0:
                     return await emit_failure(

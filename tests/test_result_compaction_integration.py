@@ -353,6 +353,92 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             direct_types.index("result_compaction_started"),
         )
 
+    async def test_compactor_receives_latest_user_constraints_and_flags_detail(self):
+        raw = dumps_json({
+            "status": "ok",
+            "data": {
+                "returned": 2,
+                "items": [
+                    {
+                        "title": "event one",
+                        "site_url": "https://example.test/one",
+                        "matching_dates": [{
+                            "schedules": [{
+                                "days_of_week": [6],
+                                "start_time": "10:00:00",
+                                "end_time": "18:00:00",
+                            }],
+                        }],
+                    },
+                    {
+                        "title": "event two",
+                        "site_url": "https://example.test/two",
+                        "matching_dates": [{
+                            "schedules": [{
+                                "days_of_week": [6],
+                                "start_time": "12:00:00",
+                                "end_time": "17:00:00",
+                            }],
+                        }],
+                    },
+                ],
+            },
+        })
+        messages = [
+            {"role": "system", "content": "system"},
+            {
+                "role": "user",
+                "content": dumps_json({
+                    "type": "user_reply_during_waiting_user",
+                    "reply": "завтра вечером, рядом с МЦД-2",
+                }),
+            },
+            {
+                "role": "user",
+                "content": dumps_json({
+                    "type": "user_reply_during_waiting_user",
+                    "reply": "радиус 20 км",
+                }),
+            },
+            {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{"id": "call-1"}],
+            },
+        ]
+        self.client._call_llm_with_retries = AsyncMock(return_value={
+            "content": dumps_json({
+                "type": "result_compaction",
+                "summary": "Two events were returned.",
+                "key_facts": ["2 events"],
+                "limitations": [],
+                "suggested_follow_up": [],
+                "needs_original_content": False,
+            }),
+        })
+
+        outcome, _, _, _ = await self._process(
+            raw,
+            handling=ResultHandling.COMPACT,
+            effective_tool_name="find_events",
+            messages=messages,
+        )
+
+        compactor_messages = (
+            self.client._call_llm_with_retries.await_args.args[0]
+        )
+        request = json.loads(compactor_messages[1]["content"])
+        self.assertIn("завтра вечером", request["current_goal"])
+        self.assertIn("МЦД-2", request["current_goal"])
+        self.assertIn("радиус 20 км", request["current_goal"])
+        self.assertTrue(outcome.stored_result_ref.needs_retrieval)
+        self.assertTrue(
+            any(
+                "времени или транспорту" in limitation
+                for limitation in outcome.stored_result_ref.limitations
+            )
+        )
+
     async def test_fenced_summary_is_parsed_without_repair(self):
         raw = "x" * 2_000
         self.client._call_llm_with_retries = AsyncMock(return_value={

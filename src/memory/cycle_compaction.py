@@ -135,6 +135,50 @@ class CycleSegmentSelection:
     reason: str
 
 
+@dataclass(frozen=True, slots=True)
+class CycleSegmentSelectionDecision:
+    """A selection plus content-free diagnostics for observability."""
+
+    selection: CycleSegmentSelection | None
+    reason: str
+    boundary_reason: str | None
+
+    block_count: int
+    candidate_block_count: int
+    protected_block_count: int
+    eligible_block_count: int
+    selected_block_count: int
+
+    selected_tokens: int
+    required_reclaim_tokens: int
+    expected_summary_tokens: int
+    max_compactor_input_tokens: int
+    first_eligible_block_tokens: int | None
+    barrier_block_index: int | None
+    keep_recent_blocks: int
+
+    def safe_log_data(self) -> dict[str, Any]:
+        """Return only bounded numeric/reason diagnostics, never messages."""
+        return {
+            "selection_reason": self.reason,
+            "selection_boundary_reason": self.boundary_reason,
+            "block_count": self.block_count,
+            "candidate_block_count": self.candidate_block_count,
+            "protected_block_count": self.protected_block_count,
+            "eligible_block_count": self.eligible_block_count,
+            "selected_block_count": self.selected_block_count,
+            "selected_tokens": self.selected_tokens,
+            "required_reclaim_tokens": self.required_reclaim_tokens,
+            "expected_summary_tokens": self.expected_summary_tokens,
+            "max_compactor_input_tokens": self.max_compactor_input_tokens,
+            "first_eligible_block_tokens": (
+                self.first_eligible_block_tokens
+            ),
+            "barrier_block_index": self.barrier_block_index,
+            "keep_recent_blocks": self.keep_recent_blocks,
+        }
+
+
 @dataclass(slots=True)
 class CycleCompactionOutcome:
     changed: bool
@@ -487,12 +531,71 @@ class CycleSegmentSelector:
         max_compactor_input_tokens: int,
         keep_recent_blocks: int,
     ) -> CycleSegmentSelection | None:
+        return self.evaluate(
+            messages=messages,
+            original_user_message_index=original_user_message_index,
+            current_tokens=current_tokens,
+            target_tokens=target_tokens,
+            expected_summary_tokens=expected_summary_tokens,
+            max_compactor_input_tokens=max_compactor_input_tokens,
+            keep_recent_blocks=keep_recent_blocks,
+        ).selection
+
+    def evaluate(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        original_user_message_index: int,
+        current_tokens: int,
+        target_tokens: int,
+        expected_summary_tokens: int,
+        max_compactor_input_tokens: int,
+        keep_recent_blocks: int,
+    ) -> CycleSegmentSelectionDecision:
+        """Select a segment and explain content-free failure conditions."""
+        required_reclaim = max(
+            1,
+            current_tokens - target_tokens + expected_summary_tokens,
+        )
+
+        def decision(
+            *,
+            selection: CycleSegmentSelection | None = None,
+            reason: str,
+            boundary_reason: str | None = None,
+            block_count: int = 0,
+            candidate_block_count: int = 0,
+            protected_block_count: int = 0,
+            eligible_block_count: int = 0,
+            selected_block_count: int = 0,
+            selected_tokens: int = 0,
+            first_eligible_block_tokens: int | None = None,
+            barrier_block_index: int | None = None,
+        ) -> CycleSegmentSelectionDecision:
+            return CycleSegmentSelectionDecision(
+                selection=selection,
+                reason=reason,
+                boundary_reason=boundary_reason,
+                block_count=block_count,
+                candidate_block_count=candidate_block_count,
+                protected_block_count=protected_block_count,
+                eligible_block_count=eligible_block_count,
+                selected_block_count=selected_block_count,
+                selected_tokens=selected_tokens,
+                required_reclaim_tokens=required_reclaim,
+                expected_summary_tokens=expected_summary_tokens,
+                max_compactor_input_tokens=max_compactor_input_tokens,
+                first_eligible_block_tokens=first_eligible_block_tokens,
+                barrier_block_index=barrier_block_index,
+                keep_recent_blocks=keep_recent_blocks,
+            )
+
         blocks = self.build_blocks(
             messages=messages,
             original_user_message_index=original_user_message_index,
         )
         if not blocks:
-            return None
+            return decision(reason="no_blocks")
 
         barrier_index = next(
             (
@@ -503,6 +606,9 @@ class CycleSegmentSelector:
             len(blocks),
         )
         candidate_blocks = blocks[:barrier_index]
+        barrier_block_index = (
+            barrier_index if barrier_index < len(blocks) else None
+        )
         non_memory_indexes = [
             index
             for index, block in enumerate(candidate_blocks)
@@ -544,17 +650,27 @@ class CycleSegmentSelector:
             if index not in protected_indexes
         ]
         if not eligible_indexes:
-            return None
+            return decision(
+                reason="no_eligible_blocks",
+                block_count=len(blocks),
+                candidate_block_count=len(candidate_blocks),
+                protected_block_count=len(protected_indexes),
+                barrier_block_index=barrier_block_index,
+            )
 
         first_index = eligible_indexes[0]
         first_block = candidate_blocks[first_index]
         if first_block.estimated_tokens > max_compactor_input_tokens:
-            return None
+            return decision(
+                reason="first_eligible_block_over_budget",
+                block_count=len(blocks),
+                candidate_block_count=len(candidate_blocks),
+                protected_block_count=len(protected_indexes),
+                eligible_block_count=len(eligible_indexes),
+                first_eligible_block_tokens=first_block.estimated_tokens,
+                barrier_block_index=barrier_block_index,
+            )
 
-        required_reclaim = max(
-            1,
-            current_tokens - target_tokens + expected_summary_tokens,
-        )
         selected: list[CycleMessageBlock] = []
         selected_tokens = 0
         expected_start = first_block.start
@@ -582,11 +698,22 @@ class CycleSegmentSelector:
                 break
 
         if not selected or selected_tokens <= expected_summary_tokens:
-            return None
+            return decision(
+                reason="insufficient_summary_gain",
+                boundary_reason=reason,
+                block_count=len(blocks),
+                candidate_block_count=len(candidate_blocks),
+                protected_block_count=len(protected_indexes),
+                eligible_block_count=len(eligible_indexes),
+                selected_block_count=len(selected),
+                selected_tokens=selected_tokens,
+                first_eligible_block_tokens=first_block.estimated_tokens,
+                barrier_block_index=barrier_block_index,
+            )
 
         start = selected[0].start
         end_exclusive = selected[-1].end_exclusive
-        return CycleSegmentSelection(
+        selection = CycleSegmentSelection(
             start=start,
             end_exclusive=end_exclusive,
             messages=copy.deepcopy(messages[start:end_exclusive]),
@@ -599,6 +726,19 @@ class CycleSegmentSelector:
             selected_block_count=len(selected),
             eligible_block_count=len(eligible_indexes),
             reason=reason,
+        )
+        return decision(
+            selection=selection,
+            reason="selected",
+            boundary_reason=reason,
+            block_count=len(blocks),
+            candidate_block_count=len(candidate_blocks),
+            protected_block_count=len(protected_indexes),
+            eligible_block_count=len(eligible_indexes),
+            selected_block_count=len(selected),
+            selected_tokens=selected_tokens,
+            first_eligible_block_tokens=first_block.estimated_tokens,
+            barrier_block_index=barrier_block_index,
         )
 
 

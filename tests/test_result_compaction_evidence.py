@@ -156,6 +156,38 @@ class ResultCompactionEvidenceTests(unittest.TestCase):
         self.assertEqual(decision.mode.value, "strict_grounded")
         self.assertEqual(decision.reason, "risky_tool_workflow")
 
+    def test_retrieval_needed_is_a_limitation_and_selects_strict_grounding(self):
+        self.client.llm_config = SimpleNamespace(final_audit=True)
+        trace = [{
+            "type": "tool_result_stored",
+            "tool_name": "find_events",
+            "tool_call_id": "call-1",
+            "result_ref": {
+                "type": "stored_result_ref",
+                "result_id": "res_1",
+                "content_id": "cnt_1",
+                "tool_name": "find_events",
+                "summary_status": "summarized",
+                "summary": "Several candidates.",
+                "needs_retrieval": True,
+            },
+        }]
+
+        evidence = self._build(trace)
+        decision = self.client._select_final_processing_mode(
+            result_text="draft",
+            state=self.state,
+            cycle_trace=trace,
+        )
+
+        self.assertIn(
+            "требуется проверка сохранённого оригинала",
+            evidence["tool_results"][0]["limitations"][0],
+        )
+        self.assertTrue(self.client._trace_needs_original_tool_content(trace))
+        self.assertEqual(decision.mode.value, "strict_grounded")
+        self.assertEqual(decision.reason, "risky_tool_workflow")
+
 
 if __name__ == "__main__":
     unittest.main()

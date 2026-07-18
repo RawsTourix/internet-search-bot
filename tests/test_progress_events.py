@@ -543,8 +543,13 @@ class GatewayProgressTests(unittest.IsolatedAsyncioTestCase):
 
 
 class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
-    def setUp(self):
+    async def asyncSetUp(self):
+        await telegram_server.stop_all_progress_edits()
         telegram_server.progress_edit_state.clear()
+        telegram_server.progress_edit_versions.clear()
+
+    async def asyncTearDown(self):
+        await telegram_server.stop_all_progress_edits()
 
     def test_attach_progress_metadata_enables_local_callback(self):
         payload = {"id": "request-1", "metadata": {}}
@@ -598,6 +603,113 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["status"], "ignored")
         edit.assert_not_awaited()
+
+    async def test_internal_endpoint_queues_edit_without_waiting_for_telegram(self):
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def slow_edit(**kwargs):
+            started.set()
+            await release.wait()
+
+        request = SimpleNamespace(
+            headers={
+                "X-Progress-Token": (
+                    telegram_server.TELEGRAM_PROGRESS_CALLBACK_TOKEN
+                )
+            },
+            json=AsyncMock(return_value={
+                "client_type": "telegram",
+                "target": {"chat_id": 10, "message_id": 20},
+                "event": {
+                    "type": "tool_start",
+                    "message": "Running tool",
+                    "visibility": "user",
+                },
+            }),
+        )
+
+        with patch.object(
+            telegram_server,
+            "maybe_edit_progress_message",
+            side_effect=slow_edit,
+        ) as edit:
+            result = await telegram_server.internal_progress_handler(request)
+            self.assertEqual(result["status"], "queued")
+            self.assertEqual(result["version"], 1)
+            await asyncio.wait_for(started.wait(), timeout=1)
+            edit.assert_awaited_once()
+            release.set()
+            queue = telegram_server.progress_edit_queues["10:20"]
+            await asyncio.wait_for(queue.join(), timeout=1)
+
+    async def test_progress_dispatcher_serializes_newer_edit_after_slow_one(self):
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls = []
+        active = 0
+        max_active = 0
+
+        async def ordered_edit(**kwargs):
+            nonlocal active, max_active
+            active += 1
+            max_active = max(max_active, active)
+            calls.append((kwargs["text"], kwargs["version"]))
+            try:
+                if kwargs["text"] == "first":
+                    first_started.set()
+                    await release_first.wait()
+            finally:
+                active -= 1
+
+        with patch.object(
+            telegram_server,
+            "maybe_edit_progress_message",
+            side_effect=ordered_edit,
+        ):
+            telegram_server.enqueue_progress_message(
+                chat_id=10,
+                message_id=20,
+                text="first",
+            )
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            telegram_server.enqueue_progress_message(
+                chat_id=10,
+                message_id=20,
+                text="second",
+            )
+            release_first.set()
+            queue = telegram_server.progress_edit_queues["10:20"]
+            await asyncio.wait_for(queue.join(), timeout=1)
+
+        self.assertEqual(calls, [("first", 1), ("second", 2)])
+        self.assertEqual(max_active, 1)
+
+    async def test_stale_progress_retry_stops_before_second_attempt(self):
+        stale = False
+
+        async def timeout_and_mark_stale(**kwargs):
+            nonlocal stale
+            stale = True
+            raise telegram_server.TimedOut("timeout")
+
+        edit = AsyncMock(side_effect=timeout_and_mark_stale)
+        test_application = SimpleNamespace(
+            bot=SimpleNamespace(edit_message_text=edit)
+        )
+        with patch.object(
+            telegram_server,
+            "application",
+            test_application,
+        ):
+            await telegram_server.edit_telegram_message_with_retries(
+                chat_id=10,
+                message_id=20,
+                text="old progress",
+                is_stale=lambda: stale,
+            )
+
+        edit.assert_awaited_once()
 
     async def test_progress_edit_is_deduplicated(self):
         with patch.object(

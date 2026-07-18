@@ -4,7 +4,7 @@ import httpx
 import asyncio
 import uuid
 import logging
-from typing import Any
+from typing import Any, Callable
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, Request, HTTPException, status
 from telegram import Update, BotCommand
@@ -59,6 +59,12 @@ logger.addHandler(console_handler)
 # Инициализация Telegram Application
 application = Application.builder().token(BOT_TOKEN).build()
 progress_edit_state: dict[str, dict[str, Any]] = {}
+progress_edit_queues: dict[
+    str,
+    asyncio.Queue[tuple[int, str]],
+] = {}
+progress_edit_workers: dict[str, asyncio.Task[None]] = {}
+progress_edit_versions: dict[str, int] = {}
 
 FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
     "ru": {
@@ -508,10 +514,20 @@ async def edit_telegram_message_with_retries(
     disable_web_page_preview: bool = True,
     max_retries: int = 5,
     base_delay: float = 2.0,
+    is_stale: Callable[[], bool] | None = None,
 ):
     last_error = None
 
     for attempt in range(1, max_retries + 1):
+        if is_stale is not None and is_stale():
+            logger.debug(
+                "Пропущен устаревший progress edit: chat_id=%s "
+                "message_id=%s attempt=%s",
+                chat_id,
+                message_id,
+                attempt,
+            )
+            return None
         try:
             return await application.bot.edit_message_text(
                 chat_id=chat_id,
@@ -526,6 +542,15 @@ async def edit_telegram_message_with_retries(
             raise
         except (TimedOut, NetworkError) as e:
             last_error = e
+            if is_stale is not None and is_stale():
+                logger.debug(
+                    "Отменён retry устаревшего progress edit: "
+                    "chat_id=%s message_id=%s attempt=%s",
+                    chat_id,
+                    message_id,
+                    attempt,
+                )
+                return None
             delay = base_delay * (2 ** (attempt - 1))
             logger.warning(
                 "Telegram edit timeout/network error. Попытка %s/%s, "
@@ -548,6 +573,7 @@ async def maybe_edit_progress_message(
     chat_id: int,
     message_id: int,
     text: str,
+    version: int | None = None,
 ) -> None:
     text = (text or "").strip()
     if not text:
@@ -556,13 +582,25 @@ async def maybe_edit_progress_message(
         text = text[:PROGRESS_MAX_TEXT_LENGTH] + "…"
 
     key = f"{chat_id}:{message_id}"
+    is_stale = (
+        (lambda: progress_edit_versions.get(key) != version)
+        if version is not None
+        else None
+    )
+    if is_stale is not None and is_stale():
+        return
+
     now = asyncio.get_running_loop().time()
     edit_state = progress_edit_state.get(key) or {}
 
     if edit_state.get("last_text") == text:
         return
-    if now - float(edit_state.get("last_edit_at", 0.0)) < PROGRESS_EDIT_MIN_INTERVAL:
-        return
+    since_last_edit = now - float(edit_state.get("last_edit_at", 0.0))
+    if since_last_edit < PROGRESS_EDIT_MIN_INTERVAL:
+        await asyncio.sleep(PROGRESS_EDIT_MIN_INTERVAL - since_last_edit)
+        if is_stale is not None and is_stale():
+            return
+        now = asyncio.get_running_loop().time()
 
     try:
         await edit_telegram_message_with_retries(
@@ -571,7 +609,10 @@ async def maybe_edit_progress_message(
             text=text,
             parse_mode=None,
             disable_web_page_preview=True,
+            is_stale=is_stale,
         )
+        if is_stale is not None and is_stale():
+            return
         progress_edit_state[key] = {
             "last_text": text,
             "last_edit_at": now,
@@ -584,6 +625,123 @@ async def maybe_edit_progress_message(
         )
     except Exception as e:
         logger.warning(f"Не удалось обновить progress-сообщение: {e!r}")
+
+
+async def _run_progress_edit_worker(
+    *,
+    key: str,
+    chat_id: int,
+    message_id: int,
+    queue: asyncio.Queue[tuple[int, str]],
+) -> None:
+    """Serialize edits per Telegram message and coalesce queued stages."""
+    try:
+        while True:
+            pending = [await queue.get()]
+            while True:
+                try:
+                    pending.append(queue.get_nowait())
+                except asyncio.QueueEmpty:
+                    break
+
+            for _ in pending[:-1]:
+                queue.task_done()
+
+            version, text = pending[-1]
+            try:
+                await maybe_edit_progress_message(
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    text=text,
+                    version=version,
+                )
+            finally:
+                queue.task_done()
+
+            if queue.empty():
+                break
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        logger.exception(
+            "Ошибка фоновой обработки progress edit: "
+            "chat_id=%s message_id=%s",
+            chat_id,
+            message_id,
+        )
+    finally:
+        current = asyncio.current_task()
+        if progress_edit_workers.get(key) is current:
+            progress_edit_workers.pop(key, None)
+        if queue.empty() and progress_edit_queues.get(key) is queue:
+            progress_edit_queues.pop(key, None)
+            progress_edit_versions.pop(key, None)
+
+
+def enqueue_progress_message(
+    *,
+    chat_id: int,
+    message_id: int,
+    text: str,
+) -> int:
+    """Queue a progress edit without blocking the Gateway callback."""
+    key = f"{chat_id}:{message_id}"
+    version = progress_edit_versions.get(key, 0) + 1
+    progress_edit_versions[key] = version
+
+    queue = progress_edit_queues.get(key)
+    if queue is None:
+        queue = asyncio.Queue()
+        progress_edit_queues[key] = queue
+    queue.put_nowait((version, text))
+
+    worker = progress_edit_workers.get(key)
+    if worker is None or worker.done():
+        progress_edit_workers[key] = asyncio.create_task(
+            _run_progress_edit_worker(
+                key=key,
+                chat_id=chat_id,
+                message_id=message_id,
+                queue=queue,
+            )
+        )
+    return version
+
+
+async def stop_progress_edits(*, chat_id: int, message_id: int) -> None:
+    """Invalidate and stop pending progress edits before final delivery."""
+    key = f"{chat_id}:{message_id}"
+    progress_edit_versions[key] = progress_edit_versions.get(key, 0) + 1
+    worker = progress_edit_workers.pop(key, None)
+    if worker is not None and not worker.done():
+        worker.cancel()
+        try:
+            await worker
+        except asyncio.CancelledError:
+            pass
+
+    queue = progress_edit_queues.pop(key, None)
+    if queue is not None:
+        while True:
+            try:
+                queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+            else:
+                queue.task_done()
+    progress_edit_state.pop(key, None)
+    progress_edit_versions.pop(key, None)
+
+
+async def stop_all_progress_edits() -> None:
+    """Stop all background edits during shutdown and isolated tests."""
+    keys = set(progress_edit_workers) | set(progress_edit_queues)
+    for key in keys:
+        chat_id, message_id = key.split(":", maxsplit=1)
+        await stop_progress_edits(
+            chat_id=int(chat_id),
+            message_id=int(message_id),
+        )
 
 
 async def finish_status_or_send_reply(
@@ -606,9 +764,9 @@ async def finish_status_or_send_reply(
         await send_telegram_markdown_reply(update, text)
         return
 
-    progress_edit_state.pop(
-        f"{update.effective_chat.id}:{status_message.message_id}",
-        None,
+    await stop_progress_edits(
+        chat_id=update.effective_chat.id,
+        message_id=status_message.message_id,
     )
 
     raw_text = text or ""
@@ -688,6 +846,8 @@ async def lifespan(app: FastAPI):
     logger.info(f"Список команд задан: {[command.command for command in commands]}")
     
     yield
+
+    await stop_all_progress_edits()
     
     # Очистка при завершении
     await application.bot.delete_webhook()
@@ -756,12 +916,12 @@ async def internal_progress_handler(request: Request):
             logger.warning(f"Progress event без chat_id/message_id: {payload}")
             return {"status": "ignored", "reason": "missing target"}
 
-        await maybe_edit_progress_message(
+        version = enqueue_progress_message(
             chat_id=int(chat_id),
             message_id=int(message_id),
             text=str(message),
         )
-        return {"status": "ok"}
+        return {"status": "queued", "version": version}
     except HTTPException:
         raise
     except Exception as e:

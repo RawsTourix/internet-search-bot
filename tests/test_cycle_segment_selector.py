@@ -174,6 +174,42 @@ class CycleSegmentSelectorTests(unittest.TestCase):
 
         self.assertIsNone(selection)
 
+    def test_evaluate_explains_when_recent_blocks_leave_too_little_gain(self):
+        messages = [
+            {"role": "system", "content": "system"},
+            user_payload("user_request", user_request="goal"),
+            {"role": "assistant", "content": "small old action"},
+            user_payload("user_reply", reply="older addendum"),
+            {"role": "assistant", "content": "x" * 400},
+            user_payload("user_reply", reply="latest addendum"),
+            {"role": "assistant", "content": "fresh action"},
+        ]
+
+        decision = self.selector.evaluate(
+            messages=messages,
+            original_user_message_index=1,
+            current_tokens=1_000,
+            target_tokens=400,
+            expected_summary_tokens=100,
+            max_compactor_input_tokens=2_000,
+            keep_recent_blocks=2,
+        )
+
+        self.assertIsNone(decision.selection)
+        self.assertEqual(decision.reason, "insufficient_summary_gain")
+        self.assertEqual(decision.boundary_reason, "protected_boundary")
+        self.assertEqual(decision.block_count, 3)
+        self.assertEqual(decision.protected_block_count, 2)
+        self.assertEqual(decision.eligible_block_count, 1)
+        self.assertEqual(decision.selected_block_count, 1)
+        self.assertLessEqual(
+            decision.selected_tokens,
+            decision.expected_summary_tokens,
+        )
+        diagnostics = decision.safe_log_data()
+        self.assertNotIn("messages", diagnostics)
+        self.assertNotIn("content", diagnostics)
+
 
 if __name__ == "__main__":
     unittest.main()
