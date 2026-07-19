@@ -4546,6 +4546,153 @@ Local development mode сохраняет прямой callback/in-process trans
 
 ---
 
+## 124.2. Durable Web request lifecycle
+
+Длительный agent run не должен быть неявно привязан к lifetime одного
+синхронного HTTP-соединения.
+
+Agent cycle может включать несколько LLM-вызовов, tool calls, transport retry,
+result/cycle compaction и final audit. Поэтому даже исправный run способен
+работать дольше timeout браузера, reverse proxy или HTTP-клиента.
+
+Недопустимо промежуточное состояние:
+
+```text
+HTTP client disconnected
+→ Agent Runtime продолжил работу
+→ final result был создан
+→ клиент не может узнать status или получить result
+```
+
+Отключение клиента и lifecycle run являются разными событиями:
+
+```text
+client connection / delivery subscription
+≠ logical request
+≠ AgentRun
+≠ AgentCycle
+```
+
+Минимальные идентификаторы:
+
+```text
+request_id       конкретный ingress request и idempotency boundary
+run_id           durable исполнение пользовательской задачи
+session_id       диалоговая/клиентская сессия
+cycle_id         внутренний agent cycle
+event_id         progress/trace event
+```
+
+Целевой Web-контракт:
+
+```text
+POST /web/runs
+Idempotency-Key: ...
+→ 202 Accepted
+→ request_id, run_id, session_id
+→ status_url, events_url, result_url
+
+GET /web/runs/{run_id}
+→ durable status and safe metadata
+
+GET /web/runs/{run_id}/events
+→ SSE/WebSocket replay from event_id / sequence
+
+GET /web/runs/{run_id}/result
+→ persisted final result after completion
+
+POST /web/runs/{run_id}/cancel
+→ explicit idempotent cancellation request
+```
+
+Названия routes могут меняться, но semantic contract обязателен.
+
+`AgentRun` имеет явный lifecycle:
+
+```text
+accepted
+queued
+running
+waiting_user
+finalizing
+succeeded
+failed
+cancelled
+expired
+```
+
+Disconnect сам по себе не должен оставлять outcome неопределённым. Политика
+может разрешать run продолжиться либо запросить cancellation, но решение
+принимает server-side lifecycle policy, сохраняет его в durable state и не
+зависит от случайного закрытия socket.
+
+Если run продолжается после disconnect:
+
+- progress events сохраняются и доступны для replay;
+- final result сохраняется до перехода в `succeeded`;
+- reconnect не создаёт новый run;
+- клиент может получить status/result без нового LLM-цикла;
+- delivery metrics отдельно фиксируют disconnect и последующий result fetch.
+
+Если run отменяется:
+
+- cancellation является явной и идемпотентной;
+- runtime останавливается в safe checkpoint;
+- незавершённые LLM/tool tasks получают bounded cancellation;
+- уже сохранённые results/artifacts не повреждаются;
+- run получает terminal status `cancelled`, а не исчезает.
+
+Timeout budget разделяется по уровням:
+
+```text
+HTTP sync wait timeout
+LLM/tool per-attempt timeout
+retry/backoff budget
+queue/start deadline
+total AgentRun wall-clock deadline
+```
+
+Per-call retry не может бесконечно продлевать общий run. Достижение total
+deadline должно давать контролируемый terminal/resumable outcome и сохранять
+достаточное состояние для диагностики или продолжения согласно policy.
+
+Session concurrency также задаётся явно:
+
+- один active run на session либо очередь `InputBatch`;
+- повтор ingress с тем же `Idempotency-Key` возвращает существующий `run_id`;
+- resume `WAITING_USER` продолжает существующий run/cycle;
+- новый request не запускает конкурентный cycle поверх незавершённого;
+- duplicate/replayed HTTP request не повторяет tool side effects.
+
+Compatibility mode для текущего `/web/message` может работать поверх того же
+run contract:
+
+```text
+create/get idempotent AgentRun
+→ ждать не более sync_wait_timeout
+→ если run завершён: вернуть прежний 200 response
+→ если run продолжается: вернуть 202 + run_id/status URLs
+```
+
+Так short requests сохраняют простой local UX, а long requests не теряют
+результат после timeout. Redis не обязателен для local mode: in-process runner
+может использовать тот же interface с durable metadata в PostgreSQL/storage.
+
+Acceptance criteria:
+
+1. Disconnect во время LLM retry не теряет final result и не создаёт duplicate
+   run.
+2. Reconnect/replay возвращает события строго после известного
+   `event_id`/sequence.
+3. Один `Idempotency-Key` соответствует одному logical run.
+4. Terminal `succeeded` публикуется только после durable save final result.
+5. Total deadline и explicit cancellation оставляют согласованное состояние.
+6. Один session не исполняет два конфликтующих active cycles.
+7. Execution success, delivery success и result retrieval наблюдаются
+   раздельно.
+
+---
+
 ## 125. Redis/arq
 
 Используются для:
@@ -4650,11 +4797,14 @@ Summary хранит provenance и не заменяет original content.
 
 ```text
 cycle_id
+request_id
+run_id
 tool_call_id
 batch_id
 plan_id + revision
 artifact_id + version
 job_id
+idempotency_key
 ```
 
 Повторная доставка события не должна дважды выполнять необратимое действие, создавать лишнюю file version, завершать node или добавлять batch.
@@ -4682,10 +4832,20 @@ User-visible progress остаётся отдельным адаптирован
 Для progress delivery отдельно наблюдаются:
 
 - event published / accepted / rendered / coalesced / deduplicated / failed;
-- `request_id`, `event_id`, `cycle_id`, client type и delivery target ID;
+- `request_id`, `run_id`, `event_id`, `cycle_id`, client type и delivery
+  target ID;
 - event bus lag, client queue depth и render latency;
 - reconnect/replay, retry и late-event rejection;
 - закрытие delivery session перед final response.
+
+Для Web request/run lifecycle отдельно наблюдаются:
+
+- request accepted / deduplicated / client disconnected;
+- run queued / started / waiting / retrying / finalizing / terminal;
+- per-attempt timeout, retry/backoff time и total wall-clock time;
+- final result persisted / delivered / fetched;
+- active runs per session и rejected concurrent starts;
+- execution outcome отдельно от delivery outcome.
 
 Логирование не содержит raw tool results, secrets или полный пользовательский
 контент.
@@ -4700,9 +4860,10 @@ User-visible progress остаётся отдельным адаптирован
 3. Workspace/memory service.
 4. MCP tool runtime service.
 5. Gateway and Agent Runtime separation.
-6. Client delivery contracts and client-specific progress sinks.
-7. Progress event bus and Notification / Delivery boundary.
-8. Automatic DAG scheduler.
+6. Durable AgentRun and idempotent Web request lifecycle.
+7. Client delivery contracts and client-specific progress sinks.
+8. Progress event bus and Notification / Delivery boundary.
+9. Automatic DAG scheduler.
 ```
 
 Монолит `v0.5` не переписывается целиком одним шагом.
@@ -5032,12 +5193,20 @@ object storage
 service boundaries
 observability/idempotency
 Gateway / Client API and Agent Runtime separation
+durable AgentRun lifecycle
+idempotent Web ingress with request_id/run_id
+bounded synchronous compatibility mode
+status/result/cancel endpoints for long runs
+separate per-attempt, retry and total run deadlines
+durable final result before succeeded status
 canonical progress event contract
 progress event bus with at-least-once delivery
 idempotent client consumption by event_id
 Notification / Delivery boundary
 common client delivery lifecycle
 Telegram/Web/CLI-specific progress sinks
+SSE/WebSocket reconnect and event replay
+separate execution, delivery and result-retrieval metrics
 local callback compatibility mode
 ```
 
@@ -5095,3 +5264,10 @@ local callback compatibility mode
 48. Surface-specific formatting применяется на финальной стадии.
 49. Delivery constraints влияют на форму, а не на facts/actions.
 50. Новые слои сохраняют local development mode.
+51. Длительный AgentRun не зависит от lifetime одного HTTP-соединения.
+52. Client disconnect не оставляет run в неопределённом состоянии.
+53. Final result сохраняется до terminal status `succeeded`.
+54. Повтор Web request с тем же idempotency key не создаёт duplicate run.
+55. Per-attempt timeout/retry budget отделён от total run deadline.
+56. Execution outcome, delivery outcome и result retrieval наблюдаются
+    раздельно.
