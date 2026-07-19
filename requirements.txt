@@ -9,6 +9,9 @@ mcp
 httpx
 aiohttp
 
+# Локальная оценка токенов LLM-запросов
+tiktoken
+
 # Telegram Bot
 python-telegram-bot
 

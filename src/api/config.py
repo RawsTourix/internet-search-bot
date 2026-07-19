@@ -21,6 +21,7 @@ def safe_llm_config_summary(config: Any) -> dict[str, Any]:
         "api_url": config.api_url,
         "openai_compatible": config.is_openai_compatible,
         "context_window_tokens": config.context_window_tokens,
+        "tokenizer_encoding": config.tokenizer_encoding,
         "final_audit": config.final_audit,
     }
 

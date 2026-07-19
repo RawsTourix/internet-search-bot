@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from ..memory.models import CycleWorkingMemory
+from ..memory.token_estimation import TokenUsageSnapshot
 
 
 @dataclass(slots=True)
@@ -37,6 +38,9 @@ class ActiveAgentCycle:
     compaction_failures: int = 0
     last_compaction_message_count: int | None = None
     last_compaction_failure_signature: tuple[Any, ...] | None = None
+    compaction_retry_min_eligible_tokens: int | None = None
+
+    token_usage_snapshot: TokenUsageSnapshot | None = None
 
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)

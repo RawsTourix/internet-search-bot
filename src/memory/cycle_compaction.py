@@ -155,7 +155,10 @@ class CycleSegmentSelectionDecision:
     selected_block_count: int
 
     selected_tokens: int
+    eligible_tokens: int
+    protected_tokens: int
     required_reclaim_tokens: int
+    effective_target_tokens: int
     expected_compacted_tokens: int
     max_compactor_input_tokens: int
     first_eligible_block_tokens: int | None
@@ -173,7 +176,10 @@ class CycleSegmentSelectionDecision:
             "eligible_block_count": self.eligible_block_count,
             "selected_block_count": self.selected_block_count,
             "selected_tokens": self.selected_tokens,
+            "eligible_tokens": self.eligible_tokens,
+            "protected_tokens": self.protected_tokens,
             "required_reclaim_tokens": self.required_reclaim_tokens,
+            "effective_target_tokens": self.effective_target_tokens,
             "expected_compacted_tokens": self.expected_compacted_tokens,
             "max_compactor_input_tokens": self.max_compactor_input_tokens,
             "first_eligible_block_tokens": (
@@ -199,7 +205,10 @@ class CycleSegmentSelectionDecision:
             self.eligible_block_count,
             self.selected_block_count,
             self.selected_tokens,
+            self.eligible_tokens,
+            self.protected_tokens,
             self.expected_compacted_tokens,
+            self.effective_target_tokens,
             self.max_compactor_input_tokens,
             self.first_eligible_block_tokens,
             self.barrier_block_index,
@@ -593,6 +602,9 @@ class CycleSegmentSelector:
             1,
             current_tokens - target_tokens + expected_compacted_tokens,
         )
+        effective_target_tokens = target_tokens
+        eligible_tokens = 0
+        protected_tokens = 0
 
         def decision(
             *,
@@ -618,7 +630,10 @@ class CycleSegmentSelector:
                 eligible_block_count=eligible_block_count,
                 selected_block_count=selected_block_count,
                 selected_tokens=selected_tokens,
+                eligible_tokens=eligible_tokens,
+                protected_tokens=protected_tokens,
                 required_reclaim_tokens=required_reclaim,
+                effective_target_tokens=effective_target_tokens,
                 expected_compacted_tokens=expected_compacted_tokens,
                 max_compactor_input_tokens=max_compactor_input_tokens,
                 first_eligible_block_tokens=first_eligible_block_tokens,
@@ -679,12 +694,35 @@ class CycleSegmentSelector:
             for index, block in enumerate(candidate_blocks)
             if block.kind == "working_memory"
         )
+        protected_tokens = sum(
+            candidate_blocks[index].estimated_tokens
+            for index in protected_indexes
+        )
 
         eligible_indexes = [
             index
             for index in non_memory_indexes
             if index not in protected_indexes
         ]
+        eligible_tokens = sum(
+            candidate_blocks[index].estimated_tokens
+            for index in eligible_indexes
+        )
+        minimum_reachable_tokens = (
+            current_tokens
+            - eligible_tokens
+            + expected_compacted_tokens
+        )
+        effective_target_tokens = max(
+            target_tokens,
+            minimum_reachable_tokens,
+        )
+        required_reclaim = max(
+            1,
+            current_tokens
+            - effective_target_tokens
+            + expected_compacted_tokens,
+        )
         if not eligible_indexes:
             return decision(
                 reason="no_eligible_blocks",

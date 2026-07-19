@@ -20,7 +20,7 @@ class MemoryConfigTests(unittest.TestCase):
     def tearDown(self):
         self.temporary.cleanup()
 
-    def _write_config(self, memory_marker=...):
+    def _write_config(self, memory_marker=..., *, llm_marker=None):
         payload = {
             "servers": [
                 {
@@ -34,6 +34,8 @@ class MemoryConfigTests(unittest.TestCase):
                 "api_url": "https://example.invalid/v1/chat/completions",
             },
         }
+        if llm_marker:
+            payload["llm"].update(llm_marker)
         if memory_marker is not ...:
             payload["memory"] = memory_marker
         path = self.root / "config.json"
@@ -80,6 +82,20 @@ class MemoryConfigTests(unittest.TestCase):
         )
         self.assertEqual(memory.cycle_compaction_keep_recent_blocks, 4)
         self.assertEqual(memory.cycle_compaction_max_passes, 5)
+
+    def test_tokenizer_encoding_is_loaded_with_llm_config(self):
+        _, llm, _, _ = load_config(
+            str(
+                self._write_config(
+                    llm_marker={
+                        "model": "openai/gpt-oss-120b",
+                        "tokenizer_encoding": "o200k_harmony",
+                    }
+                )
+            )
+        )
+
+        self.assertEqual(llm.tokenizer_encoding, "o200k_harmony")
 
     def test_invalid_memory_config_is_managed(self):
         invalid_values = (

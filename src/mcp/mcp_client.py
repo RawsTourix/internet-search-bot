@@ -57,12 +57,15 @@ from ..memory import (
     ResultFidelityPolicy,
     ResultHandling,
     ResultProcessingOutcome,
+    TokenAccountingService,
     TokenEstimator,
+    TokenUsageSnapshot,
     build_cycle_working_memory_message,
     extract_cycle_refs,
     parse_cycle_working_memory_message,
     validate_openai_tool_sequence,
     build_result_compaction_system_prompt,
+    create_request_token_estimator,
 )
 from ..runtime import ActiveAgentCycle, AgentCycleSnapshot
 from ..storage.models import new_result_id
@@ -105,6 +108,7 @@ class LLMConfigType(BaseModel):
     context_safety_ratio: float = 0.75
     context_compaction_target_ratio: float = 0.55
     enable_context_compaction: bool = True
+    tokenizer_encoding: Optional[str] = None
 
     @model_validator(mode="after")
     def validate_context_budget(self):
@@ -457,6 +461,7 @@ class MCPClient:
         storage_services: StorageServices,
         memory_config: MemoryConfigType | None = None,
         token_estimator: TokenEstimator | None = None,
+        request_token_estimator: TokenEstimator | None = None,
         result_fidelity_policy: ResultFidelityPolicy | None = None,
     ):
         """
@@ -469,7 +474,8 @@ class MCPClient:
             llm_config: Конфигурация для LLM
             storage_services: Внедрённые storage interfaces
             memory_config: Настройки обработки результатов инструментов
-            token_estimator: Оценщик полного LLM request budget
+            token_estimator: Строгий оценщик сырых результатов инструментов
+            request_token_estimator: Оценщик полного LLM request budget
             result_fidelity_policy: Общая политика fidelity для summary
         """
         self.session = None
@@ -484,13 +490,25 @@ class MCPClient:
         self.content_store = storage_services.content_store
         self.artifact_store = storage_services.artifact_store
         self.memory_config = memory_config or MemoryConfigType()
-        self.token_estimator = (
+        self.raw_token_estimator = (
             token_estimator or ConservativeTokenEstimator()
+        )
+        self.token_estimator = self.raw_token_estimator
+        self.request_token_estimator = (
+            request_token_estimator
+            or create_request_token_estimator(
+                model=llm_config.model,
+                encoding_name=llm_config.tokenizer_encoding,
+            )
+        )
+        self.token_accounting = TokenAccountingService(
+            model=llm_config.model,
+            request_estimator=self.request_token_estimator,
         )
         self.result_fidelity_policy = (
             result_fidelity_policy
             or ConservativeResultFidelityPolicy(
-                token_estimator=self.token_estimator
+                token_estimator=self.raw_token_estimator
             )
         )
         self.result_budget_policy = ResultContextBudgetPolicy(
@@ -1422,6 +1440,30 @@ class MCPClient:
 
         return "llm_http_error", False
 
+    @staticmethod
+    def _is_context_overflow_error(error: LLMHTTPError) -> bool:
+        """Recognize common OpenAI-compatible context-limit responses."""
+        if error.status_code not in {400, 413, 422}:
+            return False
+
+        response_text = error.response_text.casefold()
+        markers = (
+            "context_length_exceeded",
+            "context length",
+            "context window",
+            "maximum context",
+            "max context",
+            "input is too long",
+            "input too long",
+            "prompt is too long",
+            "prompt too long",
+            "too many tokens",
+            "maximum number of tokens",
+            "request too large",
+            "input exceeds",
+        )
+        return any(marker in response_text for marker in markers)
+
     def _is_infrastructure_error(self, error: BaseException) -> bool:
         if isinstance(error, LLMHTTPError):
             _, can_resume = self._classify_llm_http_error(error)
@@ -1594,6 +1636,32 @@ class MCPClient:
             tools_used=list(getattr(pending_cycle, "tools_used", [])),
             progress_events=list(
                 getattr(pending_cycle, "progress_events", [])
+            ),
+            compaction_failures=int(
+                getattr(pending_cycle, "compaction_failures", 0)
+            ),
+            last_compaction_message_count=getattr(
+                pending_cycle,
+                "last_compaction_message_count",
+                None,
+            ),
+            last_compaction_failure_signature=getattr(
+                pending_cycle,
+                "last_compaction_failure_signature",
+                None,
+            ),
+            compaction_retry_min_eligible_tokens=getattr(
+                pending_cycle,
+                "compaction_retry_min_eligible_tokens",
+                None,
+            ),
+            token_usage_snapshot=(
+                getattr(pending_cycle, "token_usage_snapshot", None)
+                if isinstance(
+                    getattr(pending_cycle, "token_usage_snapshot", None),
+                    TokenUsageSnapshot,
+                )
+                else None
             ),
             created_at=float(
                 getattr(pending_cycle, "created_at", time.time())
@@ -2932,6 +3000,7 @@ class MCPClient:
         cycle_trace: list[dict[str, Any]],
         progress_callback,
         request_tools: list[dict[str, Any]] | None = None,
+        usage_snapshot: TokenUsageSnapshot | None = None,
     ) -> ResultProcessingOutcome:
         canonical_result = self._extract_canonical_tool_result(
             tool_payload=tool_payload,
@@ -2955,6 +3024,7 @@ class MCPClient:
             messages=messages_for_llm,
             state=state,
             tools=effective_request_tools,
+            usage_snapshot=usage_snapshot,
         )
         summary_overhead_tokens = (
             self._result_summary_request_overhead_tokens(
@@ -3747,19 +3817,24 @@ class MCPClient:
                             self.max_iterations - state.iterations,
                         ),
                     )
-                    llm_messages = self._with_iteration_runtime_message(
-                        messages_for_llm,
-                        state,
-                    )
-                    llm_response = await self._call_llm_with_retries(
+                    (
+                        llm_response,
                         llm_messages,
-                        tools,
-                        context=f"Итерация {i + 1}",
+                    ) = await self._call_main_llm_with_context_recovery(
+                        active_cycle=active_cycle,
                         state=state,
                         session_id=session_id,
-                        cycle_id=cycle_id,
                         progress_callback=progress_callback,
-                        cycle_trace=cycle_trace,
+                        tools=tools,
+                        context=f"Итерация {i + 1}",
+                        include_iteration_runtime=True,
+                        request_iteration=i + 1,
+                    )
+                    self._observe_main_llm_usage(
+                        active_cycle=active_cycle,
+                        messages=llm_messages,
+                        tools=tools,
+                        response=llm_response,
                     )
                     tool_calls = llm_response.get("tool_calls", []) or []
                     content = llm_response.get("content", "") or ""
@@ -4003,6 +4078,9 @@ class MCPClient:
                                     cycle_trace=cycle_trace,
                                     progress_callback=progress_callback,
                                     request_tools=tools,
+                                    usage_snapshot=(
+                                        active_cycle.token_usage_snapshot
+                                    ),
                                 )
                             )
                             tool_result_count += 1
@@ -4188,16 +4266,24 @@ class MCPClient:
                             messages_for_llm = (
                                 compaction_outcome.messages_for_llm
                             )
-                            messages = messages_for_llm
-                            final_response = await self._call_llm_with_retries(
+                            (
+                                final_response,
                                 messages,
-                                tools,
-                                context="Финальный ответ после tool calls",
+                            ) = await self._call_main_llm_with_context_recovery(
+                                active_cycle=active_cycle,
                                 state=state,
                                 session_id=session_id,
-                                cycle_id=cycle_id,
                                 progress_callback=progress_callback,
-                                cycle_trace=cycle_trace,
+                                tools=tools,
+                                context="Финальный ответ после tool calls",
+                                include_iteration_runtime=False,
+                                request_iteration=state.iterations,
+                            )
+                            self._observe_main_llm_usage(
+                                active_cycle=active_cycle,
+                                messages=messages,
+                                tools=tools,
+                                response=final_response,
                             )
 
                             self._trace_event(
@@ -4274,7 +4360,6 @@ class MCPClient:
                                 progress_callback=progress_callback,
                                 cycle_trace=cycle_trace,
                             )
-
                             if action.agent_request:
                                 await self._emit_progress_event(
                                     state=state,
@@ -5365,6 +5450,7 @@ class MCPClient:
         temperature_override: float | None = None,
         top_p_override: float | None = None,
         redact_error_details: bool = True,
+        defer_context_overflow_error: bool = False,
     ) -> Dict[str, Any]:
         max_attempts = self.llm_max_retries + 1
 
@@ -5386,6 +5472,22 @@ class MCPClient:
             except LLMHTTPError as e:
                 error_repr = safe_error_repr(e)
                 can_retry = e.status_code in self.llm_retryable_http_statuses
+
+                if (
+                    defer_context_overflow_error
+                    and self._is_context_overflow_error(e)
+                ):
+                    logger.warning(
+                        "%s: provider rejected the request for context "
+                        "overflow; deferring to cycle recovery; "
+                        "status_code=%s attempt=%s/%s error=%s",
+                        context,
+                        e.status_code,
+                        attempt,
+                        max_attempts,
+                        error_repr,
+                    )
+                    raise
 
                 if not can_retry:
                     logger.error(
@@ -5609,6 +5711,149 @@ class MCPClient:
                     },
                 )
                 raise
+
+    async def _call_main_llm_with_context_recovery(
+        self,
+        *,
+        active_cycle: ActiveAgentCycle,
+        state: SessionState,
+        session_id: str,
+        progress_callback,
+        tools: list[dict[str, Any]],
+        context: str,
+        include_iteration_runtime: bool,
+        request_iteration: int | None = None,
+    ) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Run one main-model request with a single overflow recovery pass."""
+
+        def build_request_messages() -> list[dict[str, Any]]:
+            base_messages = active_cycle.messages_for_llm
+            if not include_iteration_runtime:
+                return base_messages
+            return self._with_iteration_runtime_message(
+                base_messages,
+                state,
+            )
+
+        request_messages = build_request_messages()
+        try:
+            response = await self._call_llm_with_retries(
+                request_messages,
+                tools,
+                context=context,
+                state=state,
+                session_id=session_id,
+                cycle_id=active_cycle.cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=active_cycle.cycle_trace,
+                defer_context_overflow_error=True,
+            )
+            return response, request_messages
+        except LLMHTTPError as caught_error:
+            if not self._is_context_overflow_error(caught_error):
+                raise
+            overflow_error = caught_error
+
+        overflow_data = {
+            "status_code": overflow_error.status_code,
+            "request_iteration": request_iteration,
+            "recovery_attempt": 1,
+        }
+        self._trace_event(
+            active_cycle.cycle_trace,
+            "context_overflow_recovery_started",
+            **overflow_data,
+        )
+        logger.warning(
+            "Main LLM context overflow detected: cycle_id=%s "
+            "status_code=%s request_iteration=%s; forcing one "
+            "compaction recovery",
+            active_cycle.cycle_id,
+            overflow_error.status_code,
+            request_iteration,
+        )
+
+        try:
+            compaction_outcome = await self._compact_context_if_needed(
+                active_cycle=active_cycle,
+                state=state,
+                session_id=session_id,
+                progress_callback=progress_callback,
+                request_tools=tools,
+                request_iteration=request_iteration,
+                force=True,
+            )
+        except LLMHTTPError as compactor_error:
+            if not self._is_context_overflow_error(compactor_error):
+                raise
+            self._trace_event(
+                active_cycle.cycle_trace,
+                "context_overflow_recovery_failed",
+                status_code=compactor_error.status_code,
+                request_iteration=request_iteration,
+                recovery_attempt=1,
+                stage="compactor",
+            )
+            raise CycleContextLimitError(
+                "The cycle compactor also exceeded the provider context "
+                "limit during overflow recovery."
+            ) from compactor_error
+        if not compaction_outcome.changed:
+            raise CycleContextLimitError(
+                "Provider reported context overflow, but runtime could not "
+                "safely compact the active cycle."
+            ) from overflow_error
+
+        request_messages = build_request_messages()
+        try:
+            response = await self._call_llm_with_retries(
+                request_messages,
+                tools,
+                context=f"{context}: after context recovery",
+                state=state,
+                session_id=session_id,
+                cycle_id=active_cycle.cycle_id,
+                progress_callback=progress_callback,
+                cycle_trace=active_cycle.cycle_trace,
+                defer_context_overflow_error=True,
+            )
+        except LLMHTTPError as repeated_error:
+            if not self._is_context_overflow_error(repeated_error):
+                raise
+            self._trace_event(
+                active_cycle.cycle_trace,
+                "context_overflow_recovery_failed",
+                status_code=repeated_error.status_code,
+                request_iteration=request_iteration,
+                recovery_attempt=1,
+                stage="main_retry",
+            )
+            raise CycleContextLimitError(
+                "Provider still reported context overflow after one safe "
+                "cycle-compaction recovery."
+            ) from repeated_error
+
+        self._trace_event(
+            active_cycle.cycle_trace,
+            "context_overflow_recovered",
+            status_code=overflow_error.status_code,
+            request_iteration=request_iteration,
+            recovery_attempt=1,
+            before_tokens=compaction_outcome.before_tokens,
+            after_tokens=compaction_outcome.after_tokens,
+            passes_completed=compaction_outcome.passes_completed,
+        )
+        logger.info(
+            "Main LLM context overflow recovered: cycle_id=%s "
+            "request_iteration=%s before_tokens=%s after_tokens=%s "
+            "passes_completed=%s",
+            active_cycle.cycle_id,
+            request_iteration,
+            compaction_outcome.before_tokens,
+            compaction_outcome.after_tokens,
+            compaction_outcome.passes_completed,
+        )
+        return response, request_messages
     
     def _format_messages_for_custom_llm(
         self, 
@@ -6071,6 +6316,29 @@ class MCPClient:
                 )
                 else None
             ),
+            "token_usage_snapshot": (
+                {
+                    "model": active_cycle.token_usage_snapshot.model,
+                    "prompt_tokens": (
+                        active_cycle.token_usage_snapshot.prompt_tokens
+                    ),
+                    "request_estimate_tokens": (
+                        active_cycle.token_usage_snapshot
+                        .request_estimate_tokens
+                    ),
+                    "estimator_source": (
+                        active_cycle.token_usage_snapshot.estimator_source
+                    ),
+                    "observed_at": (
+                        active_cycle.token_usage_snapshot.observed_at
+                    ),
+                }
+                if (
+                    active_cycle is not None
+                    and active_cycle.token_usage_snapshot is not None
+                )
+                else None
+            ),
         }
 
         # TODO v0.5: replace the compatibility cycle JSON archive with a
@@ -6090,13 +6358,13 @@ class MCPClient:
 
     def _estimate_tokens_rough(self, text: str) -> int:
         """Compatibility wrapper around the configured token estimator."""
-        return self.token_estimator.estimate_text(text)
+        return self.request_token_estimator.estimate_text(text)
 
     def _estimate_messages_tokens(
         self,
         messages: List[Dict[str, Any]],
     ) -> int:
-        return self.token_estimator.estimate_messages(messages)
+        return self.request_token_estimator.estimate_messages(messages)
 
     def _estimate_request_tokens(
         self,
@@ -6104,7 +6372,7 @@ class MCPClient:
         messages: List[Dict[str, Any]],
         tools: List[Dict[str, Any]],
     ) -> int:
-        return self.token_estimator.estimate_request(
+        return self.request_token_estimator.estimate_request(
             messages=messages,
             tools=tools,
         )
@@ -6116,18 +6384,99 @@ class MCPClient:
         state: SessionState,
         tools: List[Dict[str, Any]],
         iteration_override: int | None = None,
+        usage_snapshot: TokenUsageSnapshot | None = None,
     ) -> int:
+        return self._estimate_main_request_accounting(
+            messages=messages,
+            state=state,
+            tools=tools,
+            iteration_override=iteration_override,
+            usage_snapshot=usage_snapshot,
+        ).total_tokens
+
+    def _estimate_main_request_accounting(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        state: SessionState,
+        tools: List[Dict[str, Any]],
+        iteration_override: int | None = None,
+        usage_snapshot: TokenUsageSnapshot | None = None,
+    ):
         request_state = (
             state
             if iteration_override is None
             else replace(state, iterations=iteration_override)
         )
-        return self._estimate_request_tokens(
+        return self.token_accounting.estimate_request(
             messages=self._with_iteration_runtime_message(
                 messages,
                 request_state,
             ),
             tools=tools,
+            usage_snapshot=usage_snapshot,
+        )
+
+    def _observe_main_llm_usage(
+        self,
+        *,
+        active_cycle: ActiveAgentCycle,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+        response: Dict[str, Any],
+    ) -> None:
+        diagnostics = self._safe_llm_response_diagnostics(response)
+        prompt_tokens = diagnostics["prompt_tokens"]
+        if not isinstance(prompt_tokens, int) or prompt_tokens < 1:
+            logger.debug(
+                "Main LLM usage snapshot unavailable: cycle_id=%s "
+                "model=%s estimator_source=%s",
+                active_cycle.cycle_id,
+                self.llm_config.model,
+                self.token_accounting.source,
+            )
+            return
+
+        snapshot = self.token_accounting.observe_prompt_usage(
+            messages=messages,
+            tools=tools,
+            prompt_tokens=prompt_tokens,
+        )
+        if snapshot is None:
+            return
+
+        active_cycle.token_usage_snapshot = snapshot
+        estimate_error = snapshot.request_estimate_tokens - prompt_tokens
+        error_ratio = (
+            snapshot.request_estimate_tokens / prompt_tokens
+            if prompt_tokens
+            else None
+        )
+        usage_data = {
+            "model": snapshot.model,
+            "prompt_tokens": snapshot.prompt_tokens,
+            "request_estimate_tokens": snapshot.request_estimate_tokens,
+            "estimate_error_tokens": estimate_error,
+            "estimate_to_actual_ratio": error_ratio,
+            "estimator_source": snapshot.estimator_source,
+        }
+        self._trace_event(
+            active_cycle.cycle_trace,
+            "main_llm_token_usage_observed",
+            **usage_data,
+        )
+        logger.info(
+            "Main LLM token usage observed: cycle_id=%s model=%s "
+            "prompt_tokens=%s request_estimate_tokens=%s "
+            "estimate_error_tokens=%s estimate_to_actual_ratio=%.3f "
+            "estimator_source=%s",
+            active_cycle.cycle_id,
+            snapshot.model,
+            snapshot.prompt_tokens,
+            snapshot.request_estimate_tokens,
+            estimate_error,
+            error_ratio,
+            snapshot.estimator_source,
         )
 
     def _effective_reserved_output_tokens(self) -> int:
@@ -6300,6 +6649,7 @@ class MCPClient:
         progress_callback,
         request_tools: list[dict[str, Any]] | None = None,
         request_iteration: int | None = None,
+        force: bool = False,
     ) -> CycleCompactionOutcome:
         messages_for_llm = active_cycle.messages_for_llm
         cycle_trace = active_cycle.cycle_trace
@@ -6308,12 +6658,14 @@ class MCPClient:
             if request_tools is not None
             else self._format_tools_for_llm()
         )
-        before_tokens = self._estimate_main_request_tokens(
+        before_accounting = self._estimate_main_request_accounting(
             messages=messages_for_llm,
             state=state,
             tools=effective_request_tools,
             iteration_override=request_iteration,
+            usage_snapshot=active_cycle.token_usage_snapshot,
         )
+        before_tokens = before_accounting.total_tokens
         trigger_tokens = self._context_trigger_tokens()
         target_tokens = self._context_target_tokens()
         usable_input_tokens = self._context_usable_input_tokens()
@@ -6323,6 +6675,25 @@ class MCPClient:
             else 0
         )
         attempt_failure_signature: tuple[object, ...] | None = None
+        logger.debug(
+            "Cycle context accounting: cycle_id=%s total_tokens=%s "
+            "raw_estimate_tokens=%s fixed_tokens=%s compactable_tokens=%s "
+            "source=%s confidence=%s used_usage_snapshot=%s "
+            "trigger_tokens=%s target_tokens=%s usable_input_tokens=%s "
+            "force=%s",
+            active_cycle.cycle_id,
+            before_accounting.total_tokens,
+            before_accounting.raw_estimate_tokens,
+            before_accounting.fixed_tokens,
+            before_accounting.compactable_tokens,
+            before_accounting.source,
+            before_accounting.confidence,
+            before_accounting.used_usage_snapshot,
+            trigger_tokens,
+            target_tokens,
+            usable_input_tokens,
+            force,
+        )
 
         def outcome(
             *,
@@ -6407,7 +6778,10 @@ class MCPClient:
             )
             if (
                 enforce_hard_limit
-                and current_tokens >= usable_input_tokens
+                and (
+                    force
+                    or current_tokens >= usable_input_tokens
+                )
             ):
                 raise CycleContextLimitError(
                     "Runtime could not safely reduce the active cycle "
@@ -6420,7 +6794,7 @@ class MCPClient:
                 failure_reason=reason,
             )
 
-        if before_tokens < trigger_tokens:
+        if before_tokens < trigger_tokens and not force:
             return outcome(
                 changed=False,
                 after_tokens=before_tokens,
@@ -6436,10 +6810,10 @@ class MCPClient:
                 target_tokens=target_tokens,
                 compaction_status="disabled",
             )
-            if before_tokens >= usable_input_tokens:
+            if force or before_tokens >= usable_input_tokens:
                 raise CycleContextLimitError(
                     "Context compaction is disabled and the active cycle "
-                    "has reached the hard context limit."
+                    "cannot recover from the provider context limit."
                 )
             return outcome(
                 changed=False,
@@ -6464,6 +6838,40 @@ class MCPClient:
             compactor_input_limit_tokens=trigger_tokens,
         )
         first_failure_signature = first_selection_decision.retry_signature()
+        retry_min_eligible_tokens = (
+            active_cycle.compaction_retry_min_eligible_tokens
+        )
+        if (
+            retry_min_eligible_tokens is not None
+            and first_selection_decision.eligible_tokens
+            < retry_min_eligible_tokens
+            and before_tokens < usable_input_tokens
+            and not force
+        ):
+            self._trace_event(
+                cycle_trace,
+                "cycle_compaction_skipped",
+                reason="insufficient_new_eligible_context",
+                before_tokens=before_tokens,
+                generation=current_generation,
+                eligible_tokens=(
+                    first_selection_decision.eligible_tokens
+                ),
+                retry_min_eligible_tokens=retry_min_eligible_tokens,
+            )
+            return outcome(
+                changed=False,
+                after_tokens=before_tokens,
+                passes_completed=0,
+                failure_reason="insufficient_new_eligible_context",
+            )
+        if (
+            retry_min_eligible_tokens is not None
+            and first_selection_decision.eligible_tokens
+            >= retry_min_eligible_tokens
+        ):
+            active_cycle.compaction_retry_min_eligible_tokens = None
+
         unchanged_failed_selection = (
             active_cycle.compaction_failures > 0
             and (
@@ -6486,16 +6894,55 @@ class MCPClient:
                 message_count=len(messages_for_llm),
                 selection_unchanged=True,
             )
-            if before_tokens >= usable_input_tokens:
+            if force or before_tokens >= usable_input_tokens:
                 raise CycleContextLimitError(
                     "Repeated cycle compaction was skipped for unchanged "
-                    "context at the hard limit."
+                    "context during context-limit recovery."
                 )
             return outcome(
                 changed=False,
                 after_tokens=before_tokens,
                 passes_completed=0,
                 failure_reason="unchanged_context_after_failure",
+            )
+
+        if first_selection_decision.selection is None:
+            attempt_failure_signature = first_failure_signature
+            selection_diagnostics = (
+                first_selection_decision.safe_log_data()
+            )
+            active_cycle.compaction_retry_min_eligible_tokens = max(
+                first_selection_decision.expected_compacted_tokens + 1,
+                first_selection_decision.eligible_tokens + 1,
+            )
+            self._trace_event(
+                cycle_trace,
+                "cycle_compaction_skipped",
+                reason="no_safe_segment",
+                before_tokens=before_tokens,
+                generation=current_generation,
+                pass_index=0,
+                **selection_diagnostics,
+            )
+            logger.info(
+                "Cycle compaction deferred without a net-positive segment: "
+                "cycle_id=%s diagnostics=%s",
+                active_cycle.cycle_id,
+                selection_diagnostics,
+            )
+            if force or before_tokens >= usable_input_tokens:
+                return await emit_failure(
+                    reason="no_safe_segment",
+                    error_type="CycleSegmentSelectionError",
+                    current_tokens=before_tokens,
+                    passes_completed=0,
+                    logical_failure=True,
+                )
+            return outcome(
+                changed=False,
+                after_tokens=before_tokens,
+                passes_completed=0,
+                failure_reason="no_safe_segment",
             )
 
         started_data = {
@@ -6567,20 +7014,31 @@ class MCPClient:
                     pass_index=pass_index,
                     **selection_diagnostics,
                 )
-                logger.warning(
-                    "Cycle compaction selector found no safe segment: "
+                logger.info(
+                    "Cycle compaction has no additional net-positive segment: "
                     "cycle_id=%s pass_index=%s diagnostics=%s",
                     active_cycle.cycle_id,
                     pass_index,
                     selection_diagnostics,
                 )
                 if passes_completed == 0:
-                    return await emit_failure(
-                        reason="no_safe_segment",
-                        error_type="CycleSegmentSelectionError",
-                        current_tokens=current_tokens,
+                    if force or current_tokens >= usable_input_tokens:
+                        return await emit_failure(
+                            reason="no_safe_segment",
+                            error_type="CycleSegmentSelectionError",
+                            current_tokens=current_tokens,
+                            passes_completed=passes_completed,
+                            logical_failure=True,
+                        )
+                    active_cycle.compaction_retry_min_eligible_tokens = max(
+                        selection_decision.expected_compacted_tokens + 1,
+                        selection_decision.eligible_tokens + 1,
+                    )
+                    return outcome(
+                        changed=False,
+                        after_tokens=current_tokens,
                         passes_completed=passes_completed,
-                        logical_failure=True,
+                        failure_reason="no_safe_segment",
                     )
                 break
 
@@ -6684,6 +7142,7 @@ class MCPClient:
                     max_tokens_override=compactor_output_tokens,
                     temperature_override=0.1,
                     redact_error_details=True,
+                    defer_context_overflow_error=force,
                 )
                 validated_response = response
                 validated_attempt = 1
@@ -6758,6 +7217,7 @@ class MCPClient:
                         max_tokens_override=repair_max_tokens,
                         temperature_override=0.0,
                         redact_error_details=True,
+                        defer_context_overflow_error=force,
                     )
                     try:
                         compaction_result = (
@@ -6891,6 +7351,7 @@ class MCPClient:
                 state=state,
                 tools=effective_request_tools,
                 iteration_override=request_iteration,
+                usage_snapshot=active_cycle.token_usage_snapshot,
             )
             if after_tokens >= current_tokens:
                 return await emit_failure(
@@ -6918,6 +7379,7 @@ class MCPClient:
             active_cycle.compaction_failures = 0
             active_cycle.last_compaction_message_count = None
             active_cycle.last_compaction_failure_signature = None
+            active_cycle.compaction_retry_min_eligible_tokens = None
             passes_completed += 1
 
             pass_data = {
@@ -6951,6 +7413,15 @@ class MCPClient:
             current_tokens = after_tokens
             if current_tokens <= target_tokens:
                 break
+
+        if force and passes_completed == 0:
+            return await emit_failure(
+                reason="forced_compaction_made_no_progress",
+                error_type="CycleContextLimitError",
+                current_tokens=current_tokens,
+                passes_completed=passes_completed,
+                logical_failure=False,
+            )
 
         if current_tokens >= usable_input_tokens:
             return await emit_failure(
@@ -7195,6 +7666,7 @@ def load_config(
                 "enable_context_compaction",
                 True,
             ),
+            tokenizer_encoding=llm_data.get("tokenizer_encoding"),
         )
 
         if not llm_config.api_url:

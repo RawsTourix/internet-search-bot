@@ -51,6 +51,7 @@
         "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
         "api_key": "your_api_key",
         "model": "moonshotai/kimi-k2.6",
+        "tokenizer_encoding": null,
         "is_openai_compatible": true,
         "max_tokens": 4096,
         "temperature": 0.35,

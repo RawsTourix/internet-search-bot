@@ -6,12 +6,15 @@ from unittest.mock import AsyncMock, Mock
 
 from src.agent.protocol import dumps_json
 from src.memory import (
+    ConservativeTokenEstimator,
     CycleContextLimitError,
     CycleWorkingMemory,
     CycleWorkingState,
+    HeuristicRequestTokenEstimator,
     MemoryConfigType,
     parse_cycle_working_memory_message,
 )
+from src.core.errors import LLMHTTPError
 from src.mcp.mcp_client import LLMConfigType, MCPClient, SessionState
 from src.runtime import ActiveAgentCycle
 from src.storage import StorageConfigType, StorageError, create_storage_services
@@ -39,8 +42,8 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.client = MCPClient(
             LLMConfigType(
                 api_url="https://example.invalid/v1/chat/completions",
-                context_window_tokens=40_000,
-                reserved_output_tokens=2_000,
+                context_window_tokens=20_000,
+                reserved_output_tokens=1_000,
                 max_tokens=1_000,
                 context_safety_ratio=0.60,
                 context_compaction_target_ratio=0.35,
@@ -50,6 +53,7 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 cycle_compaction_keep_recent_blocks=2,
                 cycle_compaction_max_passes=3,
             ),
+            request_token_estimator=HeuristicRequestTokenEstimator(),
         )
         self.state = SessionState(progress_locale="en")
 
@@ -283,6 +287,211 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events, [])
         self.client._call_llm_with_retries.assert_not_awaited()
 
+    def test_main_request_trigger_does_not_use_raw_result_estimator(self):
+        self.client.llm_config.context_window_tokens = 32_000
+        self.client.llm_config.reserved_output_tokens = 8_192
+        self.client.llm_config.context_safety_ratio = 0.60
+        messages = [
+            {"role": "system", "content": "s" * 8_000},
+            {"role": "user", "content": "u" * 1_000},
+            {"role": "assistant", "content": "a" * 4_000},
+        ]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "manager_tool",
+                "description": "d" * 5_000,
+                "parameters": {"type": "object"},
+            },
+        }]
+
+        request_tokens = self.client._estimate_main_request_tokens(
+            messages=messages,
+            state=self.state,
+            tools=tools,
+            iteration_override=1,
+        )
+        raw_style_tokens = ConservativeTokenEstimator().estimate_request(
+            messages=self.client._with_iteration_runtime_message(
+                messages,
+                self.state,
+            ),
+            tools=tools,
+        )
+
+        self.assertLess(
+            request_tokens,
+            self.client._context_trigger_tokens(),
+        )
+        self.assertGreaterEqual(
+            raw_style_tokens,
+            self.client._context_trigger_tokens(),
+        )
+
+    def test_only_recognized_provider_errors_are_context_overflow(self):
+        recognized = LLMHTTPError(
+            400,
+            '{"error":{"code":"context_length_exceeded"}}',
+        )
+        unrelated = LLMHTTPError(
+            400,
+            '{"error":{"message":"invalid temperature"}}',
+        )
+
+        self.assertTrue(
+            self.client._is_context_overflow_error(recognized)
+        )
+        self.assertFalse(
+            self.client._is_context_overflow_error(unrelated)
+        )
+
+    async def test_provider_overflow_forces_one_compaction_and_retries(self):
+        self.client.llm_config.context_window_tokens = 40_000
+        self.client.llm_config.reserved_output_tokens = 2_000
+        cycle = self._active_cycle()
+        self.state.iterations = 1
+        overflow = LLMHTTPError(
+            400,
+            '{"error":{"code":"context_length_exceeded"}}',
+        )
+        successful_response = {"content": "recovered"}
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            overflow,
+            valid_compaction_response(),
+            successful_response,
+        ])
+
+        response, request_messages = (
+            await self.client._call_main_llm_with_context_recovery(
+                active_cycle=cycle,
+                state=self.state,
+                session_id="session-1",
+                progress_callback=None,
+                tools=[],
+                context="test main call",
+                include_iteration_runtime=True,
+                request_iteration=1,
+            )
+        )
+
+        self.assertEqual(response, successful_response)
+        self.assertEqual(
+            self.client._call_llm_with_retries.await_count,
+            3,
+        )
+        self.assertIsNotNone(cycle.working_memory)
+        self.assertIn(
+            "context_overflow_recovered",
+            [event["type"] for event in cycle.cycle_trace],
+        )
+        self.assertNotIn(
+            "OLD_BLOCK_0",
+            json.dumps(request_messages, ensure_ascii=False),
+        )
+
+    async def test_repeated_provider_overflow_stops_after_one_recovery(self):
+        self.client.llm_config.context_window_tokens = 40_000
+        self.client.llm_config.reserved_output_tokens = 2_000
+        cycle = self._active_cycle()
+        overflow = LLMHTTPError(
+            400,
+            '{"error":{"message":"maximum context length exceeded"}}',
+        )
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            overflow,
+            valid_compaction_response(),
+            overflow,
+        ])
+
+        with self.assertRaises(CycleContextLimitError):
+            await self.client._call_main_llm_with_context_recovery(
+                active_cycle=cycle,
+                state=self.state,
+                session_id="session-1",
+                progress_callback=None,
+                tools=[],
+                context="test main call",
+                include_iteration_runtime=True,
+                request_iteration=1,
+            )
+
+        self.assertEqual(
+            self.client._call_llm_with_retries.await_count,
+            3,
+        )
+        self.assertIn(
+            "context_overflow_recovery_failed",
+            [event["type"] for event in cycle.cycle_trace],
+        )
+
+    async def test_compactor_overflow_becomes_resumable_context_limit(self):
+        self.client.llm_config.context_window_tokens = 40_000
+        self.client.llm_config.reserved_output_tokens = 2_000
+        cycle = self._active_cycle()
+        main_overflow = LLMHTTPError(
+            400,
+            '{"error":{"code":"context_length_exceeded"}}',
+        )
+        compactor_overflow = LLMHTTPError(
+            413,
+            '{"error":{"message":"prompt is too long"}}',
+        )
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            main_overflow,
+            compactor_overflow,
+        ])
+
+        with self.assertRaises(CycleContextLimitError):
+            await self.client._call_main_llm_with_context_recovery(
+                active_cycle=cycle,
+                state=self.state,
+                session_id="session-1",
+                progress_callback=None,
+                tools=[],
+                context="test main call",
+                include_iteration_runtime=True,
+                request_iteration=1,
+            )
+
+        failed = next(
+            event
+            for event in cycle.cycle_trace
+            if event["type"] == "context_overflow_recovery_failed"
+        )
+        self.assertEqual(failed["stage"], "compactor")
+        self.assertEqual(
+            self.client._call_llm_with_retries.await_count,
+            2,
+        )
+
+    async def test_unrelated_http_400_never_triggers_compaction_recovery(self):
+        cycle = self._active_cycle()
+        unrelated = LLMHTTPError(
+            400,
+            '{"error":{"message":"invalid request parameter"}}',
+        )
+        self.client._call_llm_with_retries = AsyncMock(
+            side_effect=unrelated
+        )
+
+        with self.assertRaises(LLMHTTPError):
+            await self.client._call_main_llm_with_context_recovery(
+                active_cycle=cycle,
+                state=self.state,
+                session_id="session-1",
+                progress_callback=None,
+                tools=[],
+                context="test main call",
+                include_iteration_runtime=True,
+                request_iteration=1,
+            )
+
+        self.assertIsNone(cycle.working_memory)
+        self.assertNotIn(
+            "context_overflow_recovery_started",
+            [event["type"] for event in cycle.cycle_trace],
+        )
+
     async def test_disabled_compaction_warns_or_stops_at_hard_limit(self):
         self.client.llm_config.enable_context_compaction = False
         safe_cycle = self._active_cycle()
@@ -426,8 +635,10 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         decision, _ = self.client._select_cycle_segment_to_fit(
             active_cycle=cycle,
             messages=cycle.messages_for_llm,
-            current_tokens=self.client._estimate_messages_tokens(
-                cycle.messages_for_llm
+            current_tokens=self.client._estimate_main_request_tokens(
+                messages=cycle.messages_for_llm,
+                state=self.state,
+                tools=self.client._format_tools_for_llm(),
             ),
             target_tokens=self.client._context_target_tokens(),
             summary_target_tokens=self.client._cycle_summary_target_tokens(),

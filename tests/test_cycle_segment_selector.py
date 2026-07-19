@@ -197,7 +197,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
 
         self.assertIsNone(decision.selection)
         self.assertEqual(decision.reason, "insufficient_summary_gain")
-        self.assertEqual(decision.boundary_reason, "protected_boundary")
+        self.assertEqual(decision.boundary_reason, "target_reclaim")
         self.assertEqual(decision.block_count, 4)
         self.assertEqual(decision.protected_block_count, 3)
         self.assertEqual(decision.eligible_block_count, 1)
@@ -206,6 +206,7 @@ class CycleSegmentSelectorTests(unittest.TestCase):
             decision.selected_tokens,
             decision.expected_compacted_tokens,
         )
+        self.assertGreater(decision.effective_target_tokens, 400)
         diagnostics = decision.safe_log_data()
         self.assertNotIn("messages", diagnostics)
         self.assertNotIn("content", diagnostics)

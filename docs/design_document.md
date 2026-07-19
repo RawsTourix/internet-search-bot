@@ -5152,6 +5152,58 @@ safe checkpoints
 per-session lock
 ```
 
+### Учёт токенов и восстановление после переполнения контекста
+
+Runtime разделяет две задачи оценки:
+
+```text
+raw-result accounting
+    консервативная верхнесмещённая оценка недоверенного результата;
+    применяется для inline/store/summary policy и fidelity checks.
+
+main-request accounting
+    оценка полного запроса к основной LLM:
+    messages + runtime state + tool schemas + protocol overhead.
+```
+
+Для main request используется следующий порядок источников:
+
+```text
+1. Локальный tokenizer, явно заданный tokenizer_encoding.
+2. Локальный tokenizer, автоматически выбранный по model.
+3. Model-neutral UTF-8/character heuristic, если tokenizer неизвестен.
+4. Фактический prompt_tokens из успешного ответа провайдера как
+   calibration snapshot для последующих запросов того же model и набора tools.
+```
+
+`prompt_tokens` не переносится между разными моделями и схемами инструментов.
+Snapshot привязывается к fingerprint запроса и tool schemas; для изменившегося
+запроса рост учитывается как консервативная оценённая дельта. При уменьшении
+low-confidence request используются одновременно additive- и ratio-calibration
+от последнего фактического usage, после чего выбирается более безопасная
+оценка. Выбор источника, confidence, estimate/actual ratio и факт применения
+snapshot сохраняются в безопасной диагностике без содержимого сообщений.
+
+Compaction target относится к реально компактируемой части цикла. Системный
+prompt, tool schemas, исходный пользовательский запрос, незакрытые tool
+последовательности и защищённые последние блоки учитываются как fixed/protected
+overhead и не создают недостижимую цель для selector.
+
+Если провайдер всё же возвращает распознаваемую ошибку context overflow,
+основной LLM-вызов выполняет ровно один recovery:
+
+```text
+provider context overflow
+    -> принудительная безопасная cycle compaction
+    -> повторная сборка полного main request
+    -> один повтор LLM-вызова
+```
+
+Recovery не применяется к произвольным `400/413/422`, не делает повторов без
+компактизации и не превращает остальные configuration errors в resumable.
+Повторный overflow после recovery завершается `CycleContextLimitError` с
+сохранением рабочего цикла.
+
 ---
 
 ## v0.5 — PostgreSQL, lazy indexing и RAG

@@ -15,6 +15,7 @@ class ApiConfigLoggingTests(unittest.TestCase):
             api_url="https://llm.example.test/v1/chat/completions",
             api_key="llm-secret-value",
             model="test-model",
+            tokenizer_encoding="test-encoding",
             headers={"Authorization": "Bearer llm-header-secret"},
         )
         server_configs = [
@@ -41,6 +42,7 @@ class ApiConfigLoggingTests(unittest.TestCase):
         self.assertNotIn("mcp-header-secret", summaries)
         self.assertNotIn("mcp-env-secret", summaries)
         self.assertIn("test-model", summaries)
+        self.assertIn("test-encoding", summaries)
         self.assertIn("private-server", summaries)
         self.assertIn("enable_result_compaction", summaries)
         self.assertIn("result_summary_target_tokens", summaries)

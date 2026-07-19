@@ -10,6 +10,7 @@ from src.core.errors import LLMTransportError
 from src.memory import (
     CycleWorkingMemory,
     CycleWorkingState,
+    HeuristicRequestTokenEstimator,
     MemoryConfigType,
     parse_cycle_working_memory_message,
 )
@@ -37,8 +38,8 @@ class CycleCompactionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.client = MCPClient(
             LLMConfigType(
                 api_url="https://example.invalid/v1/chat/completions",
-                context_window_tokens=40_000,
-                reserved_output_tokens=2_000,
+                context_window_tokens=20_000,
+                reserved_output_tokens=1_000,
                 max_tokens=1_000,
                 context_safety_ratio=0.60,
                 context_compaction_target_ratio=0.35,
@@ -47,6 +48,7 @@ class CycleCompactionRecoveryTests(unittest.IsolatedAsyncioTestCase):
             memory_config=MemoryConfigType(
                 cycle_compaction_keep_recent_blocks=1,
             ),
+            request_token_estimator=HeuristicRequestTokenEstimator(),
         )
 
     async def asyncTearDown(self):

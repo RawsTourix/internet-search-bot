@@ -136,6 +136,27 @@ class LLMErrorSafetyTests(unittest.IsolatedAsyncioTestCase):
             "LLMError(details omitted)",
         )
 
+    async def test_context_overflow_can_be_deferred_without_error_progress(self):
+        overflow = LLMHTTPError(
+            400,
+            '{"error":{"code":"context_length_exceeded"}}',
+        )
+        self.client.llm_max_retries = 4
+        self.client.llm_retryable_http_statuses = {429, 500}
+        self.client._call_llm = AsyncMock(side_effect=overflow)
+        self.client._emit_llm_retry_progress = AsyncMock()
+
+        with self.assertRaises(LLMHTTPError):
+            await self.client._call_llm_with_retries(
+                [],
+                [],
+                context="Main cycle",
+                defer_context_overflow_error=True,
+            )
+
+        self.client._call_llm.assert_awaited_once()
+        self.client._emit_llm_retry_progress.assert_not_awaited()
+
     async def test_success_response_exposes_only_safe_runtime_diagnostics(self):
         finish_reason_sentinel = "PRIVATE_PROVIDER_FINISH_REASON"
         self.client.llm_config = SimpleNamespace(

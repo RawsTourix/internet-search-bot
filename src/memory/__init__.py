@@ -54,7 +54,15 @@ from .result_fidelity import (
 )
 from .token_estimation import (
     ConservativeTokenEstimator,
+    HeuristicRequestTokenEstimator,
+    RequestTokenEstimate,
+    TiktokenRequestTokenEstimator,
+    TokenAccountingService,
+    TokenEstimateConfidence,
+    TokenEstimateSource,
     TokenEstimator,
+    TokenUsageSnapshot,
+    create_request_token_estimator,
 )
 
 __all__ = [
@@ -77,6 +85,7 @@ __all__ = [
     "CycleWorkingState",
     "ConservativeResultFidelityPolicy",
     "ConservativeTokenEstimator",
+    "HeuristicRequestTokenEstimator",
     "ExtractedCycleRefs",
     "InvalidResultHandlingError",
     "MemoryConfigType",
@@ -91,11 +100,18 @@ __all__ = [
     "ResultFidelityPolicy",
     "ResultHandling",
     "ResultProcessingOutcome",
+    "RequestTokenEstimate",
+    "TiktokenRequestTokenEstimator",
+    "TokenAccountingService",
+    "TokenEstimateConfidence",
+    "TokenEstimateSource",
     "TokenEstimator",
+    "TokenUsageSnapshot",
     "RESULT_COMPACTION_SYSTEM_PROMPT",
     "build_cycle_compaction_system_prompt",
     "build_cycle_working_memory_message",
     "build_result_compaction_system_prompt",
+    "create_request_token_estimator",
     "estimate_untrusted_result_tokens",
     "extract_cycle_refs",
     "parse_cycle_working_memory_message",

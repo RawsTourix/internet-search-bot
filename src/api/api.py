@@ -68,11 +68,13 @@ class Api:
             llm_log_summary = safe_llm_config_summary(self.llm_config)
             logger.debug(
                 "LLM config: model=%s api_url=%s openai_compatible=%s "
-                "context_window_tokens=%s final_audit=%s",
+                "context_window_tokens=%s tokenizer_encoding=%s "
+                "final_audit=%s",
                 llm_log_summary["model"],
                 llm_log_summary["api_url"],
                 llm_log_summary["openai_compatible"],
                 llm_log_summary["context_window_tokens"],
+                llm_log_summary["tokenizer_encoding"],
                 llm_log_summary["final_audit"],
             )
             logger.debug(
