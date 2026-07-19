@@ -5169,12 +5169,21 @@ main-request accounting
 Для main request используется следующий порядок источников:
 
 ```text
-1. Локальный tokenizer, явно заданный tokenizer_encoding.
-2. Локальный tokenizer, автоматически выбранный по model.
+1. Локальный tokenizer, явно заданный валидным tokenizer_encoding.
+2. Локальный tokenizer, автоматически выбранный по полному имени model,
+   затем по имени модели без provider-префикса. Этот шаг также выполняется,
+   если явно заданный tokenizer_encoding не существует в tiktoken.
 3. Model-neutral UTF-8/character heuristic, если tokenizer неизвестен.
 4. Фактический prompt_tokens из успешного ответа провайдера как
    calibration snapshot для последующих запросов того же model и набора tools.
 ```
+
+Валидный явно заданный `tokenizer_encoding` остаётся приоритетным override.
+Если автоматический mapping модели указывает на другую кодировку, runtime
+сохраняет явную настройку и пишет безопасное предупреждение без содержимого
+запроса. Диагностика выбора содержит requested/resolved encoding и источник:
+`explicit`, `model_mapping`, `model_mapping_after_explicit_failure` или
+`heuristic`.
 
 `prompt_tokens` не переносится между разными моделями и схемами инструментов.
 Snapshot привязывается к fingerprint запроса и tool schemas; для изменившегося

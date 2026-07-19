@@ -150,12 +150,46 @@ class TiktokenRequestTokenEstimator:
         *,
         encoding_name: str,
         protocol_overhead_tokens: int = 32,
+        selection_source: str = "injected",
+        requested_encoding: str | None = None,
+        model_mapping_candidate: str | None = None,
     ):
         if protocol_overhead_tokens < 0:
             raise ValueError("protocol_overhead_tokens must be non-negative")
         self.encoding = encoding
         self.encoding_name = encoding_name
         self.protocol_overhead_tokens = protocol_overhead_tokens
+        self.selection_source = selection_source
+        self.requested_encoding = requested_encoding
+        self.model_mapping_candidate = model_mapping_candidate
+
+    @staticmethod
+    def _model_candidates(model: str) -> list[str]:
+        candidates = [model]
+        if "/" in model:
+            suffix = model.rsplit("/", 1)[-1]
+            if suffix not in candidates:
+                candidates.append(suffix)
+        return candidates
+
+    @classmethod
+    def _resolve_model_encoding(
+        cls,
+        tiktoken_module: Any,
+        model: str,
+    ) -> tuple[Any, str]:
+        last_error: Exception | None = None
+        for candidate in cls._model_candidates(model):
+            try:
+                return (
+                    tiktoken_module.encoding_for_model(candidate),
+                    candidate,
+                )
+            except Exception as error:
+                last_error = error
+        if last_error is not None:
+            raise last_error
+        raise KeyError(f"No tokenizer mapping for model {model!r}")
 
     @classmethod
     def for_model(
@@ -167,32 +201,71 @@ class TiktokenRequestTokenEstimator:
     ) -> "TiktokenRequestTokenEstimator":
         import tiktoken
 
+        model_mapping_candidate: str | None = None
         if encoding_name:
-            encoding = tiktoken.get_encoding(encoding_name)
-            resolved_name = encoding_name
-        else:
-            candidates = [model]
-            if "/" in model:
-                candidates.append(model.rsplit("/", 1)[-1])
-
-            last_error: Exception | None = None
-            encoding = None
-            for candidate in candidates:
+            try:
+                encoding = tiktoken.get_encoding(encoding_name)
+            except Exception as error:
+                logger.warning(
+                    "Configured tokenizer encoding unavailable; trying model "
+                    "mapping: model=%s requested_encoding=%s error_type=%s",
+                    model,
+                    encoding_name,
+                    type(error).__name__,
+                )
+                (
+                    encoding,
+                    model_mapping_candidate,
+                ) = cls._resolve_model_encoding(tiktoken, model)
+                resolved_name = str(
+                    getattr(encoding, "name", "unknown"),
+                )
+                selection_source = (
+                    "model_mapping_after_explicit_failure"
+                )
+            else:
+                resolved_name = str(
+                    getattr(encoding, "name", encoding_name),
+                )
+                selection_source = "explicit"
                 try:
-                    encoding = tiktoken.encoding_for_model(candidate)
-                    break
-                except Exception as error:
-                    last_error = error
-            if encoding is None:
-                if last_error is not None:
-                    raise last_error
-                raise KeyError(f"No tokenizer mapping for model {model!r}")
+                    (
+                        model_encoding,
+                        model_candidate,
+                    ) = cls._resolve_model_encoding(tiktoken, model)
+                except Exception:
+                    pass
+                else:
+                    model_encoding_name = str(
+                        getattr(model_encoding, "name", "unknown"),
+                    )
+                    if model_encoding_name != resolved_name:
+                        logger.warning(
+                            "Configured tokenizer encoding differs from model "
+                            "mapping; keeping explicit override: model=%s "
+                            "requested_encoding=%s resolved_encoding=%s "
+                            "model_encoding=%s model_candidate=%s",
+                            model,
+                            encoding_name,
+                            resolved_name,
+                            model_encoding_name,
+                            model_candidate,
+                        )
+        else:
+            (
+                encoding,
+                model_mapping_candidate,
+            ) = cls._resolve_model_encoding(tiktoken, model)
             resolved_name = str(getattr(encoding, "name", "unknown"))
+            selection_source = "model_mapping"
 
         return cls(
             encoding,
             encoding_name=resolved_name,
             protocol_overhead_tokens=protocol_overhead_tokens,
+            selection_source=selection_source,
+            requested_encoding=encoding_name,
+            model_mapping_candidate=model_mapping_candidate,
         )
 
     def estimate_text(self, text: str) -> int:
@@ -239,8 +312,9 @@ def create_request_token_estimator(
     except Exception as error:
         log_method = logger.warning if encoding_name else logger.info
         log_method(
-            "Model tokenizer unavailable; using request heuristic: "
-            "model=%s requested_encoding=%s error_type=%s",
+            "No local tokenizer could be resolved; using request heuristic: "
+            "model=%s requested_encoding=%s selection_source=heuristic "
+            "error_type=%s",
             model,
             encoding_name,
             type(error).__name__,
@@ -250,9 +324,14 @@ def create_request_token_estimator(
         )
 
     logger.info(
-        "Model tokenizer enabled: model=%s encoding=%s",
+        "Model tokenizer enabled: model=%s requested_encoding=%s "
+        "resolved_encoding=%s selection_source=%s "
+        "model_mapping_candidate=%s",
         model,
+        estimator.requested_encoding,
         estimator.encoding_name,
+        estimator.selection_source,
+        estimator.model_mapping_candidate,
     )
     return estimator
 

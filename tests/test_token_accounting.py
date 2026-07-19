@@ -1,6 +1,7 @@
 import json
 import math
 import unittest
+from unittest.mock import patch
 
 from src.memory import (
     ConservativeTokenEstimator,
@@ -40,9 +41,8 @@ class DeterministicRequestEstimator:
 
 
 class FakeEncoding:
-    name = "fake_encoding"
-
-    def __init__(self):
+    def __init__(self, name="fake_encoding"):
+        self.name = name
         self.calls = []
 
     def encode(self, text, **kwargs):
@@ -88,13 +88,143 @@ class RequestEstimatorTests(unittest.TestCase):
         )
 
     def test_configured_gpt_oss_encoding_is_available(self):
-        estimator = TiktokenRequestTokenEstimator.for_model(
-            "openai/gpt-oss-120b",
-            encoding_name="o200k_harmony",
-        )
+        with self.assertNoLogs(
+            "src.memory.token_estimation",
+            level="WARNING",
+        ):
+            estimator = TiktokenRequestTokenEstimator.for_model(
+                "openai/gpt-oss-120b",
+                encoding_name="o200k_harmony",
+            )
 
         self.assertEqual(estimator.encoding_name, "o200k_harmony")
+        self.assertEqual(estimator.selection_source, "explicit")
         self.assertGreater(estimator.estimate_text("test request"), 0)
+
+    def test_invalid_explicit_encoding_falls_back_to_model_mapping(self):
+        mapped_encoding = FakeEncoding("model_encoding")
+        with (
+            patch(
+                "tiktoken.get_encoding",
+                side_effect=KeyError("unknown encoding"),
+            ),
+            patch(
+                "tiktoken.encoding_for_model",
+                side_effect=[
+                    KeyError("provider-qualified model is unknown"),
+                    mapped_encoding,
+                ],
+            ) as encoding_for_model,
+            self.assertLogs(
+                "src.memory.token_estimation",
+                level="WARNING",
+            ) as logs,
+        ):
+            estimator = create_request_token_estimator(
+                model="provider/model",
+                encoding_name="missing_encoding",
+            )
+
+        self.assertIsInstance(
+            estimator,
+            TiktokenRequestTokenEstimator,
+        )
+        self.assertEqual(estimator.encoding_name, "model_encoding")
+        self.assertEqual(
+            estimator.selection_source,
+            "model_mapping_after_explicit_failure",
+        )
+        self.assertEqual(
+            estimator.requested_encoding,
+            "missing_encoding",
+        )
+        self.assertEqual(estimator.model_mapping_candidate, "model")
+        self.assertEqual(
+            [call.args[0] for call in encoding_for_model.call_args_list],
+            ["provider/model", "model"],
+        )
+        self.assertIn(
+            "trying model mapping",
+            "\n".join(logs.output),
+        )
+
+    def test_valid_explicit_encoding_wins_over_different_model_mapping(self):
+        explicit_encoding = FakeEncoding("explicit_encoding")
+        mapped_encoding = FakeEncoding("model_encoding")
+        with (
+            patch(
+                "tiktoken.get_encoding",
+                return_value=explicit_encoding,
+            ),
+            patch(
+                "tiktoken.encoding_for_model",
+                return_value=mapped_encoding,
+            ),
+            self.assertLogs(
+                "src.memory.token_estimation",
+                level="WARNING",
+            ) as logs,
+        ):
+            estimator = TiktokenRequestTokenEstimator.for_model(
+                "provider/model",
+                encoding_name="explicit_encoding",
+            )
+
+        self.assertIs(estimator.encoding, explicit_encoding)
+        self.assertEqual(estimator.selection_source, "explicit")
+        self.assertIn(
+            "keeping explicit override",
+            "\n".join(logs.output),
+        )
+
+    def test_invalid_explicit_and_unknown_model_use_request_heuristic(self):
+        with (
+            patch(
+                "tiktoken.get_encoding",
+                side_effect=KeyError("unknown encoding"),
+            ),
+            patch(
+                "tiktoken.encoding_for_model",
+                side_effect=KeyError("unknown model"),
+            ),
+            self.assertLogs(
+                "src.memory.token_estimation",
+                level="WARNING",
+            ) as logs,
+        ):
+            estimator = create_request_token_estimator(
+                model="unknown-provider/unknown-model",
+                encoding_name="missing_encoding",
+            )
+
+        self.assertIsInstance(
+            estimator,
+            HeuristicRequestTokenEstimator,
+        )
+        combined_logs = "\n".join(logs.output)
+        self.assertIn("trying model mapping", combined_logs)
+        self.assertIn("selection_source=heuristic", combined_logs)
+
+    def test_missing_explicit_encoding_uses_model_mapping(self):
+        mapped_encoding = FakeEncoding("model_encoding")
+        with patch(
+            "tiktoken.encoding_for_model",
+            return_value=mapped_encoding,
+        ):
+            estimator = create_request_token_estimator(
+                model="provider/model",
+            )
+
+        self.assertIsInstance(
+            estimator,
+            TiktokenRequestTokenEstimator,
+        )
+        self.assertEqual(estimator.selection_source, "model_mapping")
+        self.assertIsNone(estimator.requested_encoding)
+        self.assertEqual(
+            estimator.model_mapping_candidate,
+            "provider/model",
+        )
 
     def test_unknown_model_uses_request_heuristic(self):
         estimator = create_request_token_estimator(
