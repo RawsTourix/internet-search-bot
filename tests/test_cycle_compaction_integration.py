@@ -165,7 +165,7 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             if event["type"] == "cycle_compaction_done"
         )
         self.assertEqual(started["visibility"], "user")
-        self.assertEqual(done["visibility"], "internal")
+        self.assertEqual(done["visibility"], "user")
         self.assertIn("before_tokens", started["data"])
         self.assertIn("generation", done["data"])
         self.assertNotIn(

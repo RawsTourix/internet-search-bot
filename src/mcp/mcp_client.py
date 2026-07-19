@@ -7456,7 +7456,7 @@ class MCPClient:
             cycle_trace=cycle_trace,
             event_type="cycle_compaction_done",
             severity="success",
-            visibility="internal",
+            visibility="user",
             data=done_data,
         )
         return outcome(
