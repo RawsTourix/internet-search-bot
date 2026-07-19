@@ -4442,7 +4442,7 @@ artifacts and pending batch metadata.
 Gateway / Client API
 → Telegram/Web/CLI ingress
 → InputBatch
-→ delivery
+→ client request/session routing
 
 Agent Runtime Service
 → agent cycle
@@ -4450,6 +4450,7 @@ Agent Runtime Service
 → safe checkpoints
 → working memory
 → plan decisions
+→ canonical progress/trace events
 
 MCP Tool Runtime Service
 → MCP servers
@@ -4467,9 +4468,81 @@ Worker Service
 
 Notification / Delivery Service
 → progress/final text/artifacts
+→ common client delivery lifecycle
+→ Telegram/Web/CLI-specific sinks
 ```
 
 Не все services обязаны появиться одновременно.
+
+---
+
+## 124.1. Разделение Agent Runtime и client delivery
+
+Agent Runtime и клиенты не должны использовать один общий модуль, смешивающий
+domain events с UI/delivery-логикой.
+
+Целевая граница:
+
+```text
+Agent Runtime
+→ создаёт canonical ProgressEvent
+→ сохраняет event как часть trace/source of truth
+→ публикует event через transport port
+
+Progress transport
+→ local/in-process или HTTP callback в compatibility mode
+→ PostgreSQL event log / Redis Stream / PubSub в distributed mode
+
+Client delivery
+→ принимает ProgressEvent envelope
+→ применяет общий только для клиентов delivery lifecycle
+→ передаёт event в client-specific sink
+```
+
+Agent Runtime:
+
+- не вызывает Telegram/Web/CLI API;
+- не управляет edit throttling, spinner, SSE/WebSocket reconnect или terminal UI;
+- не решает, какие client-visible события можно coalesce;
+- остаётся источником истины для `event_id`, `cycle_id`, event type, severity,
+  visibility и безопасного structured payload.
+
+Общая client-side логика может включать:
+
+- delivery session на `request_id`/target;
+- ordering и bounded buffering;
+- deduplication/idempotency по `event_id`;
+- lifecycle `active → closing → closed`;
+- защиту от late delivery после final response;
+- structured delivery receipts, metrics и safe logging;
+- pluggable policy для throttling/coalescing.
+
+Основное отображение остаётся индивидуальным:
+
+```text
+Telegram
+→ edit одного status message
+→ Telegram rate limits/retry
+→ semantic coalescing
+
+Web
+→ WebSocket/SSE
+→ sequence/reconnect/replay
+→ timeline или concurrent stages
+
+CLI
+→ TTY line/spinner
+→ plain lines или JSONL для non-TTY
+→ controlled shutdown
+```
+
+Повторная доставка event bus должна быть безопасной: client consumer применяет
+один `event_id` не более одного раза. Важные runtime stages не должны
+безусловно вытесняться более новым transient event. Конкретная политика
+отображения и coalescing принадлежит client adapter/sink, а не Agent Runtime.
+
+Local development mode сохраняет прямой callback/in-process transport и не
+требует обязательного запуска Redis или Notification / Delivery Service.
 
 ---
 
@@ -4606,6 +4679,17 @@ cancelled
 
 User-visible progress остаётся отдельным адаптированным слоем.
 
+Для progress delivery отдельно наблюдаются:
+
+- event published / accepted / rendered / coalesced / deduplicated / failed;
+- `request_id`, `event_id`, `cycle_id`, client type и delivery target ID;
+- event bus lag, client queue depth и render latency;
+- reconnect/replay, retry и late-event rejection;
+- закрытие delivery session перед final response.
+
+Логирование не содержит raw tool results, secrets или полный пользовательский
+контент.
+
 ---
 
 ## 133. Постепенная миграция
@@ -4616,7 +4700,9 @@ User-visible progress остаётся отдельным адаптирован
 3. Workspace/memory service.
 4. MCP tool runtime service.
 5. Gateway and Agent Runtime separation.
-6. Automatic DAG scheduler.
+6. Client delivery contracts and client-specific progress sinks.
+7. Progress event bus and Notification / Delivery boundary.
+8. Automatic DAG scheduler.
 ```
 
 Монолит `v0.5` не переписывается целиком одним шагом.
@@ -4630,6 +4716,8 @@ User-visible progress остаётся отдельным адаптирован
 - потеря local development mode;
 - перенос durable domain state в Redis;
 - отказ от storage interfaces;
+- client-specific UI/delivery logic внутри Agent Runtime;
+- единый progress-модуль, смешивающий agent domain и client presentation;
 - automatic unsafe parallel actions.
 
 ---
@@ -4943,6 +5031,14 @@ safe parallel nodes
 object storage
 service boundaries
 observability/idempotency
+Gateway / Client API and Agent Runtime separation
+canonical progress event contract
+progress event bus with at-least-once delivery
+idempotent client consumption by event_id
+Notification / Delivery boundary
+common client delivery lifecycle
+Telegram/Web/CLI-specific progress sinks
+local callback compatibility mode
 ```
 
 ---
