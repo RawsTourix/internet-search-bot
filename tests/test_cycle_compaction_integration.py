@@ -39,8 +39,8 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.client = MCPClient(
             LLMConfigType(
                 api_url="https://example.invalid/v1/chat/completions",
-                context_window_tokens=20_000,
-                reserved_output_tokens=1_000,
+                context_window_tokens=40_000,
+                reserved_output_tokens=2_000,
                 max_tokens=1_000,
                 context_safety_ratio=0.60,
                 context_compaction_target_ratio=0.35,
@@ -110,6 +110,7 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             cycle.working_memory.generation,
             outcome.passes_completed,
         )
+
         memories = [
             parse_cycle_working_memory_message(message)
             for message in cycle.messages_for_llm
@@ -167,6 +168,44 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "working summary",
             json.dumps(events, ensure_ascii=False),
         )
+
+    async def test_trigger_accounts_for_runtime_state_and_tool_schemas(self):
+        cycle = self._active_cycle(block_count=0)
+        large_tools = [{
+            "type": "function",
+            "function": {
+                "name": "large_tool",
+                "description": "x" * 24_000,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        }]
+        messages_only = self.client._estimate_messages_tokens(
+            cycle.messages_for_llm
+        )
+        self.client._call_llm_with_retries = AsyncMock()
+
+        outcome = await self.client._compact_context_if_needed(
+            active_cycle=cycle,
+            state=self.state,
+            session_id="session-1",
+            progress_callback=None,
+            request_tools=large_tools,
+            request_iteration=1,
+        )
+
+        self.assertLess(
+            messages_only,
+            self.client._context_trigger_tokens(),
+        )
+        self.assertGreaterEqual(
+            outcome.before_tokens,
+            self.client._context_trigger_tokens(),
+        )
+        self.assertEqual(outcome.failure_reason, "no_safe_segment")
+        self.client._call_llm_with_retries.assert_not_awaited()
 
     async def test_resumed_cycle_compacts_work_after_latest_user_reply(self):
         reply = dumps_json({
@@ -544,6 +583,7 @@ class CycleCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_process_query_compacts_before_main_iteration(self):
+        self.client.memory_config.cycle_compaction_max_passes = 1
         cycle = self._active_cycle(block_count=8, block_chars=3_000)
         cycle.status = "interrupted"
         cycle.interruption_reason = "temporary interruption"

@@ -48,6 +48,14 @@ from .result_compaction import (
     ResultCompactionService,
     build_result_compaction_system_prompt,
 )
+from .result_fidelity import (
+    ConservativeResultFidelityPolicy,
+    ResultFidelityPolicy,
+)
+from .token_estimation import (
+    ConservativeTokenEstimator,
+    TokenEstimator,
+)
 
 __all__ = [
     "CYCLE_COMPACTION_SYSTEM_PROMPT",
@@ -67,6 +75,8 @@ __all__ = [
     "CycleSegmentSelector",
     "CycleWorkingMemory",
     "CycleWorkingState",
+    "ConservativeResultFidelityPolicy",
+    "ConservativeTokenEstimator",
     "ExtractedCycleRefs",
     "InvalidResultHandlingError",
     "MemoryConfigType",
@@ -78,8 +88,10 @@ __all__ = [
     "ResultCompactionService",
     "ResultCompactionSummary",
     "ResultContextBudgetPolicy",
+    "ResultFidelityPolicy",
     "ResultHandling",
     "ResultProcessingOutcome",
+    "TokenEstimator",
     "RESULT_COMPACTION_SYSTEM_PROMPT",
     "build_cycle_compaction_system_prompt",
     "build_cycle_working_memory_message",

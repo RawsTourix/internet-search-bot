@@ -2,6 +2,7 @@ import json
 import unittest
 
 from src.memory import (
+    ConservativeTokenEstimator,
     ResultContextBudgetPolicy,
     ResultHandling,
     estimate_untrusted_result_tokens,
@@ -47,6 +48,61 @@ class UntrustedResultTokenEstimatorTests(unittest.TestCase):
             ),
             estimate_untrusted_result_tokens(text),
         )
+
+
+class ConservativeTokenEstimatorTests(unittest.TestCase):
+    def setUp(self):
+        self.estimator = ConservativeTokenEstimator(
+            protocol_overhead_tokens=32
+        )
+
+    def test_text_estimates_are_conservative_across_payload_types(self):
+        samples = (
+            "Кириллический текст",
+            "plain ASCII",
+            "结构化数据",
+            "🔎🧩✅⚠️",
+            json.dumps(
+                {"items": [{"id": index} for index in range(20)]},
+                ensure_ascii=False,
+                separators=(",", ":"),
+            ),
+        )
+
+        for text in samples:
+            with self.subTest(text=text):
+                self.assertGreaterEqual(
+                    self.estimator.estimate_text(text),
+                    len(text),
+                )
+                self.assertGreaterEqual(
+                    self.estimator.estimate_text(text),
+                    (len(text.encode("utf-8")) + 1) // 2,
+                )
+
+    def test_request_includes_large_tool_schemas(self):
+        messages = [{"role": "user", "content": "small request"}]
+        tools = [{
+            "type": "function",
+            "function": {
+                "name": "large_tool",
+                "description": "x" * 8_000,
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                },
+            },
+        }]
+
+        messages_only = self.estimator.estimate_messages(messages)
+        complete_request = self.estimator.estimate_request(
+            messages=messages,
+            tools=tools,
+        )
+
+        self.assertLess(messages_only, 1_000)
+        self.assertGreater(complete_request, 8_000)
+        self.assertGreater(complete_request, messages_only)
 
 
 class ResultContextBudgetPolicyTests(unittest.TestCase):

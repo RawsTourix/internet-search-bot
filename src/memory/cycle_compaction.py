@@ -29,6 +29,7 @@ from .models import (
     CycleWorkingMemory,
     CycleWorkingState,
 )
+from .token_estimation import ConservativeTokenEstimator
 
 
 _PLAN_ID_RE = re.compile(r"^plan_[0-9a-f]{32}$")
@@ -253,8 +254,7 @@ def _dedupe(values: list[str] | tuple[str, ...]) -> list[str]:
 
 
 def _default_message_estimator(messages: list[dict[str, Any]]) -> int:
-    serialized = json.dumps(messages, ensure_ascii=False, separators=(",", ":"))
-    return max(1, len(serialized) // 2)
+    return ConservativeTokenEstimator().estimate_messages(messages)
 
 
 def _content_as_json(message: dict[str, Any]) -> Any | None:
@@ -1006,18 +1006,42 @@ class CycleCompactionService:
             compaction_result.working_state.current_goal.strip()
             or active_cycle.original_user_request
         )
+        previous_state = previous.working_state if previous else None
         state_payload["result_refs"] = _dedupe(
-            list(compaction_result.working_state.result_refs)
-            + list(extracted_refs.result_refs)
+            (
+                list(previous_state.result_refs)
+                if previous_state is not None
+                else []
+            )
             + list(active_cycle.result_refs)
+            + list(extracted_refs.result_refs)
         )
         state_payload["artifact_refs"] = _dedupe(
-            list(compaction_result.working_state.artifact_refs)
-            + list(extracted_refs.artifact_refs)
+            (
+                list(previous_state.artifact_refs)
+                if previous_state is not None
+                else []
+            )
             + list(active_cycle.artifact_refs)
+            + list(extracted_refs.artifact_refs)
         )
-        if active_cycle.active_plan_id:
-            state_payload["active_plan_id"] = active_cycle.active_plan_id
+        resolved_plan_id = (
+            active_cycle.active_plan_id
+            or (
+                previous_state.active_plan_id
+                if previous_state is not None
+                else None
+            )
+        )
+        state_payload["active_plan_id"] = resolved_plan_id
+        state_payload["active_plan_node_id"] = (
+            previous_state.active_plan_node_id
+            if (
+                previous_state is not None
+                and previous_state.active_plan_id == resolved_plan_id
+            )
+            else None
+        )
 
         previous_archive_refs = (
             list(previous.archived_segment_refs) if previous else []

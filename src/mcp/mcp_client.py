@@ -45,6 +45,8 @@ from ..memory import (
     CycleSegmentSelector,
     CycleWorkingMemory,
     CycleWorkingState,
+    ConservativeResultFidelityPolicy,
+    ConservativeTokenEstimator,
     InvalidResultHandlingError,
     MemoryConfigType,
     MemoryConfigValidationError,
@@ -52,14 +54,15 @@ from ..memory import (
     ResultCompactionService,
     ResultCompactionSummary,
     ResultContextBudgetPolicy,
+    ResultFidelityPolicy,
     ResultHandling,
     ResultProcessingOutcome,
+    TokenEstimator,
     build_cycle_working_memory_message,
     extract_cycle_refs,
     parse_cycle_working_memory_message,
     validate_openai_tool_sequence,
     build_result_compaction_system_prompt,
-    estimate_untrusted_result_tokens,
 )
 from ..runtime import ActiveAgentCycle, AgentCycleSnapshot
 from ..storage.models import new_result_id
@@ -453,6 +456,8 @@ class MCPClient:
         *,
         storage_services: StorageServices,
         memory_config: MemoryConfigType | None = None,
+        token_estimator: TokenEstimator | None = None,
+        result_fidelity_policy: ResultFidelityPolicy | None = None,
     ):
         """
         Description:
@@ -464,6 +469,8 @@ class MCPClient:
             llm_config: Конфигурация для LLM
             storage_services: Внедрённые storage interfaces
             memory_config: Настройки обработки результатов инструментов
+            token_estimator: Оценщик полного LLM request budget
+            result_fidelity_policy: Общая политика fidelity для summary
         """
         self.session = None
         self.exit_stack = AsyncExitStack()
@@ -477,6 +484,15 @@ class MCPClient:
         self.content_store = storage_services.content_store
         self.artifact_store = storage_services.artifact_store
         self.memory_config = memory_config or MemoryConfigType()
+        self.token_estimator = (
+            token_estimator or ConservativeTokenEstimator()
+        )
+        self.result_fidelity_policy = (
+            result_fidelity_policy
+            or ConservativeResultFidelityPolicy(
+                token_estimator=self.token_estimator
+            )
+        )
         self.result_budget_policy = ResultContextBudgetPolicy(
             context_window_tokens=llm_config.context_window_tokens,
             reserved_output_tokens=llm_config.reserved_output_tokens,
@@ -2583,7 +2599,10 @@ class MCPClient:
                 ),
             },
         ]
-        return self._estimate_messages_tokens(messages_without_raw)
+        return self._estimate_request_tokens(
+            messages=messages_without_raw,
+            tools=[],
+        )
 
     @staticmethod
     def _result_compaction_validation_diagnostics(
@@ -2713,76 +2732,6 @@ class MCPClient:
             diagnostics["completion_tokens"],
         )
 
-    @staticmethod
-    def _harden_result_summary_fidelity(
-        *,
-        request: ResultCompactionRequest,
-        raw_result: str,
-        summary: ResultCompactionSummary,
-    ) -> ResultCompactionSummary:
-        """Conservatively flag multi-item results with exact constraints."""
-        goal = " ".join(filter(None, (
-            request.original_user_request,
-            request.current_goal,
-        ))).lower()
-        constraint_patterns = {
-            "time": (
-                r"\b(?:сегодня|завтра|послезавтра|утром|дн[её]м|"
-                r"вечером|ночью|morning|afternoon|evening|tonight|"
-                r"tomorrow)\b|(?:^|\D)\d{1,2}[:.]\d{2}(?:\D|$)"
-            ),
-            "transport": (
-                r"\b(?:мцд|метро|маршрут|транспорт|автобус|"
-                r"электричк\w*|metro|route|transit|transport|"
-                r"departure|arrival)\b"
-            ),
-        }
-        active_constraints = [
-            name
-            for name, pattern in constraint_patterns.items()
-            if re.search(pattern, goal, flags=re.IGNORECASE)
-        ]
-        if not active_constraints:
-            return summary
-
-        has_structured_candidate_details = any(
-            marker in raw_result
-            for marker in (
-                '"matching_dates"',
-                '"schedules"',
-                '"site_url"',
-                '"route_verified"',
-                '"departure_time"',
-                '"arrival_time"',
-            )
-        )
-        returned_match = re.search(
-            r'"returned"\s*:\s*(\d+)',
-            raw_result,
-        )
-        multiple_candidates = (
-            returned_match is not None
-            and int(returned_match.group(1)) > 1
-        )
-        if not (has_structured_candidate_details and multiple_candidates):
-            return summary
-
-        limitation = (
-            "Точные ограничения пользователя по времени или транспорту "
-            "нужно сверить с сохранённым оригиналом отдельно для каждого "
-            "кандидата; краткое описание не подтверждает их автоматически."
-        )
-        limitations = list(summary.limitations)
-        if limitation not in limitations:
-            if len(limitations) >= 50:
-                limitations[-1] = limitation
-            else:
-                limitations.append(limitation)
-        return summary.model_copy(update={
-            "limitations": limitations,
-            "needs_original_content": True,
-        })
-
     async def _summarize_tool_result(
         self,
         *,
@@ -2841,8 +2790,7 @@ class MCPClient:
                 error=error,
             )
         else:
-            summary = self._harden_result_summary_fidelity(
-                request=request,
+            summary = self.result_fidelity_policy.apply(
                 raw_result=raw_result,
                 summary=summary,
             )
@@ -2914,8 +2862,7 @@ class MCPClient:
             )
             raise
 
-        summary = self._harden_result_summary_fidelity(
-            request=request,
+        summary = self.result_fidelity_policy.apply(
             raw_result=raw_result,
             summary=summary,
         )
@@ -2984,6 +2931,7 @@ class MCPClient:
         state: SessionState,
         cycle_trace: list[dict[str, Any]],
         progress_callback,
+        request_tools: list[dict[str, Any]] | None = None,
     ) -> ResultProcessingOutcome:
         canonical_result = self._extract_canonical_tool_result(
             tool_payload=tool_payload,
@@ -2991,16 +2939,22 @@ class MCPClient:
         )
         result_size_bytes = len(canonical_result.encode("utf-8"))
         result_size_chars = len(canonical_result)
-        result_tokens = estimate_untrusted_result_tokens(
-            canonical_result,
-            utf8_size_bytes=result_size_bytes,
+        result_tokens = self.token_estimator.estimate_text(
+            canonical_result
         )
         current_goal = self._result_compaction_current_goal(
             original_user_request=original_user_request,
             messages_for_llm=messages_for_llm,
         )
-        current_context_tokens = self._estimate_messages_tokens(
-            messages_for_llm
+        effective_request_tools = (
+            request_tools
+            if request_tools is not None
+            else self._format_tools_for_llm()
+        )
+        current_context_tokens = self._estimate_main_request_tokens(
+            messages=messages_for_llm,
+            state=state,
+            tools=effective_request_tools,
         )
         summary_overhead_tokens = (
             self._result_summary_request_overhead_tokens(
@@ -3729,17 +3683,23 @@ class MCPClient:
                 )
 
             messages = messages_for_llm
-            
-            logger.debug(
-                "Messages for LLM prepared: "
-                f"count={len(messages_for_llm)}, "
-                f"estimated_tokens={self._estimate_messages_tokens(messages_for_llm)}, "
-                f"cycle_id={cycle_id}"
-            )
-            
+
             # Преобразуем инструменты в формат для LLM
             tools = self._format_tools_for_llm()
-            
+
+            initial_request_tokens = self._estimate_main_request_tokens(
+                messages=messages_for_llm,
+                state=state,
+                tools=tools,
+            )
+            logger.debug(
+                "LLM request prepared: count=%s estimated_tokens=%s "
+                "cycle_id=%s",
+                len(messages_for_llm),
+                initial_request_tokens,
+                cycle_id,
+            )
+
             # Основной цикл обработки            
             for i in range(self.max_iterations):
                 try:
@@ -3749,6 +3709,8 @@ class MCPClient:
                             state=state,
                             session_id=session_id,
                             progress_callback=progress_callback,
+                            request_tools=tools,
+                            request_iteration=i + 1,
                         )
                     )
                     messages_for_llm = (
@@ -4040,6 +4002,7 @@ class MCPClient:
                                     state=state,
                                     cycle_trace=cycle_trace,
                                     progress_callback=progress_callback,
+                                    request_tools=tools,
                                 )
                             )
                             tool_result_count += 1
@@ -4219,6 +4182,7 @@ class MCPClient:
                                     state=state,
                                     session_id=session_id,
                                     progress_callback=progress_callback,
+                                    request_tools=tools,
                                 )
                             )
                             messages_for_llm = (
@@ -6125,15 +6089,46 @@ class MCPClient:
             logger.warning(f"Не удалось записать agent cycle archive: {e!r}")
 
     def _estimate_tokens_rough(self, text: str) -> int:
-        """Грубая оценка токенов. Для русского консервативно: chars // 2."""
-        return max(1, len(text) // 2)
+        """Compatibility wrapper around the configured token estimator."""
+        return self.token_estimator.estimate_text(text)
 
     def _estimate_messages_tokens(
         self,
         messages: List[Dict[str, Any]],
     ) -> int:
-        raw = json.dumps(messages, ensure_ascii=False)
-        return self._estimate_tokens_rough(raw)
+        return self.token_estimator.estimate_messages(messages)
+
+    def _estimate_request_tokens(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        tools: List[Dict[str, Any]],
+    ) -> int:
+        return self.token_estimator.estimate_request(
+            messages=messages,
+            tools=tools,
+        )
+
+    def _estimate_main_request_tokens(
+        self,
+        *,
+        messages: List[Dict[str, Any]],
+        state: SessionState,
+        tools: List[Dict[str, Any]],
+        iteration_override: int | None = None,
+    ) -> int:
+        request_state = (
+            state
+            if iteration_override is None
+            else replace(state, iterations=iteration_override)
+        )
+        return self._estimate_request_tokens(
+            messages=self._with_iteration_runtime_message(
+                messages,
+                request_state,
+            ),
+            tools=tools,
+        )
 
     def _effective_reserved_output_tokens(self) -> int:
         return max(
@@ -6212,7 +6207,10 @@ class MCPClient:
             segment_content_id="cnt_" + "0" * 32,
             summary_target_tokens=summary_target_tokens,
         )
-        return self._estimate_messages_tokens(messages)
+        return self._estimate_request_tokens(
+            messages=messages,
+            tools=[],
+        )
 
     def _select_cycle_segment_to_fit(
         self,
@@ -6300,10 +6298,22 @@ class MCPClient:
         state: SessionState,
         session_id: str,
         progress_callback,
+        request_tools: list[dict[str, Any]] | None = None,
+        request_iteration: int | None = None,
     ) -> CycleCompactionOutcome:
         messages_for_llm = active_cycle.messages_for_llm
         cycle_trace = active_cycle.cycle_trace
-        before_tokens = self._estimate_messages_tokens(messages_for_llm)
+        effective_request_tools = (
+            request_tools
+            if request_tools is not None
+            else self._format_tools_for_llm()
+        )
+        before_tokens = self._estimate_main_request_tokens(
+            messages=messages_for_llm,
+            state=state,
+            tools=effective_request_tools,
+            iteration_override=request_iteration,
+        )
         trigger_tokens = self._context_trigger_tokens()
         target_tokens = self._context_target_tokens()
         usable_input_tokens = self._context_usable_input_tokens()
@@ -6631,7 +6641,10 @@ class MCPClient:
                 summary_target_tokens=summary_target_tokens,
             )
             actual_compactor_input_tokens = (
-                self._estimate_messages_tokens(compactor_messages)
+                self._estimate_request_tokens(
+                    messages=compactor_messages,
+                    tools=[],
+                )
             )
             if actual_compactor_input_tokens > trigger_tokens:
                 logger.error(
@@ -6873,8 +6886,11 @@ class MCPClient:
                     logical_failure=True,
                 )
 
-            after_tokens = self._estimate_messages_tokens(
-                candidate_messages
+            after_tokens = self._estimate_main_request_tokens(
+                messages=candidate_messages,
+                state=state,
+                tools=effective_request_tools,
+                iteration_override=request_iteration,
             )
             if after_tokens >= current_tokens:
                 return await emit_failure(

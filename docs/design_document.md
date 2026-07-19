@@ -3305,6 +3305,14 @@ previous working memory
 ```
 
 LLM не должна удалять refs, добавлять факты, менять пользовательские подтверждения или считать незавершённое действие завершённым.
+Opaque `result_refs`, `artifact_refs` и активный plan принадлежат runtime:
+cycle compactor не может создавать новые capability handles. Runtime строит
+эти поля только из предыдущего working memory, состояния active cycle и
+валидных ссылок, извлечённых из архивируемого source segment.
+
+После невалидного structured output runtime выполняет ровно один repair-вызов
+на тех же исходных данных. Второй невалидный ответ завершает compaction как
+контролируемую ошибку; дополнительные structured-output retries запрещены.
 
 Размер cycle compact-артефакта задаётся независимо от context window:
 
@@ -3329,7 +3337,8 @@ LLM не должна удалять refs, добавлять факты, мен
 Алгоритм:
 
 ```text
-estimate messages_for_llm
+estimate полный main LLM request:
+messages_for_llm + runtime_iteration_state + manager tool schemas
 → ниже trigger: продолжить
 
 → выше trigger:

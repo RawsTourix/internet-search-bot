@@ -37,8 +37,8 @@ class CycleCompactionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.client = MCPClient(
             LLMConfigType(
                 api_url="https://example.invalid/v1/chat/completions",
-                context_window_tokens=20_000,
-                reserved_output_tokens=1_000,
+                context_window_tokens=40_000,
+                reserved_output_tokens=2_000,
                 max_tokens=1_000,
                 context_safety_ratio=0.60,
                 context_compaction_target_ratio=0.35,
@@ -180,6 +180,7 @@ class CycleCompactionRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("infrastructure_error", progress_types)
 
     async def test_process_query_transport_interruption_can_retry_compaction(self):
+        self.client.memory_config.cycle_compaction_max_passes = 1
         cycle = self._large_cycle()
         cycle.status = "interrupted"
         cycle.interruption_reason = "previous interruption"

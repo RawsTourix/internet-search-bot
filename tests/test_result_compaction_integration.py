@@ -29,7 +29,7 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.client = MCPClient(
             LLMConfigType(
                 api_url="https://example.invalid/v1/chat/completions",
-                context_window_tokens=10_000,
+                context_window_tokens=40_000,
                 reserved_output_tokens=1_000,
                 max_tokens=500,
                 context_safety_ratio=0.8,
@@ -37,8 +37,8 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             ),
             storage_services=self.services,
             memory_config=MemoryConfigType(
-                inline_result_max_input_ratio=0.1,
-                single_pass_summary_max_input_ratio=0.6,
+                inline_result_max_input_ratio=0.025,
+                single_pass_summary_max_input_ratio=0.14,
                 result_summary_target_tokens=128,
                 result_compaction_max_output_tokens=500,
                 result_preview_max_chars=80,
@@ -108,6 +108,7 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             state=self.state,
             cycle_trace=trace,
             progress_callback=events.append,
+            request_tools=[],
         )
         return outcome, messages, trace, events
 
@@ -221,7 +222,7 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_unsafe_control_plane_result_is_not_llm_compacted(self):
         raw = dumps_json({
             "type": "mcp_tools",
-            "tools": [{"description": "x" * 12_000}],
+            "tools": [{"description": "x" * 40_000}],
         })
         self.client.result_compaction_service.persist_result = AsyncMock()
         self.client._call_llm_with_retries = AsyncMock()
@@ -366,7 +367,7 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             direct_types.index("result_compaction_started"),
         )
 
-    async def test_compactor_receives_latest_user_constraints_and_flags_detail(self):
+    async def test_compactor_receives_latest_constraints_and_generic_fidelity_guard(self):
         raw = dumps_json({
             "status": "ok",
             "data": {
@@ -447,7 +448,7 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.stored_result_ref.needs_retrieval)
         self.assertTrue(
             any(
-                "времени или транспорту" in limitation
+                "структурированную коллекцию" in limitation
                 for limitation in outcome.stored_result_ref.limitations
             )
         )

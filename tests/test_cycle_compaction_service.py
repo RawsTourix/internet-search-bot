@@ -25,6 +25,10 @@ from src.storage import StorageConfigType, create_storage_services
 RESULT_ID = "res_" + "1" * 32
 CONTENT_ID = "cnt_" + "2" * 32
 ARTIFACT_ID = "art_" + "3" * 32
+UNKNOWN_RESULT_ID = "res_" + "a" * 32
+UNKNOWN_ARTIFACT_ID = "art_" + "b" * 32
+UNKNOWN_PLAN_ID = "plan_" + "c" * 32
+KNOWN_PLAN_ID = "plan_" + "d" * 32
 
 
 class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -161,13 +165,14 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_runtime_merges_refs_and_builds_atomic_candidate(self):
         source_payload = {
-            "result_id": RESULT_ID,
+            "known": {"result_id": RESULT_ID},
             "content_id": CONTENT_ID,
             "artifact_id": ARTIFACT_ID,
-            "invalid": "res_not-valid",
+            "invalid": {"result_id": "res_not-valid"},
         }
         self.selection.messages[0]["content"] = dumps_json(source_payload)
         self.cycle.result_refs = [RESULT_ID]
+        self.cycle.active_plan_id = KNOWN_PLAN_ID
         ref = await self.service.persist_segment(
             active_cycle=self.cycle,
             selection=self.selection,
@@ -176,7 +181,13 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
         )
         result = CycleCompactionResult(
             summary="summary",
-            working_state=CycleWorkingState(current_goal="goal"),
+            working_state=CycleWorkingState(
+                current_goal="goal",
+                result_refs=[RESULT_ID, UNKNOWN_RESULT_ID],
+                artifact_refs=[UNKNOWN_ARTIFACT_ID],
+                active_plan_id=UNKNOWN_PLAN_ID,
+                active_plan_node_id="invented-node",
+            ),
         )
         memory = self.service.build_working_memory(
             active_cycle=self.cycle,
@@ -196,6 +207,11 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed_memory, memory)
         self.assertEqual(memory.working_state.result_refs, [RESULT_ID])
         self.assertEqual(memory.working_state.artifact_refs, [ARTIFACT_ID])
+        self.assertEqual(
+            memory.working_state.active_plan_id,
+            KNOWN_PLAN_ID,
+        )
+        self.assertIsNone(memory.working_state.active_plan_node_id)
         self.assertNotIn(self.selection.messages[0], candidate)
         self.assertEqual(candidate[-1]["content"], "fresh")
 

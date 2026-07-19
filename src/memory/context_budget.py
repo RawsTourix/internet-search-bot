@@ -3,6 +3,7 @@
 from typing import Literal
 
 from .models import ResultBudgetDecision, ResultHandling
+from .token_estimation import ConservativeTokenEstimator
 
 
 def estimate_untrusted_result_tokens(
@@ -11,12 +12,11 @@ def estimate_untrusted_result_tokens(
     utf8_size_bytes: int | None = None,
 ) -> int:
     """Conservatively estimate tokens for arbitrary untrusted tool output."""
+    if utf8_size_bytes is None:
+        return ConservativeTokenEstimator().estimate_text(text)
+
     chars_estimate = len(text)
-    byte_count = (
-        len(text.encode("utf-8"))
-        if utf8_size_bytes is None
-        else max(0, utf8_size_bytes)
-    )
+    byte_count = max(0, utf8_size_bytes)
     utf8_bytes_estimate = (byte_count + 1) // 2
     return max(1, chars_estimate, utf8_bytes_estimate)
 
