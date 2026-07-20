@@ -42,14 +42,14 @@ class MemoryConfigTests(unittest.TestCase):
         path.write_text(json.dumps(payload), encoding="utf-8")
         return path
 
-    def test_config_without_memory_uses_defaults_and_returns_four_values(self):
+    def test_config_without_memory_uses_defaults(self):
         loaded = load_config(str(self._write_config()))
 
-        self.assertEqual(len(loaded), 4)
+        self.assertEqual(len(loaded), 5)
         self.assertEqual(loaded[3], MemoryConfigType())
 
     def test_full_memory_config_is_loaded(self):
-        _, _, _, memory = load_config(
+        _, _, _, memory, _ = load_config(
             str(
                 self._write_config({
                     "enable_result_compaction": False,
@@ -84,7 +84,7 @@ class MemoryConfigTests(unittest.TestCase):
         self.assertEqual(memory.cycle_compaction_max_passes, 5)
 
     def test_tokenizer_encoding_is_loaded_with_llm_config(self):
-        _, llm, _, _ = load_config(
+        _, llm, _, _, _ = load_config(
             str(
                 self._write_config(
                     llm_marker={

@@ -11,6 +11,7 @@ from .config import (
     safe_llm_config_summary,
     safe_memory_config_summary,
     safe_mcp_server_config_summary,
+    safe_runtime_config_summary,
 )
 from ..mcp.mcp_client import MCPClient, load_config
 from ..core.models import ClientType, AgentStatus, AgentResult
@@ -54,13 +55,15 @@ class Api:
         try:
             # Загрузка конфигурации
             logger.info(
-                "Загрузка конфигурации MCP-серверов, LLM, storage и memory"
+                "Загрузка конфигурации MCP-серверов, LLM, storage, "
+                "memory и runtime"
             )
             (
                 self.server_configs,
                 self.llm_config,
                 self.storage_config,
                 self.memory_config,
+                self.runtime_config,
             ) = load_config(config_path)
 
             # Логируем только безопасную сводку: конфигурация также содержит
@@ -98,6 +101,10 @@ class Api:
                 "Memory result compaction: %s",
                 safe_memory_config_summary(self.memory_config),
             )
+            logger.info(
+                "Runtime lifecycle: %s",
+                safe_runtime_config_summary(self.runtime_config),
+            )
 
             self.storage_services = create_storage_services(self.storage_config)
 
@@ -107,6 +114,7 @@ class Api:
                 self.llm_config,
                 storage_services=self.storage_services,
                 memory_config=self.memory_config,
+                runtime_config=self.runtime_config,
             )
         except Exception as e:
             raise APIError(f"Ошибка инициализации Api: {repr(e)}") from e

@@ -631,8 +631,10 @@ v0.3-mcp-server-manager: handle MCP transport shutdowns without gateway failure
    - `connected_at`;
    - `generation`.
 2. Настройки MCP lifecycle:
+   - `mcp_startup_timeout`;
    - `mcp_transport_call_timeout`;
    - `mcp_reconnect_timeout`;
+   - `mcp_runtime_close_timeout`;
    - `mcp_call_retries_after_recovery`;
    - `server_reconnect_locks`.
 3. Ошибки manager-layer:
@@ -1964,26 +1966,40 @@ tool вернул нормальный error payload
 tool_call_timeout
   общий верхний предел на tool call внутри agent loop.
 
+mcp_startup_timeout
+  timeout подключения одного MCP runtime при запуске Gateway.
+
 mcp_transport_call_timeout
   timeout одной попытки вызова runtime.
 
 mcp_reconnect_timeout
   timeout восстановления runtime.
 
+mcp_runtime_close_timeout
+  timeout graceful close одного runtime при shutdown, recovery,
+  reload или disable. После превышения runtime отсоединяется локально,
+  чтобы устаревшая SSE-сессия не блокировала lifecycle.
+
 mcp_call_retries_after_recovery
   количество повторов после восстановления.
 ```
 
-Рекомендуемые значения на v0.3-mcp-server-manager:
+Штатные значения runtime-конфига:
 
 ```text
-tool_call_timeout = 240 sec          общий предохранитель
-mcp_transport_call_timeout = 30-45 sec
-mcp_reconnect_timeout = 15-20 sec
+mcp_startup_timeout = 30 sec
+mcp_transport_call_timeout = 15 sec
+mcp_reconnect_timeout = 10 sec
+mcp_runtime_close_timeout = 10 sec
 mcp_call_retries_after_recovery = 1
 ```
 
-Смысл: общий `tool_call_timeout` остаётся safety net, но stale runtime не должен молча висеть до него.
+Эти значения задаются в отдельном верхнеуровневом блоке `runtime`,
+не смешиваются с `llm`, `memory` или `storage` и валидируются при старте.
+`asyncio.timeout()` сохраняет открытие и закрытие MCP transport в одном task.
+Reconnect выполняется только в рабочем lifecycle; close никогда не создаёт
+новое соединение. Смысл: stale runtime не должен молча висеть ни до общего
+`tool_call_timeout`, ни до стандартного пятиминутного SSE read timeout SDK.
 
 ---
 

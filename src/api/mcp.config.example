@@ -64,6 +64,13 @@
         "enable_context_compaction": true,
         "instructions": "Ты — MC Pilot, ИИ-агент для практических и инженерных задач с доступом к внешним MCP-инструментам. MCPilot — пилот инструментов Model Context Protocol; MC Pilot — ведущий, который помогает провести задачу от запроса до результата. Твоя роль — понять цель пользователя, при необходимости использовать доступные инструменты, проверить результат и дать полезный итоговый ответ. Если можно надёжно ответить без инструментов — отвечай сам. Не выдумывай факты, источники, инструменты и результаты вызовов. Стиль ответа — спокойный, точный, прикладной и структурированный."
     },
+    "runtime": {
+        "mcp_startup_timeout": 30,
+        "mcp_transport_call_timeout": 15,
+        "mcp_reconnect_timeout": 10,
+        "mcp_runtime_close_timeout": 10,
+        "mcp_call_retries_after_recovery": 1
+    },
     "storage": {
         "backend": "filesystem",
         "root_dir": "storage",

@@ -258,7 +258,10 @@ class MCPServerManager:
         old_generation = old_runtime.generation if old_runtime is not None else 0
 
         if old_runtime is not None:
-            await self.owner._close_runtime(old_runtime)
+            await self.owner._close_runtime(
+                old_runtime,
+                reason="runtime_replace",
+            )
 
         new_runtime.generation = old_generation + 1
         new_runtime.healthy = True
@@ -298,10 +301,12 @@ class MCPServerManager:
             logger.warning("Recovering MCP server runtime: %s", server_name)
 
             try:
-                new_runtime = await asyncio.wait_for(
-                    self.owner._connect_single_server(config),
-                    timeout=self.owner.mcp_reconnect_timeout,
-                )
+                async with asyncio.timeout(
+                    self.owner.mcp_reconnect_timeout
+                ):
+                    new_runtime = await self.owner._connect_single_server(
+                        config
+                    )
                 new_runtime = await self.replace_runtime(
                     server_name,
                     new_runtime,
@@ -468,7 +473,7 @@ class MCPServerManager:
         if runtime is None:
             return {"status": "already_disconnected", "server": name}
 
-        await self.owner._close_runtime(runtime)
+        await self.owner._close_runtime(runtime, reason="server_disable")
 
         return {"status": "disconnected", "server": name}
 

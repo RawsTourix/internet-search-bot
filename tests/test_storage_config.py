@@ -42,12 +42,12 @@ class StorageConfigTests(unittest.IsolatedAsyncioTestCase):
         return path
 
     def test_config_without_storage_uses_defaults(self):
-        _, _, storage, _ = load_config(str(self._write_config()))
+        _, _, storage, _, _ = load_config(str(self._write_config()))
 
         self.assertEqual(storage, StorageConfigType())
 
     def test_full_storage_config_is_loaded(self):
-        _, _, storage, _ = load_config(
+        _, _, storage, _, _ = load_config(
             str(
                 self._write_config(
                     {

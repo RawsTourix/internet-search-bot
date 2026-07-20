@@ -68,3 +68,16 @@ def safe_memory_config_summary(config: Any) -> dict[str, Any]:
             config.cycle_compaction_max_passes
         ),
     }
+
+
+def safe_runtime_config_summary(config: Any) -> dict[str, Any]:
+    """Return the non-sensitive runtime lifecycle settings."""
+    return {
+        "mcp_startup_timeout": config.mcp_startup_timeout,
+        "mcp_transport_call_timeout": config.mcp_transport_call_timeout,
+        "mcp_reconnect_timeout": config.mcp_reconnect_timeout,
+        "mcp_runtime_close_timeout": config.mcp_runtime_close_timeout,
+        "mcp_call_retries_after_recovery": (
+            config.mcp_call_retries_after_recovery
+        ),
+    }

@@ -358,8 +358,33 @@ class MCPServerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(new_runtime.generation, 1)
         self.assertTrue(new_runtime.healthy)
         owner._connect_single_server.assert_awaited_once()
-        owner._close_runtime.assert_awaited_once_with(old_runtime)
+        owner._close_runtime.assert_awaited_once_with(
+            old_runtime,
+            reason="runtime_replace",
+        )
         new_session.call_tool.assert_awaited_once()
+
+    async def test_recovery_connection_stays_in_caller_task(self):
+        old_runtime = make_runtime(
+            session=SimpleNamespace(),
+            healthy=False,
+        )
+        owner, _ = make_owner(old_runtime)
+        new_runtime = make_runtime(session=SimpleNamespace())
+        connection_tasks = []
+
+        async def connect(_config):
+            connection_tasks.append(asyncio.current_task())
+            return new_runtime
+
+        owner._connect_single_server.side_effect = connect
+        manager = MCPServerManager(owner)
+        caller_task = asyncio.current_task()
+
+        recovered = await manager.recover_runtime("demo")
+
+        self.assertIs(recovered, new_runtime)
+        self.assertEqual(connection_tasks, [caller_task])
 
     async def test_session_terminated_text_recovers_and_retries_once(self):
         stale_session = SimpleNamespace(
@@ -438,6 +463,65 @@ class MCPServerManagerTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(runtime.healthy)
         self.assertIsNone(runtime.last_error)
         owner._connect_single_server.assert_not_awaited()
+
+    async def test_runtime_close_timeout_detaches_stale_runtime(self):
+        client = object.__new__(MCPClient)
+        client.mcp_runtime_close_timeout = 0.01
+
+        async def hang_forever():
+            await asyncio.Event().wait()
+
+        exit_stack = SimpleNamespace(
+            aclose=AsyncMock(side_effect=hang_forever),
+        )
+        session = SimpleNamespace()
+        runtime = MCPServerRuntime(
+            name="stale",
+            alias="",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            session=session,
+            exit_stack=exit_stack,
+            healthy=True,
+        )
+
+        closed_cleanly = await client._close_runtime(
+            runtime,
+            reason="test_timeout",
+        )
+
+        self.assertFalse(closed_cleanly)
+        self.assertIsNone(runtime.session)
+        self.assertIsNone(runtime.exit_stack)
+        self.assertFalse(runtime.healthy)
+        exit_stack.aclose.assert_awaited_once()
+
+    async def test_runtime_close_success_uses_caller_task(self):
+        client = object.__new__(MCPClient)
+        client.mcp_runtime_close_timeout = 1.0
+        close_tasks = []
+
+        async def close_stack():
+            close_tasks.append(asyncio.current_task())
+
+        exit_stack = SimpleNamespace(
+            aclose=AsyncMock(side_effect=close_stack),
+        )
+        runtime = MCPServerRuntime(
+            name="healthy",
+            alias="",
+            connect_type=ServerConnectType.STREAMABLE_HTTP,
+            session=SimpleNamespace(),
+            exit_stack=exit_stack,
+        )
+        caller_task = asyncio.current_task()
+
+        closed_cleanly = await client._close_runtime(
+            runtime,
+            reason="test_success",
+        )
+
+        self.assertTrue(closed_cleanly)
+        self.assertEqual(close_tasks, [caller_task])
 
     async def test_unknown_tool_fails_without_recovery(self):
         runtime = make_runtime(

@@ -67,7 +67,12 @@ from ..memory import (
     build_result_compaction_system_prompt,
     create_request_token_estimator,
 )
-from ..runtime import ActiveAgentCycle, AgentCycleSnapshot
+from ..runtime import (
+    ActiveAgentCycle,
+    AgentCycleSnapshot,
+    RuntimeConfigType,
+    RuntimeConfigValidationError,
+)
 from ..storage.models import new_result_id
 
 # Модели
@@ -460,6 +465,7 @@ class MCPClient:
         *,
         storage_services: StorageServices,
         memory_config: MemoryConfigType | None = None,
+        runtime_config: RuntimeConfigType | None = None,
         token_estimator: TokenEstimator | None = None,
         request_token_estimator: TokenEstimator | None = None,
         result_fidelity_policy: ResultFidelityPolicy | None = None,
@@ -474,6 +480,7 @@ class MCPClient:
             llm_config: Конфигурация для LLM
             storage_services: Внедрённые storage interfaces
             memory_config: Настройки обработки результатов инструментов
+            runtime_config: Настройки lifecycle и таймаутов runtime
             token_estimator: Строгий оценщик сырых результатов инструментов
             request_token_estimator: Оценщик полного LLM request budget
             result_fidelity_policy: Общая политика fidelity для summary
@@ -490,6 +497,7 @@ class MCPClient:
         self.content_store = storage_services.content_store
         self.artifact_store = storage_services.artifact_store
         self.memory_config = memory_config or MemoryConfigType()
+        self.runtime_config = runtime_config or RuntimeConfigType()
         self.raw_token_estimator = (
             token_estimator or ConservativeTokenEstimator()
         )
@@ -576,10 +584,19 @@ class MCPClient:
         
         # Настройки таймаутов
         self.tool_call_timeout = 240.0  # Таймаут для вызова инструментов
-        self.mcp_startup_timeout = 30.0
-        self.mcp_transport_call_timeout = 15.0
-        self.mcp_reconnect_timeout = 10.0
-        self.mcp_call_retries_after_recovery = 1
+        self.mcp_startup_timeout = self.runtime_config.mcp_startup_timeout
+        self.mcp_transport_call_timeout = (
+            self.runtime_config.mcp_transport_call_timeout
+        )
+        self.mcp_reconnect_timeout = (
+            self.runtime_config.mcp_reconnect_timeout
+        )
+        self.mcp_runtime_close_timeout = (
+            self.runtime_config.mcp_runtime_close_timeout
+        )
+        self.mcp_call_retries_after_recovery = (
+            self.runtime_config.mcp_call_retries_after_recovery
+        )
         self.server_reconnect_locks: Dict[str, asyncio.Lock] = {}
         self.llm_call_timeout = 120.0   # Таймаут для вызова LLM
 
@@ -1104,7 +1121,10 @@ class MCPClient:
             except Exception as error:
                 if runtime is not None:
                     self._unregister_server_tools(runtime.name)
-                    await self._close_runtime(runtime)
+                    await self._close_runtime(
+                        runtime,
+                        reason="startup_rollback",
+                    )
 
                 connection_error = (
                     error
@@ -5988,23 +6008,66 @@ class MCPClient:
                     import traceback
                     traceback.print_exc()
 
-    async def _close_runtime(self, runtime: MCPServerRuntime) -> None:
+    async def _close_runtime(
+        self,
+        runtime: MCPServerRuntime,
+        *,
+        reason: str = "runtime_close",
+    ) -> bool:
+        closed_cleanly = False
         try:
-            logger.info(f"Закрытие MCP-сервера {runtime.name}...")
-
-            if runtime.http_client is not None:
-                await runtime.http_client.close()
-
-            if runtime.exit_stack is not None:
-                await runtime.exit_stack.aclose()
-
-            logger.info(f"MCP-сервер {runtime.name} отключён")
-
-        except Exception as e:
-            logger.warning(
-                "Ошибка при закрытии MCP runtime %s: %r",
+            logger.info(
+                "Закрытие MCP-сервера %s: reason=%s timeout_seconds=%s",
                 runtime.name,
-                e,
+                reason,
+                self.mcp_runtime_close_timeout,
+            )
+
+            async with asyncio.timeout(self.mcp_runtime_close_timeout):
+                if runtime.http_client is not None:
+                    await runtime.http_client.close()
+
+                if runtime.exit_stack is not None:
+                    await runtime.exit_stack.aclose()
+
+            closed_cleanly = True
+            logger.info(
+                "MCP-сервер %s отключён: reason=%s",
+                runtime.name,
+                reason,
+            )
+
+        except TimeoutError:
+            logger.warning(
+                "Превышен таймаут закрытия MCP-сервера %s: "
+                "reason=%s timeout_seconds=%s; runtime будет отсоединён",
+                runtime.name,
+                reason,
+                self.mcp_runtime_close_timeout,
+            )
+
+        except asyncio.CancelledError as error:
+            task = asyncio.current_task()
+            if task is not None and task.cancelling():
+                raise
+            logger.warning(
+                "Внутреннее закрытие MCP-сервера %s было отменено: "
+                "reason=%s error=%r",
+                runtime.name,
+                reason,
+                error,
+            )
+
+        except BaseException as error:
+            if isinstance(error, (KeyboardInterrupt, SystemExit)):
+                raise
+            logger.warning(
+                "Ошибка при закрытии MCP runtime %s: "
+                "reason=%s error_type=%s error=%r",
+                runtime.name,
+                reason,
+                type(error).__name__,
+                error,
             )
 
         finally:
@@ -6013,6 +6076,8 @@ class MCPClient:
             runtime.exit_stack = None
             runtime.healthy = False
             runtime.reconnecting = False
+
+        return closed_cleanly
 
 
     def _unregister_server_tools(self, server_name: str) -> None:
@@ -6039,33 +6104,7 @@ class MCPClient:
         """
         # Закрытие MCP-серверов в ОБРАТНОМ порядке
         for runtime in reversed(list(self.server_runtimes.values())):
-            try:
-                logger.info(f"Закрытие MCP-сервера {runtime.name}...")
-
-                if runtime.http_client is not None:
-                    await runtime.http_client.close()
-
-                if runtime.exit_stack is not None:
-                    await runtime.exit_stack.aclose()
-
-                logger.info(f"MCP-сервер {runtime.name} отключён")
-
-            except asyncio.CancelledError as e:
-                # На shutdown anyio/mcp иногда пробрасывает CancelledError.
-                # Для штатного завершения приложения лучше не валить весь shutdown.
-                logger.warning(
-                    f"Закрытие MCP-сервера {runtime.name} было отменено: {e!r}"
-                )
-
-            except BaseException as e:
-                logger.exception(
-                    f"Ошибка при закрытии MCP-сервера {runtime.name}: {type(e).__name__}: {e!r}"
-                )
-
-            finally:
-                runtime.session = None
-                runtime.http_client = None
-                runtime.exit_stack = None
+            await self._close_runtime(runtime, reason="shutdown")
 
         # Очистка реестров
         self.server_runtimes.clear()
@@ -7537,6 +7576,7 @@ def load_config(
     LLMConfigType,
     StorageConfigType,
     MemoryConfigType,
+    RuntimeConfigType,
 ]:
     """
     Description:
@@ -7549,7 +7589,7 @@ def load_config(
         
     Returns:
     ---------------
-        Конфигурации серверов, LLM, storage и memory
+        Конфигурации серверов, LLM, storage, memory и runtime
         
     Raises:
         ImportError: Если требуется YAML, но библиотека не установлена
@@ -7557,7 +7597,7 @@ def load_config(
         Exception: При ошибке загрузки конфигурации
         
     Examples:
-        >>> server_configs, llm_config, storage_config, memory_config = load_config("config.json")
+        >>> server_configs, llm_config, storage_config, memory_config, runtime_config = load_config("config.json")
     """
     try:
         with open(config_path, "r", encoding="utf-8") as f:
@@ -7686,7 +7726,21 @@ def load_config(
                 "Invalid memory configuration"
             ) from error
 
-        return server_configs, llm_config, storage_config, memory_config
+        runtime_data = config.get("runtime", {})
+        try:
+            runtime_config = RuntimeConfigType.model_validate(runtime_data)
+        except ValidationError as error:
+            raise RuntimeConfigValidationError(
+                "Invalid runtime configuration"
+            ) from error
+
+        return (
+            server_configs,
+            llm_config,
+            storage_config,
+            memory_config,
+            runtime_config,
+        )
 
     except Exception as e:
         logger.error(f"Ошибка при загрузке конфигурации: {type(e).__name__}: {e!r}")
