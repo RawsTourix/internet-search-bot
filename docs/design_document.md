@@ -3323,8 +3323,9 @@ previous working memory
 LLM не должна удалять refs, добавлять факты, менять пользовательские подтверждения или считать незавершённое действие завершённым.
 Opaque `result_refs`, `artifact_refs` и активный plan принадлежат runtime:
 cycle compactor не может создавать новые capability handles. Runtime строит
-эти поля только из предыдущего working memory, состояния active cycle и
-валидных ссылок, извлечённых из архивируемого source segment.
+эти поля только из предыдущего working memory и состояния active cycle.
+Архивируемый source segment является недоверенным и не может быть источником
+capability handles, даже если содержит синтаксически корректные opaque IDs.
 
 После невалидного structured output runtime выполняет ровно один repair-вызов
 на тех же исходных данных. Второй невалидный ответ завершает compaction как
@@ -5203,11 +5204,23 @@ main-request accounting
 
 `prompt_tokens` не переносится между разными моделями и схемами инструментов.
 Snapshot привязывается к fingerprint запроса и tool schemas; для изменившегося
-запроса рост учитывается как консервативная оценённая дельта. При уменьшении
-low-confidence request используются одновременно additive- и ratio-calibration
-от последнего фактического usage, после чего выбирается более безопасная
-оценка. Выбор источника, confidence, estimate/actual ratio и факт применения
-snapshot сохраняются в безопасной диагностике без содержимого сообщений.
+low-confidence request независимо от направления изменения используются
+одновременно additive- и ratio-calibration от последнего фактического usage,
+после чего выбирается более безопасная оценка. Для high-confidence estimator
+используется additive calibration. Выбор источника, confidence,
+estimate/actual ratio и факт применения snapshot сохраняются в безопасной
+диагностике без содержимого сообщений.
+
+До сохранения token usage snapshots в persistent CycleStore требуется ввести
+стабильный `estimator_identity`: implementation, encoding name, protocol
+overhead и algorithm version. Совместимость snapshot должна проверять эту
+identity вместе с model и tool-schema fingerprint.
+
+Для non-OpenAI provider необходим общий `ProviderInputAdapter`, формирующий
+одинаковое tokenizable input representation для фактического LLM-вызова и
+token accounting. В него входят только prompt-bearing поля (`messages` или
+форматированный `prompt`, а также `tools`), но не generation-параметры вроде
+`temperature` и `max_tokens`.
 
 Compaction target относится к реально компактируемой части цикла. Системный
 prompt, tool schemas, исходный пользовательский запрос, незакрытые tool

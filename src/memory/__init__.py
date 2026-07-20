@@ -13,10 +13,8 @@ from .cycle_compaction import (
     CycleSegmentSelection,
     CycleSegmentSelectionDecision,
     CycleSegmentSelector,
-    ExtractedCycleRefs,
     build_cycle_compaction_system_prompt,
     build_cycle_working_memory_message,
-    extract_cycle_refs,
     parse_cycle_working_memory_message,
     validate_openai_tool_sequence,
 )
@@ -86,7 +84,6 @@ __all__ = [
     "ConservativeResultFidelityPolicy",
     "ConservativeTokenEstimator",
     "HeuristicRequestTokenEstimator",
-    "ExtractedCycleRefs",
     "InvalidResultHandlingError",
     "MemoryConfigType",
     "MemoryConfigValidationError",
@@ -113,7 +110,6 @@ __all__ = [
     "build_result_compaction_system_prompt",
     "create_request_token_estimator",
     "estimate_untrusted_result_tokens",
-    "extract_cycle_refs",
     "parse_cycle_working_memory_message",
     "validate_openai_tool_sequence",
 ]

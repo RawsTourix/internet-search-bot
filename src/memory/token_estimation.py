@@ -447,16 +447,11 @@ class TokenAccountingService:
                     raw_estimate
                     - usage_snapshot.request_estimate_tokens
                 )
-                if delta >= 0:
-                    total_tokens = usage_snapshot.prompt_tokens + delta
-                    used_snapshot = True
-                elif self.confidence == TokenEstimateConfidence.HIGH.value:
-                    total_tokens = max(
-                        1,
-                        usage_snapshot.prompt_tokens + delta,
-                    )
-                    used_snapshot = True
-                else:
+                additive = max(
+                    1,
+                    usage_snapshot.prompt_tokens + delta,
+                )
+                if self.confidence == TokenEstimateConfidence.LOW.value:
                     ratio_scaled = math.ceil(
                         usage_snapshot.prompt_tokens
                         * raw_estimate
@@ -467,10 +462,12 @@ class TokenAccountingService:
                     )
                     total_tokens = max(
                         1,
-                        usage_snapshot.prompt_tokens + delta,
+                        additive,
                         ratio_scaled,
                     )
-                    used_snapshot = True
+                else:
+                    total_tokens = additive
+                used_snapshot = True
 
         fixed_messages = [
             message

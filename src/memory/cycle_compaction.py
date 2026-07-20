@@ -11,12 +11,7 @@ from typing import Any, Callable
 
 from ..runtime.cycle import ActiveAgentCycle
 from ..storage.interfaces import ContentStore
-from ..storage.models import (
-    ContentRef,
-    is_artifact_id,
-    is_content_id,
-    is_result_id,
-)
+from ..storage.models import ContentRef
 from .errors import (
     CycleCompactionOutputError,
     CycleSegmentSelectionError,
@@ -31,8 +26,6 @@ from .models import (
 )
 from .token_estimation import ConservativeTokenEstimator
 
-
-_PLAN_ID_RE = re.compile(r"^plan_[0-9a-f]{32}$")
 
 _PRESERVE_RULES = [
     "Preserve confirmed and rejected user decisions.",
@@ -231,14 +224,6 @@ class CycleCompactionOutcome:
     target_reached: bool
 
     failure_reason: str | None = None
-
-
-@dataclass(frozen=True, slots=True)
-class ExtractedCycleRefs:
-    result_refs: tuple[str, ...]
-    content_refs: tuple[str, ...]
-    artifact_refs: tuple[str, ...]
-    plan_refs: tuple[str, ...]
 
 
 @dataclass(frozen=True, slots=True)
@@ -857,54 +842,6 @@ class CycleSegmentSelector:
         )
 
 
-def extract_cycle_refs(messages: list[dict[str, Any]]) -> ExtractedCycleRefs:
-    """Extract only schema-keyed, valid opaque IDs from untrusted messages."""
-    results: list[str] = []
-    contents: list[str] = []
-    artifacts: list[str] = []
-    plans: list[str] = []
-
-    def visit(value: Any) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                if key == "result_id" and isinstance(item, str):
-                    if is_result_id(item):
-                        results.append(item)
-                elif key == "content_id" and isinstance(item, str):
-                    if is_content_id(item):
-                        contents.append(item)
-                elif key == "artifact_id" and isinstance(item, str):
-                    if is_artifact_id(item):
-                        artifacts.append(item)
-                elif key == "plan_id" and isinstance(item, str):
-                    if _PLAN_ID_RE.fullmatch(item):
-                        plans.append(item)
-                visit(item)
-            return
-        if isinstance(value, list):
-            for item in value:
-                visit(item)
-            return
-        if isinstance(value, str):
-            stripped = value.lstrip()
-            if not stripped.startswith(("{", "[")):
-                return
-            try:
-                parsed = json.loads(value)
-            except Exception:
-                return
-            if isinstance(parsed, (dict, list)):
-                visit(parsed)
-
-    visit(messages)
-    return ExtractedCycleRefs(
-        result_refs=tuple(_dedupe(results)),
-        content_refs=tuple(_dedupe(contents)),
-        artifact_refs=tuple(_dedupe(artifacts)),
-        plan_refs=tuple(_dedupe(plans)),
-    )
-
-
 class CycleCompactionService:
     """Persist source segments and construct validated replacement state."""
 
@@ -1035,7 +972,6 @@ class CycleCompactionService:
         selection: CycleSegmentSelection,
         segment_content_ref: ContentRef,
         compaction_result: CycleCompactionResult,
-        extracted_refs: ExtractedCycleRefs,
     ) -> CycleWorkingMemory:
         previous = active_cycle.working_memory
         generation = previous.generation + 1 if previous else 1
@@ -1052,7 +988,6 @@ class CycleCompactionService:
                 else []
             )
             + list(active_cycle.result_refs)
-            + list(extracted_refs.result_refs)
         )
         state_payload["artifact_refs"] = _dedupe(
             (
@@ -1061,7 +996,6 @@ class CycleCompactionService:
                 else []
             )
             + list(active_cycle.artifact_refs)
-            + list(extracted_refs.artifact_refs)
         )
         resolved_plan_id = (
             active_cycle.active_plan_id

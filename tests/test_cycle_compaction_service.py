@@ -14,7 +14,6 @@ from src.memory import (
     CycleWorkingMemory,
     CycleWorkingState,
     build_cycle_compaction_system_prompt,
-    extract_cycle_refs,
     parse_cycle_working_memory_message,
     validate_openai_tool_sequence,
 )
@@ -23,7 +22,6 @@ from src.storage import StorageConfigType, create_storage_services
 
 
 RESULT_ID = "res_" + "1" * 32
-CONTENT_ID = "cnt_" + "2" * 32
 ARTIFACT_ID = "art_" + "3" * 32
 UNKNOWN_RESULT_ID = "res_" + "a" * 32
 UNKNOWN_ARTIFACT_ID = "art_" + "b" * 32
@@ -163,15 +161,15 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(CycleCompactionOutputError):
                 self.service.parse_compaction_result('{"type":"broken"}')
 
-    async def test_runtime_merges_refs_and_builds_atomic_candidate(self):
+    async def test_only_runtime_owned_refs_enter_working_memory(self):
         source_payload = {
-            "known": {"result_id": RESULT_ID},
-            "content_id": CONTENT_ID,
-            "artifact_id": ARTIFACT_ID,
+            "result_id": UNKNOWN_RESULT_ID,
+            "artifact_id": UNKNOWN_ARTIFACT_ID,
             "invalid": {"result_id": "res_not-valid"},
         }
         self.selection.messages[0]["content"] = dumps_json(source_payload)
         self.cycle.result_refs = [RESULT_ID]
+        self.cycle.artifact_refs = [ARTIFACT_ID]
         self.cycle.active_plan_id = KNOWN_PLAN_ID
         ref = await self.service.persist_segment(
             active_cycle=self.cycle,
@@ -194,7 +192,6 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
             selection=self.selection,
             segment_content_ref=ref,
             compaction_result=result,
-            extracted_refs=extract_cycle_refs(self.selection.messages),
         )
         candidate = self.service.build_candidate_messages(
             active_cycle=self.cycle,
@@ -207,6 +204,14 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parsed_memory, memory)
         self.assertEqual(memory.working_state.result_refs, [RESULT_ID])
         self.assertEqual(memory.working_state.artifact_refs, [ARTIFACT_ID])
+        self.assertNotIn(
+            UNKNOWN_RESULT_ID,
+            memory.working_state.result_refs,
+        )
+        self.assertNotIn(
+            UNKNOWN_ARTIFACT_ID,
+            memory.working_state.artifact_refs,
+        )
         self.assertEqual(
             memory.working_state.active_plan_id,
             KNOWN_PLAN_ID,
@@ -267,7 +272,6 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
                 summary="completed old work",
                 working_state=CycleWorkingState(current_goal="goal"),
             ),
-            extracted_refs=extract_cycle_refs(selection.messages),
         )
 
         candidate = self.service.build_candidate_messages(
@@ -297,12 +301,13 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
             summary="one",
             working_state=CycleWorkingState(current_goal="goal"),
         )
+        self.cycle.result_refs = [RESULT_ID]
+        self.cycle.artifact_refs = [ARTIFACT_ID]
         first = self.service.build_working_memory(
             active_cycle=self.cycle,
             selection=self.selection,
             segment_content_ref=first_ref,
             compaction_result=result,
-            extracted_refs=extract_cycle_refs([]),
         )
         self.cycle.messages_for_llm[:] = (
             self.service.build_candidate_messages(
@@ -312,6 +317,8 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
             )
         )
         self.cycle.working_memory = first
+        self.cycle.result_refs = []
+        self.cycle.artifact_refs = []
         second_selection = CycleSegmentSelection(
             start=3,
             end_exclusive=4,
@@ -335,7 +342,6 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
                 summary="two",
                 working_state=CycleWorkingState(current_goal="goal"),
             ),
-            extracted_refs=extract_cycle_refs([]),
         )
         candidate = self.service.build_candidate_messages(
             active_cycle=self.cycle,
@@ -352,6 +358,8 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second.generation, 2)
         self.assertEqual(second.previous_generation, 1)
         self.assertEqual(len(second.archived_segment_refs), 2)
+        self.assertEqual(second.working_state.result_refs, [RESULT_ID])
+        self.assertEqual(second.working_state.artifact_refs, [ARTIFACT_ID])
         self.assertEqual(
             second.source_message_ranges,
             [

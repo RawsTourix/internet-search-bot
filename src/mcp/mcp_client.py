@@ -61,7 +61,6 @@ from ..memory import (
     TokenEstimator,
     TokenUsageSnapshot,
     build_cycle_working_memory_message,
-    extract_cycle_refs,
     parse_cycle_working_memory_message,
     validate_openai_tool_sequence,
     build_result_compaction_system_prompt,
@@ -7130,7 +7129,6 @@ class MCPClient:
                 **segment_saved_data,
             )
 
-            extracted_refs = extract_cycle_refs(selection.messages)
             compactor_messages = self._build_cycle_compactor_messages(
                 active_cycle=active_cycle,
                 selection=selection,
@@ -7362,7 +7360,6 @@ class MCPClient:
                     selection=selection,
                     segment_content_ref=segment_content_ref,
                     compaction_result=compaction_result,
-                    extracted_refs=extracted_refs,
                 )
             )
             try:

@@ -378,6 +378,52 @@ class TokenAccountingServiceTests(unittest.TestCase):
         )
         self.assertTrue(accounting.used_usage_snapshot)
 
+    def test_low_confidence_snapshot_scales_request_growth(self):
+        estimator = HeuristicRequestTokenEstimator(
+            protocol_overhead_tokens=0
+        )
+        service = TokenAccountingService(
+            model="unknown/model",
+            request_estimator=estimator,
+        )
+        short_messages = [
+            {"role": "user", "content": "x" * 1_000},
+        ]
+        long_messages = [
+            {"role": "user", "content": "x" * 2_000},
+        ]
+        snapshot = service.observe_prompt_usage(
+            messages=short_messages,
+            tools=[],
+            prompt_tokens=900,
+        )
+        raw_long = estimator.estimate_request(
+            messages=long_messages,
+            tools=[],
+        )
+        additive = (
+            snapshot.prompt_tokens
+            + raw_long
+            - snapshot.request_estimate_tokens
+        )
+        ratio_scaled = math.ceil(
+            snapshot.prompt_tokens
+            * raw_long
+            / snapshot.request_estimate_tokens
+        )
+
+        accounting = service.estimate_request(
+            messages=long_messages,
+            tools=[],
+            usage_snapshot=snapshot,
+        )
+
+        self.assertEqual(
+            accounting.total_tokens,
+            max(1, additive, ratio_scaled),
+        )
+        self.assertTrue(accounting.used_usage_snapshot)
+
     def test_fixed_and_compactable_diagnostics_partition_total(self):
         accounting = self.service.estimate_request(
             messages=self.messages,
