@@ -3183,6 +3183,8 @@ class ActiveAgentCycle:
     cycle_trace: list[dict]
     working_memory: CycleWorkingMemory | None
     active_plan_id: str | None
+    active_plan_revision: int | None
+    active_plan_node_id: str | None
     artifact_refs: list[str]
     result_refs: list[str]
     status: str
@@ -3241,6 +3243,7 @@ user/addendum
     "pending_confirmation": null,
     "errors_affecting_continuation": [],
     "active_plan_id": null,
+    "active_plan_revision": null,
     "active_plan_node_id": null,
     "result_refs": [],
     "artifact_refs": []
@@ -3313,6 +3316,7 @@ previous working memory
     "pending_confirmation": null,
     "errors_affecting_continuation": [],
     "active_plan_id": null,
+    "active_plan_revision": null,
     "active_plan_node_id": null,
     "result_refs": [],
     "artifact_refs": []
@@ -3400,150 +3404,980 @@ Trace хранит before/after tokens, generation и source event range, но �
 
 # Часть VIII-D. v0.4-dag-planning
 
-## 82. Назначение DAG
+## 82. Назначение и архитектурные границы DAG
 
-DAG-план — необязательный artifact текущего cycle.
+DAG-план — это необязательный, runtime-owned, ревизионный рабочий artifact
+активного agent cycle, описывающий существенные этапы задачи и зависимости
+между ними.
 
-Он полезен для многоэтапных задач, зависимых действий, нескольких файлов, длительного сбора данных, изменений с последующей проверкой и восстановления после compaction/resume.
+Он не является:
 
-Простые одношаговые задачи работают без плана.
+- chain-of-thought;
+- копией `messages_for_llm`;
+- заменой `CycleWorkingMemory`;
+- автоматическим scheduler;
+- очередью tool calls;
+- источником истины о результатах;
+- обязательной церемонией для каждого запроса.
 
----
+Как и в
+[Apache Airflow](https://airflow.apache.org/docs/apache-airflow/stable/core-concepts/dags.html),
+DAG отделяет структуру зависимостей от содержимого задач и сохраняет topology
+относительно стабильной. Зависимости выполняют роль, сходную с `needs` в
+GitHub Actions. При этом `v0.4` не переносит scheduler: узлы выбирает и
+выполняет основная LLM через обычный agent loop.
 
-## 83. Модели плана
+Temporal и
+[LangGraph](https://langchain-ai.github.io/langgraph/concepts/faq/)
+служат ориентиром для будущего durable execution: plan и runtime state должны
+переживать паузы и инфраструктурные сбои. Автоматическая оркестрация относится
+к следующим версиям.
 
-```python
-class AgentPlan:
-    plan_id: str
-    cycle_id: str
-    goal: str
-    revision: int
-    nodes: list[PlanNode]
-    created_at: float
-    updated_at: float
-    metadata: dict
+### 82.1. Разделение ответственности
+
+| Компонент | Ответственность |
+| --- | --- |
+| `PlanStore` | Точное ревизионное хранение плана |
+| `PlanningService` | Валидация DAG, переходы состояний и вычисление ready nodes |
+| Manager tools | Команды и точечные запросы от LLM |
+| Agent runtime | Активный plan, activity, guards и связь с cycle/tool trace |
+
+`CycleWorkingMemory` не хранит полный plan. Она сохраняет только минимальное
+runtime-состояние, необходимое для восстановления:
+
+```json
+{
+  "active_plan_id": "plan_...",
+  "active_plan_revision": 7,
+  "active_plan_node_id": "pnode_..."
+}
 ```
 
-```python
-class PlanNode:
-    node_id: str
-    title: str
-    description: str
-    kind: str
-    depends_on: list[str]
-    status: str
-    result_refs: list[str]
-    artifact_refs: list[str]
-    notes: list[str]
-```
+Полный актуальный plan всегда получается точным запросом в `PlanStore`, а не
+из working-memory summary.
 
-Статусы:
+### 82.2. PlanStore и RAG решают разные задачи
+
+Текущий authoritative plan нельзя получать через semantic search. RAG не
+гарантирует актуальную revision, полный набор nodes, точные dependencies,
+действующие statuses и active node.
 
 ```text
-pending
-ready
-in_progress
-blocked
-done
-failed
-skipped
+текущий plan
+→ точный PlanStore / manager query
+
+история, outcome и связанные знания
+→ v0.5 RAG
 ```
 
+RAG применяется к старым результатам, архивам cycles, outcome узлов, заметкам,
+истории revisions и связанным документам. В `v0.5` файловый `PlanStore`
+заменяется PostgreSQL-реализацией, но точный контракт чтения current plan
+сохраняется.
+
+### 82.3. Когда plan нужен
+
+Plan создаётся, если задача содержит хотя бы один значимый признак сложности:
+
+- несколько зависимых этапов;
+- несколько файлов или artifacts;
+- несколько внешних источников с последующей обработкой;
+- side effects с обязательной проверкой;
+- вероятный `WAITING_USER`;
+- необходимость продолжить задачу после compaction/resume;
+- развилки или существенная корректировка стратегии;
+- длительный cycle, где легко повторить или забыть действие.
+
+Plan не создаётся для:
+
+- ответа без tools;
+- одного понятного tool call;
+- одного небольшого чтения;
+- одного прямого изменения файла;
+- простого уточнения;
+- задачи, где plan добавляет больше действий, чем сама работа.
+
+Практическое правило для system prompt:
+
+> Создавай DAG-план не по формальному количеству шагов, а когда он снижает
+> риск пропуска, повтора, неправильного порядка или потери состояния.
+
+Runtime автоматически plan не создаёт. В `v0.4` решение принимает основная
+LLM. Отдельный planner LLM-call не выполняется: это исключает дополнительную
+стоимость, вложенный planning loop и второй источник решений.
+
+Правила authoring выносятся в одну константу:
+
+```python
+PLAN_AUTHORING_RULES
+```
+
+Она используется в system prompt, description `agent_plan_create`, тестах и
+позднее может быть переиспользована dedicated planner.
+
+Основные authoring rules:
+
+```text
+DAG-план создаётся только для действительно многоэтапной задачи.
+
+Nodes являются существенными единицами работы, а не внутренними
+мыслительными действиями.
+
+Запрещены nodes:
+- «подумать»;
+- «выбрать инструмент»;
+- «создать plan»;
+- «ответить пользователю»;
+- отдельный node на каждый технический tool call.
+
+Каждый node:
+- имеет одну ясную цель;
+- имеет проверяемые success criteria;
+- зависит только от необходимых predecessors;
+- не предполагает, что результат уже получен;
+- не содержит выдуманных tool/result/artifact/plan IDs.
+
+Для side effects добавляется отдельный validation node.
+Независимые nodes не связываются искусственной линейной dependency.
+Неизвестная условная ветвь добавляется новой revision после получения фактов.
+```
+
+Condition expressions, branch predicates, trigger rules, dynamic mapping и
+subplans в `v0.4` не вводятся.
+
 ---
 
-## 84. Валидация DAG
+## 83. PlanStore, идентификаторы и domain models
 
-Runtime проверяет:
+### 83.1. Отдельный `PlanStore`
 
-1. уникальность node IDs;
-2. существование dependencies;
-3. отсутствие cycles;
-4. невозможность завершить node до обязательных dependencies;
-5. безопасное удаление node с dependants;
-6. связи done-node с result/artifact refs;
-7. увеличение revision;
-8. защиту от изменения устаревшей revision.
+`ContentStore` хранит immutable content и не является authoritative storage
+для изменяемого plan. Plan требует текущую revision, optimistic concurrency,
+доменные переходы, точное чтение current state и историю изменений.
+
+```python
+@runtime_checkable
+class PlanStore(Protocol):
+    async def create_plan(
+        self,
+        plan: AgentPlan,
+    ) -> AgentPlan:
+        ...
+
+    async def get_plan(
+        self,
+        plan_id: str,
+        *,
+        revision: int | None = None,
+    ) -> AgentPlan:
+        ...
+
+    async def save_revision(
+        self,
+        plan: AgentPlan,
+        *,
+        expected_revision: int,
+    ) -> AgentPlan:
+        ...
+
+    async def list_cycle_plans(
+        self,
+        cycle_id: str,
+    ) -> list[PlanRef]:
+        ...
+```
+
+Файловая структура `v0.4`:
+
+```text
+storage/
+  plans/
+    <plan_id>/
+      metadata.json
+      revisions/
+        000001.json
+        000002.json
+        000003.json
+```
+
+`metadata.json` содержит только безопасный pointer:
+
+```json
+{
+  "schema_version": 1,
+  "plan_id": "plan_...",
+  "cycle_id": "cycle-...",
+  "current_revision": 3,
+  "status": "active",
+  "updated_at": "..."
+}
+```
+
+Запись новой revision:
+
+```text
+проверить expected_revision
+→ валидировать новый DAG
+→ записать revisions/000004.json
+→ атомарно заменить metadata.json
+```
+
+В одном процессе операции защищает per-plan lock. PostgreSQL backend `v0.5`
+использует optimistic update:
+
+```sql
+UPDATE plans
+SET revision = revision + 1, ...
+WHERE plan_id = :plan_id
+  AND revision = :expected_revision;
+```
+
+### 83.2. Runtime-owned IDs
+
+Opaque capability IDs генерирует только runtime:
+
+```text
+plan_id = plan_<uuid4 hex>
+node_id = pnode_<uuid4 hex>
+```
+
+При создании или batch-добавлении nodes LLM использует локальные
+`client_key`, чтобы описать dependencies до генерации IDs:
+
+```json
+{
+  "client_key": "collect_sources",
+  "depends_on": ["inspect_input"]
+}
+```
+
+Runtime возвращает mapping:
+
+```json
+{
+  "node_id_map": {
+    "inspect_input": "pnode_a1...",
+    "collect_sources": "pnode_b2..."
+  }
+}
+```
+
+`client_key` может сохраняться как читаемый стабильный key, но capability
+handle остаётся runtime-generated `node_id`.
+
+### 83.3. `AgentPlan`
+
+```python
+class PlanStatus(str, Enum):
+    ACTIVE = "active"
+    COMPLETED = "completed"
+    CANCELLED = "cancelled"
+
+
+class AgentPlan(BaseModel):
+    schema_version: Literal[1] = 1
+
+    plan_id: str
+    session_id: str
+    cycle_id: str
+
+    goal: str
+    strategy: str | None = None
+
+    status: PlanStatus
+    revision: int
+    nodes: list[PlanNode]
+
+    created_at: datetime
+    updated_at: datetime
+```
+
+`blocked` и `failed` не являются statuses всего plan. Они вычисляются из
+состояния nodes. Если есть unresolved nodes, но нет ready и `in_progress`,
+projection содержит `stalled=true`.
+
+### 83.4. `PlanNode`
+
+```python
+class PlanNodeKind(str, Enum):
+    COLLECT = "collect"
+    PROCESS = "process"
+    EXECUTE = "execute"
+    VALIDATE = "validate"
+    COORDINATE = "coordinate"
+    OTHER = "other"
+
+
+class PlanNodeStatus(str, Enum):
+    PENDING = "pending"
+    IN_PROGRESS = "in_progress"
+    BLOCKED = "blocked"
+    DONE = "done"
+    FAILED = "failed"
+    SKIPPED = "skipped"
+
+
+class PlanNode(BaseModel):
+    node_id: str
+    key: str
+
+    title: str
+    objective: str
+    kind: PlanNodeKind
+
+    depends_on: list[str]
+    success_criteria: list[str]
+    status: PlanNodeStatus
+
+    outcome_summary: str | None = None
+    status_reason: str | None = None
+
+    result_refs: list[str] = Field(default_factory=list)
+    artifact_refs: list[str] = Field(default_factory=list)
+
+    created_at: datetime
+    updated_at: datetime
+    started_at: datetime | None = None
+    finished_at: datetime | None = None
+```
+
+Произвольный `metadata: dict` в `v0.4` не добавляется: domain state должен
+оставаться typed.
+
+### 83.5. `ready` является projection
+
+`ready` не хранится как status:
+
+```python
+node.status == PlanNodeStatus.PENDING
+and all(
+    dependency.status == PlanNodeStatus.DONE
+    for dependency in dependencies
+)
+```
+
+`SKIPPED` dependency не считается выполненной. Downstream node должен быть
+изменён отдельной revision либо явно skipped/blocked. Вычисляемый ready-state
+не устаревает и не требует массовой перезаписи downstream nodes.
 
 ---
 
-## 85. Manager tools плана
+## 84. PlanningService, DAG validation и lifecycle
+
+### 84.1. Базовая валидация
+
+`PlanningService` проверяет:
+
+1. уникальность `client_key` и `node_id`;
+2. существование всех dependencies;
+3. отсутствие self-dependencies и cycles;
+4. лимиты размера graph;
+5. возможность start только для ready node;
+6. максимум один `in_progress` node;
+7. невозможность изменить dependencies начатого или terminal node;
+8. безопасное удаление node с dependants;
+9. runtime provenance `result_refs` и `artifact_refs`;
+10. ожидаемую revision для каждой mutation.
+
+### 84.2. Таблица переходов
+
+| Текущее состояние | Разрешённые следующие состояния |
+| --- | --- |
+| `pending` | `in_progress`, `skipped` |
+| `in_progress` | `done`, `blocked`, `failed`, `skipped` |
+| `blocked` | `pending`, `skipped` |
+| `failed` | `pending`, `skipped` |
+| `done` | terminal |
+| `skipped` | terminal |
+
+Дополнительные invariants:
+
+- `done` требует непустой `outcome_summary`;
+- `blocked`, `failed` и `skipped` требуют `status_reason`;
+- terminal node нельзя редактировать, удалять или повторно открывать;
+- неполная работа исправляется новым corrective node;
+- start разрешён только после `DONE` всех dependencies;
+- refs принимаются только из runtime-owned списков active cycle.
+
+### 84.3. Изменение topology
+
+Plan остаётся адаптивным, но не переписывается после каждой iteration:
+
+- новые факты требуют новой revision;
+- новый обязательный этап добавляется новым node;
+- потерявший смысл pending node удаляется либо становится skipped;
+- выполненная работа не переписывается;
+- terminal nodes не удаляются;
+- ошибки исправляются corrective nodes.
+
+Условная ветвь в `v0.4`:
+
+```text
+collect facts
+→ condition resolved
+→ add required branch nodes
+→ skip or remove irrelevant pending nodes
+```
+
+### 84.4. Завершение и stalled projection
+
+Plan автоматически становится `completed`, когда все nodes находятся в
+`done` или `skipped`.
+
+Поскольку skipped dependencies не удовлетворяют downstream requirements,
+зависимые nodes до завершения plan должны быть изменены, skipped, удалены до
+start или заменены.
+
+Если нет ready/`in_progress`, но остаются unresolved nodes:
+
+```json
+{
+  "stalled": true,
+  "blocked_by": {
+    "pnode_x": ["pnode_failed_dependency"]
+  }
+}
+```
+
+Agent должен retry failed node, изменить dependencies, добавить corrective
+node, skip ветку либо отменить plan.
+
+### 84.5. `WAITING_USER`
+
+В `v0.4` используется полностью явная модель:
+
+```text
+transition current node → blocked
+reason=waiting_user
+→ следующая iteration возвращает ask_user
+```
+
+После resume:
+
+```text
+blocked → pending
+pending → in_progress
+```
+
+Runtime не выполняет скрытую plan mutation при `WAITING_USER`. Это сохраняет
+аудируемость, хотя требует дополнительной LLM iteration.
+
+---
+
+## 85. Manager tool context, команды и concurrency
+
+### 85.1. `ManagerToolContext`
+
+Plan manager tools требуют session/cycle context. Mutable global вроде
+`self.current_cycle` запрещён, поскольку ломает параллельные sessions.
+
+```python
+@dataclass(slots=True)
+class ManagerToolContext:
+    session_id: str
+    cycle_id: str
+
+    active_cycle: ActiveAgentCycle
+    session_state: SessionState
+
+
+ManagerToolHandler = Callable[
+    [dict[str, Any], ManagerToolContext],
+    Awaitable[dict[str, Any]],
+]
+```
+
+Существующие MCP manager tools принимают тот же context, но не обязаны
+использовать все поля. Этот контракт позже переиспользуют artifact tools,
+`InputBatch`, `CycleInbox` и session-aware memory tools.
+
+### 85.2. Набор manager tools
+
+`v0.4` использует семь command-oriented tools:
 
 ```text
 agent_plan_create
 agent_plan_get
-agent_plan_add_node
+agent_plan_add_nodes
 agent_plan_update_node
+agent_plan_transition_node
 agent_plan_remove_node
-agent_plan_get_ready_nodes
+agent_plan_cancel
 ```
 
-Tools работают через `PlanningService`, а не напрямую редактируют JSON.
+Универсальный `agent_plan_patch` и JSON Patch не используются: они раскрывают
+внутреннюю структуру документа, ухудшают status-specific validation и
+позволяют случайно менять runtime-owned поля.
 
-Полный план хранится во внешнем storage. В context остаётся compact state:
+#### `agent_plan_create`
+
+Создаёт и активирует новый plan текущего cycle.
+
+```text
+goal
+strategy
+nodes[]
+```
+
+Не принимает `plan_id`, `node_id`, `revision`, status, `result_refs` и
+`artifact_refs`.
+
+Пример:
+
+```json
+{
+  "goal": "Проверить проект и безопасно обновить конфигурацию",
+  "strategy": "Изучить входные данные, внести изменения и проверить результат",
+  "nodes": [
+    {
+      "client_key": "inspect_inputs",
+      "title": "Изучить входные файлы",
+      "objective": "Определить структуру и необходимые изменения",
+      "kind": "process",
+      "depends_on": [],
+      "success_criteria": [
+        "Определены изменяемые файлы",
+        "Зафиксированы ограничения"
+      ]
+    },
+    {
+      "client_key": "apply_changes",
+      "title": "Внести изменения",
+      "objective": "Создать новую версию файлов",
+      "kind": "execute",
+      "depends_on": ["inspect_inputs"],
+      "success_criteria": [
+        "Созданы новые версии изменяемых файлов"
+      ]
+    },
+    {
+      "client_key": "validate_changes",
+      "title": "Проверить результат",
+      "objective": "Убедиться, что изменения корректны",
+      "kind": "validate",
+      "depends_on": ["apply_changes"],
+      "success_criteria": [
+        "Проверки завершены без критических ошибок"
+      ]
+    }
+  ]
+}
+```
+
+Runtime проверяет `client_key`, генерирует IDs, разрешает local dependencies,
+валидирует DAG, сохраняет revision 1, активирует plan и возвращает
+`node_id_map` вместе с compact state.
+
+#### `agent_plan_get`
+
+Выполняет точное чтение active либо явно указанного plan.
+
+```json
+{
+  "plan_id": null,
+  "view": "summary",
+  "node_id": null,
+  "status_filter": [],
+  "offset": 0,
+  "limit": 10
+}
+```
+
+Поддерживаемые views:
+
+```text
+summary — compact current state
+nodes   — paginated compact node list
+node    — один полный node
+```
+
+Отдельный `agent_plan_get_ready_nodes` не нужен: ready nodes входят в summary.
+
+#### `agent_plan_add_nodes`
+
+Добавляет batch nodes и требует `expected_revision`. Dependencies на
+существующие nodes задаются через `node_id`, а внутри batch — через
+`client_key`.
+
+#### `agent_plan_update_node`
+
+Меняет только незапущенный `pending` node:
+
+```text
+title
+objective
+kind
+success_criteria
+depends_on
+```
+
+Status и runtime-owned поля не изменяются.
+
+#### `agent_plan_transition_node`
+
+Выполняет lifecycle command:
+
+```text
+start
+complete
+block
+fail
+skip
+retry
+```
+
+```json
+{
+  "plan_id": "plan_...",
+  "expected_revision": 5,
+  "node_id": "pnode_...",
+  "transition": "complete",
+  "outcome_summary": "...",
+  "reason": null,
+  "result_refs": ["res_..."],
+  "artifact_refs": []
+}
+```
+
+`PlanningService` проверяет обязательные поля и допустимость перехода.
+
+#### `agent_plan_remove_node`
+
+Удаляет только незапущенный `pending` node без dependants. Иначе возвращает:
+
+```json
+{
+  "type": "plan_validation_error",
+  "code": "node_has_dependants",
+  "dependant_node_ids": ["pnode_..."]
+}
+```
+
+#### `agent_plan_cancel`
+
+Отменяет active plan с обязательными `expected_revision` и bounded `reason`.
+Явная cancellation необходима final-answer guard, когда plan утратил
+актуальность.
+
+### 85.3. Optimistic concurrency
+
+Все mutations, кроме create, требуют `expected_revision`. При конфликте:
+
+```json
+{
+  "type": "plan_revision_conflict",
+  "plan_id": "plan_...",
+  "expected_revision": 5,
+  "current_revision": 6,
+  "retryable": true,
+  "active_plan_state": {}
+}
+```
+
+Runtime не повторяет mutation автоматически. LLM должна получить current
+revision, сравнить изменения и сформировать новую осмысленную command.
+
+---
+
+## 86. Runtime integration и guards
+
+### 86.1. Compact `ActivePlanState`
+
+Полный plan автоматически в LLM context не помещается. На каждой iteration
+runtime строит bounded projection и добавляет её в существующее временное
+сообщение `runtime_iteration_state`:
 
 ```json
 {
   "type": "active_plan_state",
   "plan_id": "plan_...",
-  "revision": 5,
-  "current_node_id": "node_4",
-  "ready_node_ids": ["node_4", "node_7"],
-  "completed_node_ids": ["node_1", "node_2"],
-  "blocked_node_ids": ["node_5"]
+  "revision": 6,
+  "status": "active",
+  "goal": "Проверить и обновить проект",
+  "current_node": {
+    "node_id": "pnode_...",
+    "title": "Проверить изменения",
+    "kind": "validate"
+  },
+  "ready_nodes": [
+    {
+      "node_id": "pnode_...",
+      "title": "Собрать данные",
+      "kind": "collect"
+    }
+  ],
+  "counts": {
+    "total": 5,
+    "pending": 2,
+    "in_progress": 1,
+    "blocked": 0,
+    "done": 2,
+    "failed": 0,
+    "skipped": 0
+  },
+  "stalled": false
 }
 ```
 
----
+Projection не сохраняется отдельным постоянным message. Она каждый раз
+строится из `PlanStore`, поэтому содержит current revision, не попадает в
+source segment compaction и не создаёт вторую authoritative копию.
 
-## 86. DAG — карта, а не scheduler
+`ActiveAgentCycle` получает `active_plan_revision` в дополнение к уже
+существующему `active_plan_id`.
 
-В `v0.4` LLM создаёт и обновляет plan, выбирает ready node и выполняет действия через обычный agent loop.
+После каждого mutating plan tool ответ содержит обновлённый
+`ActivePlanState`. Отдельный `agent_plan_get` обычно нужен только после
+resume, revision conflict, изменения стратегии или для подробного чтения.
 
-В `v0.4` нет automatic parallel execution, worker queue, background scheduler и automatic retry nodes.
+### 86.2. Связь plan и tool calls
 
-Это переносится в `v0.6`.
+После активации plan содержательный `mcp_call_tool` разрешён только при наличии
+ровно одного `in_progress` node.
 
----
+Исключения:
 
-## 87. Lifecycle и `AgentActivity`
+- `mcp_list_servers`;
+- `mcp_list_tools`;
+- `mcp_get_tool_schema`;
+- `mcp_get_runtime_context`;
+- plan manager tools.
 
-Lifecycle status остаётся:
+Если active node отсутствует:
 
-```text
-IDLE
-RUNNING
-WAITING_USER
-DONE
-ERROR
+```json
+{
+  "type": "plan_node_required",
+  "plan_id": "plan_...",
+  "revision": 4,
+  "ready_nodes": [],
+  "message": "Перед содержательным tool call выбери и запусти ready node."
+}
 ```
 
-Дополнительная activity:
+Tool trace и metadata большого результата получают:
 
-```text
-planning
-collecting
-processing
-executing
-validating
-finalizing
+```json
+{
+  "plan_id": "plan_...",
+  "plan_revision": 5,
+  "plan_node_id": "pnode_..."
+}
 ```
 
-Activity не является жёсткой машиной состояний. Она используется для trace, progress, prompt/context policy и диагностики.
+Это создаёт точную provenance-связь result → plan node → cycle для `v0.5`
+retrieval.
+
+### 86.3. Result и artifact refs
+
+При `complete`, `block` или `fail` LLM может предложить `result_refs` и
+`artifact_refs`, но `PlanningService` принимает только IDs, уже
+зарегистрированные в:
+
+```text
+active_cycle.result_refs
+active_cycle.artifact_refs
+```
+
+Неизвестный ID отклоняется. Новая plan revision не создаётся автоматически
+после каждого tool result: refs прикрепляются осмысленной lifecycle command,
+а отдельные tool calls уже связаны с node через trace.
+
+### 86.4. Final-answer guard
+
+Если plan был активирован, runtime не принимает premature:
+
+```json
+{
+  "status": "done",
+  "action": "answer"
+}
+```
+
+Финальный ответ разрешён только при:
+
+```text
+plan.status == completed
+or plan.status == cancelled
+```
+
+Для active plan runtime возвращает:
+
+```json
+{
+  "type": "plan_reconciliation_required",
+  "plan_id": "plan_...",
+  "revision": 8,
+  "unfinished_node_ids": ["pnode_..."],
+  "failed_node_ids": [],
+  "message": "Перед финальным ответом заверши, измени или отмени активный план."
+}
+```
+
+Message добавляется в следующий LLM request. Число reconciliation attempts
+ограничивается конфигурацией; после повторного игнорирования возникает
+controlled plan consistency error.
+
+### 86.5. `AgentActivity`
+
+Lifecycle status и activity остаются разными осями:
+
+```text
+status=RUNNING
+activity=VALIDATING
+```
+
+```python
+class AgentActivity(str, Enum):
+    PLANNING = "planning"
+    COLLECTING = "collecting"
+    PROCESSING = "processing"
+    EXECUTING = "executing"
+    VALIDATING = "validating"
+    FINALIZING = "finalizing"
+```
+
+| Node kind / runtime phase | Agent activity |
+| --- | --- |
+| `collect` | `collecting` |
+| `process` | `processing` |
+| `execute` | `executing` |
+| `validate` | `validating` |
+| `coordinate` | `planning` или `executing` |
+| active node отсутствует | `planning` или обычный `running` |
+| final pipeline | `finalizing` |
+
+LLM не управляет activity отдельным tool. Runtime выводит её из active
+operation и использует для trace, progress и диагностики.
 
 ---
 
-## 88. Plan events
+## 87. Progress и trace
+
+Plan events:
 
 ```text
 plan_created
-plan_updated
+plan_revised
 plan_node_started
-plan_node_done
+plan_node_completed
 plan_node_blocked
+plan_node_failed
+plan_node_skipped
+plan_completed
+plan_cancelled
+plan_revision_conflict
 plan_validation_failed
+plan_finalization_blocked
 ```
 
-Cycle compaction обязана сохранять plan ID, revision, active/ready/blocked nodes и связи с result/artifact refs.
+Trace хранит:
+
+```text
+plan_id
+revision before/after
+node_id
+transition
+counts
+validation code
+```
+
+Trace не хранит полный plan JSON, длинные descriptions, raw results, tool
+output и полный `outcome_summary`.
+
+User-visible progress:
+
+```text
+🗺️ Создан план работы.
+▶️ Выполняю этап: Проверить конфигурацию
+⏸️ Этап заблокирован.
+✅ План выполнен.
+```
+
+Structural revision без смены active work остаётся internal/debug.
+
+Cycle compaction сохраняет только runtime-owned `active_plan_id`,
+`active_plan_revision` и `active_plan_node_id`. Полный plan и вычисляемые
+ready/stalled projections повторно из source segment не восстанавливаются.
+
+---
+
+## 88. Scope, configuration и переход к следующим версиям
+
+### 88.1. Ограничения `v0.4`
+
+```text
+один active plan на cycle
+один in_progress node
+не более 32 nodes
+не более 16 dependencies на node
+нет subplans
+нет conditional expressions
+нет loop edges
+нет parallel execution
+нет automatic retry
+нет node timeout
+нет worker assignment
+нет background scheduler
+нет automatic tool selection per node
+```
+
+```python
+class PlanningConfigType(BaseModel):
+    enabled: bool = True
+    max_nodes: int = 32
+    max_dependencies_per_node: int = 16
+    max_ready_nodes_in_context: int = 5
+    max_reconciliation_attempts: int = 2
+```
+
+### 88.2. Что переносится в `v0.5`
+
+- PostgreSQL `PlanStore`;
+- exact SQL projections;
+- persistent plan revision history;
+- cross-cycle plan continuation;
+- связь plan nodes с session memory;
+- RAG по outcome, history и связанным results;
+- retrieval сохранённых результатов по node;
+- optional planner/critic LLM;
+- richer plan queries;
+- persistent `estimator_identity` и другие runtime snapshots.
+
+Current plan и в `v0.5` читается точно, а не через vector search.
+
+### 88.3. Что переносится в `v0.6`
+
+- automatic scheduler;
+- несколько `in_progress` nodes;
+- parallel ready branches;
+- workers;
+- node retries/backoff;
+- timeouts/deadlines;
+- distributed locks;
+- durable event bus;
+- idempotent node execution;
+- automatic resume;
+- human approval gates;
+- automatic branch conditions;
+- subplans;
+- compensation/rollback workflows.
+
+Именно в `v0.6` plan превращается из карты в исполняемый workflow.
+
+### 88.4. Итоговые решения `v0.4-dag-planning`
+
+1. DAG необязателен и создаётся только когда снижает риск ошибки или потери
+   состояния.
+2. Plan является отдельным domain artifact, а не message, summary или
+   RAG-документом.
+3. Полный current plan читается точными manager tools.
+4. `ready` и `stalled` являются вычисляемыми projections.
+5. LLM управляет plan через typed commands, а не raw JSON patch.
+6. Runtime обеспечивает один active node, association tool calls, revision
+   checks и final-answer guard.
+7. `v0.4` не исполняет DAG автоматически и создаёт фундамент для
+   PostgreSQL/RAG `v0.5` и scheduler `v0.6`.
 
 ---
 
@@ -3932,11 +4766,15 @@ User-visible progress:
 
 ### `v0.4-dag-planning`
 
-- DAG models;
-- validation;
-- manager tools;
-- plan refs;
-- progress events.
+- filesystem `PlanStore` with revisions and optimistic concurrency;
+- typed `AgentPlan` / `PlanNode` models;
+- computed ready/stalled projections;
+- `PlanningService` validation and strict node transitions;
+- seven command-oriented manager tools;
+- bounded `ActivePlanState` in runtime context;
+- runtime-owned plan/node/result/artifact refs;
+- tool-call association and final-answer guard;
+- progress/trace events without scheduler semantics.
 
 ### `v0.4-file-artifacts`
 
@@ -4171,6 +5009,8 @@ error
 error_kind
 can_resume
 active_plan_id
+active_plan_revision
+active_plan_node_id
 working_memory_generation
 created_at
 updated_at
@@ -5340,33 +6180,39 @@ local callback compatibility mode
 25. DAG — отдельный artifact cycle, а не system-prompt text.
 26. DAG необязателен для simple tasks.
 27. В `v0.4` DAG — карта, а не scheduler.
-28. Lifecycle status и `AgentActivity` — разные оси.
-29. File представлен `ArtifactRef`, а не arbitrary local path.
-30. Edit пользовательского file создаёт новую version.
-31. File delivery выполняет adapter layer.
-32. Прочитанное file content проходит result-compaction policy.
-33. Transport message не равен logical user turn.
-34. `InputBatch` объединяет text и attachments.
-35. `CycleInbox` принимает sealed `InputBatch`.
-36. Initial request и active-cycle addendum используют одну batch model.
-37. Addendum вставляется только в safe checkpoint.
-38. Полезный tool call не игнорируется ради нового input.
-39. Per-session lock защищает active cycle и inbox.
-40. `WAITING_USER`/infrastructure interruption сохраняют resumable workspace.
-41. v0.4 работает без PostgreSQL, но через PostgreSQL-friendly interfaces.
-42. v0.5 добавляет PostgreSQL/pgvector без обязательных microservices.
-43. v0.6 вводит Redis/workers/services при реальной необходимости.
-44. PostgreSQL — durable source of truth; Redis его не заменяет.
-45. Background jobs должны быть idempotent.
-46. MCPServerManager остаётся lifecycle coordinator MCP runtime.
-47. Agent loop не управляет reconnect/restart transport напрямую.
-48. Surface-specific formatting применяется на финальной стадии.
-49. Delivery constraints влияют на форму, а не на facts/actions.
-50. Новые слои сохраняют local development mode.
-51. Длительный AgentRun не зависит от lifetime одного HTTP-соединения.
-52. Client disconnect не оставляет run в неопределённом состоянии.
-53. Final result сохраняется до terminal status `succeeded`.
-54. Повтор Web request с тем же idempotency key не создаёт duplicate run.
-55. Per-attempt timeout/retry budget отделён от total run deadline.
-56. Execution outcome, delivery outcome и result retrieval наблюдаются
+28. Authoritative current plan читается через точный `PlanStore`, не через RAG.
+29. Plan/node IDs принадлежат runtime; LLM использует только `client_key`.
+30. `ready` и `stalled` вычисляются и не сохраняются как lifecycle statuses.
+31. Каждая plan mutation, кроме create, требует `expected_revision`.
+32. При active plan содержательный tool call требует один `in_progress` node.
+33. Active plan должен быть completed либо cancelled до final answer.
+34. Lifecycle status и `AgentActivity` — разные оси.
+35. File представлен `ArtifactRef`, а не arbitrary local path.
+36. Edit пользовательского file создаёт новую version.
+37. File delivery выполняет adapter layer.
+38. Прочитанное file content проходит result-compaction policy.
+39. Transport message не равен logical user turn.
+40. `InputBatch` объединяет text и attachments.
+41. `CycleInbox` принимает sealed `InputBatch`.
+42. Initial request и active-cycle addendum используют одну batch model.
+43. Addendum вставляется только в safe checkpoint.
+44. Полезный tool call не игнорируется ради нового input.
+45. Per-session lock защищает active cycle и inbox.
+46. `WAITING_USER`/infrastructure interruption сохраняют resumable workspace.
+47. v0.4 работает без PostgreSQL, но через PostgreSQL-friendly interfaces.
+48. v0.5 добавляет PostgreSQL/pgvector без обязательных microservices.
+49. v0.6 вводит Redis/workers/services при реальной необходимости.
+50. PostgreSQL — durable source of truth; Redis его не заменяет.
+51. Background jobs должны быть idempotent.
+52. MCPServerManager остаётся lifecycle coordinator MCP runtime.
+53. Agent loop не управляет reconnect/restart transport напрямую.
+54. Surface-specific formatting применяется на финальной стадии.
+55. Delivery constraints влияют на форму, а не на facts/actions.
+56. Новые слои сохраняют local development mode.
+57. Длительный AgentRun не зависит от lifetime одного HTTP-соединения.
+58. Client disconnect не оставляет run в неопределённом состоянии.
+59. Final result сохраняется до terminal status `succeeded`.
+60. Повтор Web request с тем же idempotency key не создаёт duplicate run.
+61. Per-attempt timeout/retry budget отделён от total run deadline.
+62. Execution outcome, delivery outcome и result retrieval наблюдаются
     раздельно.
