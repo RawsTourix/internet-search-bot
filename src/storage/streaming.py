@@ -10,7 +10,7 @@ import shutil
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import AsyncIterator, Callable, TypeVar
+from typing import Any, AsyncIterator, Callable, TypeVar
 
 from pydantic import ValidationError
 
@@ -35,12 +35,12 @@ async def _await_blocking(callable_: Callable[..., _T], *args) -> _T:
     """Finish one bounded thread operation before propagating cancellation."""
     task = asyncio.create_task(asyncio.to_thread(callable_, *args))
     try:
-        return await task
+        return await asyncio.shield(task)
     except asyncio.CancelledError:
-        # Closing or deleting a file while a worker thread still uses it is
-        # racy. Finish only this bounded operation and preserve cancellation.
+        # Shield keeps the worker task alive. Wait for the current bounded
+        # operation before cleanup, then preserve the caller's cancellation.
         try:
-            await asyncio.shield(task)
+            await task
         except BaseException:
             pass
         raise
@@ -60,7 +60,7 @@ class StreamingFileSystemContentStore(FileSystemContentStore):
         cycle_id: str | None = None,
         tool_call_id: str | None = None,
         size_tokens_estimate: int | None = None,
-        metadata: dict | None = None,
+        metadata: dict[str, Any] | None = None,
         max_size_bytes: int,
     ) -> ContentRef:
         """Persist an async stream while hashing and enforcing a hard limit."""
