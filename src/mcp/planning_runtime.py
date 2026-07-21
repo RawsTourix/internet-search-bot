@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from ..agent.protocol import AgentAction
+from ..core.models import AgentStatus
 from ..planning import AgentActivity, PlanConsistencyError
 from ..planning.safe_tools import SafePlanningToolController
 from .manager_context import ManagerToolContext
@@ -12,13 +13,49 @@ from .planning_client import PlanningMCPClient
 
 
 class FinalizingPlanningMCPClient(PlanningMCPClient):
-    """Turn repeated plan-protocol violations into resumable user handoff."""
+    """Apply production guards around planning-aware agent execution."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
         self.plan_tool_controller = SafePlanningToolController(
             self.planning_services.planning_service
         )
+
+    async def process_query(self, *args: Any, **kwargs: Any):
+        """Keep AgentResult.can_resume aligned with the saved pending cycle.
+
+        The stable base runtime already persists an ActiveAgentCycle when an
+        AgentAction enters WAITING_USER. Historically AgentResult.can_resume was
+        populated only for infrastructure interruptions, so a normal user
+        handoff incorrectly reported ``False`` despite having resumable state.
+        """
+
+        result = await super().process_query(*args, **kwargs)
+        if result.status == AgentStatus.WAITING_USER:
+            session_id = result.session_id or "default"
+            session = self._get_or_create_session(session_id)
+            result.can_resume = session.pending_cycle is not None
+        return result
+
+    async def _manager_get_tool_schema(
+        self,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Return schemas for built-in manager tools as well as remote tools."""
+
+        tool_name = str(arguments["tool_name"])
+        manager_spec = self.manager_tools.get(tool_name)
+        if manager_spec is not None:
+            return {
+                "type": "mcp_tool_schema",
+                "tool": {
+                    "name": manager_spec.name,
+                    "description": manager_spec.description,
+                    "inputSchema": manager_spec.parameters,
+                    "source": "manager",
+                },
+            }
+        return await super()._manager_get_tool_schema(arguments)
 
     async def _apply_plan_action_guard(
         self,
