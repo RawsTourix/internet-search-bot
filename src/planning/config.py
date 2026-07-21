@@ -1,6 +1,11 @@
 """Configuration for the v0.4 DAG planning foundation."""
 
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+import json
+from pathlib import Path
+
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+
+from .errors import PlanningConfigValidationError
 
 
 class PlanningConfigType(BaseModel):
@@ -27,3 +32,28 @@ class PlanningConfigType(BaseModel):
         if self.max_plan_get_limit > self.max_nodes:
             raise ValueError("max_plan_get_limit must not exceed max_nodes")
         return self
+
+
+def load_planning_config(config_path: str) -> PlanningConfigType:
+    """Load the optional root-level ``planning`` section with defaults."""
+    try:
+        payload = json.loads(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+        raise PlanningConfigValidationError(
+            "Failed to read planning configuration"
+        ) from error
+    if not isinstance(payload, dict):
+        raise PlanningConfigValidationError("Configuration root must be an object")
+    planning_data = payload.get("planning", {})
+    if planning_data is None:
+        planning_data = {}
+    if not isinstance(planning_data, dict):
+        raise PlanningConfigValidationError(
+            "Planning configuration must be an object"
+        )
+    try:
+        return PlanningConfigType.model_validate(planning_data)
+    except ValidationError as error:
+        raise PlanningConfigValidationError(
+            "Invalid planning configuration"
+        ) from error
