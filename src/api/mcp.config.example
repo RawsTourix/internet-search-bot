@@ -89,5 +89,17 @@
         "cycle_compaction_max_output_tokens": 2048,
         "cycle_compaction_keep_recent_blocks": 2,
         "cycle_compaction_max_passes": 3
+    },
+    "planning": {
+        "enabled": true,
+        "max_nodes": 32,
+        "max_dependencies_per_node": 16,
+        "max_ready_nodes_in_context": 5,
+        "max_plan_get_limit": 20,
+        "max_reconciliation_attempts": 2,
+        "max_title_chars": 160,
+        "max_objective_chars": 2000,
+        "max_outcome_summary_chars": 4000,
+        "max_success_criteria_per_node": 20
     }
 }
