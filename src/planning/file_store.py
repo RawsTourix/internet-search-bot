@@ -174,6 +174,10 @@ class FileSystemPlanStore(PlanStore):
                 "invalid_revision",
                 "Plan revision must be positive.",
             )
+        if selected_revision > metadata.current_revision:
+            raise PlanNotFoundError(
+                f"Plan {plan_id} revision {selected_revision} is not committed"
+            )
         revision_path = self._revisions_dir(plan_id) / self._revision_filename(
             selected_revision
         )
