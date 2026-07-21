@@ -12,3 +12,4 @@ class ManagerToolContext:
     cycle_id: str
     active_cycle: ActiveAgentCycle
     session_state: Any
+    progress_callback: Any = None
