@@ -29,6 +29,14 @@ def validate_plan(plan: AgentPlan, config: PlanningConfigType) -> None:
             "strategy_too_long",
             "Plan strategy exceeds the configured limit.",
         )
+    if (
+        plan.cancellation_reason is not None
+        and len(plan.cancellation_reason) > config.max_objective_chars
+    ):
+        raise PlanValidationError(
+            "cancellation_reason_too_long",
+            "Plan cancellation reason exceeds the configured limit.",
+        )
     if len(plan.nodes) > config.max_nodes:
         raise PlanValidationError(
             "too_many_nodes",
@@ -92,6 +100,16 @@ def validate_plan(plan: AgentPlan, config: PlanningConfigType) -> None:
                 "Node outcome summary exceeds the configured limit.",
                 details={"node_id": node.node_id},
             )
+        if (
+            node.status_reason is not None
+            and len(node.status_reason) > config.max_objective_chars
+        ):
+            raise PlanValidationError(
+                "status_reason_too_long",
+                "Node status reason exceeds the configured limit.",
+                details={"node_id": node.node_id},
+            )
+        _validate_node_lifecycle(node)
         if node.status == PlanNodeStatus.IN_PROGRESS:
             in_progress_count += 1
         node_by_id[node.node_id] = node
@@ -133,6 +151,122 @@ def validate_plan(plan: AgentPlan, config: PlanningConfigType) -> None:
             "Completed plan contains unresolved nodes.",
             retryable=False,
         )
+
+
+def _validate_node_lifecycle(node: PlanNode) -> None:
+    """Reject persisted lifecycle combinations not produced by the service."""
+    if node.updated_at < node.created_at:
+        raise PlanValidationError(
+            "invalid_node_timestamps",
+            "Node updated_at precedes created_at.",
+            retryable=False,
+            details={"node_id": node.node_id},
+        )
+    if node.started_at is not None and node.started_at < node.created_at:
+        raise PlanValidationError(
+            "invalid_node_timestamps",
+            "Node started_at precedes created_at.",
+            retryable=False,
+            details={"node_id": node.node_id},
+        )
+    if node.finished_at is not None:
+        baseline = node.started_at or node.created_at
+        if node.finished_at < baseline:
+            raise PlanValidationError(
+                "invalid_node_timestamps",
+                "Node finished_at precedes its start.",
+                retryable=False,
+                details={"node_id": node.node_id},
+            )
+
+    if node.status == PlanNodeStatus.PENDING:
+        if any((
+            node.started_at is not None,
+            node.finished_at is not None,
+            node.outcome_summary is not None,
+            node.status_reason is not None,
+            bool(node.result_refs),
+            bool(node.artifact_refs),
+        )):
+            raise PlanValidationError(
+                "invalid_pending_node_state",
+                "Pending node contains runtime outcome state.",
+                retryable=False,
+                details={"node_id": node.node_id},
+            )
+        return
+
+    if node.status == PlanNodeStatus.IN_PROGRESS:
+        if (
+            node.started_at is None
+            or node.finished_at is not None
+            or node.outcome_summary is not None
+            or node.status_reason is not None
+            or node.result_refs
+            or node.artifact_refs
+            or node.attempt_count < 1
+        ):
+            raise PlanValidationError(
+                "invalid_in_progress_node_state",
+                "In-progress node has inconsistent lifecycle data.",
+                retryable=False,
+                details={"node_id": node.node_id},
+            )
+        return
+
+    if node.status == PlanNodeStatus.BLOCKED:
+        if (
+            node.started_at is None
+            or node.finished_at is not None
+            or not node.status_reason
+            or node.attempt_count < 1
+        ):
+            raise PlanValidationError(
+                "invalid_blocked_node_state",
+                "Blocked node has inconsistent lifecycle data.",
+                retryable=False,
+                details={"node_id": node.node_id},
+            )
+        return
+
+    if node.status == PlanNodeStatus.FAILED:
+        if (
+            node.started_at is None
+            or node.finished_at is None
+            or not node.status_reason
+            or node.attempt_count < 1
+        ):
+            raise PlanValidationError(
+                "invalid_failed_node_state",
+                "Failed node has inconsistent lifecycle data.",
+                retryable=False,
+                details={"node_id": node.node_id},
+            )
+        return
+
+    if node.status == PlanNodeStatus.DONE:
+        if (
+            node.started_at is None
+            or node.finished_at is None
+            or not node.outcome_summary
+            or node.attempt_count < 1
+        ):
+            raise PlanValidationError(
+                "invalid_done_node_state",
+                "Done node has inconsistent lifecycle data.",
+                retryable=False,
+                details={"node_id": node.node_id},
+            )
+        return
+
+    if node.status == PlanNodeStatus.SKIPPED:
+        if node.finished_at is None or not node.status_reason:
+            raise PlanValidationError(
+                "invalid_skipped_node_state",
+                "Skipped node has inconsistent lifecycle data.",
+                retryable=False,
+                details={"node_id": node.node_id},
+            )
 
 
 def _validate_acyclic(node_by_id: dict[str, PlanNode]) -> None:
