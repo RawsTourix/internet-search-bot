@@ -172,7 +172,7 @@ class PlanRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             for message in self.cycle.messages_for_llm
         ))
 
-    async def test_reconciliation_limit_returns_honest_partial_answer(self):
+    async def test_reconciliation_limit_returns_resumable_user_handoff(self):
         root = Path(self.temporary.name)
         storage_config = StorageConfigType(root_dir=str(root / "final-storage"))
         storage_services = create_storage_services(storage_config)
@@ -246,9 +246,10 @@ class PlanRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 response=response,
                 context=context,
             )
-            final_action = AgentAction.model_validate_json(second["content"])
-            self.assertEqual(final_action.status, "done")
-            self.assertIn("не удалось безопасно завершить", final_action.final_answer)
+            handoff = AgentAction.model_validate_json(second["content"])
+            self.assertEqual(handoff.status, "waiting_user")
+            self.assertEqual(handoff.action, "ask_user")
+            self.assertIn("Продолжить выполнение", handoff.question_to_user)
         finally:
             set_manager_context(self.context)
             await client.cleanup()
