@@ -19,6 +19,16 @@ from .models import (
 
 def validate_plan(plan: AgentPlan, config: PlanningConfigType) -> None:
     """Validate structural and lifecycle invariants for one plan revision."""
+    if len(plan.goal) > config.max_objective_chars:
+        raise PlanValidationError(
+            "goal_too_long",
+            "Plan goal exceeds the configured limit.",
+        )
+    if plan.strategy is not None and len(plan.strategy) > config.max_objective_chars:
+        raise PlanValidationError(
+            "strategy_too_long",
+            "Plan strategy exceeds the configured limit.",
+        )
     if len(plan.nodes) > config.max_nodes:
         raise PlanValidationError(
             "too_many_nodes",
