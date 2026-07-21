@@ -84,6 +84,31 @@ class PlanManagerToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(get_outcome.payload["type"], "active_plan_state")
         self.assertEqual(get_outcome.payload["revision"], 1)
 
+    async def test_historical_read_does_not_replace_active_pointer(self):
+        historical = await self._create()
+        await self.controller.execute(
+            "agent_plan_cancel",
+            {
+                "plan_id": historical["plan_id"],
+                "expected_revision": 1,
+                "reason": "Superseded",
+            },
+            self.context,
+        )
+        current = await self._create()
+        self.assertEqual(self.cycle.active_plan_id, current["plan_id"])
+
+        outcome = await self.controller.execute(
+            "agent_plan_get",
+            {
+                "plan_id": historical["plan_id"],
+                "view": "summary",
+            },
+            self.context,
+        )
+        self.assertEqual(outcome.payload["plan_id"], historical["plan_id"])
+        self.assertEqual(self.cycle.active_plan_id, current["plan_id"])
+
     async def test_revision_conflict_returns_fresh_state(self):
         created = await self._create()
         plan_id = created["plan_id"]
