@@ -22,6 +22,7 @@ from ..planning import (
     create_planning_services,
     load_planning_config,
 )
+from ..planning.cycle_memory import PlanningCycleCompactionService
 from ..planning.runtime_context import PlanningAwareContentStore
 from ..storage import StorageServices, create_storage_services
 
@@ -139,6 +140,11 @@ class Api:
                 memory_config=self.memory_config,
                 runtime_config=self.runtime_config,
                 planning_services=self.planning_services,
+            )
+            self.mcp_client.cycle_compaction_service = (
+                PlanningCycleCompactionService(
+                    content_store=self.mcp_client.content_store
+                )
             )
         except Exception as e:
             raise APIError(f"Ошибка инициализации Api: {repr(e)}") from e
