@@ -42,6 +42,11 @@ from src.storage import StorageServices, create_storage_services
 SMOKE_SERVER_PATH = (
     REPOSITORY_ROOT / "scripts" / "dag_planning_smoke_mcp_server.py"
 )
+SMOKE_REMOTE_TOOLS = (
+    "smoke_get_alpha",
+    "smoke_get_beta",
+    "smoke_verify_total",
+)
 
 
 class SmokeFailure(RuntimeError):
@@ -61,14 +66,60 @@ def _event_types(result: AgentResult) -> list[str]:
     ]
 
 
-def _target_tools(result: AgentResult) -> set[str]:
-    names = set(result.tools_used)
+def _observed_tool_names(result: AgentResult) -> set[str]:
+    """Collect manager, public and target tool names exposed by the runtime."""
+
+    names = {
+        value
+        for value in result.tools_used
+        if isinstance(value, str) and value
+    }
     for event in result.progress_events:
         for key in ("target_tool_name", "tool_name"):
             value = event.get(key)
             if isinstance(value, str) and value:
                 names.add(value)
+
+        data = event.get("data")
+        if isinstance(data, dict):
+            for key in ("target_tool_name", "tool_name"):
+                value = data.get(key)
+                if isinstance(value, str) and value:
+                    names.add(value)
     return names
+
+
+def _normalized_tool_name(value: str) -> str:
+    """Remove manager prefixes while preserving the public MCP tool name."""
+
+    return value.rsplit(":", 1)[-1]
+
+
+def _tool_was_called(observed: set[str], remote_name: str) -> bool:
+    """Match a remote tool through its alias-prefixed public runtime name.
+
+    For a server alias ``smoke`` and remote tool ``smoke_get_alpha`` the
+    current registry correctly exposes ``smoke_smoke_get_alpha``. Agent traces
+    may additionally store ``mcp_call_tool:smoke_smoke_get_alpha``. The smoke
+    assertion is interested in the remote capability, not the chosen alias.
+    """
+
+    for raw_name in observed:
+        name = _normalized_tool_name(raw_name)
+        if name == remote_name or name.endswith(f"_{remote_name}"):
+            return True
+    return False
+
+
+def _missing_remote_tools(
+    observed: set[str],
+    expected_remote_names: Iterable[str],
+) -> list[str]:
+    return sorted(
+        remote_name
+        for remote_name in expected_remote_names
+        if not _tool_was_called(observed, remote_name)
+    )
 
 
 def _find_plan_id(result: AgentResult) -> str:
@@ -214,7 +265,7 @@ async def _run_complex_scenario(
         progress_locale="ru",
     )
     types = _event_types(result)
-    targets = _target_tools(result)
+    observed = _observed_tool_names(result)
 
     _require(
         result.status == AgentStatus.DONE,
@@ -231,20 +282,15 @@ async def _run_complex_scenario(
     )
     _require("plan_completed" in types, "complex scenario did not complete plan")
 
-    expected_tools = {
-        "smoke_get_alpha",
-        "smoke_get_beta",
-        "smoke_verify_total",
-    }
-    missing_tools = expected_tools - targets
+    missing_tools = _missing_remote_tools(observed, SMOKE_REMOTE_TOOLS)
     _require(
         not missing_tools,
-        f"complex scenario did not call tools: {sorted(missing_tools)}; "
-        f"observed={sorted(targets)}",
+        f"complex scenario did not call tools: {missing_tools}; "
+        f"observed={sorted(observed)}",
     )
     _require(
-        "42" in result.content,
-        f"complex final answer does not contain 42: {result.content!r}",
+        "SMOKE_TOTAL=42" in result.content,
+        f"complex final answer does not contain SMOKE_TOTAL=42: {result.content!r}",
     )
 
     plan_id = _find_plan_id(result)
@@ -259,7 +305,7 @@ async def _run_complex_scenario(
         "iterations": result.iterations,
         "plan_id": plan_id,
         "plan_revision": metadata.get("current_revision"),
-        "tools": sorted(expected_tools),
+        "tools": list(SMOKE_REMOTE_TOOLS),
         "final": result.content,
     }
 
@@ -278,16 +324,22 @@ async def _run_simple_scenario(
         progress_locale="ru",
     )
     types = _event_types(result)
-    targets = _target_tools(result)
+    observed = _observed_tool_names(result)
 
     _require(
         result.status == AgentStatus.DONE,
         f"simple scenario status is {result.status.value}: {result.content}",
     )
     _require("plan_created" not in types, "simple scenario created a plan")
+    called_smoke_tools = [
+        name
+        for name in SMOKE_REMOTE_TOOLS
+        if _tool_was_called(observed, name)
+    ]
     _require(
-        not ({"smoke_get_alpha", "smoke_get_beta", "smoke_verify_total"} & targets),
-        f"simple scenario called smoke tools: {sorted(targets)}",
+        not called_smoke_tools,
+        f"simple scenario called smoke tools: {called_smoke_tools}; "
+        f"observed={sorted(observed)}",
     )
     _require(
         "SMOKE_SIMPLE_OK" in result.content,
@@ -322,7 +374,7 @@ smoke_get_beta обязательно запроси у пользователя
         progress_locale="ru",
     )
     first_types = _event_types(first)
-    first_targets = _target_tools(first)
+    first_observed = _observed_tool_names(first)
 
     _require(
         first.status == AgentStatus.WAITING_USER,
@@ -335,7 +387,12 @@ smoke_get_beta обязательно запроси у пользователя
         "waiting scenario did not explicitly block a node",
     )
     _require(
-        "smoke_get_beta" not in first_targets,
+        _tool_was_called(first_observed, "smoke_get_alpha"),
+        f"waiting scenario did not call alpha before pausing: "
+        f"{sorted(first_observed)}",
+    )
+    _require(
+        not _tool_was_called(first_observed, "smoke_get_beta"),
         "waiting scenario called beta before approval",
     )
 
@@ -346,7 +403,7 @@ smoke_get_beta обязательно запроси у пользователя
         progress_locale="ru",
     )
     second_types = _event_types(second)
-    second_targets = _target_tools(second)
+    second_observed = _observed_tool_names(second)
 
     _require(
         second.status == AgentStatus.DONE,
@@ -357,11 +414,19 @@ smoke_get_beta обязательно запроси у пользователя
         "plan_completed" in second_types,
         "resumed waiting scenario did not complete plan",
     )
-    _require(
-        {"smoke_get_beta", "smoke_verify_total"}.issubset(second_targets),
-        f"resumed waiting scenario missed tools: {sorted(second_targets)}",
+    missing_after_resume = _missing_remote_tools(
+        second_observed,
+        ("smoke_get_beta", "smoke_verify_total"),
     )
-    _require("42" in second.content, "resumed final answer does not contain 42")
+    _require(
+        not missing_after_resume,
+        f"resumed waiting scenario missed tools: {missing_after_resume}; "
+        f"observed={sorted(second_observed)}",
+    )
+    _require(
+        "42" in second.content,
+        "resumed final answer does not contain 42",
+    )
 
     plan_id = _find_plan_id(first)
     metadata = _load_plan_metadata(storage_root, plan_id)
@@ -396,6 +461,10 @@ async def _run(args: argparse.Namespace) -> int:
             keep_final_audit=args.keep_final_audit,
         )
         client = _build_client(temporary_config)
+        # The client already owns parsed config values. Remove the temporary
+        # config immediately so an API key is never retained with --keep-temp.
+        temporary_config.unlink(missing_ok=True)
+
         await client.connect_to_servers(client._live_smoke_server_configs)
 
         report: dict[str, Any] = {
@@ -451,7 +520,7 @@ def _parse_args(argv: Iterable[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--keep-temp",
         action="store_true",
-        help="Keep temporary config, plans and content after the run.",
+        help="Keep temporary plans and content after the run.",
     )
     args = parser.parse_args(argv)
     if not args.config:
