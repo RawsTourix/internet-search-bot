@@ -9,6 +9,10 @@ class PlanningError(RuntimeError):
     """Base error for planning domain and persistence failures."""
 
 
+class PlanningConfigValidationError(PlanningError):
+    """Raised when the planning configuration is invalid."""
+
+
 class PlanNotFoundError(PlanningError):
     """Raised when a requested plan or revision does not exist."""
 
