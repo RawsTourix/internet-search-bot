@@ -89,6 +89,37 @@ class PlanRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertTrue(PLAN_TOOL_NAMES.issubset(formatted_names))
 
+    async def test_planning_disabled_omits_plan_tools(self):
+        root = Path(self.temporary.name)
+        storage_config = StorageConfigType(
+            root_dir=str(root / "disabled-storage")
+        )
+        storage_services = create_storage_services(storage_config)
+        services = create_planning_services(
+            storage_config=storage_config,
+            planning_config=PlanningConfigType(enabled=False),
+        )
+        client = PlanningMCPClient(
+            LLMConfigType(
+                api_url="https://example.invalid/v1/chat/completions",
+                api_key="test",
+                model="test-model",
+                max_tokens=256,
+                context_window_tokens=4096,
+            ),
+            storage_services=storage_services,
+            planning_services=services,
+        )
+        try:
+            self.assertTrue(PLAN_TOOL_NAMES.isdisjoint(client.manager_tools))
+            formatted_names = {
+                item["function"]["name"]
+                for item in client._format_tools_for_llm()
+            }
+            self.assertTrue(PLAN_TOOL_NAMES.isdisjoint(formatted_names))
+        finally:
+            await client.cleanup()
+
     async def test_runtime_message_contains_bounded_active_plan_state(self):
         await self._create_plan()
         self.cycle.activity = self.client._activity_for_state(
