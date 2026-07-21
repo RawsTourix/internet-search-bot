@@ -27,6 +27,7 @@ UNKNOWN_RESULT_ID = "res_" + "a" * 32
 UNKNOWN_ARTIFACT_ID = "art_" + "b" * 32
 UNKNOWN_PLAN_ID = "plan_" + "c" * 32
 KNOWN_PLAN_ID = "plan_" + "d" * 32
+UNKNOWN_PLAN_NODE_ID = "pnode_" + "e" * 32
 
 
 class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
@@ -184,7 +185,7 @@ class CycleCompactionServiceTests(unittest.IsolatedAsyncioTestCase):
                 result_refs=[RESULT_ID, UNKNOWN_RESULT_ID],
                 artifact_refs=[UNKNOWN_ARTIFACT_ID],
                 active_plan_id=UNKNOWN_PLAN_ID,
-                active_plan_node_id="invented-node",
+                active_plan_node_id=UNKNOWN_PLAN_NODE_ID,
             ),
         )
         memory = self.service.build_working_memory(
