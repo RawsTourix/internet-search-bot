@@ -11,6 +11,13 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "mcp_get_tool_schema": "📋 Проверяю схему {tool_name}…",
         "mcp_call_tool": "🔧 Запускаю {tool_name}…",
         "mcp_get_runtime_context": "🕒 Получаю runtime-контекст агента…",
+        "agent_plan_create": "🗺️ Создаю план работы…",
+        "agent_plan_get": "🗺️ Проверяю план работы…",
+        "agent_plan_add_nodes": "🗺️ Добавляю этапы в план…",
+        "agent_plan_update_node": "🗺️ Уточняю этап плана…",
+        "agent_plan_transition_node": "🗺️ Обновляю состояние этапа…",
+        "agent_plan_remove_node": "🗺️ Удаляю неактуальный этап…",
+        "agent_plan_cancel": "🗺️ Отменяю план работы…",
         "tool_start": "🔧 Запускаю инструмент {tool_name}…",
         "tool_done": "✅ Инструмент {tool_name} завершил работу.",
         "tool_error": "⚠️ Инструмент {tool_name} завершился с ошибкой.",
@@ -84,6 +91,19 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "oversized_result_stored": (
             "📦 Результат сохранён для последующей обработки."
         ),
+        "plan_created": "🗺️ Создан план работы.",
+        "plan_revised": "🗺️ План работы обновлён.",
+        "plan_node_started": "▶️ Выполняю этап: {node_title}",
+        "plan_node_completed": "✅ Этап выполнен: {node_title}",
+        "plan_node_blocked": "⏸️ Этап приостановлен: {node_title}",
+        "plan_node_failed": "⚠️ Этап завершился ошибкой: {node_title}",
+        "plan_node_skipped": "⏭️ Этап пропущен: {node_title}",
+        "plan_completed": "✅ План работы выполнен.",
+        "plan_cancelled": "⛔ План работы отменён.",
+        "plan_revision_conflict": "⚠️ План уже изменился; перечитываю актуальную ревизию.",
+        "plan_validation_failed": "⚠️ Изменение плана не прошло проверку.",
+        "plan_finalization_blocked": "🗺️ Сначала нужно согласовать незавершённый план.",
+        "plan_waiting_user_blocked": "🗺️ Перед вопросом пользователю нужно приостановить активный этап.",
     },
     "en": {
         "cycle_started": "🧭 Starting task processing…",
@@ -94,6 +114,13 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "mcp_get_tool_schema": "📋 Checking schema for {tool_name}…",
         "mcp_call_tool": "🔧 Running {tool_name}…",
         "mcp_get_runtime_context": "🕒 Getting agent runtime context…",
+        "agent_plan_create": "🗺️ Creating a work plan…",
+        "agent_plan_get": "🗺️ Reading the work plan…",
+        "agent_plan_add_nodes": "🗺️ Adding plan stages…",
+        "agent_plan_update_node": "🗺️ Updating a plan stage…",
+        "agent_plan_transition_node": "🗺️ Updating stage state…",
+        "agent_plan_remove_node": "🗺️ Removing an obsolete stage…",
+        "agent_plan_cancel": "🗺️ Cancelling the work plan…",
         "tool_start": "🔧 Running tool {tool_name}…",
         "tool_done": "✅ Tool {tool_name} finished.",
         "tool_error": "⚠️ Tool {tool_name} failed.",
@@ -167,6 +194,19 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "oversized_result_stored": (
             "📦 Result saved for later processing."
         ),
+        "plan_created": "🗺️ Work plan created.",
+        "plan_revised": "🗺️ Work plan updated.",
+        "plan_node_started": "▶️ Working on stage: {node_title}",
+        "plan_node_completed": "✅ Stage completed: {node_title}",
+        "plan_node_blocked": "⏸️ Stage paused: {node_title}",
+        "plan_node_failed": "⚠️ Stage failed: {node_title}",
+        "plan_node_skipped": "⏭️ Stage skipped: {node_title}",
+        "plan_completed": "✅ Work plan completed.",
+        "plan_cancelled": "⛔ Work plan cancelled.",
+        "plan_revision_conflict": "⚠️ The plan changed; reading the current revision.",
+        "plan_validation_failed": "⚠️ The plan change failed validation.",
+        "plan_finalization_blocked": "🗺️ The unfinished plan must be reconciled first.",
+        "plan_waiting_user_blocked": "🗺️ Pause the active stage before asking the user.",
     },
 }
 
@@ -213,6 +253,21 @@ PROGRESS_MESSAGE_DEFAULT_KWARGS: dict[str, dict[str, dict[str, str]]] = {
             "ru": "неизвестный",
             "en": "unknown",
         },
+    },
+    "plan_node_started": {
+        "node_title": {"ru": "этап", "en": "stage"},
+    },
+    "plan_node_completed": {
+        "node_title": {"ru": "этап", "en": "stage"},
+    },
+    "plan_node_blocked": {
+        "node_title": {"ru": "этап", "en": "stage"},
+    },
+    "plan_node_failed": {
+        "node_title": {"ru": "этап", "en": "stage"},
+    },
+    "plan_node_skipped": {
+        "node_title": {"ru": "этап", "en": "stage"},
     },
 }
 
