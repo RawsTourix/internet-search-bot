@@ -13,11 +13,17 @@ from ..planning import (
     AgentActivity,
     PlanConsistencyError,
     PlanNodeKind,
+    PlanNodeStatus,
     PlanStatus,
     PlanStorageError,
     PlanningServices,
 )
-from ..planning.runtime_context import get_manager_context, set_manager_context
+from ..planning.cycle_memory import PlanningCycleCompactionService
+from ..planning.runtime_context import (
+    get_manager_context,
+    reset_manager_context,
+    set_manager_context,
+)
 from ..planning.tools import (
     PLAN_TOOL_NAMES,
     PLANNING_TOOL_DEFINITIONS,
@@ -65,6 +71,9 @@ class PlanningMCPClient(MCPClient):
             storage_services=storage_services,
             **kwargs,
         )
+        self.cycle_compaction_service = PlanningCycleCompactionService(
+            content_store=self.content_store
+        )
 
     def _build_manager_tools(self) -> dict[str, ManagerToolSpec]:
         tools = super()._build_manager_tools()
@@ -102,11 +111,11 @@ class PlanningMCPClient(MCPClient):
         return tools
 
     async def process_query(self, *args: Any, **kwargs: Any):
-        set_manager_context(None)
+        token = set_manager_context(None)
         try:
             return await super().process_query(*args, **kwargs)
         finally:
-            set_manager_context(None)
+            reset_manager_context(token)
 
     def _activate_manager_context(
         self,
@@ -147,7 +156,15 @@ class PlanningMCPClient(MCPClient):
         cycle.active_plan_state = state
         cycle.activity = self._activity_for_state(state)
 
-    async def _compact_context_if_needed(self, *, active_cycle, state, session_id, progress_callback, **kwargs):
+    async def _compact_context_if_needed(
+        self,
+        *,
+        active_cycle,
+        state,
+        session_id,
+        progress_callback,
+        **kwargs,
+    ):
         context = self._activate_manager_context(
             active_cycle=active_cycle,
             state=state,
@@ -347,16 +364,26 @@ class PlanningMCPClient(MCPClient):
                 "The agent repeatedly ignored active-plan reconciliation."
             )
 
+        plan = await self.planning_services.planning_service.get_plan(
+            session_id=context.session_id,
+            cycle_id=context.cycle_id,
+            plan_id=state.plan_id,
+        )
+        unfinished_node_ids = [
+            node.node_id
+            for node in plan.nodes
+            if node.status not in {
+                PlanNodeStatus.DONE,
+                PlanNodeStatus.SKIPPED,
+            }
+        ]
         self._replace_reconciliation_message(
             cycle.messages_for_llm,
             {
                 "type": message_type,
                 "plan_id": state.plan_id,
                 "revision": state.revision,
-                "unfinished_node_ids": [
-                    node.node_id
-                    for node in state.ready_nodes
-                ],
+                "unfinished_node_ids": unfinished_node_ids,
                 "blocked_node_ids": state.blocked_node_ids,
                 "failed_node_ids": state.failed_node_ids,
                 "message": message,
