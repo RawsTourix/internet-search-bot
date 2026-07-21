@@ -6,10 +6,10 @@ from .config import StorageConfigType
 from .errors import UnsupportedStorageBackendError
 from .file_backend import (
     FileSystemArtifactStore,
-    FileSystemContentStore,
     _AtomicFileBackend,
 )
 from .interfaces import ArtifactStore, ContentStore
+from .streaming import StreamingFileSystemContentStore
 
 
 @dataclass(slots=True)
@@ -28,6 +28,6 @@ def create_storage_services(config: StorageConfigType) -> StorageServices:
     backend = _AtomicFileBackend(config)
     return StorageServices(
         config=config,
-        content_store=FileSystemContentStore(backend),
+        content_store=StreamingFileSystemContentStore(backend),
         artifact_store=FileSystemArtifactStore(backend),
     )

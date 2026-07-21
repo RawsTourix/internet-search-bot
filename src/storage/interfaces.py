@@ -1,6 +1,6 @@
 """Protocols consumed by agent runtime and higher-level services."""
 
-from typing import Any, Protocol, runtime_checkable
+from typing import Any, AsyncIterator, Protocol, runtime_checkable
 
 from .models import ArtifactRef, ContentMatch, ContentMetadata, ContentRange, ContentRef
 
@@ -21,6 +21,32 @@ class ContentStore(Protocol):
         metadata: dict[str, Any] | None = None,
     ) -> ContentRef:
         """Persist content and return an opaque reference."""
+        ...
+
+    async def save_stream(
+        self,
+        chunks: AsyncIterator[bytes],
+        *,
+        source_type: str,
+        source_name: str | None = None,
+        mime_type: str | None = None,
+        encoding: str | None = None,
+        cycle_id: str | None = None,
+        tool_call_id: str | None = None,
+        size_tokens_estimate: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        max_size_bytes: int,
+    ) -> ContentRef:
+        """Persist an async byte stream without buffering the complete object."""
+        ...
+
+    def iter_content(
+        self,
+        content_id: str,
+        *,
+        chunk_size: int = 64 * 1024,
+    ) -> AsyncIterator[bytes]:
+        """Iterate verified content bytes without the full-read memory limit."""
         ...
 
     async def get_metadata(self, content_id: str) -> ContentMetadata:

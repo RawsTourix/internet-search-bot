@@ -35,6 +35,27 @@ class PlanningAwareContentStore(ContentStore):
     def __init__(self, wrapped: ContentStore) -> None:
         self.wrapped = wrapped
 
+    @staticmethod
+    def _enrich_metadata(
+        metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        enriched = dict(metadata or {})
+        context = get_manager_context()
+        if context is not None:
+            cycle = context.active_cycle
+            if cycle.active_plan_id is not None:
+                enriched.update({
+                    "plan_id": cycle.active_plan_id,
+                    "plan_revision": cycle.active_plan_revision,
+                    "plan_node_id": cycle.active_plan_node_id,
+                    "agent_activity": (
+                        cycle.activity.value
+                        if cycle.activity is not None
+                        else None
+                    ),
+                })
+        return enriched
+
     async def save_content(
         self,
         content: bytes | str,
@@ -48,19 +69,6 @@ class PlanningAwareContentStore(ContentStore):
         size_tokens_estimate: int | None = None,
         metadata: dict[str, Any] | None = None,
     ):
-        enriched = dict(metadata or {})
-        context = get_manager_context()
-        if context is not None:
-            cycle = context.active_cycle
-            if cycle.active_plan_id is not None:
-                enriched.update({
-                    "plan_id": cycle.active_plan_id,
-                    "plan_revision": cycle.active_plan_revision,
-                    "plan_node_id": cycle.active_plan_node_id,
-                    "agent_activity": (
-                        cycle.activity.value if cycle.activity is not None else None
-                    ),
-                })
         return await self.wrapped.save_content(
             content,
             source_type=source_type,
@@ -70,7 +78,34 @@ class PlanningAwareContentStore(ContentStore):
             cycle_id=cycle_id,
             tool_call_id=tool_call_id,
             size_tokens_estimate=size_tokens_estimate,
-            metadata=enriched,
+            metadata=self._enrich_metadata(metadata),
+        )
+
+    async def save_stream(
+        self,
+        chunks,
+        *,
+        source_type: str,
+        source_name: str | None = None,
+        mime_type: str | None = None,
+        encoding: str | None = None,
+        cycle_id: str | None = None,
+        tool_call_id: str | None = None,
+        size_tokens_estimate: int | None = None,
+        metadata: dict[str, Any] | None = None,
+        max_size_bytes: int,
+    ):
+        return await self.wrapped.save_stream(
+            chunks,
+            source_type=source_type,
+            source_name=source_name,
+            mime_type=mime_type,
+            encoding=encoding,
+            cycle_id=cycle_id,
+            tool_call_id=tool_call_id,
+            size_tokens_estimate=size_tokens_estimate,
+            metadata=self._enrich_metadata(metadata),
+            max_size_bytes=max_size_bytes,
         )
 
     async def get_metadata(self, content_id: str):
@@ -79,17 +114,41 @@ class PlanningAwareContentStore(ContentStore):
     async def read_content(self, content_id: str) -> bytes:
         return await self.wrapped.read_content(content_id)
 
+    async def iter_content(
+        self,
+        content_id: str,
+        *,
+        chunk_size: int = 64 * 1024,
+    ):
+        async for chunk in self.wrapped.iter_content(
+            content_id,
+            chunk_size=chunk_size,
+        ):
+            yield chunk
+
     async def read_text(self, content_id: str) -> str:
         return await self.wrapped.read_text(content_id)
 
-    async def read_range(self, content_id: str, *, offset: int, length: int):
+    async def read_range(
+        self,
+        content_id: str,
+        *,
+        offset: int,
+        length: int,
+    ):
         return await self.wrapped.read_range(
             content_id,
             offset=offset,
             length=length,
         )
 
-    async def search_text(self, content_id: str, *, query: str, limit: int = 10):
+    async def search_text(
+        self,
+        content_id: str,
+        *,
+        query: str,
+        limit: int = 10,
+    ):
         return await self.wrapped.search_text(
             content_id,
             query=query,
