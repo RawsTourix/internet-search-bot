@@ -14,10 +14,11 @@ from src.planning import (
     new_plan_node_id,
 )
 from src.planning.errors import (
+    PlanNotFoundError,
     PlanRevisionConflictError,
     PlanValidationError,
 )
-from src.planning.file_store import FileSystemPlanStore
+from src.planning.file_store import FileSystemPlanStore, _serialize_model
 from src.storage import StorageConfigType
 
 
@@ -87,6 +88,23 @@ class PlanStoreTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(PlanRevisionConflictError):
             await self.store.save_revision(candidate, expected_revision=0)
+
+    async def test_orphan_revision_is_not_exposed_before_metadata_commit(self):
+        plan = make_plan()
+        await self.store.create_plan(plan)
+        orphan = AgentPlan.model_validate(
+            plan.model_copy(update={"revision": 2, "goal": "Orphan"}).model_dump()
+        )
+        revision_path = (
+            self.store.root
+            / plan.plan_id
+            / "revisions"
+            / "000002.json"
+        )
+        revision_path.write_bytes(_serialize_model(orphan))
+        with self.assertRaises(PlanNotFoundError):
+            await self.store.get_plan(plan.plan_id, revision=2)
+        self.assertEqual((await self.store.get_plan(plan.plan_id)).revision, 1)
 
     async def test_list_cycle_plans(self):
         first = make_plan(cycle_id="cycle-a")
