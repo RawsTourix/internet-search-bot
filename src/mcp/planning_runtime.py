@@ -12,7 +12,7 @@ from .planning_client import PlanningMCPClient
 
 
 class FinalizingPlanningMCPClient(PlanningMCPClient):
-    """Convert repeated plan-protocol violations into an honest partial answer."""
+    """Turn repeated plan-protocol violations into resumable user handoff."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
@@ -62,25 +62,24 @@ class FinalizingPlanningMCPClient(PlanningMCPClient):
                 getattr(context.session_state, "progress_locale", "ru") or "ru"
             ).lower()
             if locale_name.startswith("en"):
-                final_answer = (
-                    "The task could not be completed safely because the agent "
-                    "repeatedly tried to finish while the active work plan still "
-                    "contained unresolved stages. The plan and collected runtime "
-                    "state were preserved for a later continuation."
+                question = (
+                    "The task could not be finalized safely because the active "
+                    "work plan still contains unresolved stages. The plan and "
+                    "collected runtime state were preserved. Continue working "
+                    "through the active plan?"
                 )
             else:
-                final_answer = (
-                    "Задачу не удалось безопасно завершить: агент несколько раз "
-                    "попытался сформировать финальный ответ, пока в активном плане "
-                    "оставались незавершённые этапы. План и собранное состояние "
-                    "сохранены для последующего продолжения."
+                question = (
+                    "Задачу не удалось безопасно финализировать: в активном плане "
+                    "остались незавершённые этапы. План и собранное состояние "
+                    "сохранены. Продолжить выполнение активного плана?"
                 )
 
             result = dict(response)
             result["content"] = AgentAction(
-                status="done",
-                action="answer",
-                final_answer=final_answer,
+                status="waiting_user",
+                action="ask_user",
+                question_to_user=question,
             ).model_dump_json()
             result["tool_calls"] = []
             return result
