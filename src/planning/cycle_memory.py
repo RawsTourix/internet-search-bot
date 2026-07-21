@@ -6,7 +6,26 @@ from ..memory import CycleCompactionService, CycleWorkingState
 
 
 class PlanningCycleCompactionService(CycleCompactionService):
-    """Overlay runtime-owned plan identity after ordinary cycle compaction."""
+    """Overlay runtime-owned plan identity around ordinary cycle compaction."""
+
+    @staticmethod
+    def _active_plan_projection(active_cycle):
+        state = active_cycle.active_plan_state
+        return state.model_dump(mode="json") if state is not None else None
+
+    def build_request(self, **kwargs):
+        kwargs.setdefault(
+            "active_plan_state",
+            self._active_plan_projection(kwargs["active_cycle"]),
+        )
+        return super().build_request(**kwargs)
+
+    def build_request_for_content_id(self, **kwargs):
+        kwargs.setdefault(
+            "active_plan_state",
+            self._active_plan_projection(kwargs["active_cycle"]),
+        )
+        return super().build_request_for_content_id(**kwargs)
 
     def build_working_memory(self, **kwargs):
         active_cycle = kwargs["active_cycle"]
