@@ -11,12 +11,19 @@ from .config import (
     safe_llm_config_summary,
     safe_memory_config_summary,
     safe_mcp_server_config_summary,
+    safe_planning_config_summary,
     safe_runtime_config_summary,
 )
-from ..mcp.mcp_client import MCPClient, load_config
+from ..mcp.mcp_client import load_config
+from ..mcp.planning_client import PlanningMCPClient
 from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import APIError
-from ..storage import create_storage_services
+from ..planning import (
+    create_planning_services,
+    load_planning_config,
+)
+from ..planning.runtime_context import PlanningAwareContentStore
+from ..storage import StorageServices, create_storage_services
 
 # Настройка прокси
 os.environ['http_proxy'] = HTTP_PROXY
@@ -56,7 +63,7 @@ class Api:
             # Загрузка конфигурации
             logger.info(
                 "Загрузка конфигурации MCP-серверов, LLM, storage, "
-                "memory и runtime"
+                "memory, runtime и planning"
             )
             (
                 self.server_configs,
@@ -65,6 +72,7 @@ class Api:
                 self.memory_config,
                 self.runtime_config,
             ) = load_config(config_path)
+            self.planning_config = load_planning_config(config_path)
 
             # Логируем только безопасную сводку: конфигурация также содержит
             # api_key, Authorization headers и env-переменные MCP-серверов.
@@ -105,16 +113,32 @@ class Api:
                 "Runtime lifecycle: %s",
                 safe_runtime_config_summary(self.runtime_config),
             )
+            logger.info(
+                "DAG planning: %s",
+                safe_planning_config_summary(self.planning_config),
+            )
 
-            self.storage_services = create_storage_services(self.storage_config)
+            base_storage_services = create_storage_services(self.storage_config)
+            self.storage_services = StorageServices(
+                config=base_storage_services.config,
+                content_store=PlanningAwareContentStore(
+                    base_storage_services.content_store
+                ),
+                artifact_store=base_storage_services.artifact_store,
+            )
+            self.planning_services = create_planning_services(
+                storage_config=self.storage_config,
+                planning_config=self.planning_config,
+            )
 
             # Создание и запуск клиента
-            logger.info("Инициализация MCP-клиента")
-            self.mcp_client = MCPClient(
+            logger.info("Инициализация planning-aware MCP-клиента")
+            self.mcp_client = PlanningMCPClient(
                 self.llm_config,
                 storage_services=self.storage_services,
                 memory_config=self.memory_config,
                 runtime_config=self.runtime_config,
+                planning_services=self.planning_services,
             )
         except Exception as e:
             raise APIError(f"Ошибка инициализации Api: {repr(e)}") from e
