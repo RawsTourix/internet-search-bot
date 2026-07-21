@@ -1,0 +1,54 @@
+name: Apply design document component map
+
+on:
+  push:
+    branches: [feature]
+    paths:
+      - "scripts/apply_design_document_component_map.py"
+      - ".github/workflows/apply-design-document-component-map.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-design-document:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Apply component-map migration
+        run: python scripts/apply_design_document_component_map.py
+
+      - name: Validate component map and prompt contract
+        run: |
+          python -m py_compile scripts/apply_design_document_component_map.py
+          grep -Fq "### 95.1. Граница существующих модулей и transport API" docs/design_document.md
+          grep -Fq "src/servers/telegram/telegram_server.py" docs/design_document.md
+          grep -Fq "src/core/message_processor.py" docs/design_document.md
+          grep -Fq "src/gateway.py" docs/design_document.md
+          grep -Fq "src/api/api.py" docs/design_document.md
+          grep -Fq "### 100.1. System prompt и agent protocol для артефактов" docs/design_document.md
+          grep -Fq "ClientResponseOutbox" docs/design_document.md
+
+      - name: Remove one-shot migration files
+        run: |
+          rm scripts/apply_design_document_component_map.py
+          rm .github/workflows/apply-design-document-component-map.yml
+
+      - name: Commit updated design document
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "docs: map input and artifact runtime components"
+          git push origin HEAD:feature
