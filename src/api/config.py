@@ -81,3 +81,15 @@ def safe_runtime_config_summary(config: Any) -> dict[str, Any]:
             config.mcp_call_retries_after_recovery
         ),
     }
+
+
+def safe_planning_config_summary(config: Any) -> dict[str, Any]:
+    """Return bounded non-sensitive DAG planning limits."""
+    return {
+        "enabled": config.enabled,
+        "max_nodes": config.max_nodes,
+        "max_dependencies_per_node": config.max_dependencies_per_node,
+        "max_ready_nodes_in_context": config.max_ready_nodes_in_context,
+        "max_plan_get_limit": config.max_plan_get_limit,
+        "max_reconciliation_attempts": config.max_reconciliation_attempts,
+    }
