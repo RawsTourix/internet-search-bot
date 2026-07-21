@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 
 from ..storage.config import StorageConfigType
+from .concurrent_service import ConcurrentPlanningService
 from .config import PlanningConfigType
 from .file_store import FileSystemPlanStore
 from .interfaces import PlanStore
@@ -28,7 +29,7 @@ def create_planning_services(
     return PlanningServices(
         config=planning_config,
         plan_store=plan_store,
-        planning_service=PlanningService(
+        planning_service=ConcurrentPlanningService(
             store=plan_store,
             config=planning_config,
         ),
