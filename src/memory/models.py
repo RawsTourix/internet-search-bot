@@ -13,6 +13,7 @@ from pydantic import (
     model_validator,
 )
 
+from ..planning.models import is_plan_id, is_plan_node_id
 from ..storage.models import (
     ContentRef,
     StoredResultRef,
@@ -212,6 +213,7 @@ class CycleWorkingState(_CycleModel):
     )
 
     active_plan_id: str | None = None
+    active_plan_revision: int | None = Field(default=None, ge=1)
     active_plan_node_id: str | None = None
 
     result_refs: list[str] = Field(
@@ -231,17 +233,33 @@ class CycleWorkingState(_CycleModel):
             raise ValueError("current_goal must not be empty")
         return value
 
-    @field_validator(
-        "pending_confirmation",
-        "active_plan_id",
-        "active_plan_node_id",
-    )
+    @field_validator("pending_confirmation")
     @classmethod
     def normalize_optional_text(cls, value: str | None) -> str | None:
         if value is None:
             return None
         value = value.strip()
         return value or None
+
+    @field_validator("active_plan_id")
+    @classmethod
+    def validate_active_plan_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not is_plan_id(value):
+            raise ValueError("active_plan_id must be an opaque plan ID")
+        return value
+
+    @field_validator("active_plan_node_id")
+    @classmethod
+    def validate_active_plan_node_id(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        value = value.strip()
+        if not is_plan_node_id(value):
+            raise ValueError("active_plan_node_id must be an opaque plan-node ID")
+        return value
 
     @field_validator(
         "completed_actions",
@@ -281,6 +299,15 @@ class CycleWorkingState(_CycleModel):
         if any(not is_artifact_id(ref) for ref in refs):
             raise ValueError("artifact_refs must contain opaque artifact IDs")
         return refs
+
+    @model_validator(mode="after")
+    def validate_plan_identity(self):
+        if self.active_plan_id is None:
+            if self.active_plan_revision is not None or self.active_plan_node_id is not None:
+                raise ValueError(
+                    "plan revision/node require active_plan_id"
+                )
+        return self
 
 
 class CycleWorkingMemory(_CycleModel):
