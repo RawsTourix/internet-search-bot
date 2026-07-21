@@ -8,6 +8,7 @@ from typing import Any
 
 from ..memory.models import CycleWorkingMemory
 from ..memory.token_estimation import TokenUsageSnapshot
+from ..planning.models import ActivePlanState, AgentActivity
 
 
 @dataclass(slots=True)
@@ -30,7 +31,13 @@ class ActiveAgentCycle:
 
     result_refs: list[str] = field(default_factory=list)
     artifact_refs: list[str] = field(default_factory=list)
+
     active_plan_id: str | None = None
+    active_plan_revision: int | None = None
+    active_plan_node_id: str | None = None
+    active_plan_state: ActivePlanState | None = None
+    activity: AgentActivity | None = None
+    plan_reconciliation_attempts: int = 0
 
     tools_used: list[str] = field(default_factory=list)
     progress_events: list[dict[str, Any]] = field(default_factory=list)
