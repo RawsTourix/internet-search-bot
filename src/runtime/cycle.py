@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
-from ..memory.models import CycleWorkingMemory
-from ..memory.token_estimation import TokenUsageSnapshot
-from ..planning.models import ActivePlanState, AgentActivity
+if TYPE_CHECKING:
+    from ..memory.models import CycleWorkingMemory
+    from ..memory.token_estimation import TokenUsageSnapshot
+    from ..planning.models import ActivePlanState, AgentActivity
 
 
 @dataclass(slots=True)
