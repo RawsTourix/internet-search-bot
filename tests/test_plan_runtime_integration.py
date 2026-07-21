@@ -7,6 +7,7 @@ from src.agent.protocol import AgentAction
 from src.mcp.manager_context import ManagerToolContext
 from src.mcp.mcp_client import LLMConfigType, SessionState
 from src.mcp.planning_client import PlanningMCPClient
+from src.mcp.planning_runtime import FinalizingPlanningMCPClient
 from src.planning import PlanningConfigType, create_planning_services
 from src.planning.runtime_context import set_manager_context
 from src.planning.tools import PLAN_TOOL_NAMES
@@ -89,6 +90,14 @@ class PlanRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         }
         self.assertTrue(PLAN_TOOL_NAMES.issubset(formatted_names))
 
+    def test_planning_tool_schemas_have_no_local_refs(self):
+        for item in self.client._format_tools_for_llm():
+            if item["function"]["name"] not in PLAN_TOOL_NAMES:
+                continue
+            serialized = json.dumps(item["function"]["parameters"])
+            self.assertNotIn('"$ref"', serialized)
+            self.assertNotIn('"$defs"', serialized)
+
     async def test_planning_disabled_omits_plan_tools(self):
         root = Path(self.temporary.name)
         storage_config = StorageConfigType(
@@ -162,6 +171,87 @@ class PlanRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             "plan_reconciliation_required" in str(message.get("content"))
             for message in self.cycle.messages_for_llm
         ))
+
+    async def test_reconciliation_limit_returns_honest_partial_answer(self):
+        root = Path(self.temporary.name)
+        storage_config = StorageConfigType(root_dir=str(root / "final-storage"))
+        storage_services = create_storage_services(storage_config)
+        services = create_planning_services(
+            storage_config=storage_config,
+            planning_config=PlanningConfigType(max_reconciliation_attempts=1),
+        )
+        client = FinalizingPlanningMCPClient(
+            LLMConfigType(
+                api_url="https://example.invalid/v1/chat/completions",
+                api_key="test",
+                model="test-model",
+                max_tokens=256,
+                context_window_tokens=4096,
+            ),
+            storage_services=storage_services,
+            planning_services=services,
+        )
+        cycle = ActiveAgentCycle(
+            cycle_id="cycle-final",
+            session_id="session-final",
+            original_user_request="Complex task",
+            messages_for_llm=[],
+            cycle_trace=[],
+            original_user_message_index=0,
+        )
+        state = SessionState()
+        context = ManagerToolContext(
+            session_id="session-final",
+            cycle_id="cycle-final",
+            active_cycle=cycle,
+            session_state=state,
+        )
+        set_manager_context(context)
+        try:
+            created = await client.plan_tool_controller.execute(
+                "agent_plan_create",
+                {
+                    "goal": "Unfinished work",
+                    "nodes": [
+                        {
+                            "client_key": "work",
+                            "title": "Work",
+                            "objective": "Do the work",
+                            "kind": "execute",
+                            "depends_on": [],
+                            "success_criteria": [],
+                        }
+                    ],
+                },
+                context,
+            )
+            self.assertEqual(created.payload["type"], "plan_created")
+            response = {
+                "content": AgentAction(
+                    status="done",
+                    action="answer",
+                    final_answer="Premature",
+                ).model_dump_json(),
+                "tool_calls": [],
+            }
+            first = await client._apply_plan_action_guard(
+                response=response,
+                context=context,
+            )
+            self.assertEqual(
+                AgentAction.model_validate_json(first["content"]).status,
+                "running",
+            )
+            second = await client._apply_plan_action_guard(
+                response=response,
+                context=context,
+            )
+            final_action = AgentAction.model_validate_json(second["content"])
+            self.assertEqual(final_action.status, "done")
+            self.assertIn("не удалось безопасно завершить", final_action.final_answer)
+        finally:
+            set_manager_context(self.context)
+            await client.cleanup()
 
     async def test_waiting_user_requires_blocked_node(self):
         created = await self._create_plan()
