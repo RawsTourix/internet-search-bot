@@ -15,7 +15,7 @@ from .config import (
     safe_runtime_config_summary,
 )
 from ..mcp.mcp_client import load_config
-from ..mcp.planning_client import PlanningMCPClient
+from ..mcp.planning_runtime import FinalizingPlanningMCPClient
 from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import APIError
 from ..planning import (
@@ -133,7 +133,7 @@ class Api:
 
             # Создание и запуск клиента
             logger.info("Инициализация planning-aware MCP-клиента")
-            self.mcp_client = PlanningMCPClient(
+            self.mcp_client = FinalizingPlanningMCPClient(
                 self.llm_config,
                 storage_services=self.storage_services,
                 memory_config=self.memory_config,
