@@ -22,6 +22,7 @@ from .models import (
     CreatePlanNodeInput,
     PlanNodeKind,
     PlanNodeStatus,
+    PlanNodeSummary,
     PlanNodeTransition,
     PlanStatus,
 )
@@ -352,9 +353,13 @@ class PlanningToolController:
             cycle_id=context.cycle_id,
             plan_id=plan_id,
         )
+        reading_current_pointer = (
+            context.active_cycle.active_plan_id == plan.plan_id
+        )
         if parsed.view == PlanGetView.SUMMARY:
             state = self.service._state(plan)
-            self._sync_cycle(context, state)
+            if reading_current_pointer:
+                self._sync_cycle(context, state)
             payload = state.model_dump(mode="json")
         elif parsed.view == PlanGetView.NODE:
             node = next(
@@ -388,7 +393,16 @@ class PlanningToolController:
                 "offset": parsed.offset,
                 "limit": limit,
                 "total": len(items),
-                "items": [item.model_dump(mode="json") for item in page],
+                "items": [
+                    PlanNodeSummary(
+                        node_id=item.node_id,
+                        key=item.key,
+                        title=item.title,
+                        kind=item.kind,
+                        status=item.status,
+                    ).model_dump(mode="json")
+                    for item in page
+                ],
             }
         return PlanningToolOutcome(payload=payload)
 
@@ -591,7 +605,8 @@ class PlanningToolController:
             )
         except Exception:
             return None
-        self._sync_cycle(context, state)
+        if context.active_cycle.active_plan_id == state.plan_id:
+            self._sync_cycle(context, state)
         return state
 
     @staticmethod
