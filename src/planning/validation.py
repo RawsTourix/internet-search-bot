@@ -153,6 +153,8 @@ def _validate_acyclic(node_by_id: dict[str, PlanNode]) -> None:
 
 def ready_nodes(plan: AgentPlan) -> list[PlanNode]:
     """Return deterministic ready nodes without persisting a ready status."""
+    if plan.status != PlanStatus.ACTIVE:
+        return []
     node_by_id = {node.node_id: node for node in plan.nodes}
     ready: list[PlanNode] = []
     for node in plan.nodes:
@@ -167,6 +169,8 @@ def ready_nodes(plan: AgentPlan) -> list[PlanNode]:
 
 
 def current_node(plan: AgentPlan) -> PlanNode | None:
+    if plan.status != PlanStatus.ACTIVE:
+        return None
     return next(
         (node for node in plan.nodes if node.status == PlanNodeStatus.IN_PROGRESS),
         None,
