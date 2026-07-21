@@ -4,10 +4,12 @@ from src.api.config import (
     safe_llm_config_summary,
     safe_memory_config_summary,
     safe_mcp_server_config_summary,
+    safe_planning_config_summary,
     safe_runtime_config_summary,
 )
 from src.memory import MemoryConfigType
 from src.mcp.mcp_client import LLMConfigType, ServerConfigType, ServerConnectType
+from src.planning import PlanningConfigType
 from src.runtime import RuntimeConfigType
 
 
@@ -37,6 +39,7 @@ class ApiConfigLoggingTests(unittest.TestCase):
                 "servers": safe_mcp_server_config_summary(server_configs),
                 "memory": safe_memory_config_summary(MemoryConfigType()),
                 "runtime": safe_runtime_config_summary(RuntimeConfigType()),
+                "planning": safe_planning_config_summary(PlanningConfigType()),
             }
         )
 
@@ -53,6 +56,8 @@ class ApiConfigLoggingTests(unittest.TestCase):
         self.assertIn("cycle_compaction_summary_target_tokens", summaries)
         self.assertIn("cycle_compaction_max_output_tokens", summaries)
         self.assertIn("mcp_runtime_close_timeout", summaries)
+        self.assertIn("max_ready_nodes_in_context", summaries)
+        self.assertIn("max_reconciliation_attempts", summaries)
 
 
 if __name__ == "__main__":
