@@ -24,6 +24,7 @@ from ..planning.runtime_context import (
     reset_manager_context,
     set_manager_context,
 )
+from ..planning.schema import inline_local_schema_refs
 from ..planning.tools import (
     PLAN_TOOL_NAMES,
     PLANNING_TOOL_DEFINITIONS,
@@ -104,7 +105,7 @@ class PlanningMCPClient(MCPClient):
             tools[definition.name] = ManagerToolSpec(
                 name=definition.name,
                 description=definition.description,
-                parameters=definition.parameters(),
+                parameters=inline_local_schema_refs(definition.parameters()),
                 handler=handler,
                 progress_key=definition.progress_key,
             )
@@ -293,23 +294,31 @@ class PlanningMCPClient(MCPClient):
             )
             if payload.get(key) is not None
         }
-        self._trace_event(
-            cycle.cycle_trace,
-            outcome.event_type,
-            **safe_data,
-        )
-        await self._emit_progress_event(
-            state=context.session_state,
-            session_id=context.session_id,
-            cycle_id=context.cycle_id,
-            progress_callback=context.progress_callback,
-            cycle_trace=cycle.cycle_trace,
-            event_type=outcome.event_type,
-            severity=outcome.severity,
-            visibility=outcome.visibility,
-            data=safe_data,
-            message_kwargs={"node_title": outcome.node_title or ""},
-        )
+        event_types = [outcome.event_type]
+        if (
+            outcome.event_type == "plan_completed"
+            and payload.get("transition") == "complete"
+        ):
+            event_types = ["plan_node_completed", "plan_completed"]
+
+        for event_type in event_types:
+            self._trace_event(
+                cycle.cycle_trace,
+                event_type,
+                **safe_data,
+            )
+            await self._emit_progress_event(
+                state=context.session_state,
+                session_id=context.session_id,
+                cycle_id=context.cycle_id,
+                progress_callback=context.progress_callback,
+                cycle_trace=cycle.cycle_trace,
+                event_type=event_type,
+                severity=outcome.severity,
+                visibility=outcome.visibility,
+                data=safe_data,
+                message_kwargs={"node_title": outcome.node_title or ""},
+            )
 
     async def _apply_plan_action_guard(
         self,
