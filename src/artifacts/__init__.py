@@ -14,6 +14,10 @@ from .errors import (
     ArtifactValidationError,
     ArtifactVersionConflictError,
 )
+from .factory import ArtifactServices, create_artifact_services
+from .file_store import FileSystemArtifactStore
+from .interfaces import ArtifactStore
+from .migration import LegacyArtifactMigrator, LegacyMigrationReport
 from .models import (
     ArtifactAccessContext,
     ArtifactCandidate,
@@ -63,12 +67,18 @@ __all__ = [
     "ArtifactNotFoundError",
     "ArtifactProvenance",
     "ArtifactPurpose",
+    "ArtifactServices",
     "ArtifactStorageError",
+    "ArtifactStore",
     "ArtifactValidationError",
     "ArtifactVersion",
     "ArtifactVersionConflictError",
     "ArtifactVersionRef",
     "ExactTextPatchOperation",
+    "FileSystemArtifactStore",
+    "LegacyArtifactMigrator",
+    "LegacyMigrationReport",
+    "create_artifact_services",
     "is_artifact_candidate_id",
     "is_artifact_delivery_id",
     "is_artifact_id",
