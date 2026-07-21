@@ -1,6 +1,6 @@
 """Public planning-layer exports."""
 
-from .config import PlanningConfigType
+from .config import PlanningConfigType, load_planning_config
 from .errors import (
     PlanAccessError,
     PlanConsistencyError,
@@ -8,6 +8,7 @@ from .errors import (
     PlanRevisionConflictError,
     PlanStorageError,
     PlanValidationError,
+    PlanningConfigValidationError,
     PlanningError,
 )
 from .factory import PlanningServices, create_planning_services
@@ -63,6 +64,7 @@ __all__ = [
     "PlanStore",
     "PlanValidationError",
     "PlanningConfigType",
+    "PlanningConfigValidationError",
     "PlanningError",
     "PlanningService",
     "PlanningServices",
@@ -73,6 +75,7 @@ __all__ = [
     "is_plan_id",
     "is_plan_node_id",
     "is_stalled",
+    "load_planning_config",
     "new_plan_id",
     "new_plan_node_id",
     "ready_nodes",
