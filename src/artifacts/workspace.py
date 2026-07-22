@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import json
 import os
@@ -486,9 +487,46 @@ def _bounded_container_entries(path: Path, *, limit: int) -> list[str]:
         return []
 
 
+def _make_workspace_tree_writable(path: Path) -> None:
+    """Restore write permission without following tool-created symlinks."""
+    for root, directories, files in os.walk(path, topdown=False, followlinks=False):
+        for name in files:
+            candidate = Path(root) / name
+            if candidate.is_symlink():
+                continue
+            try:
+                candidate.chmod(candidate.stat().st_mode | stat.S_IWRITE)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                # rmtree below remains the authority and will surface a useful
+                # cleanup error if the entry is still undeletable.
+                pass
+        for name in directories:
+            candidate = Path(root) / name
+            if candidate.is_symlink():
+                continue
+            try:
+                candidate.chmod(candidate.stat().st_mode | stat.S_IWRITE)
+            except FileNotFoundError:
+                continue
+            except OSError:
+                pass
+    if not path.is_symlink():
+        try:
+            path.chmod(path.stat().st_mode | stat.S_IWRITE)
+        except (FileNotFoundError, OSError):
+            pass
+
+
+def _remove_tree_sync(path: Path) -> None:
+    _make_workspace_tree_writable(path)
+    shutil.rmtree(path, ignore_errors=False)
+
+
 async def _remove_tree(path: Path) -> None:
     try:
-        shutil.rmtree(path, ignore_errors=False)
+        await asyncio.to_thread(_remove_tree_sync, path)
     except FileNotFoundError:
         return
     except OSError as error:
