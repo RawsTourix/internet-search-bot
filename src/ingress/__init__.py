@@ -1,6 +1,10 @@
 """Public API for transport-neutral file ingress."""
 
-from .config import IngressConfigType
+from .config import (
+    IngressConfigType,
+    IngressConfigValidationError,
+    load_ingress_config,
+)
 from .factory import IngressServices, create_ingress_services
 from .models import (
     ClientAttachmentLocator,
@@ -45,6 +49,7 @@ __all__ = [
     "FileSystemInputBatchStore",
     "IngressAttachmentSlot",
     "IngressConfigType",
+    "IngressConfigValidationError",
     "IngressConflictError",
     "IngressNotFoundError",
     "IngressServices",
@@ -60,6 +65,7 @@ __all__ = [
     "create_ingress_services",
     "is_ingress_event_id",
     "is_input_batch_id",
+    "load_ingress_config",
     "new_ingress_event_id",
     "new_input_batch_id",
 ]
