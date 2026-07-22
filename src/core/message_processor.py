@@ -6,6 +6,7 @@ from logging.handlers import RotatingFileHandler
 
 from .models import UnifiedMessage, UnifiedResponse, ClientType, MessageType
 from ..api.api import API
+from ..ingress import CommittedInputBatch
 
 # Проверяем и создаем папку для логов
 log_dir = "logging"
@@ -52,30 +53,67 @@ class MessageProcessor:
     ) -> UnifiedResponse:
         """Обработка унифицированного сообщения"""
         try:
-            logger.info(f"Обработка сообщения от {message.client_type}: {message.content}")
-            
-            # Обновление статистики
-            self.stats["total_messages"] += 1
-            self.stats["messages_by_client"][message.client_type.value] += 1
-            
-            # Получение ответа
-            response = await self._generate_response(
+            logger.info(
+                "Обработка сообщения от %s, content_chars=%s",
+                message.client_type,
+                len(message.content or ""),
+            )
+            self._record_request(message.client_type)
+            return await self._generate_response(
                 message,
                 progress_callback=progress_callback,
             )
-            
-            return response
-            
         except Exception as e:
             logger.error(f"Ошибка обработки сообщения: {e}")
             self.stats["errors"] += 1
-            
             return UnifiedResponse(
                 message_id=message.id,
                 client_type=message.client_type,
                 content=f"Произошла ошибка при обработке сообщения: {str(e)}",
                 response_type=MessageType.TEXT
             )
+
+    async def process_committed_batch(
+        self,
+        batch: CommittedInputBatch,
+        *,
+        progress_callback=None,
+        progress_locale: str = "ru",
+    ) -> UnifiedResponse:
+        """Run the agent from one immutable batch committed by ingress."""
+        try:
+            self._record_request(batch.client_type)
+            result = await API.call_agent_batch(
+                batch.input_batch_id,
+                session_id=batch.session_id,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+            )
+            return UnifiedResponse(
+                message_id=batch.input_batch_id,
+                client_type=batch.client_type,
+                content=result.content,
+                response_type=MessageType.TEXT,
+                metadata=self._agent_result_metadata(result),
+            )
+        except Exception as error:
+            logger.error(
+                "Ошибка обработки committed batch %s: %r",
+                batch.input_batch_id,
+                error,
+            )
+            self.stats["errors"] += 1
+            return UnifiedResponse(
+                message_id=batch.input_batch_id,
+                client_type=batch.client_type,
+                content=f"Произошла ошибка при обработке batch: {error}",
+                response_type=MessageType.TEXT,
+                metadata={"input_batch_id": batch.input_batch_id},
+            )
+
+    def _record_request(self, client_type: ClientType) -> None:
+        self.stats["total_messages"] += 1
+        self.stats["messages_by_client"][client_type.value] += 1
         
     def _build_session_id(self, message: UnifiedMessage) -> str:
         """Строит идентификатор сессии"""
@@ -116,16 +154,7 @@ class MessageProcessor:
                     progress_locale=progress_locale,
                 )
                 response_content = agent_result.content
-                response_metadata = {
-                    "agent_status": agent_result.status,
-                    "session_id": agent_result.session_id,
-                    "iterations": agent_result.iterations,
-                    "tools_used": agent_result.tools_used,
-                    "error": agent_result.error,
-                    "error_kind": agent_result.error_kind,
-                    "can_resume": agent_result.can_resume,
-                    "progress_events": agent_result.progress_events
-                }
+                response_metadata = self._agent_result_metadata(agent_result)
 
             except Exception as e:
                 response_content = f"Сообщение не обработано: {e}"
@@ -139,6 +168,20 @@ class MessageProcessor:
         )
         
         return response
+
+    @staticmethod
+    def _agent_result_metadata(agent_result) -> dict[str, Any]:
+        return {
+            "agent_status": agent_result.status,
+            "session_id": agent_result.session_id,
+            "iterations": agent_result.iterations,
+            "tools_used": agent_result.tools_used,
+            "error": agent_result.error,
+            "error_kind": agent_result.error_kind,
+            "can_resume": agent_result.can_resume,
+            "progress_events": agent_result.progress_events,
+            "artifacts": list(agent_result.artifacts),
+        }
         
     async def _handle_command(self, message: UnifiedMessage) -> str:
         """Обработка команд"""
@@ -172,7 +215,7 @@ class MessageProcessor:
 /reset - очиска памяти
 /help - справка
 
-Вы можете отправлять любые текстовые сообщения для обработки.
+Вы можете отправлять текст и файлы для обработки.
         """.strip()
     
     async def _get_status_text(self) -> str:
