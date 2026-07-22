@@ -17,6 +17,7 @@ from .config import (
 )
 from ..artifacts import (
     apply_local_workspace_server_policy,
+    cleanup_stale_artifact_workspaces,
     create_artifact_services,
     load_artifact_config,
     recover_stale_delivery_claims,
@@ -174,19 +175,39 @@ class Api:
             raise APIError(f"Ошибка инициализации Api: {error!r}") from error
 
     async def start(self):
-        """Recover durable transport state, then connect MCP servers."""
+        """Recover durable state conservatively, then connect MCP servers."""
         try:
-            recovered = await recover_stale_delivery_claims(
+            removed_workspaces = await cleanup_stale_artifact_workspaces(
+                self.artifact_services.workspace_manager,
+                ttl_seconds=self.artifact_config.workspace_ttl_seconds,
+            )
+            if removed_workspaces:
+                logger.warning(
+                    "Removed %s stale artifact workspaces",
+                    len(removed_workspaces),
+                )
+
+            recovered_deliveries = await recover_stale_delivery_claims(
                 self.artifact_services.delivery_store,
                 claim_timeout_seconds=(
                     self.artifact_config.delivery_claim_timeout_seconds
                 ),
             )
-            if recovered:
+            if recovered_deliveries:
                 logger.warning(
                     "Recovered %s stale delivery claims as unknown",
-                    len(recovered),
+                    len(recovered_deliveries),
                 )
+
+            committed_drafts = (
+                await self.ingress_services.ingress_service.commit_ready_drafts()
+            )
+            if committed_drafts:
+                logger.warning(
+                    "Committed %s recovered input drafts without automatic agent run",
+                    len(committed_drafts),
+                )
+
             logger.info("Подключение к MCP-серверам")
             await self.mcp_client.connect_to_servers(self.server_configs)
         except Exception as error:
