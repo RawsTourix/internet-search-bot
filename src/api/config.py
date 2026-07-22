@@ -35,6 +35,7 @@ def safe_mcp_server_config_summary(configs: Iterable[Any]) -> list[dict[str, Any
             "connect_type": item.connect_type.value,
             "enabled": item.enabled,
             "startup_required": item.startup_required,
+            "artifact_transport": getattr(item, "artifact_transport", "none"),
         }
         for item in configs
     ]
@@ -112,4 +113,7 @@ def safe_artifact_config_summary(config: Any) -> dict[str, Any]:
         ),
         "allow_opaque_binary": config.allow_opaque_binary,
         "auto_select_deliverables": config.auto_select_deliverables,
+        "local_workspace_server_count": len(
+            config.local_workspace_server_names
+        ),
     }
