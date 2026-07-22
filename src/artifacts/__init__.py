@@ -16,6 +16,11 @@ from .errors import (
 )
 from .factory import ArtifactServices, create_artifact_services
 from .file_store import FileSystemArtifactStore
+from .format_registry import (
+    ArtifactFormatDetection,
+    ArtifactFormatRegistry,
+    build_default_format_registry,
+)
 from .interfaces import ArtifactStore
 from .migration import LegacyArtifactMigrator, LegacyMigrationReport
 from .models import (
@@ -44,6 +49,9 @@ from .models import (
     new_artifact_lineage_id,
     utc_now,
 )
+from .service import ArtifactSearchResult, ArtifactService, ArtifactTextReadResult
+from .text_operations import apply_exact_text_patch, enforce_text_size
+from .validators import ArtifactValidationReport, validate_native_text
 
 __all__ = [
     "ArtifactAccessContext",
@@ -59,6 +67,8 @@ __all__ = [
     "ArtifactDeliveryRef",
     "ArtifactDeliveryState",
     "ArtifactError",
+    "ArtifactFormatDetection",
+    "ArtifactFormatRegistry",
     "ArtifactFormatSpec",
     "ArtifactIntegrityError",
     "ArtifactLimitError",
@@ -67,10 +77,14 @@ __all__ = [
     "ArtifactNotFoundError",
     "ArtifactProvenance",
     "ArtifactPurpose",
+    "ArtifactSearchResult",
+    "ArtifactService",
     "ArtifactServices",
     "ArtifactStorageError",
     "ArtifactStore",
+    "ArtifactTextReadResult",
     "ArtifactValidationError",
+    "ArtifactValidationReport",
     "ArtifactVersion",
     "ArtifactVersionConflictError",
     "ArtifactVersionRef",
@@ -78,7 +92,10 @@ __all__ = [
     "FileSystemArtifactStore",
     "LegacyArtifactMigrator",
     "LegacyMigrationReport",
+    "apply_exact_text_patch",
+    "build_default_format_registry",
     "create_artifact_services",
+    "enforce_text_size",
     "is_artifact_candidate_id",
     "is_artifact_delivery_id",
     "is_artifact_id",
@@ -89,4 +106,5 @@ __all__ = [
     "new_artifact_id",
     "new_artifact_lineage_id",
     "utc_now",
+    "validate_native_text",
 ]
