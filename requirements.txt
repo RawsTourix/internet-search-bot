@@ -1,6 +1,7 @@
 # Основные веб-фреймворки и серверы
 fastapi
 uvicorn
+python-multipart
 
 # Model Context Protocol
 mcp
