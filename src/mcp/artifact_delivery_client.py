@@ -4,20 +4,25 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..agent.protocol import dumps_json
 from ..artifacts.delivery_tools import (
     ARTIFACT_DELIVERY_TOOL_DEFINITIONS,
     ARTIFACT_DELIVERY_TOOL_NAMES,
     ArtifactDeliveryToolController,
 )
+from ..artifacts.errors import ArtifactAccessError
 from ..artifacts.runtime import ArtifactRuntimeCoordinator
 from .artifact_client import ArtifactMCPClient
 from .artifact_request_context import (
     get_artifact_request_client_type,
     get_artifact_request_cycle_identity,
+    get_artifact_request_input_batch,
     reset_artifact_request_client_type,
     reset_artifact_request_cycle_identity,
+    reset_artifact_request_input_batch,
     set_artifact_request_client_type,
     set_artifact_request_cycle_identity,
+    set_artifact_request_input_batch,
 )
 from .manager_context import ManagerToolContext
 from .manager_runtime_context import get_manager_context
@@ -26,7 +31,7 @@ from .schema import inline_local_schema_refs
 
 
 class ArtifactDeliveryMixin:
-    """Add delivery control without bypassing the inherited agent runtime."""
+    """Add input artifacts and delivery without bypassing inherited runtime."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         artifact_services = kwargs.get("artifact_services")
@@ -82,10 +87,22 @@ class ArtifactDeliveryMixin:
         return tools
 
     async def process_query(self, *args: Any, **kwargs: Any):
-        client_token = set_artifact_request_client_type(
-            kwargs.get("client_type")
-        )
+        input_batch = kwargs.pop("input_batch", None)
+        client_type = kwargs.get("client_type")
+        if client_type is None and input_batch is not None:
+            client_type = input_batch.client_type
+            kwargs["client_type"] = client_type
+
+        if input_batch is not None:
+            query = dumps_json(input_batch.to_agent_payload())
+            if args:
+                args = (query, *args[1:])
+            else:
+                kwargs["query"] = query
+
+        client_token = set_artifact_request_client_type(client_type)
         identity_token = set_artifact_request_cycle_identity(None)
+        batch_token = set_artifact_request_input_batch(input_batch)
         try:
             result = await super().process_query(*args, **kwargs)
             identity = get_artifact_request_cycle_identity()
@@ -105,6 +122,7 @@ class ArtifactDeliveryMixin:
                 ]
             return result
         finally:
+            reset_artifact_request_input_batch(batch_token)
             reset_artifact_request_cycle_identity(identity_token)
             reset_artifact_request_client_type(client_token)
 
@@ -126,6 +144,25 @@ class ArtifactDeliveryMixin:
         set_artifact_request_cycle_identity(
             (context.session_id, context.cycle_id)
         )
+
+        input_batch = get_artifact_request_input_batch()
+        if input_batch is not None:
+            if input_batch.session_id != context.session_id:
+                raise ArtifactAccessError(
+                    "Committed input batch belongs to another session"
+                )
+            existing_batch_id = context.active_cycle.original_input_batch_id
+            if (
+                existing_batch_id is not None
+                and existing_batch_id != input_batch.input_batch_id
+            ):
+                raise ArtifactAccessError(
+                    "Additional committed batches require CycleInbox runtime"
+                )
+            context.active_cycle.original_input_batch_id = input_batch.input_batch_id
+            for artifact_id in input_batch.artifact_refs:
+                if artifact_id not in context.active_cycle.artifact_refs:
+                    context.active_cycle.artifact_refs.append(artifact_id)
         return context
 
     async def _call_registered_tool(
