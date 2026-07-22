@@ -70,7 +70,7 @@ class ServerConnectType(str, Enum):
     """Перечисление типов подключения к серверу"""
     EXECUTABLE = "executable"           # Запуск сервера как процесса
     MCP_LOOKUP = "mcp_lookup"           # Использование имени из конфигурации MCP
-    HTTP = "http"                       # Подключение к серверу по HTTP
+    HTTP = "http"                       # Подключение по HTTP
     STREAMABLE_HTTP = "streamable_http"
     SSE = "sse"
 
@@ -113,3 +113,4 @@ class AgentResult(BaseModel):
     error_kind: Optional[str] = None
     can_resume: bool = False
     progress_events: List[Dict[str, Any]] = Field(default_factory=list)
+    artifacts: List[Dict[str, Any]] = Field(default_factory=list)
