@@ -1,4 +1,3 @@
-import logging
 import os
 from dotenv import load_dotenv
 
@@ -26,6 +25,23 @@ TELEGRAM_PROGRESS_CALLBACK_TOKEN = os.getenv(
     "TELEGRAM_PROGRESS_CALLBACK_TOKEN",
     "",
 ) or WEBHOOK_SECRET or ""
+
+# Закрытый endpoint, через который Gateway потоково забирает Telegram file_id.
+TELEGRAM_FILE_PROVIDER_TOKEN = os.getenv(
+    "TELEGRAM_FILE_PROVIDER_TOKEN",
+    "",
+) or WEBHOOK_SECRET or ""
+TELEGRAM_BOT_INSTANCE_ID = os.getenv(
+    "TELEGRAM_BOT_INSTANCE_ID",
+    "default",
+).strip() or "default"
+TELEGRAM_MEDIA_GROUP_COMMIT_DELAY_SECONDS = float(
+    os.getenv("TELEGRAM_MEDIA_GROUP_COMMIT_DELAY_SECONDS", "2.5")
+)
+TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES = int(
+    os.getenv("TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES", str(8 * 1024 * 1024))
+)
+
 PROGRESS_EDIT_MIN_INTERVAL = float(
     os.getenv("PROGRESS_EDIT_MIN_INTERVAL", "1.2")
 )
