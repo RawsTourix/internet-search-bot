@@ -20,6 +20,7 @@ from ..ingress import (
     IngressNotFoundError,
     InputGroupingMode,
     InputSubmissionResult,
+    resolve_input_grouping,
 )
 
 
@@ -214,10 +215,13 @@ class ArtifactTransportFacade:
                 max_size_bytes=self.api.artifact_config.max_artifact_size_bytes,
             )
 
-        return await self.api.submit_input(
+        grouping = resolve_input_grouping(envelope)
+        return await self.api.ingress_services.ingress_service.submit_atomic(
             envelope,
             session_id=self.session_id_for(envelope),
             upload_streams=streams,
+            grouping_mode=grouping.mode,
+            grouping_key=grouping.key,
         )
 
     async def commit_grouped_batch(
