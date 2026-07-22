@@ -1,16 +1,9 @@
-name: Validate v0.4 artifact MCP workspace
+name: Apply and validate v0.4 artifact MCP workspace
 
 on:
   push:
     branches: [feature]
     paths:
-      - "src/artifacts/**"
-      - "src/mcp/artifact_client.py"
-      - "src/api/**"
-      - "src/agent/**"
-      - "tests/test_artifact*.py"
-      - "tests/test_api*.py"
-      - "tests/test_server_manager.py"
       - ".github/workflows/validate-v0.4-artifact-mcp-workspace.yml"
   workflow_dispatch:
 
@@ -32,7 +25,50 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - name: Validate and publish result
+      - name: Apply exact compatibility patch
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path("src/mcp/artifact_client.py")
+          text = path.read_text(encoding="utf-8")
+
+          old_arguments = "    arguments: dict[str, Any] = Field(default_factory=dict)\n"
+          new_arguments = "    arguments: dict[str, Any]\n"
+          if text.count(old_arguments) != 1:
+              raise SystemExit("artifact call arguments anchor mismatch")
+          text = text.replace(old_arguments, new_arguments, 1)
+
+          old_runtime = '''        maximum = self.artifact_config.max_runtime_artifact_summaries
+        candidate_ids = context.active_cycle.artifact_candidate_refs[-maximum:]
+        payload["artifact_candidates"] = {
+            "count": len(context.active_cycle.artifact_candidate_refs),
+            "candidate_ids": candidate_ids,
+            "truncated": (
+                len(context.active_cycle.artifact_candidate_refs)
+                > len(candidate_ids)
+            ),
+        }
+'''
+          new_runtime = '''        if self.artifact_config is not None:
+            maximum = self.artifact_config.max_runtime_artifact_summaries
+            candidate_ids = context.active_cycle.artifact_candidate_refs[-maximum:]
+            payload["artifact_candidates"] = {
+                "count": len(context.active_cycle.artifact_candidate_refs),
+                "candidate_ids": candidate_ids,
+                "truncated": (
+                    len(context.active_cycle.artifact_candidate_refs)
+                    > len(candidate_ids)
+                ),
+            }
+'''
+          if text.count(old_runtime) != 1:
+              raise SystemExit("artifact runtime payload anchor mismatch")
+          text = text.replace(old_runtime, new_runtime, 1)
+          path.write_text(text, encoding="utf-8")
+          PY
+      - name: Validate
         shell: bash
         run: |
           set +e
@@ -53,16 +89,29 @@ jobs:
           run_check python -m unittest discover -s tests -p "test_planning*.py" -v
           run_check python -m unittest discover -s tests -p "test_cycle_compaction*.py" -v
           set -e
+          echo "$overall" > /tmp/validation-status
+      - name: Publish result
+        shell: bash
+        run: |
+          status=$(cat /tmp/validation-status)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if [ "$status" -eq 0 ]; then
+            git rm .github/workflows/validate-v0.4-artifact-mcp-workspace.yml
+            git rm -f .ci/v0.4-artifact-mcp-workspace-validation.txt
+            git add src/mcp/artifact_client.py
+            git commit -m "v0.4-file-artifacts: finalize artifact-aware MCP workspaces"
+            git push origin HEAD:feature
+            exit 0
+          fi
           mkdir -p .ci
           {
-            echo "status=$overall"
+            echo "status=$status"
             echo "validated_head=$(git rev-parse HEAD)"
             echo "--- output ---"
             tail -n 1000 /tmp/artifact-mcp-workspace-validation.log
           } > .ci/v0.4-artifact-mcp-workspace-validation.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add .ci/v0.4-artifact-mcp-workspace-validation.txt
           git commit -m "v0.4-file-artifacts: record MCP workspace validation"
           git push origin HEAD:feature
-          exit "$overall"
+          exit "$status"
