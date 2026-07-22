@@ -17,6 +17,7 @@ from ..ingress import (
     ClientInputEnvelope,
     CommittedInputBatch,
     IngressConflictError,
+    IngressNotFoundError,
     InputGroupingMode,
     InputSubmissionResult,
 )
@@ -237,11 +238,8 @@ class ArtifactTransportFacade:
 
         try:
             committed = await store.get_committed(input_batch_id)
-        except Exception as error:
-            from ..ingress import IngressNotFoundError
-
-            if not isinstance(error, IngressNotFoundError):
-                raise
+        except IngressNotFoundError:
+            pass
         else:
             return committed, True
 
@@ -250,12 +248,12 @@ class ArtifactTransportFacade:
             raise IngressConflictError(
                 "Grouped input batch store is not configured"
             )
-        committed = await commit_batch(
+        committed, duplicate = await commit_batch(
             input_batch_id,
             session_id=session_id,
             reason="explicit_client_commit",
         )
-        return committed, False
+        return committed, duplicate
 
     async def run_committed_batch(
         self,
