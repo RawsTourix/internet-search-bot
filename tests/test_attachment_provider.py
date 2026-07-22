@@ -30,28 +30,18 @@ class StrictAttachmentProviderTests(unittest.IsolatedAsyncioTestCase):
             base_url="https://provider.example",
             token="secret",
             provider_name="telegram",
+            transport=httpx.MockTransport(handler),
         )
-        provider.open_stream.__func__  # keep method visible to type checkers
-        original_client = httpx.AsyncClient
-        try:
-            httpx.AsyncClient = lambda *args, **kwargs: original_client(
-                transport=httpx.MockTransport(handler),
-                timeout=kwargs.get("timeout"),
-            )
-            self.assertEqual(await self._read(provider), b"exact")
-        finally:
-            httpx.AsyncClient = original_client
+        self.assertEqual(await self._read(provider), b"exact")
 
     async def test_truncated_and_overlong_streams_are_rejected(self):
         for payload, declared in ((b"short", "10"), (b"too-long", "3")):
             with self.subTest(payload=payload, declared=declared):
                 async def handler(request, payload=payload, declared=declared):
-                    # MockTransport/httpx may normalize Content-Length to the
-                    # actual body length when using content=. Use an explicit
-                    # async stream to preserve the declared header.
                     class Stream(httpx.AsyncByteStream):
                         async def __aiter__(self):
                             yield payload
+
                     return httpx.Response(
                         200,
                         stream=Stream(),
@@ -62,40 +52,26 @@ class StrictAttachmentProviderTests(unittest.IsolatedAsyncioTestCase):
                     base_url="https://provider.example",
                     token="secret",
                     provider_name="telegram",
+                    transport=httpx.MockTransport(handler),
                 )
-                original_client = httpx.AsyncClient
-                try:
-                    httpx.AsyncClient = lambda *args, **kwargs: original_client(
-                        transport=httpx.MockTransport(handler),
-                        timeout=kwargs.get("timeout"),
-                    )
-                    with self.assertRaises(AttachmentProviderError):
-                        await self._read(provider)
-                finally:
-                    httpx.AsyncClient = original_client
+                with self.assertRaises(AttachmentProviderError):
+                    await self._read(provider)
 
     async def test_locator_is_percent_encoded_and_control_chars_rejected(self):
         requested_path = None
 
         async def handler(request):
             nonlocal requested_path
-            requested_path = request.url.path
+            requested_path = request.url.raw_path.decode("ascii")
             return httpx.Response(200, content=b"x")
 
         provider = StrictHttpAttachmentStreamProvider(
             base_url="https://provider.example",
             token="secret",
             provider_name="telegram",
+            transport=httpx.MockTransport(handler),
         )
-        original_client = httpx.AsyncClient
-        try:
-            httpx.AsyncClient = lambda *args, **kwargs: original_client(
-                transport=httpx.MockTransport(handler),
-                timeout=kwargs.get("timeout"),
-            )
-            self.assertEqual(await self._read(provider, "a/b+c"), b"x")
-        finally:
-            httpx.AsyncClient = original_client
+        self.assertEqual(await self._read(provider, "a/b+c"), b"x")
         self.assertEqual(requested_path, "/internal/files/a%2Fb%2Bc")
 
         with self.assertRaises(AttachmentProviderError):
