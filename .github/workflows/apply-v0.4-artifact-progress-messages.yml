@@ -33,19 +33,40 @@ jobs:
       - name: Apply exact progress-message patch
         run: python scripts/patch_v0_4_artifact_progress_messages.py
 
-      - name: Validate
+      - name: Validate and publish explicit result
+        shell: bash
         run: |
-          python -m compileall src tests scripts
-          python -m unittest discover -s tests -p "test_progress_events.py" -v
-          python -m unittest discover -s tests -p "test_artifact*.py" -v
-          python -m unittest discover -s tests -p "test_plan*.py" -v
+          set +e
+          {
+            python -m compileall src tests scripts
+            python -m unittest discover -s tests -p "test_progress_events.py" -v
+            python -m unittest discover -s tests -p "test_artifact*.py" -v
+            python -m unittest discover -s tests -p "test_plan*.py" -v
+          } > /tmp/artifact-progress-validation.log 2>&1
+          status=$?
+          set -e
 
-      - name: Publish target commit
-        run: |
-          rm scripts/patch_v0_4_artifact_progress_messages.py
-          rm .github/workflows/apply-v0.4-artifact-progress-messages.yml
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git commit -m "v0.4-file-artifacts: add artifact progress messages"
+
+          if [ "$status" -eq 0 ]; then
+            rm -f scripts/patch_v0_4_artifact_progress_messages.py
+            rm -f .github/workflows/apply-v0.4-artifact-progress-messages.yml
+            rm -f .ci/v0.4-artifact-progress-validation.txt
+            git add -A
+            git commit -m "v0.4-file-artifacts: add artifact progress messages"
+            git push origin HEAD:feature
+            exit 0
+          fi
+
+          mkdir -p .ci
+          {
+            echo "status=$status"
+            echo "validated_head=$(git rev-parse HEAD)"
+            echo "--- output ---"
+            tail -n 500 /tmp/artifact-progress-validation.log
+          } > .ci/v0.4-artifact-progress-validation.txt
+          git add .ci/v0.4-artifact-progress-validation.txt
+          git commit -m "v0.4-file-artifacts: record progress validation failure"
           git push origin HEAD:feature
+          exit "$status"
