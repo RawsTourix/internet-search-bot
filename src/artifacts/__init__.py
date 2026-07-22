@@ -10,6 +10,7 @@ from .delivery import (
     ArtifactDeliveryService,
     FileSystemArtifactDeliveryStore,
 )
+from .delivery_recovery import recover_stale_delivery_claims
 from .errors import (
     ArtifactAccessError,
     ArtifactCandidateError,
@@ -140,6 +141,7 @@ __all__ = [
     "new_artifact_delivery_id",
     "new_artifact_id",
     "new_artifact_lineage_id",
+    "recover_stale_delivery_claims",
     "register_artifact_progress_messages",
     "utc_now",
     "validate_native_text",
