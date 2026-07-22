@@ -74,6 +74,7 @@ from .workspace import (
     ArtifactWorkspace,
     ArtifactWorkspaceManager,
 )
+from .workspace_recovery import cleanup_stale_artifact_workspaces
 
 __all__ = [
     "ArtifactAccessContext",
@@ -130,6 +131,7 @@ __all__ = [
     "apply_exact_text_patch",
     "apply_local_workspace_server_policy",
     "build_default_format_registry",
+    "cleanup_stale_artifact_workspaces",
     "create_artifact_services",
     "enforce_text_size",
     "is_artifact_candidate_id",
