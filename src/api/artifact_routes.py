@@ -62,13 +62,19 @@ def _committed_batch_payload(batch) -> dict[str, Any]:
     }
 
 
-def _submission_payload(result, response=None) -> dict[str, Any]:
+def _submission_payload(
+    result,
+    response=None,
+    *,
+    run_skipped_duplicate: bool = False,
+) -> dict[str, Any]:
     payload = {
         "status": result.state,
         "event_id": result.event_id,
         "input_batch_id": result.input_batch_id,
         "duplicate": result.duplicate,
         "error_code": result.error_code,
+        "run_skipped_duplicate": run_skipped_duplicate,
     }
     if result.committed_batch is not None:
         payload["committed_batch"] = _committed_batch_payload(
@@ -88,17 +94,12 @@ def create_artifact_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    async def _run_batch_if_requested(
-        batch,
-        *,
-        run: bool,
-        progress_locale: str,
-    ):
-        if not run:
-            return None
-        callback = None
-        if progress_callback_factory is not None:
-            callback = progress_callback_factory(batch)
+    async def run_batch(batch, *, progress_locale: str):
+        callback = (
+            progress_callback_factory(batch)
+            if progress_callback_factory is not None
+            else None
+        )
         return await facade.run_committed_batch(
             batch.input_batch_id,
             session_id=batch.session_id,
@@ -106,12 +107,11 @@ def create_artifact_router(
             progress_locale=progress_locale,
         )
 
-    async def _run_if_requested(result, *, run: bool, progress_locale: str):
-        if result.committed_batch is None:
+    async def run_submission(result, *, run: bool, progress_locale: str):
+        if not run or result.committed_batch is None or result.duplicate:
             return None
-        return await _run_batch_if_requested(
+        return await run_batch(
             result.committed_batch,
-            run=run,
             progress_locale=progress_locale,
         )
 
@@ -126,7 +126,7 @@ def create_artifact_router(
     ):
         try:
             result = await facade.submit_envelope(envelope)
-            response = await _run_if_requested(
+            response = await run_submission(
                 result,
                 run=run,
                 progress_locale=progress_locale,
@@ -136,11 +136,19 @@ def create_artifact_router(
                 if result.state == "committed"
                 else status.HTTP_202_ACCEPTED
             )
+            if result.duplicate:
+                code = status.HTTP_200_OK
             if result.state == "failed":
                 code = status.HTTP_422_UNPROCESSABLE_ENTITY
             return JSONResponse(
                 status_code=code,
-                content=_submission_payload(result, response),
+                content=_submission_payload(
+                    result,
+                    response,
+                    run_skipped_duplicate=bool(
+                        run and result.duplicate and result.committed_batch is not None
+                    ),
+                ),
             )
         except IngressConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
@@ -174,13 +182,14 @@ def create_artifact_router(
             envelope = ClientInputEnvelope.model_validate_json(raw_manifest)
             upload_fields: dict[str, UploadFile] = {}
             for field_name, value in form.multi_items():
-                if isinstance(value, UploadFile):
-                    if field_name in upload_fields:
-                        raise HTTPException(
-                            status_code=422,
-                            detail=f"Duplicate upload field {field_name!r}",
-                        )
-                    upload_fields[field_name] = value
+                if not isinstance(value, UploadFile):
+                    continue
+                if field_name in upload_fields:
+                    raise HTTPException(
+                        status_code=422,
+                        detail=f"Duplicate upload field {field_name!r}",
+                    )
+                upload_fields[field_name] = value
 
             streams: dict[str, AsyncIterator[bytes]] = {}
             expected_fields: set[str] = set()
@@ -207,7 +216,7 @@ def create_artifact_router(
                 envelope,
                 upload_streams=streams,
             )
-            response = await _run_if_requested(
+            response = await run_submission(
                 result,
                 run=run,
                 progress_locale=progress_locale,
@@ -217,11 +226,19 @@ def create_artifact_router(
                 if result.state == "committed"
                 else status.HTTP_202_ACCEPTED
             )
+            if result.duplicate:
+                code = status.HTTP_200_OK
             if result.state == "failed":
                 code = status.HTTP_422_UNPROCESSABLE_ENTITY
             return JSONResponse(
                 status_code=code,
-                content=_submission_payload(result, response),
+                content=_submission_payload(
+                    result,
+                    response,
+                    run_skipped_duplicate=bool(
+                        run and result.duplicate and result.committed_batch is not None
+                    ),
+                ),
             )
         except HTTPException:
             raise
@@ -250,15 +267,17 @@ def create_artifact_router(
                 input_batch_id,
                 session_id=body.session_id,
             )
-            response = await _run_batch_if_requested(
-                batch,
-                run=body.run,
-                progress_locale=body.progress_locale,
-            )
+            response = None
+            if body.run and not duplicate:
+                response = await run_batch(
+                    batch,
+                    progress_locale=body.progress_locale,
+                )
             payload: dict[str, Any] = {
                 "status": "committed",
                 "input_batch_id": batch.input_batch_id,
                 "duplicate": duplicate,
+                "run_skipped_duplicate": bool(body.run and duplicate),
                 "committed_batch": _committed_batch_payload(batch),
             }
             if response is not None:
@@ -296,15 +315,10 @@ def create_artifact_router(
             batch = await facade.api.ingress_services.batch_store.get_committed(
                 input_batch_id
             )
-            callback = (
-                progress_callback_factory(batch)
-                if progress_callback_factory is not None
-                else None
-            )
-            response = await facade.run_committed_batch(
-                input_batch_id,
-                session_id=body.session_id,
-                progress_callback=callback,
+            if batch.session_id != body.session_id:
+                raise ArtifactAccessError("Input batch belongs to another session")
+            response = await run_batch(
+                batch,
                 progress_locale=body.progress_locale,
             )
             return {
@@ -330,9 +344,7 @@ def create_artifact_router(
             ref = await facade.get_delivery_ref(
                 delivery_id,
                 session_id=session_id,
-                client_type=facade.api.core_client_type(client_type)
-                if hasattr(facade.api, "core_client_type")
-                else _client_type(client_type),
+                client_type=_client_type(client_type),
             )
             return ref.model_dump(mode="json")
         except ArtifactDeliveryNotFoundError as error:
