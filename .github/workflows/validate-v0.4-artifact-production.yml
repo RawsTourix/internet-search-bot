@@ -1,0 +1,78 @@
+name: Validate v0.4 artifact production wiring
+
+on:
+  push:
+    branches: [feature]
+    paths:
+      - "src/api/**"
+      - "src/agent/prompts.py"
+      - "src/mcp/artifact_client.py"
+      - "tests/test_artifact*.py"
+      - "tests/test_api_security.py"
+      - ".github/workflows/validate-v0.4-artifact-production.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Validate and publish explicit result
+        shell: bash
+        run: |
+          set +e
+          {
+            python -m compileall src tests scripts
+            python -m unittest discover -s tests -p "test_artifact*.py" -v
+            python -m unittest discover -s tests -p "test_api_security.py" -v
+            python -m unittest discover -s tests -p "test_progress_events.py" -v
+            python -m unittest discover -s tests -p "test_llm_contracts.py" -v
+            python -m unittest discover -s tests -p "test_planning*.py" -v
+            python -m unittest discover -s tests -p "test_plan*.py" -v
+            python -m unittest discover -s tests -p "test_storage*.py" -v
+            python -m unittest discover -s tests -p "test_result_compaction*.py" -v
+            python -m unittest discover -s tests -p "test_cycle_compaction*.py" -v
+          } > /tmp/artifact-production-validation.log 2>&1
+          status=$?
+          set -e
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          if [ "$status" -eq 0 ]; then
+            rm -f .github/workflows/validate-v0.4-artifact-production.yml
+            rm -f .ci/v0.4-artifact-production-validation.txt
+            git add -A
+            git commit -m "v0.4-file-artifacts: validate production artifact runtime"
+            git push origin HEAD:feature
+            exit 0
+          fi
+
+          mkdir -p .ci
+          {
+            echo "status=$status"
+            echo "validated_head=$(git rev-parse HEAD)"
+            echo "--- output ---"
+            tail -n 800 /tmp/artifact-production-validation.log
+          } > .ci/v0.4-artifact-production-validation.txt
+          git add .ci/v0.4-artifact-production-validation.txt
+          git commit -m "v0.4-file-artifacts: record production validation failure"
+          git push origin HEAD:feature
+          exit "$status"
