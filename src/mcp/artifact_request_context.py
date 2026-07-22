@@ -1,4 +1,4 @@
-"""Task-local request identity used by artifact delivery orchestration."""
+"""Task-local request identity used by artifact delivery and input binding."""
 
 from contextvars import ContextVar, Token
 from typing import Any
@@ -10,6 +10,10 @@ _REQUEST_CLIENT_TYPE: ContextVar[Any] = ContextVar(
 )
 _REQUEST_CYCLE_IDENTITY: ContextVar[tuple[str, str] | None] = ContextVar(
     "artifact_request_cycle_identity",
+    default=None,
+)
+_REQUEST_INPUT_BATCH: ContextVar[Any] = ContextVar(
+    "artifact_request_input_batch",
     default=None,
 )
 
@@ -38,3 +42,15 @@ def set_artifact_request_cycle_identity(
 
 def reset_artifact_request_cycle_identity(token: Token) -> None:
     _REQUEST_CYCLE_IDENTITY.reset(token)
+
+
+def get_artifact_request_input_batch() -> Any:
+    return _REQUEST_INPUT_BATCH.get()
+
+
+def set_artifact_request_input_batch(value: Any) -> Token:
+    return _REQUEST_INPUT_BATCH.set(value)
+
+
+def reset_artifact_request_input_batch(token: Token) -> None:
+    _REQUEST_INPUT_BATCH.reset(token)
