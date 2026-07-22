@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict
 
 from .models import ClientType, MessageType, UnifiedMessage, UnifiedResponse
+from .response_metadata import agent_result_metadata
 from .session_ids import resolve_message_session_id
 from ..api.api import API
 from ..ingress import CommittedInputBatch
@@ -154,17 +155,7 @@ class MessageProcessor:
 
     @staticmethod
     def _agent_result_metadata(agent_result) -> dict[str, Any]:
-        return {
-            "agent_status": agent_result.status,
-            "session_id": agent_result.session_id,
-            "iterations": agent_result.iterations,
-            "tools_used": agent_result.tools_used,
-            "error": agent_result.error,
-            "error_kind": agent_result.error_kind,
-            "can_resume": agent_result.can_resume,
-            "progress_events": agent_result.progress_events,
-            "artifacts": list(agent_result.artifacts),
-        }
+        return agent_result_metadata(agent_result)
 
     async def _handle_command(self, message: UnifiedMessage) -> str:
         command = message.content.strip()
