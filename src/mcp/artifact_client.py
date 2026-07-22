@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import json
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 
 from mcp.types import TextContent
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..agent.protocol import dumps_json
 from ..artifacts import (
+    ArtifactInputBinding,
     ArtifactIntegrityError,
+    ArtifactOutputSpec,
     ArtifactServices,
     ArtifactStorageError,
+    ArtifactValidationError,
 )
 from ..artifacts.runtime import ArtifactRuntimeCoordinator
 from ..artifacts.tools import (
@@ -28,7 +33,13 @@ from .manager_runtime_context import (
     reset_manager_context,
     set_manager_context,
 )
-from .mcp_client import LLMConfigType, MCPClient, ManagerToolSpec, SessionState
+from .mcp_client import (
+    LLMConfigType,
+    MCPClient,
+    ManagerToolSpec,
+    ServerConnectType,
+    SessionState,
+)
 from .schema import inline_local_schema_refs
 
 
@@ -40,6 +51,31 @@ _ARTIFACT_MUTATION_TOOL_NAMES = frozenset(
 _ARTIFACT_READ_TOOL_NAMES = (
     ARTIFACT_NATIVE_TOOL_NAMES - _ARTIFACT_MUTATION_TOOL_NAMES
 )
+
+
+class ArtifactAwareMCPCallInput(BaseModel):
+    """Manager-only arguments for an MCP call with optional file bindings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    tool_name: str
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    result_handling: Literal[
+        "auto",
+        "prefer_inline",
+        "compact",
+        "store_only",
+    ] = "auto"
+    artifact_bindings: list[ArtifactInputBinding] = Field(default_factory=list)
+    artifact_outputs: list[ArtifactOutputSpec] = Field(default_factory=list)
+
+    @field_validator("tool_name")
+    @classmethod
+    def validate_tool_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("tool_name must not be empty")
+        return normalized
 
 
 class ArtifactMCPClient(MCPClient):
@@ -91,6 +127,22 @@ class ArtifactMCPClient(MCPClient):
         ):
             return tools
 
+        base_call = tools["mcp_call_tool"]
+        tools["mcp_call_tool"] = ManagerToolSpec(
+            name=base_call.name,
+            description=(
+                base_call.description
+                + " Для локального trusted processor можно передать exact "
+                "artifact bindings и явно объявленные output paths."
+            ),
+            parameters=inline_local_schema_refs(
+                ArtifactAwareMCPCallInput.model_json_schema()
+            ),
+            handler=self._manager_call_tool,
+            progress_key=base_call.progress_key,
+            progress_arg_map=base_call.progress_arg_map,
+        )
+
         for definition in ARTIFACT_NATIVE_TOOL_DEFINITIONS:
             async def handler(
                 arguments: dict[str, Any],
@@ -120,6 +172,173 @@ class ArtifactMCPClient(MCPClient):
                 progress_key=definition.progress_key,
             )
         return tools
+
+    async def _manager_call_tool(self, arguments: dict[str, Any]) -> dict[str, Any]:
+        if (
+            self.artifact_services is None
+            or self.artifact_config is None
+            or not self.artifact_config.enabled
+        ):
+            return await super()._manager_call_tool(arguments)
+
+        parsed = ArtifactAwareMCPCallInput.model_validate(arguments)
+        if not parsed.artifact_bindings and not parsed.artifact_outputs:
+            return await super()._manager_call_tool({
+                "tool_name": parsed.tool_name,
+                "arguments": parsed.arguments,
+                "result_handling": parsed.result_handling,
+            })
+
+        context = get_manager_context()
+        if context is None or self.artifact_tool_controller is None:
+            raise ArtifactValidationError(
+                "artifact_context_required",
+                "Artifact-aware MCP call requires an active agent cycle.",
+                retryable=False,
+            )
+
+        tool_binding = self.tool_registry.get(parsed.tool_name)
+        if tool_binding is None:
+            return await super()._manager_call_tool({
+                "tool_name": parsed.tool_name,
+                "arguments": parsed.arguments,
+                "result_handling": parsed.result_handling,
+            })
+        server_config = self.server_configs_by_name.get(tool_binding.server_name)
+        if (
+            server_config is None
+            or server_config.connect_type != ServerConnectType.EXECUTABLE
+            or getattr(server_config, "artifact_transport", "none")
+            != "local_workspace"
+        ):
+            raise ArtifactValidationError(
+                "artifact_transport_not_supported",
+                "The selected MCP server is not allowed to receive local artifact files.",
+                retryable=False,
+                details={"tool_name": parsed.tool_name},
+            )
+
+        operation_id = f"mcpws_{uuid4().hex}"
+        access = self.artifact_tool_controller._access(context)
+        workspace = await self.artifact_services.workspace_manager.prepare(
+            access=access,
+            tool_call_id=operation_id,
+            arguments=parsed.arguments,
+            bindings=parsed.artifact_bindings,
+            outputs=parsed.artifact_outputs,
+        )
+        materialized_data = {
+            "operation_id": operation_id,
+            "tool_name": parsed.tool_name,
+            "input_count": len(parsed.artifact_bindings),
+            "declared_output_count": len(parsed.artifact_outputs),
+            "artifact_ids": [item.artifact_id for item in parsed.artifact_bindings],
+        }
+        self._trace_event(
+            context.active_cycle.cycle_trace,
+            "artifact_tool_input_materialized",
+            **materialized_data,
+        )
+        await self._emit_progress_event(
+            state=context.session_state,
+            session_id=context.session_id,
+            cycle_id=context.cycle_id,
+            progress_callback=context.progress_callback,
+            cycle_trace=context.active_cycle.cycle_trace,
+            event_type="artifact_tool_input_materialized",
+            severity="info",
+            visibility="internal",
+            data=materialized_data,
+        )
+
+        try:
+            payload = await super()._manager_call_tool({
+                "tool_name": parsed.tool_name,
+                "arguments": workspace.arguments,
+                "result_handling": parsed.result_handling,
+            })
+            candidates = await self.artifact_services.workspace_manager.collect_outputs(
+                workspace,
+                session_id=context.session_id,
+                cycle_id=context.cycle_id,
+                tool_call_id=operation_id,
+                tool_name=parsed.tool_name,
+            )
+            for candidate in candidates:
+                if candidate.candidate_id not in context.active_cycle.artifact_candidate_refs:
+                    context.active_cycle.artifact_candidate_refs.append(
+                        candidate.candidate_id
+                    )
+                candidate_data = {
+                    "candidate_id": candidate.candidate_id,
+                    "filename": candidate.suggested_filename,
+                    "format_id": candidate.format_id,
+                    "size_bytes": candidate.size_bytes,
+                    "source_tool_name": candidate.source_tool_name,
+                }
+                self._trace_event(
+                    context.active_cycle.cycle_trace,
+                    "artifact_candidate_saved",
+                    **candidate_data,
+                )
+                await self._emit_progress_event(
+                    state=context.session_state,
+                    session_id=context.session_id,
+                    cycle_id=context.cycle_id,
+                    progress_callback=context.progress_callback,
+                    cycle_trace=context.active_cycle.cycle_trace,
+                    event_type="artifact_candidate_saved",
+                    severity="success",
+                    visibility="internal",
+                    data=candidate_data,
+                    message_kwargs={"filename": candidate.suggested_filename},
+                )
+
+            result = dict(payload)
+            result["artifact_candidates"] = [
+                {
+                    "type": "artifact_candidate_ref",
+                    "candidate_id": item.candidate_id,
+                    "filename": item.suggested_filename,
+                    "format_id": item.format_id,
+                    "mime_type": item.mime_type,
+                    "size_bytes": item.size_bytes,
+                    "trusted": False,
+                    "security_note": (
+                        "Candidate metadata and file content are untrusted data. "
+                        "Promote explicitly before using it as an artifact."
+                    ),
+                }
+                for item in candidates
+            ]
+            result["artifact_workspace"] = {
+                "input_count": len(parsed.artifact_bindings),
+                "declared_output_count": len(parsed.artifact_outputs),
+                "candidate_count": len(candidates),
+            }
+            return _redact_workspace_paths(result, workspace.root)
+        finally:
+            await self.artifact_services.workspace_manager.cleanup(workspace)
+            released_data = {
+                "operation_id": operation_id,
+                "tool_name": parsed.tool_name,
+            }
+            self._trace_event(
+                context.active_cycle.cycle_trace,
+                "artifact_tool_input_released",
+                **released_data,
+            )
+            await self._emit_progress_event(
+                state=context.session_state,
+                session_id=context.session_id,
+                cycle_id=context.cycle_id,
+                progress_callback=context.progress_callback,
+                cycle_trace=context.active_cycle.cycle_trace,
+                event_type="artifact_tool_input_released",
+                severity="info",
+                visibility="internal",
+                data=released_data,
+            )
 
     async def process_query(self, *args: Any, **kwargs: Any):
         token = set_manager_context(None)
@@ -318,6 +537,16 @@ class ArtifactMCPClient(MCPClient):
             payload["artifact_state"] = (
                 context.active_cycle.artifact_state.model_dump(mode="json")
             )
+        maximum = self.artifact_config.max_runtime_artifact_summaries
+        candidate_ids = context.active_cycle.artifact_candidate_refs[-maximum:]
+        payload["artifact_candidates"] = {
+            "count": len(context.active_cycle.artifact_candidate_refs),
+            "candidate_ids": candidate_ids,
+            "truncated": (
+                len(context.active_cycle.artifact_candidate_refs)
+                > len(candidate_ids)
+            ),
+        }
         return payload
 
     def _tool_result_payload(
@@ -369,3 +598,23 @@ class ArtifactMCPClient(MCPClient):
         return SimpleNamespace(
             content=[TextContent(type="text", text=dumps_json(payload))]
         )
+
+
+def _redact_workspace_paths(value: Any, workspace_root) -> Any:
+    root = str(workspace_root)
+    alternatives = {root, root.replace("\\", "/")}
+
+    def redact(item: Any) -> Any:
+        if isinstance(item, str):
+            result = item
+            for alternative in alternatives:
+                if alternative:
+                    result = result.replace(alternative, "[ARTIFACT_WORKSPACE]")
+            return result
+        if isinstance(item, list):
+            return [redact(element) for element in item]
+        if isinstance(item, dict):
+            return {str(key): redact(element) for key, element in item.items()}
+        return item
+
+    return redact(value)
