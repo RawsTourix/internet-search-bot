@@ -59,7 +59,7 @@ class ArtifactAwareMCPCallInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     tool_name: str
-    arguments: dict[str, Any] = Field(default_factory=dict)
+    arguments: dict[str, Any]
     result_handling: Literal[
         "auto",
         "prefer_inline",
@@ -537,16 +537,17 @@ class ArtifactMCPClient(MCPClient):
             payload["artifact_state"] = (
                 context.active_cycle.artifact_state.model_dump(mode="json")
             )
-        maximum = self.artifact_config.max_runtime_artifact_summaries
-        candidate_ids = context.active_cycle.artifact_candidate_refs[-maximum:]
-        payload["artifact_candidates"] = {
-            "count": len(context.active_cycle.artifact_candidate_refs),
-            "candidate_ids": candidate_ids,
-            "truncated": (
-                len(context.active_cycle.artifact_candidate_refs)
-                > len(candidate_ids)
-            ),
-        }
+        if self.artifact_config is not None:
+            maximum = self.artifact_config.max_runtime_artifact_summaries
+            candidate_ids = context.active_cycle.artifact_candidate_refs[-maximum:]
+            payload["artifact_candidates"] = {
+                "count": len(context.active_cycle.artifact_candidate_refs),
+                "candidate_ids": candidate_ids,
+                "truncated": (
+                    len(context.active_cycle.artifact_candidate_refs)
+                    > len(candidate_ids)
+                ),
+            }
         return payload
 
     def _tool_result_payload(
