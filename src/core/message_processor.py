@@ -5,6 +5,7 @@ from logging.handlers import RotatingFileHandler
 from typing import Any, Dict
 
 from .models import ClientType, MessageType, UnifiedMessage, UnifiedResponse
+from .session_ids import resolve_message_session_id
 from ..api.api import API
 from ..ingress import CommittedInputBatch
 
@@ -112,21 +113,11 @@ class MessageProcessor:
         self.stats["messages_by_client"][client_type.value] += 1
 
     def _build_session_id(self, message: UnifiedMessage) -> str:
-        """Build one stable session; fully namespaced IDs are authoritative."""
-        metadata = message.metadata or {}
-        explicit = metadata.get("session_id")
-        if explicit is not None:
-            normalized = str(explicit).strip()
-            if not normalized:
-                raise ValueError("session_id must not be empty")
-            if ":" in normalized:
-                return normalized
-            return f"{message.client_type.value}:session:{normalized}"
-
-        chat_id = metadata.get("chat_id")
-        if chat_id is not None:
-            return f"{message.client_type.value}:chat:{chat_id}"
-        return f"{message.client_type.value}:user:{message.user_id}"
+        return resolve_message_session_id(
+            client_type=message.client_type,
+            metadata=message.metadata,
+            user_id=message.user_id,
+        )
 
     async def _generate_response(
         self,
