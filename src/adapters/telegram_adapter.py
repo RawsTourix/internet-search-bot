@@ -2,10 +2,9 @@ import logging
 import os
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
-from typing import Any, Dict
+from typing import TYPE_CHECKING, Any, Dict
 
 from .telegram_ingress import build_telegram_input_envelope
-from ..core.message_processor import MessageProcessor
 from ..core.models import (
     AdapterStatus,
     MessageType,
@@ -13,6 +12,9 @@ from ..core.models import (
     UnifiedResponse,
 )
 from ..ingress import ClientInputEnvelope, InputAdmissionMode
+
+if TYPE_CHECKING:
+    from ..core.message_processor import MessageProcessor
 
 
 log_dir = "logging"
@@ -39,7 +41,7 @@ if not logger.handlers:
 class TelegramAdapter:
     """Adapter for Telegram compatibility and semantic file envelopes."""
 
-    def __init__(self, message_processor: MessageProcessor):
+    def __init__(self, message_processor: "MessageProcessor"):
         self.message_processor = message_processor
         self.status = AdapterStatus(is_healthy=False)
 
