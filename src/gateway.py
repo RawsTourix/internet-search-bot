@@ -1,35 +1,36 @@
+import logging
 import os
 import uuid
-import logging
+from contextlib import asynccontextmanager
+from datetime import datetime
+from logging.handlers import RotatingFileHandler
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
-from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, status, Depends
-from fastapi.responses import JSONResponse
+from dotenv import load_dotenv
+from fastapi import Depends, FastAPI, HTTPException, status
 from fastapi.middleware.cors import CORSMiddleware
-from datetime import datetime
-from logging.handlers import RotatingFileHandler
+from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 
 from .adapters.telegram_adapter import TelegramAdapter
 from .adapters.web_adapter import WebAdapter
 from .api.api import API
 from .api.artifact_routes import create_artifact_router
-from .api.artifact_transport import (
-    ArtifactTransportFacade,
-    HttpAttachmentStreamProvider,
-)
+from .api.artifact_transport import ArtifactTransportFacade
+from .api.attachment_provider import StrictHttpAttachmentStreamProvider
 from .core.message_processor import MessageProcessor
-from .core.models import UnifiedMessage, WebMessage, MessageType, ClientType
+from .core.models import ClientType, MessageType, UnifiedMessage, WebMessage
 
-from dotenv import load_dotenv
 
 load_dotenv()
 
 log_dir = "logging"
 os.makedirs(log_dir, exist_ok=True)
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("Gateway")
 logger.setLevel(logging.DEBUG)
 if not logger.handlers:
@@ -45,13 +46,11 @@ if not logger.handlers:
     console_handler.setFormatter(formatter)
     logger.addHandler(console_handler)
 
-from fastapi.security import APIKeyHeader
-
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
 
 
-def get_api_keys():
-    keys = []
+def get_api_keys() -> list[str]:
+    keys: list[str] = []
     for environment_name in (
         "TELEGRAM_API_KEY",
         "WEB_API_KEY",
@@ -117,7 +116,10 @@ def _make_http_progress_callback(
     if not callback_url:
         return None
     if not is_allowed_progress_callback_url(str(callback_url)):
-        logger.warning("Progress callback URL rejected by allowlist: %s", callback_url)
+        logger.warning(
+            "Progress callback URL rejected by allowlist: %s",
+            callback_url,
+        )
         return None
     progress_target = metadata.get("progress_target") or {
         "chat_id": metadata.get("chat_id"),
@@ -206,7 +208,7 @@ if bool(telegram_provider_url) != bool(telegram_provider_token):
         "TELEGRAM_FILE_PROVIDER_URL and its token must be configured together"
     )
 if telegram_provider_url:
-    attachment_providers["telegram"] = HttpAttachmentStreamProvider(
+    attachment_providers["telegram"] = StrictHttpAttachmentStreamProvider(
         base_url=telegram_provider_url,
         token=telegram_provider_token,
         provider_name="telegram",
