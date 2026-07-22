@@ -1,11 +1,26 @@
 import os
 import logging
-from typing import Dict, Any
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
+from typing import Any, Dict
 
-from ..core.models import UnifiedMessage, UnifiedResponse, MessageType, AdapterStatus
+from ..core.models import (
+    UnifiedMessage,
+    UnifiedResponse,
+    MessageType,
+    AdapterStatus,
+    ClientType,
+)
 from ..core.message_processor import MessageProcessor
+from ..ingress import (
+    ClientConversationRef,
+    ClientInputEnvelope,
+    ClientResponseRoute,
+    ClientSenderRef,
+    IngressAttachmentSlot,
+    IngressTextPart,
+    InputAdmissionMode,
+)
 
 
 log_dir = "logging"
@@ -33,7 +48,7 @@ logger.addHandler(console_handler)
 
 
 class WebAdapter:
-    """Адаптер для веб-интерфейса."""
+    """Adapter for text compatibility and atomic Web input envelopes."""
 
     def __init__(self, message_processor: MessageProcessor):
         self.message_processor = message_processor
@@ -49,6 +64,7 @@ class WebAdapter:
 
     async def shutdown(self):
         logger.info("Web адаптер остановлен")
+        self.status.is_healthy = False
 
     async def handle_unified_message(
         self,
@@ -85,6 +101,66 @@ class WebAdapter:
                 content=f"Произошла ошибка при обработке web-сообщения: {str(e)}",
                 response_type=MessageType.TEXT
             )
+
+    @staticmethod
+    def build_input_envelope(
+        *,
+        idempotency_key: str,
+        client_instance_id: str,
+        session_id: str,
+        user_id: str,
+        source_message_id: str,
+        text: str | None,
+        attachments: list[dict[str, Any]],
+        admission_mode: InputAdmissionMode = InputAdmissionMode.AUTO,
+        locale: str | None = None,
+        occurred_at: datetime | None = None,
+        response_metadata: dict[str, Any] | None = None,
+    ) -> ClientInputEnvelope:
+        """Build semantic Web input; bytes stay in multipart upload streams."""
+        attachment_slots = [
+            IngressAttachmentSlot(
+                slot_id=str(item["slot_id"]),
+                media_kind=str(item.get("media_kind") or "document"),
+                original_filename=item.get("filename"),
+                declared_mime_type=item.get("mime_type"),
+                declared_size_bytes=item.get("size_bytes"),
+                upload_field_name=str(item["upload_field_name"]),
+                metadata=dict(item.get("metadata") or {}),
+            )
+            for item in attachments
+        ]
+        text_parts = []
+        if text and text.strip():
+            text_parts.append(IngressTextPart(
+                part_id="message_text",
+                kind="message_text",
+                text=text,
+                attachment_slot_ids=[
+                    item.slot_id for item in attachment_slots
+                ],
+            ))
+        return ClientInputEnvelope(
+            idempotency_key=idempotency_key,
+            client_type=ClientType.WEB,
+            client_instance_id=client_instance_id,
+            conversation=ClientConversationRef(
+                conversation_id=session_id,
+            ),
+            sender=ClientSenderRef(principal_id=user_id),
+            source_message_id=source_message_id,
+            occurred_at=occurred_at or datetime.now(timezone.utc),
+            text_parts=text_parts,
+            attachment_slots=attachment_slots,
+            locale=locale,
+            admission_mode=admission_mode,
+            response_route=ClientResponseRoute(
+                route_type="web",
+                conversation_id=session_id,
+                reply_to_message_id=source_message_id,
+                metadata=dict(response_metadata or {}),
+            ),
+        )
 
     async def health_check(self) -> Dict[str, Any]:
         return {
