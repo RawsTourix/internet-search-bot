@@ -33,20 +33,28 @@ jobs:
         shell: bash
         run: |
           set +e
-          {
-            python -m compileall src tests scripts
-            python -m unittest discover -s tests -p "test_artifact*.py" -v
-            python -m unittest discover -s tests -p "test_storage*.py" -v
-            python -m unittest discover -s tests -p "test_plan*.py" -v
-            python -m unittest discover -s tests -p "test_planning*.py" -v
-            python -m unittest discover -s tests -p "test_result_compaction*.py" -v
-            python -m unittest discover -s tests -p "test_cycle_compaction*.py" -v
-          } > /tmp/artifact-candidate-validation.log 2>&1
-          status=$?
+          overall=0
+          run_check() {
+            "$@" >> /tmp/artifact-candidate-validation.log 2>&1
+            code=$?
+            if [ "$code" -ne 0 ]; then
+              overall="$code"
+            fi
+          }
+
+          : > /tmp/artifact-candidate-validation.log
+          run_check python -m compileall src tests scripts
+          run_check python -m unittest discover -s tests -p "test_artifact*.py" -v
+          run_check python -m unittest discover -s tests -p "test_storage*.py" -v
+          run_check python -m unittest discover -s tests -p "test_plan*.py" -v
+          run_check python -m unittest discover -s tests -p "test_planning*.py" -v
+          run_check python -m unittest discover -s tests -p "test_result_compaction*.py" -v
+          run_check python -m unittest discover -s tests -p "test_cycle_compaction*.py" -v
           set -e
+
           mkdir -p .ci
           {
-            echo "status=$status"
+            echo "status=$overall"
             echo "validated_head=$(git rev-parse HEAD)"
             echo "--- output ---"
             tail -n 700 /tmp/artifact-candidate-validation.log
@@ -56,4 +64,4 @@ jobs:
           git add .ci/v0.4-artifact-candidate-validation.txt
           git commit -m "v0.4-file-artifacts: record candidate storage validation"
           git push origin HEAD:feature
-          exit "$status"
+          exit "$overall"
