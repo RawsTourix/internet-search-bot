@@ -5,7 +5,14 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from .errors import ArtifactConfigValidationError
 
@@ -34,10 +41,25 @@ class ArtifactConfigType(BaseModel):
 
     allow_opaque_binary: bool = True
     auto_select_deliverables: bool = False
+    local_workspace_server_names: list[str] = Field(default_factory=list)
 
     max_container_entries_inspected: int = Field(default=2_048, ge=1)
     max_workspace_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     workspace_ttl_seconds: int = Field(default=3_600, ge=1)
+
+    @field_validator("local_workspace_server_names")
+    @classmethod
+    def normalize_local_workspace_servers(cls, values: list[str]) -> list[str]:
+        result: list[str] = []
+        seen: set[str] = set()
+        for value in values:
+            normalized = value.strip()
+            if not normalized:
+                raise ValueError("local workspace server name must not be empty")
+            if normalized not in seen:
+                result.append(normalized)
+                seen.add(normalized)
+        return result
 
     @model_validator(mode="after")
     def validate_cross_field_limits(self) -> "ArtifactConfigType":
