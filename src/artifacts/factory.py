@@ -9,6 +9,10 @@ from .candidate_store import (
     FileSystemArtifactCandidateStore,
 )
 from .config import ArtifactConfigType
+from .delivery import (
+    ArtifactDeliveryService,
+    FileSystemArtifactDeliveryStore,
+)
 from .file_store import FileSystemArtifactStore
 from .format_registry import ArtifactFormatRegistry, build_default_format_registry
 from .interfaces import ArtifactStore
@@ -22,9 +26,11 @@ class ArtifactServices:
     config: ArtifactConfigType
     artifact_store: ArtifactStore
     candidate_store: ArtifactCandidateStore
+    delivery_store: FileSystemArtifactDeliveryStore
     format_registry: ArtifactFormatRegistry
     artifact_service: ArtifactService
     promotion_service: ArtifactCandidatePromotionService
+    delivery_service: ArtifactDeliveryService
     workspace_manager: ArtifactWorkspaceManager
 
 
@@ -43,6 +49,7 @@ def create_artifact_services(
         allow_legacy_layout=allow_legacy_layout,
     )
     candidate_store = FileSystemArtifactCandidateStore(storage_config)
+    delivery_store = FileSystemArtifactDeliveryStore(storage_config)
     format_registry = build_default_format_registry()
     artifact_service = ArtifactService(
         config=artifact_config,
@@ -53,6 +60,12 @@ def create_artifact_services(
     promotion_service = ArtifactCandidatePromotionService(
         artifact_service=artifact_service,
         candidate_store=candidate_store,
+    )
+    delivery_service = ArtifactDeliveryService(
+        config=artifact_config,
+        artifact_service=artifact_service,
+        content_store=content_store,
+        store=delivery_store,
     )
     workspace_manager = ArtifactWorkspaceManager(
         storage_config=storage_config,
@@ -66,8 +79,10 @@ def create_artifact_services(
         config=artifact_config,
         artifact_store=artifact_store,
         candidate_store=candidate_store,
+        delivery_store=delivery_store,
         format_registry=format_registry,
         artifact_service=artifact_service,
         promotion_service=promotion_service,
+        delivery_service=delivery_service,
         workspace_manager=workspace_manager,
     )
