@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
-from typing import Any
 
 from ..artifacts import (
     ArtifactConfigType,
@@ -32,6 +31,7 @@ from .store import (
     FileSystemIngressEventStore,
     FileSystemInputBatchStore,
     IngressConflictError,
+    IngressNotFoundError,
 )
 
 
@@ -72,7 +72,7 @@ class ArtifactIngressService:
         grouping_mode: InputGroupingMode = InputGroupingMode.ATOMIC,
         grouping_key: str | None = None,
     ) -> InputSubmissionResult:
-        """Durably ingest one complete text/files envelope and commit it once."""
+        """Ingest one event; grouped Telegram drafts remain uncommitted."""
         if not self.config.enabled:
             raise IngressValidationError(
                 "ingress_disabled",
@@ -94,12 +94,9 @@ class ArtifactIngressService:
             committed = await self.batch_store.get_committed(
                 draft.input_batch_id
             )
-        except Exception as error:
-            from .store import IngressNotFoundError
-
-            if not isinstance(error, IngressNotFoundError):
-                raise
-        else:
+        except IngressNotFoundError:
+            committed = None
+        if committed is not None:
             return InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=committed.input_batch_id,
@@ -177,6 +174,24 @@ class ArtifactIngressService:
                         "Input batch exceeds the configured total byte limit.",
                     )
 
+            if grouping_mode != InputGroupingMode.ATOMIC:
+                mark_collecting = getattr(
+                    self.batch_store,
+                    "mark_collecting",
+                    None,
+                )
+                if mark_collecting is None:
+                    raise ArtifactStorageError(
+                        "Grouped input requires a grouped batch store"
+                    )
+                await mark_collecting(draft.input_batch_id)
+                return InputSubmissionResult(
+                    event_id=event.event_id,
+                    input_batch_id=draft.input_batch_id,
+                    state="collecting",
+                    duplicate=duplicate_event or duplicate_batch,
+                )
+
             committed = await self.batch_store.commit(
                 draft.input_batch_id,
                 reason=(
@@ -218,9 +233,55 @@ class ArtifactIngressService:
                 error_code=str(code),
             )
         except (ArtifactStorageError, ArtifactIntegrityError):
-            # Transport must receive a retryable infrastructure failure; the
-            # durable draft remains non-committed and invisible to the agent.
+            # The draft remains non-committed and invisible to the agent.
             raise
+
+    async def commit_batch(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+        reason: str,
+    ) -> CommittedInputBatch:
+        """Explicitly seal a grouped draft after client grouping is complete."""
+        draft = await self.batch_store.get_draft(input_batch_id)
+        if draft.session_id != session_id:
+            raise IngressConflictError("Input batch belongs to another session")
+        if draft.state == InputBatchDraftState.FAILED:
+            raise IngressConflictError("Failed input batch cannot be committed")
+        if any(
+            item.state != InputAttachmentState.STORED
+            for item in draft.attachment_parts
+        ):
+            raise IngressConflictError(
+                "All attachment slots must be stored before commit"
+            )
+        grouped_commit = getattr(self.batch_store, "commit_batch", None)
+        if grouped_commit is not None:
+            return await grouped_commit(
+                input_batch_id,
+                session_id=session_id,
+                reason=reason,
+            )
+        return await self.batch_store.commit(input_batch_id, reason=reason)
+
+    async def commit_ready_drafts(self) -> list[CommittedInputBatch]:
+        """Recovery/sweeper helper; it commits bytes but never starts the agent."""
+        list_ready = getattr(self.batch_store, "list_ready_drafts", None)
+        if list_ready is None:
+            return []
+        result: list[CommittedInputBatch] = []
+        for draft in await list_ready():
+            result.append(await self.commit_batch(
+                draft.input_batch_id,
+                session_id=draft.session_id,
+                reason=(
+                    "media_group_quiet_timeout"
+                    if draft.grouping_mode == InputGroupingMode.MEDIA_GROUP
+                    else "standalone_attachment_timeout"
+                ),
+            ))
+        return result
 
     async def _ingest_slot(
         self,
@@ -289,7 +350,7 @@ class ArtifactIngressService:
                 "The uploaded file format is not allowed by artifact policy.",
             )
         spec = self.artifact_services.format_registry.get(detected.format_id)
-        lineage, version = await self.artifact_services.artifact_store.create_lineage(
+        _, version = await self.artifact_services.artifact_store.create_lineage(
             session_id=session_id,
             cycle_id=f"input_batch:{input_batch_id}",
             content_id=content_ref.content_id,
