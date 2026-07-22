@@ -33,6 +33,11 @@ _OPEN_STATES = {
     InputBatchDraftState.INGESTING,
     InputBatchDraftState.READY_TO_COMMIT,
 }
+_TERMINAL_UNCOMMITTED_STATES = {
+    InputBatchDraftState.FAILED,
+    InputBatchDraftState.CANCELLED,
+    InputBatchDraftState.ABANDONED,
+}
 
 
 class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
@@ -95,6 +100,7 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
         return await asyncio.to_thread(self._list_open_drafts_sync, session_id)
 
     async def list_ready_drafts(self) -> list[InputBatchDraft]:
+        """Return drafts whose sealing grace or hard deadline has elapsed."""
         now = utc_now()
         drafts = await self.list_open_drafts()
         ready = []
@@ -106,8 +112,8 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
                 continue
             if draft.grouping_mode == InputGroupingMode.MEDIA_GROUP:
                 if (
-                    draft.quiet_deadline is not None
-                    and now >= draft.quiet_deadline
+                    draft.sealing_deadline is not None
+                    and now >= draft.sealing_deadline
                 ) or (
                     draft.maximum_deadline is not None
                     and now >= draft.maximum_deadline
@@ -135,6 +141,14 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
                 )
             committed_path = self.root / input_batch_id / "committed.json"
             duplicate = committed_path.exists() or committed_path.is_symlink()
+            if not duplicate and draft.state in _TERMINAL_UNCOMMITTED_STATES:
+                raise IngressConflictError(
+                    f"Input batch in {draft.state.value!r} state cannot be committed"
+                )
+            if not duplicate and draft.state == InputBatchDraftState.COMMITTED:
+                raise ArtifactIntegrityError(
+                    "Committed input batch draft is missing its immutable manifest"
+                )
             committed = self._commit_sync(input_batch_id, reason)
             self._release_group_index_sync(draft)
             return committed, duplicate
