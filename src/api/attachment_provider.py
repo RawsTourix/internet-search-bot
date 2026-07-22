@@ -21,6 +21,7 @@ class StrictHttpAttachmentStreamProvider:
     path_prefix: str = "/internal/files"
     connect_timeout_seconds: float = 10.0
     read_timeout_seconds: float = 120.0
+    transport: httpx.AsyncBaseTransport | None = None
 
     async def open_stream(
         self,
@@ -52,7 +53,10 @@ class StrictHttpAttachmentStreamProvider:
             total = 0
             declared_size: int | None = None
             try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
+                async with httpx.AsyncClient(
+                    timeout=timeout,
+                    transport=self.transport,
+                ) as client:
                     async with client.stream(
                         "GET",
                         url,
@@ -87,10 +91,7 @@ class StrictHttpAttachmentStreamProvider:
                                 raise AttachmentProviderError(
                                     "Attachment exceeds the configured size limit"
                                 )
-                            if (
-                                declared_size is not None
-                                and total > declared_size
-                            ):
+                            if declared_size is not None and total > declared_size:
                                 raise AttachmentProviderError(
                                     "Attachment provider length mismatch"
                                 )
