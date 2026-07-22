@@ -27,6 +27,7 @@ from ..ingress import (
 from .artifact_transport import (
     ArtifactTransportFacade,
     AttachmentProviderError,
+    CommitGroupedBatchRequest,
     DeliveryFailureRequest,
     DeliveryReceiptRequest,
     RunCommittedBatchRequest,
@@ -50,6 +51,17 @@ def _upload_stream(upload: UploadFile) -> AsyncIterator[bytes]:
     return iterator()
 
 
+def _committed_batch_payload(batch) -> dict[str, Any]:
+    return {
+        "input_batch_id": batch.input_batch_id,
+        "session_id": batch.session_id,
+        "sequence_number": batch.sequence_number,
+        "artifact_count": len(batch.artifact_refs),
+        "text_part_count": len(batch.text_parts),
+        "committed_at": batch.committed_at.isoformat(),
+    }
+
+
 def _submission_payload(result, response=None) -> dict[str, Any]:
     payload = {
         "status": result.state,
@@ -59,14 +71,9 @@ def _submission_payload(result, response=None) -> dict[str, Any]:
         "error_code": result.error_code,
     }
     if result.committed_batch is not None:
-        payload["committed_batch"] = {
-            "input_batch_id": result.committed_batch.input_batch_id,
-            "session_id": result.committed_batch.session_id,
-            "sequence_number": result.committed_batch.sequence_number,
-            "artifact_count": len(result.committed_batch.artifact_refs),
-            "text_part_count": len(result.committed_batch.text_parts),
-            "committed_at": result.committed_batch.committed_at.isoformat(),
-        }
+        payload["committed_batch"] = _committed_batch_payload(
+            result.committed_batch
+        )
     if response is not None:
         payload["response"] = response.content
         payload["metadata"] = response.metadata
@@ -81,16 +88,30 @@ def create_artifact_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    async def _run_if_requested(result, *, run: bool, progress_locale: str):
-        if not run or result.committed_batch is None:
+    async def _run_batch_if_requested(
+        batch,
+        *,
+        run: bool,
+        progress_locale: str,
+    ):
+        if not run:
             return None
         callback = None
         if progress_callback_factory is not None:
-            callback = progress_callback_factory(result.committed_batch)
+            callback = progress_callback_factory(batch)
         return await facade.run_committed_batch(
-            result.input_batch_id,
-            session_id=result.committed_batch.session_id,
+            batch.input_batch_id,
+            session_id=batch.session_id,
             progress_callback=callback,
+            progress_locale=progress_locale,
+        )
+
+    async def _run_if_requested(result, *, run: bool, progress_locale: str):
+        if result.committed_batch is None:
+            return None
+        return await _run_batch_if_requested(
+            result.committed_batch,
+            run=run,
             progress_locale=progress_locale,
         )
 
@@ -128,7 +149,10 @@ def create_artifact_router(
         except AttachmentProviderError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         except (ArtifactStorageError, ArtifactIntegrityError) as error:
-            raise HTTPException(status_code=503, detail="Ingress storage unavailable") from error
+            raise HTTPException(
+                status_code=503,
+                detail="Ingress storage unavailable",
+            ) from error
 
     @router.post(
         "/web/input-batches",
@@ -208,7 +232,57 @@ def create_artifact_router(
         except AttachmentProviderError as error:
             raise HTTPException(status_code=502, detail=str(error)) from error
         except (ArtifactStorageError, ArtifactIntegrityError) as error:
-            raise HTTPException(status_code=503, detail="Ingress storage unavailable") from error
+            raise HTTPException(
+                status_code=503,
+                detail="Ingress storage unavailable",
+            ) from error
+
+    @router.post(
+        "/input-batches/{input_batch_id}/commit",
+        dependencies=[Depends(auth_dependency)],
+    )
+    async def commit_input_batch(
+        input_batch_id: str,
+        body: CommitGroupedBatchRequest,
+    ):
+        try:
+            batch, duplicate = await facade.commit_grouped_batch(
+                input_batch_id,
+                session_id=body.session_id,
+            )
+            response = await _run_batch_if_requested(
+                batch,
+                run=body.run,
+                progress_locale=body.progress_locale,
+            )
+            payload: dict[str, Any] = {
+                "status": "committed",
+                "input_batch_id": batch.input_batch_id,
+                "duplicate": duplicate,
+                "committed_batch": _committed_batch_payload(batch),
+            }
+            if response is not None:
+                payload["response"] = response.content
+                payload["metadata"] = response.metadata
+            return JSONResponse(
+                status_code=(
+                    status.HTTP_200_OK
+                    if duplicate
+                    else status.HTTP_201_CREATED
+                ),
+                content=payload,
+            )
+        except IngressNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except ArtifactAccessError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+        except IngressConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (ArtifactStorageError, ArtifactIntegrityError) as error:
+            raise HTTPException(
+                status_code=503,
+                detail="Ingress storage unavailable",
+            ) from error
 
     @router.post(
         "/input-batches/{input_batch_id}/run",
@@ -307,7 +381,10 @@ def create_artifact_router(
         except ArtifactDeliveryError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (ArtifactStorageError, ArtifactIntegrityError) as error:
-            raise HTTPException(status_code=503, detail="Delivery storage unavailable") from error
+            raise HTTPException(
+                status_code=503,
+                detail="Delivery storage unavailable",
+            ) from error
 
     @router.post(
         "/internal/deliveries/{delivery_id}/complete",
