@@ -20,8 +20,10 @@ from ..artifacts import (
     create_artifact_services,
     load_artifact_config,
 )
+from ..mcp.artifact_delivery_runtime import (
+    FinalizingArtifactDeliveryPlanningMCPClient,
+)
 from ..mcp.mcp_client import load_config
-from ..mcp.planning_runtime import FinalizingPlanningMCPClient
 from ..core.models import ClientType, AgentStatus, AgentResult
 from ..core.errors import APIError
 from ..planning import (
@@ -154,8 +156,10 @@ class Api:
             )
 
             # Создание и запуск клиента
-            logger.info("Инициализация artifact/planning-aware MCP-клиента")
-            self.mcp_client = FinalizingPlanningMCPClient(
+            logger.info(
+                "Инициализация artifact/delivery/planning-aware MCP-клиента"
+            )
+            self.mcp_client = FinalizingArtifactDeliveryPlanningMCPClient(
                 self.llm_config,
                 storage_services=self.storage_services,
                 artifact_services=self.artifact_services,
