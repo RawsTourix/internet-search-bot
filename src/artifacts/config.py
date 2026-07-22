@@ -46,6 +46,7 @@ class ArtifactConfigType(BaseModel):
     max_container_entries_inspected: int = Field(default=2_048, ge=1)
     max_workspace_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     workspace_ttl_seconds: int = Field(default=3_600, ge=1)
+    delivery_claim_timeout_seconds: int = Field(default=900, ge=1)
 
     @field_validator("local_workspace_server_names")
     @classmethod
