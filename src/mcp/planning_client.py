@@ -32,6 +32,7 @@ from ..planning.tools import (
     PlanningToolOutcome,
 )
 from ..storage import StorageServices
+from .artifact_client import ArtifactMCPClient
 from .manager_context import ManagerToolContext
 from .mcp_client import (
     LLMConfigType,
@@ -47,7 +48,7 @@ _RECONCILIATION_MESSAGE_TYPES = {
 }
 
 
-class PlanningMCPClient(MCPClient):
+class PlanningMCPClient(ArtifactMCPClient):
     """Add exact optional DAG planning without duplicating the agent loop."""
 
     CONTROL_PLANE_MANAGER_TOOLS = frozenset(
