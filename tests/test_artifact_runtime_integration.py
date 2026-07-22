@@ -110,11 +110,11 @@ class ArtifactRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(runtime_payload["artifact_state"]["count"], 1)
         self.assertTrue(any(
             event.get("type") == "artifact_created"
-            for event in self.cycle.progress_events
+            for event in self.state.progress_events
         ))
         self.assertFalse(any(
             "alpha beta" in json.dumps(event, ensure_ascii=False)
-            for event in self.cycle.progress_events
+            for event in self.state.progress_events
         ))
 
     async def test_tool_result_payload_marks_artifact_data_untrusted(self):
