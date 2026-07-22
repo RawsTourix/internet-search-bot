@@ -1,57 +1,54 @@
-import os
 import logging
-from typing import Dict, Any
+import os
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
+from typing import Any, Dict
 
-from .models import UnifiedMessage, UnifiedResponse, ClientType, MessageType
+from .models import ClientType, MessageType, UnifiedMessage, UnifiedResponse
 from ..api.api import API
 from ..ingress import CommittedInputBatch
 
-# Проверяем и создаем папку для логов
+
 log_dir = "logging"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-
-# Настройка логирования
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
+os.makedirs(log_dir, exist_ok=True)
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("MessageProcessor")
 logger.setLevel(logging.DEBUG)
+if not logger.handlers:
+    file_handler = RotatingFileHandler(
+        filename=os.path.join(log_dir, "message_processor.log"),
+        maxBytes=8 * 1024 * 1024,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
-file_handler = RotatingFileHandler(
-    filename=os.path.join(log_dir, "message_processor.log"),
-    maxBytes=8*1024*1024,  # 8 MB
-    encoding='utf-8'
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(formatter)
-
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
 
 class MessageProcessor:
-    """Центральный процессор сообщений"""
-    
+    """Central processor for compatibility messages and committed batches."""
+
     def __init__(self):
         self.stats = {
             "total_messages": 0,
-            "messages_by_client": {client.value: 0 for client in ClientType},
+            "messages_by_client": {
+                client.value: 0 for client in ClientType
+            },
             "errors": 0,
-            "start_time": datetime.now()
+            "start_time": datetime.now(),
         }
         self.active_sessions = {}
-        
+
     async def process_message(
         self,
         message: UnifiedMessage,
         progress_callback=None,
     ) -> UnifiedResponse:
-        """Обработка унифицированного сообщения"""
         try:
             logger.info(
                 "Обработка сообщения от %s, content_chars=%s",
@@ -63,14 +60,14 @@ class MessageProcessor:
                 message,
                 progress_callback=progress_callback,
             )
-        except Exception as e:
-            logger.error(f"Ошибка обработки сообщения: {e}")
+        except Exception as error:
+            logger.error("Ошибка обработки сообщения: %s", error)
             self.stats["errors"] += 1
             return UnifiedResponse(
                 message_id=message.id,
                 client_type=message.client_type,
-                content=f"Произошла ошибка при обработке сообщения: {str(e)}",
-                response_type=MessageType.TEXT
+                content=f"Произошла ошибка при обработке сообщения: {error}",
+                response_type=MessageType.TEXT,
             )
 
     async def process_committed_batch(
@@ -80,7 +77,6 @@ class MessageProcessor:
         progress_callback=None,
         progress_locale: str = "ru",
     ) -> UnifiedResponse:
-        """Run the agent from one immutable batch committed by ingress."""
         try:
             self._record_request(batch.client_type)
             result = await API.call_agent_batch(
@@ -114,60 +110,56 @@ class MessageProcessor:
     def _record_request(self, client_type: ClientType) -> None:
         self.stats["total_messages"] += 1
         self.stats["messages_by_client"][client_type.value] += 1
-        
-    def _build_session_id(self, message: UnifiedMessage) -> str:
-        """Строит идентификатор сессии"""
-        metadata = message.metadata or {}
 
-        session_id = metadata.get("session_id")
-        if session_id is not None:
-            return f"{message.client_type.value}:session:{session_id}"
+    def _build_session_id(self, message: UnifiedMessage) -> str:
+        """Build one stable session; fully namespaced IDs are authoritative."""
+        metadata = message.metadata or {}
+        explicit = metadata.get("session_id")
+        if explicit is not None:
+            normalized = str(explicit).strip()
+            if not normalized:
+                raise ValueError("session_id must not be empty")
+            if ":" in normalized:
+                return normalized
+            return f"{message.client_type.value}:session:{normalized}"
 
         chat_id = metadata.get("chat_id")
         if chat_id is not None:
             return f"{message.client_type.value}:chat:{chat_id}"
-
         return f"{message.client_type.value}:user:{message.user_id}"
-    
+
     async def _generate_response(
         self,
         message: UnifiedMessage,
         progress_callback=None,
     ) -> UnifiedResponse:
-        """Обработка запроса"""
         response_content = ""
-        response_metadata = {}
+        response_metadata: dict[str, Any] = {}
 
         if message.message_type == MessageType.COMMAND:
             response_content = await self._handle_command(message)
         elif message.message_type == MessageType.TEXT:
             try:
-                session_id = self._build_session_id(message)
-                client_type = message.client_type
                 metadata = message.metadata or {}
-                progress_locale = metadata.get("progress_locale", "ru")
-                agent_result  = await API.call_agent(
+                result = await API.call_agent(
                     message.content,
-                    session_id=session_id,
-                    client_type=client_type,
+                    session_id=self._build_session_id(message),
+                    client_type=message.client_type,
                     progress_callback=progress_callback,
-                    progress_locale=progress_locale,
+                    progress_locale=metadata.get("progress_locale", "ru"),
                 )
-                response_content = agent_result.content
-                response_metadata = self._agent_result_metadata(agent_result)
+                response_content = result.content
+                response_metadata = self._agent_result_metadata(result)
+            except Exception as error:
+                response_content = f"Сообщение не обработано: {error}"
 
-            except Exception as e:
-                response_content = f"Сообщение не обработано: {e}"
-        
-        response = UnifiedResponse(
+        return UnifiedResponse(
             message_id=message.id,
             client_type=message.client_type,
             content=response_content,
             response_type=MessageType.TEXT,
-            metadata=response_metadata
+            metadata=response_metadata,
         )
-        
-        return response
 
     @staticmethod
     def _agent_result_metadata(agent_result) -> dict[str, Any]:
@@ -182,59 +174,52 @@ class MessageProcessor:
             "progress_events": agent_result.progress_events,
             "artifacts": list(agent_result.artifacts),
         }
-        
+
     async def _handle_command(self, message: UnifiedMessage) -> str:
-        """Обработка команд"""
         command = message.content.strip()
-        
-        # Запуск
         if command == "/start":
-            return f"Привет, {message.user_name or message.user_id}! Я интеллектуальный помощник с доступом к интернет-поиску. Задавай любые вопросы — буду рад ответить! 😊"
-        # Статус
-        elif command == "/status":
+            return (
+                f"Привет, {message.user_name or message.user_id}! "
+                "Я интеллектуальный помощник с доступом к инструментам."
+            )
+        if command == "/status":
             return await self._get_status_text()
-        # Справка
-        elif command == "/help":
+        if command == "/help":
             return self._get_help_text()
-        # Очистка памяти сессии
-        elif command == "/reset":
+        if command == "/reset":
             try:
                 await API.reset(self._build_session_id(message))
                 return "✅ Память успешно очищена."
-            except Exception as e:
-                return f"⚠️ Ошибка очистки памяти: {e}."
-        else:
-            return f"⚠️ Неизвестная команда: {command}"
-    
-    def _get_help_text(self) -> str:
-        """Справочная информация"""
+            except Exception as error:
+                return f"⚠️ Ошибка очистки памяти: {error}."
+        return f"⚠️ Неизвестная команда: {command}"
+
+    @staticmethod
+    def _get_help_text() -> str:
         return """
 Доступные команды:
 /start - приветствие
 /status - статус системы
-/reset - очиска памяти
+/reset - очистка памяти
 /help - справка
 
 Вы можете отправлять текст и файлы для обработки.
         """.strip()
-    
+
     async def _get_status_text(self) -> str:
-        """Информация о статусе"""
         uptime = datetime.now() - self.stats["start_time"]
         return f"""
 Статус Gateway:
 • Время работы: {uptime}
 • Всего сообщений: {self.stats['total_messages']}
 • Ошибок: {self.stats['errors']}
-• Сообщений по типам:
-  - Telegram: {self.stats['messages_by_client']['telegram']}
+• Telegram: {self.stats['messages_by_client']['telegram']}
         """.strip()
-    
+
     async def get_stats(self) -> Dict[str, Any]:
-        """Получение статистики"""
         uptime = datetime.now() - self.stats["start_time"]
         return {
             **self.stats,
             "uptime_seconds": uptime.total_seconds(),
-            "active_sessions": len(self.active_sessions)
+            "active_sessions": len(self.active_sessions),
         }
