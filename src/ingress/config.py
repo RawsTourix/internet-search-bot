@@ -22,10 +22,22 @@ class IngressConfigType(BaseModel):
     max_text_parts_per_batch: int = Field(default=64, ge=0)
     max_text_part_chars: int = Field(default=100_000, ge=1)
 
+    media_group_quiet_timeout_seconds: float = Field(default=0.8, gt=0)
+    media_group_sealing_grace_seconds: float = Field(default=0.5, ge=0)
+    media_group_maximum_wait_seconds: float = Field(default=5.0, gt=0)
+    standalone_attachment_maximum_wait_seconds: float = Field(default=2.0, gt=0)
+
     @model_validator(mode="after")
     def validate_part_limits(self) -> "IngressConfigType":
         if self.max_attachments_per_batch == 0 and self.max_text_parts_per_batch == 0:
             raise ValueError("ingress must allow text parts or attachments")
+        if (
+            self.media_group_maximum_wait_seconds
+            < self.media_group_quiet_timeout_seconds
+        ):
+            raise ValueError(
+                "media group maximum wait must not be shorter than quiet timeout"
+            )
         return self
 
 
