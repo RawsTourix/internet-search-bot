@@ -52,7 +52,8 @@ class PlanningMCPClient(ArtifactMCPClient):
     """Add exact optional DAG planning without duplicating the agent loop."""
 
     CONTROL_PLANE_MANAGER_TOOLS = frozenset(
-        set(MCPClient.CONTROL_PLANE_MANAGER_TOOLS) | set(PLAN_TOOL_NAMES)
+        set(ArtifactMCPClient.CONTROL_PLANE_MANAGER_TOOLS)
+        | set(PLAN_TOOL_NAMES)
     )
 
     def __init__(

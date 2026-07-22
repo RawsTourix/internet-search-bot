@@ -62,14 +62,18 @@ class ArtifactMCPClient(MCPClient):
         self.artifact_config = (
             artifact_services.config if artifact_services is not None else None
         )
+        artifacts_enabled = (
+            artifact_services is not None
+            and artifact_services.config.enabled
+        )
         self.artifact_tool_controller = (
             ArtifactToolController(artifact_services.artifact_service)
-            if artifact_services is not None
+            if artifacts_enabled
             else None
         )
         self.artifact_runtime = (
             ArtifactRuntimeCoordinator(artifact_services.artifact_service)
-            if artifact_services is not None
+            if artifacts_enabled
             else None
         )
         super().__init__(
