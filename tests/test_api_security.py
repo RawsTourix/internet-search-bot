@@ -1,12 +1,14 @@
 import unittest
 
 from src.api.config import (
+    safe_artifact_config_summary,
     safe_llm_config_summary,
     safe_memory_config_summary,
     safe_mcp_server_config_summary,
     safe_planning_config_summary,
     safe_runtime_config_summary,
 )
+from src.artifacts import ArtifactConfigType
 from src.memory import MemoryConfigType
 from src.mcp.mcp_client import LLMConfigType, ServerConfigType, ServerConnectType
 from src.planning import PlanningConfigType
@@ -40,6 +42,7 @@ class ApiConfigLoggingTests(unittest.TestCase):
                 "memory": safe_memory_config_summary(MemoryConfigType()),
                 "runtime": safe_runtime_config_summary(RuntimeConfigType()),
                 "planning": safe_planning_config_summary(PlanningConfigType()),
+                "artifacts": safe_artifact_config_summary(ArtifactConfigType()),
             }
         )
 
@@ -58,6 +61,10 @@ class ApiConfigLoggingTests(unittest.TestCase):
         self.assertIn("mcp_runtime_close_timeout", summaries)
         self.assertIn("max_ready_nodes_in_context", summaries)
         self.assertIn("max_reconciliation_attempts", summaries)
+        self.assertIn("max_artifacts_per_cycle", summaries)
+        self.assertIn("max_versions_per_lineage", summaries)
+        self.assertIn("max_runtime_artifact_summaries", summaries)
+        self.assertIn("allow_opaque_binary", summaries)
 
 
 if __name__ == "__main__":
