@@ -216,12 +216,34 @@ class ArtifactTransportFacade:
             )
 
         grouping = resolve_input_grouping(envelope)
-        return await self.api.ingress_services.ingress_service.submit_atomic(
-            envelope,
-            session_id=self.session_id_for(envelope),
-            upload_streams=streams,
-            grouping_mode=grouping.mode,
-            grouping_key=grouping.key,
+        try:
+            return await self.api.ingress_services.ingress_service.submit_atomic(
+                envelope,
+                session_id=self.session_id_for(envelope),
+                upload_streams=streams,
+                grouping_mode=grouping.mode,
+                grouping_key=grouping.key,
+            )
+        except AttachmentProviderError:
+            await self._mark_provider_stream_failed(envelope)
+            raise
+
+    async def _mark_provider_stream_failed(
+        self,
+        envelope: ClientInputEnvelope,
+    ) -> None:
+        """Close a partially ingested draft without hiding storage failures."""
+        event, _ = await self.api.ingress_services.event_store.save_if_absent(
+            envelope
+        )
+        draft, committed = await self.api.ingress_services.batch_store.find_by_event(
+            event.event_id
+        )
+        if draft is None or committed is not None:
+            return
+        await self.api.ingress_services.batch_store.fail(
+            draft.input_batch_id,
+            code="attachment_stream_failed",
         )
 
     async def commit_grouped_batch(
