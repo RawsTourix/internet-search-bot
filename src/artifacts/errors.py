@@ -41,6 +41,10 @@ class ArtifactCandidateError(ArtifactError):
     """Raised when a candidate cannot be promoted safely."""
 
 
+class ArtifactWorkspaceError(ArtifactError):
+    """Raised when an isolated MCP artifact workspace is invalid or unsafe."""
+
+
 class ArtifactValidationError(ArtifactError):
     """Structured validation failure suitable for manager-tool output."""
 
