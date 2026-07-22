@@ -12,6 +12,7 @@ from .config import ArtifactConfigType
 from .file_store import FileSystemArtifactStore
 from .format_registry import ArtifactFormatRegistry, build_default_format_registry
 from .interfaces import ArtifactStore
+from .promotion import ArtifactCandidatePromotionService
 from .service import ArtifactService
 from .workspace import ArtifactWorkspaceManager
 
@@ -23,6 +24,7 @@ class ArtifactServices:
     candidate_store: ArtifactCandidateStore
     format_registry: ArtifactFormatRegistry
     artifact_service: ArtifactService
+    promotion_service: ArtifactCandidatePromotionService
     workspace_manager: ArtifactWorkspaceManager
 
 
@@ -48,6 +50,10 @@ def create_artifact_services(
         content_store=content_store,
         format_registry=format_registry,
     )
+    promotion_service = ArtifactCandidatePromotionService(
+        artifact_service=artifact_service,
+        candidate_store=candidate_store,
+    )
     workspace_manager = ArtifactWorkspaceManager(
         storage_config=storage_config,
         artifact_config=artifact_config,
@@ -62,5 +68,6 @@ def create_artifact_services(
         candidate_store=candidate_store,
         format_registry=format_registry,
         artifact_service=artifact_service,
+        promotion_service=promotion_service,
         workspace_manager=workspace_manager,
     )
