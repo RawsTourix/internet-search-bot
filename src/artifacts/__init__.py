@@ -54,6 +54,7 @@ from .models import (
     new_artifact_lineage_id,
     utc_now,
 )
+from .promotion import ArtifactCandidatePromotionService
 from .server_policy import apply_local_workspace_server_policy
 from .service import ArtifactSearchResult, ArtifactService, ArtifactTextReadResult
 from .text_operations import apply_exact_text_patch, enforce_text_size
@@ -70,6 +71,7 @@ __all__ = [
     "ArtifactAccessError",
     "ArtifactCandidate",
     "ArtifactCandidateError",
+    "ArtifactCandidatePromotionService",
     "ArtifactCandidateStatus",
     "ArtifactCandidateStore",
     "ArtifactCapability",
