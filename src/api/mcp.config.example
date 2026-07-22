@@ -108,7 +108,8 @@
         "local_workspace_server_names": [],
         "max_container_entries_inspected": 2048,
         "max_workspace_bytes": 268435456,
-        "workspace_ttl_seconds": 3600
+        "workspace_ttl_seconds": 3600,
+        "delivery_claim_timeout_seconds": 900
     },
     "planning": {
         "enabled": true,
