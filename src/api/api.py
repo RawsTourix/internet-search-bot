@@ -1,5 +1,6 @@
 import os
 import logging
+from collections.abc import AsyncIterator, Mapping
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -19,6 +20,12 @@ from ..artifacts import (
     apply_local_workspace_server_policy,
     create_artifact_services,
     load_artifact_config,
+)
+from ..ingress import (
+    ClientInputEnvelope,
+    InputSubmissionResult,
+    create_ingress_services,
+    load_ingress_config,
 )
 from ..mcp.artifact_delivery_runtime import (
     FinalizingArtifactDeliveryPlanningMCPClient,
@@ -70,10 +77,9 @@ class Api:
     def __init__(self, config_path):
         """Инициализация Api"""
         try:
-            # Загрузка конфигурации
             logger.info(
-                "Загрузка конфигурации MCP-серверов, LLM, storage, "
-                "memory, runtime, planning и artifacts"
+                "Загрузка конфигурации MCP-серверов, LLM, storage, memory, "
+                "runtime, planning, artifacts и ingress"
             )
             (
                 self.server_configs,
@@ -84,6 +90,7 @@ class Api:
             ) = load_config(config_path)
             self.planning_config = load_planning_config(config_path)
             self.artifact_config = load_artifact_config(config_path)
+            self.ingress_config = load_ingress_config(config_path)
             apply_local_workspace_server_policy(
                 self.server_configs,
                 self.artifact_config,
@@ -136,6 +143,12 @@ class Api:
                 "Artifacts: %s",
                 safe_artifact_config_summary(self.artifact_config),
             )
+            logger.info(
+                "Ingress: enabled=%s max_attachments=%s max_batch_bytes=%s",
+                self.ingress_config.enabled,
+                self.ingress_config.max_attachments_per_batch,
+                self.ingress_config.max_batch_total_bytes,
+            )
 
             base_storage_services = create_storage_services(self.storage_config)
             self.storage_services = StorageServices(
@@ -150,12 +163,17 @@ class Api:
                 artifact_config=self.artifact_config,
                 content_store=self.storage_services.content_store,
             )
+            self.ingress_services = create_ingress_services(
+                storage_config=self.storage_config,
+                ingress_config=self.ingress_config,
+                content_store=self.storage_services.content_store,
+                artifact_services=self.artifact_services,
+            )
             self.planning_services = create_planning_services(
                 storage_config=self.storage_config,
                 planning_config=self.planning_config,
             )
 
-            # Создание и запуск клиента
             logger.info(
                 "Инициализация artifact/delivery/planning-aware MCP-клиента"
             )
@@ -178,6 +196,55 @@ class Api:
         except Exception as e:
             raise APIError(f"Ошибка подключения к MCP-серверам: {repr(e)}") from e
 
+    async def submit_input(
+        self,
+        envelope: ClientInputEnvelope,
+        *,
+        session_id: str,
+        upload_streams: Mapping[str, AsyncIterator[bytes]] | None = None,
+    ) -> InputSubmissionResult:
+        """Persist a complete client envelope and atomically commit its batch."""
+        try:
+            return await self.ingress_services.ingress_service.submit_atomic(
+                envelope,
+                session_id=session_id,
+                upload_streams=upload_streams,
+            )
+        except Exception as error:
+            logger.error("Ошибка durable ingress: %r", error)
+            raise APIError(f"Ошибка приёма входного batch: {error}") from error
+
+    async def call_agent_batch(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+        progress_callback=None,
+        progress_locale: str = "ru",
+    ) -> AgentResult:
+        """Run the agent only from an authoritative committed input batch."""
+        try:
+            batch = await self.ingress_services.batch_store.get_committed(
+                input_batch_id
+            )
+            if batch.session_id != session_id:
+                raise APIError("Input batch belongs to another session")
+            return await self.mcp_client.process_query(
+                "",
+                session_id=session_id,
+                client_type=batch.client_type,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+                input_batch=batch,
+            )
+        except APIError:
+            raise
+        except Exception as error:
+            logger.error("Ошибка запуска committed input batch: %r", error)
+            raise APIError(
+                f"Ошибка обработки committed input batch: {error}"
+            ) from error
+
     async def call_agent(
         self,
         message: str,
@@ -186,7 +253,7 @@ class Api:
         progress_callback=None,
         progress_locale: str = "ru",
     ) -> AgentResult:
-        """Обращение к MCP-клиенту"""
+        """Compatibility text-only entrypoint."""
         try:
             if not await self.mcp_client.list_tools():
                 logger.warning("Нет зарегистрированных инструментов")
