@@ -195,10 +195,11 @@ def build_telegram_input_envelope(
 
 
 class DebouncedBatchRunner:
-    """Run one callback after the last observed member of a media group."""
+    """Debounce media groups without cancelling a callback already running."""
 
     def __init__(self) -> None:
         self._tasks: dict[str, asyncio.Task[None]] = {}
+        self._running: set[str] = set()
         self._lock = asyncio.Lock()
 
     async def schedule(
@@ -208,17 +209,20 @@ class DebouncedBatchRunner:
         delay_seconds: float,
         callback: Callable[[], Awaitable[None]],
         reset: bool = True,
-    ) -> None:
+    ) -> bool:
         async with self._lock:
+            if key in self._running:
+                return False
             current = self._tasks.get(key)
             if current is not None and not current.done():
                 if not reset:
-                    return
+                    return False
                 current.cancel()
             task = asyncio.create_task(
                 self._worker(key, max(0.0, delay_seconds), callback)
             )
             self._tasks[key] = task
+            return True
 
     async def _worker(
         self,
@@ -228,6 +232,10 @@ class DebouncedBatchRunner:
     ) -> None:
         try:
             await asyncio.sleep(delay_seconds)
+            async with self._lock:
+                if self._tasks.get(key) is not asyncio.current_task():
+                    return
+                self._running.add(key)
             await callback()
         except asyncio.CancelledError:
             raise
@@ -235,6 +243,7 @@ class DebouncedBatchRunner:
             logger.exception("Debounced Telegram media-group callback failed")
         finally:
             async with self._lock:
+                self._running.discard(key)
                 if self._tasks.get(key) is asyncio.current_task():
                     self._tasks.pop(key, None)
 
@@ -372,7 +381,8 @@ class TelegramArtifactGatewayClient:
             delivery_id = str(item.get("delivery_id") or "")
             if not delivery_id:
                 continue
-            state = str(item.get("state") or "selected")
+            raw_state = item.get("state")
+            state = str(getattr(raw_state, "value", raw_state) or "selected")
             if state != "selected":
                 outcomes.append(TelegramDeliveryOutcome(
                     delivery_id=delivery_id,
@@ -404,6 +414,8 @@ class TelegramArtifactGatewayClient:
             mode="w+b",
         )
         filename = "artifact.bin"
+        sent_message: Any | None = None
+        receipt: dict[str, Any] = {"provider": "telegram", "chat_id": chat_id}
         try:
             async with self._client(read_timeout=300.0) as client:
                 async with client.stream(
@@ -449,13 +461,9 @@ class TelegramArtifactGatewayClient:
                 kwargs["message_thread_id"] = message_thread_id
             if reply_to_message_id is not None:
                 kwargs["reply_to_message_id"] = reply_to_message_id
-            sent = await bot.send_document(**kwargs)
-            receipt = {
-                "provider": "telegram",
-                "chat_id": chat_id,
-                "message_id": getattr(sent, "message_id", None),
-            }
-            document = getattr(sent, "document", None)
+            sent_message = await bot.send_document(**kwargs)
+            receipt["message_id"] = getattr(sent_message, "message_id", None)
+            document = getattr(sent_message, "document", None)
             if document is not None:
                 receipt["telegram_file_id"] = getattr(document, "file_id", None)
                 receipt["telegram_file_unique_id"] = getattr(
@@ -463,49 +471,94 @@ class TelegramArtifactGatewayClient:
                     "file_unique_id",
                     None,
                 )
-            await self._complete(delivery_id, session_id, receipt)
+            try:
+                await self._complete(delivery_id, session_id, receipt)
+            except Exception as error:
+                logger.warning(
+                    "Telegram accepted delivery %s but completion receipt failed: %r",
+                    delivery_id,
+                    error,
+                )
+                try:
+                    await self._fail(
+                        delivery_id,
+                        session_id,
+                        error="completion_receipt_failed",
+                        ambiguous=True,
+                        receipt=receipt,
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist ambiguous Telegram delivery receipt"
+                    )
+                return TelegramDeliveryOutcome(
+                    delivery_id=delivery_id,
+                    state="unknown",
+                    telegram_message_id=getattr(sent_message, "message_id", None),
+                    error="completion_receipt_failed",
+                )
             return TelegramDeliveryOutcome(
                 delivery_id=delivery_id,
                 state="delivered",
-                telegram_message_id=getattr(sent, "message_id", None),
+                telegram_message_id=getattr(sent_message, "message_id", None),
             )
         except (TimedOut, NetworkError) as error:
-            await self._fail(
-                delivery_id,
-                session_id,
-                error=type(error).__name__,
-                ambiguous=True,
-            )
+            try:
+                await self._fail(
+                    delivery_id,
+                    session_id,
+                    error=type(error).__name__,
+                    ambiguous=True,
+                    receipt=receipt,
+                )
+            except Exception:
+                logger.exception("Failed to persist ambiguous Telegram timeout")
             return TelegramDeliveryOutcome(
                 delivery_id=delivery_id,
                 state="unknown",
+                telegram_message_id=(
+                    getattr(sent_message, "message_id", None)
+                    if sent_message is not None
+                    else None
+                ),
                 error=type(error).__name__,
             )
         except BadRequest as error:
-            await self._fail(
-                delivery_id,
-                session_id,
-                error=str(error),
-                ambiguous=False,
-            )
+            try:
+                await self._fail(
+                    delivery_id,
+                    session_id,
+                    error=str(error),
+                    ambiguous=False,
+                    receipt=receipt,
+                )
+            except Exception:
+                logger.exception("Failed to persist Telegram BadRequest")
             return TelegramDeliveryOutcome(
                 delivery_id=delivery_id,
                 state="failed",
                 error=str(error),
             )
         except Exception as error:
+            ambiguous = sent_message is not None
             try:
                 await self._fail(
                     delivery_id,
                     session_id,
                     error=type(error).__name__,
-                    ambiguous=False,
+                    ambiguous=ambiguous,
+                    receipt=receipt,
                 )
             except Exception:
                 logger.exception("Failed to persist Telegram delivery failure")
             return TelegramDeliveryOutcome(
                 delivery_id=delivery_id,
-                state="failed",
+                state="unknown" if ambiguous else "failed",
+                telegram_message_id=(
+                    getattr(sent_message, "message_id", None)
+                    if sent_message is not None
+                    else None
+                ),
                 error=type(error).__name__,
             )
         finally:
@@ -535,14 +588,16 @@ class TelegramArtifactGatewayClient:
         *,
         error: str,
         ambiguous: bool,
+        receipt: dict[str, Any] | None = None,
     ) -> None:
+        payload_receipt = {"provider": "telegram", **dict(receipt or {})}
         async with self._client(read_timeout=30.0) as client:
             response = await client.post(
                 f"{self.gateway_url}/internal/deliveries/{delivery_id}/failed",
                 json={
                     "session_id": session_id,
                     "client_type": "telegram",
-                    "receipt": {"provider": "telegram"},
+                    "receipt": payload_receipt,
                     "error": error[:2_000],
                     "ambiguous": ambiguous,
                 },
