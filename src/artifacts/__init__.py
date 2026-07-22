@@ -17,6 +17,7 @@ from .errors import (
     ArtifactStorageError,
     ArtifactValidationError,
     ArtifactVersionConflictError,
+    ArtifactWorkspaceError,
 )
 from .factory import ArtifactServices, create_artifact_services
 from .file_store import FileSystemArtifactStore
@@ -56,6 +57,12 @@ from .models import (
 from .service import ArtifactSearchResult, ArtifactService, ArtifactTextReadResult
 from .text_operations import apply_exact_text_patch, enforce_text_size
 from .validators import ArtifactValidationReport, validate_native_text
+from .workspace import (
+    ArtifactInputBinding,
+    ArtifactOutputSpec,
+    ArtifactWorkspace,
+    ArtifactWorkspaceManager,
+)
 
 __all__ = [
     "ArtifactAccessContext",
@@ -75,11 +82,13 @@ __all__ = [
     "ArtifactFormatDetection",
     "ArtifactFormatRegistry",
     "ArtifactFormatSpec",
+    "ArtifactInputBinding",
     "ArtifactIntegrityError",
     "ArtifactLimitError",
     "ArtifactLineage",
     "ArtifactLineageStatus",
     "ArtifactNotFoundError",
+    "ArtifactOutputSpec",
     "ArtifactProvenance",
     "ArtifactPurpose",
     "ArtifactSearchResult",
@@ -93,6 +102,9 @@ __all__ = [
     "ArtifactVersion",
     "ArtifactVersionConflictError",
     "ArtifactVersionRef",
+    "ArtifactWorkspace",
+    "ArtifactWorkspaceError",
+    "ArtifactWorkspaceManager",
     "ExactTextPatchOperation",
     "FileSystemArtifactCandidateStore",
     "FileSystemArtifactStore",
