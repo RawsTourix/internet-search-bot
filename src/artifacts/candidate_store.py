@@ -203,8 +203,13 @@ class FileSystemArtifactCandidateStore(ArtifactCandidateStore):
                 raise ArtifactStorageError(
                     "Failed to serialize artifact candidate metadata"
                 ) from error
-            path.write_bytes(payload)
-            self._fsync_file(path)
+            # Keep the file descriptor opened for writing until fsync. On
+            # Windows, reopening the completed file as read-only and calling
+            # os.fsync() maps to an invalid CRT descriptor (WinError/errno 9).
+            with path.open("xb") as stream:
+                stream.write(payload)
+                stream.flush()
+                os.fsync(stream.fileno())
             os.replace(temp, target)
             _fsync_directory(self.root)
             return candidate
@@ -317,11 +322,6 @@ class FileSystemArtifactCandidateStore(ArtifactCandidateStore):
             raise ArtifactStorageError(
                 "Artifact candidate metadata must not use symlinks"
             )
-
-    @staticmethod
-    def _fsync_file(path: Path) -> None:
-        with path.open("rb") as stream:
-            os.fsync(stream.fileno())
 
     @staticmethod
     def _validate_id(candidate_id: str) -> None:
