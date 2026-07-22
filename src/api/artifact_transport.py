@@ -17,7 +17,6 @@ from ..ingress import (
     ClientInputEnvelope,
     CommittedInputBatch,
     IngressConflictError,
-    IngressNotFoundError,
     InputGroupingMode,
     InputSubmissionResult,
 )
@@ -228,17 +227,6 @@ class ArtifactTransportFacade:
     ) -> tuple[CommittedInputBatch, bool]:
         """Commit one complete grouped draft; repeated calls are idempotent."""
         store = self.api.ingress_services.batch_store
-        try:
-            committed = await store.get_committed(input_batch_id)
-        except IngressNotFoundError:
-            committed = None
-        if committed is not None:
-            if committed.session_id != session_id:
-                raise ArtifactAccessError(
-                    "Input batch belongs to another session"
-                )
-            return committed, True
-
         draft = await store.get_draft(input_batch_id)
         if draft.session_id != session_id:
             raise ArtifactAccessError("Input batch belongs to another session")
@@ -246,6 +234,17 @@ class ArtifactTransportFacade:
             raise IngressConflictError(
                 "Atomic input batches are committed during submission"
             )
+
+        try:
+            committed = await store.get_committed(input_batch_id)
+        except Exception as error:
+            from ..ingress import IngressNotFoundError
+
+            if not isinstance(error, IngressNotFoundError):
+                raise
+        else:
+            return committed, True
+
         commit_batch = getattr(store, "commit_batch", None)
         if commit_batch is None:
             raise IngressConflictError(
