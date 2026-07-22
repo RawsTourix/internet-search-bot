@@ -33,7 +33,6 @@ jobs:
 
           path = Path("src/mcp/mcp_client.py")
           text = path.read_text(encoding="utf-8")
-
           old_import = "from typing import Optional, List, Dict, Any, Tuple, Callable, Awaitable"
           new_import = "from typing import Optional, List, Dict, Any, Tuple, Callable, Awaitable, Literal"
           if text.count(old_import) != 1:
