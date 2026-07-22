@@ -93,3 +93,23 @@ def safe_planning_config_summary(config: Any) -> dict[str, Any]:
         "max_plan_get_limit": config.max_plan_get_limit,
         "max_reconciliation_attempts": config.max_reconciliation_attempts,
     }
+
+
+def safe_artifact_config_summary(config: Any) -> dict[str, Any]:
+    """Return bounded non-sensitive artifact feature settings."""
+    return {
+        "enabled": config.enabled,
+        "max_artifacts_per_cycle": config.max_artifacts_per_cycle,
+        "max_versions_per_lineage": config.max_versions_per_lineage,
+        "max_artifact_size_bytes": config.max_artifact_size_bytes,
+        "max_inline_text_chars": config.max_inline_text_chars,
+        "max_read_chars": config.max_read_chars,
+        "max_search_matches": config.max_search_matches,
+        "max_patch_operations": config.max_patch_operations,
+        "max_patchable_text_bytes": config.max_patchable_text_bytes,
+        "max_runtime_artifact_summaries": (
+            config.max_runtime_artifact_summaries
+        ),
+        "allow_opaque_binary": config.allow_opaque_binary,
+        "auto_select_deliverables": config.auto_select_deliverables,
+    }
