@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -17,6 +17,8 @@ from src.ingress import (
     IngressConfigType,
     IngressConflictError,
     IngressNotFoundError,
+    InputBatchDraft,
+    InputBatchDraftState,
     InputGroupingMode,
     create_ingress_services,
 )
@@ -100,6 +102,15 @@ class ArtifactIngressGroupingTests(unittest.IsolatedAsyncioTestCase):
             upload_streams={f"slot_file_{index}": chunks(b"hello\n")},
         )
 
+    async def _replace_draft(self, draft: InputBatchDraft) -> None:
+        await asyncio.to_thread(
+            self.ingress.batch_store._write_json,
+            self.ingress.batch_store.root
+            / draft.input_batch_id
+            / "draft.json",
+            draft.model_dump(mode="json"),
+        )
+
     async def test_media_group_stays_hidden_until_explicit_commit(self):
         first = await self._submit_group_part(1)
         second = await self._submit_group_part(2)
@@ -149,6 +160,46 @@ class ArtifactIngressGroupingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first_batch, second_batch)
         self.assertEqual(first_batch.sequence_number, 1)
         self.assertEqual({first_duplicate, second_duplicate}, {False, True})
+
+    async def test_quiet_timeout_does_not_skip_sealing_grace(self):
+        result = await self._submit_group_part(1)
+        draft = await self.ingress.batch_store.get_draft(result.input_batch_id)
+        now = datetime.now(timezone.utc)
+        before_sealing = InputBatchDraft.model_validate(
+            draft.model_copy(update={
+                "quiet_deadline": now - timedelta(seconds=1),
+                "sealing_deadline": now + timedelta(seconds=30),
+                "maximum_deadline": now + timedelta(seconds=60),
+            }).model_dump(mode="python")
+        )
+        await self._replace_draft(before_sealing)
+        self.assertEqual(await self.ingress.batch_store.list_ready_drafts(), [])
+
+        after_sealing = InputBatchDraft.model_validate(
+            before_sealing.model_copy(update={
+                "sealing_deadline": now - timedelta(seconds=1),
+            }).model_dump(mode="python")
+        )
+        await self._replace_draft(after_sealing)
+        ready = await self.ingress.batch_store.list_ready_drafts()
+        self.assertEqual(
+            [item.input_batch_id for item in ready],
+            [result.input_batch_id],
+        )
+
+    async def test_terminal_uncommitted_draft_is_rejected(self):
+        result = await self._submit_group_part(1)
+        await asyncio.to_thread(
+            self.ingress.batch_store._set_state_sync,
+            result.input_batch_id,
+            InputBatchDraftState.CANCELLED,
+            None,
+        )
+        with self.assertRaises(IngressConflictError):
+            await self.facade.commit_grouped_batch(
+                result.input_batch_id,
+                session_id="telegram:conversation:chat-1",
+            )
 
     async def test_commit_enforces_session_authority(self):
         result = await self._submit_group_part(1)
