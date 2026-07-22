@@ -1,32 +1,15 @@
-"""Task-local planning context shared by manager tools and storage adapters."""
+"""Planning-aware storage adapter using the shared manager-tool context."""
 
 from __future__ import annotations
 
-from contextvars import ContextVar, Token
 from typing import Any
 
-from ..mcp.manager_context import ManagerToolContext
-from ..storage.interfaces import ContentStore
-
-
-_CURRENT_MANAGER_CONTEXT: ContextVar[ManagerToolContext | None] = ContextVar(
-    "planning_manager_context",
-    default=None,
+from ..mcp.manager_runtime_context import (
+    get_manager_context,
+    reset_manager_context,
+    set_manager_context,
 )
-
-
-def get_manager_context() -> ManagerToolContext | None:
-    return _CURRENT_MANAGER_CONTEXT.get()
-
-
-def set_manager_context(
-    context: ManagerToolContext | None,
-) -> Token[ManagerToolContext | None]:
-    return _CURRENT_MANAGER_CONTEXT.set(context)
-
-
-def reset_manager_context(token: Token[ManagerToolContext | None]) -> None:
-    _CURRENT_MANAGER_CONTEXT.reset(token)
+from ..storage.interfaces import ContentStore
 
 
 class PlanningAwareContentStore(ContentStore):
@@ -154,3 +137,11 @@ class PlanningAwareContentStore(ContentStore):
             query=query,
             limit=limit,
         )
+
+
+__all__ = [
+    "PlanningAwareContentStore",
+    "get_manager_context",
+    "reset_manager_context",
+    "set_manager_context",
+]
