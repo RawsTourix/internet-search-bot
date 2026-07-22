@@ -54,6 +54,7 @@ from .models import (
     new_artifact_lineage_id,
     utc_now,
 )
+from .server_policy import apply_local_workspace_server_policy
 from .service import ArtifactSearchResult, ArtifactService, ArtifactTextReadResult
 from .text_operations import apply_exact_text_patch, enforce_text_size
 from .validators import ArtifactValidationReport, validate_native_text
@@ -111,6 +112,7 @@ __all__ = [
     "LegacyArtifactMigrator",
     "LegacyMigrationReport",
     "apply_exact_text_patch",
+    "apply_local_workspace_server_policy",
     "build_default_format_registry",
     "create_artifact_services",
     "enforce_text_size",
