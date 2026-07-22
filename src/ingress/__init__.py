@@ -28,6 +28,7 @@ from .models import (
     new_ingress_event_id,
     new_input_batch_id,
 )
+from .routing import InputGroupingDecision, resolve_input_grouping
 from .service import ArtifactIngressService, IngressValidationError
 from .store import (
     FileSystemIngressEventStore,
@@ -60,6 +61,7 @@ __all__ = [
     "InputAttachmentState",
     "InputBatchDraft",
     "InputBatchDraftState",
+    "InputGroupingDecision",
     "InputGroupingMode",
     "InputSubmissionResult",
     "create_ingress_services",
@@ -68,4 +70,5 @@ __all__ = [
     "load_ingress_config",
     "new_ingress_event_id",
     "new_input_batch_id",
+    "resolve_input_grouping",
 ]
