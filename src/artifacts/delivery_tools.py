@@ -6,6 +6,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, ValidationError
 
+from ..mcp.artifact_request_context import get_artifact_request_client_type
 from ..mcp.manager_context import ManagerToolContext
 from .delivery import ArtifactDeliveryService
 from .errors import (
@@ -68,7 +69,12 @@ class ArtifactDeliveryToolController:
             )
         try:
             parsed = ArtifactSetDeliveryInput.model_validate(arguments)
-            client_type = getattr(context.client_type, "value", context.client_type)
+            raw_client_type = (
+                context.client_type
+                if context.client_type is not None
+                else get_artifact_request_client_type()
+            )
+            client_type = getattr(raw_client_type, "value", raw_client_type)
             if not isinstance(client_type, str) or not client_type.strip():
                 return ArtifactToolOutcome(
                     payload={
