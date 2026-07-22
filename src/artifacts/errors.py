@@ -45,6 +45,14 @@ class ArtifactWorkspaceError(ArtifactError):
     """Raised when an isolated MCP artifact workspace is invalid or unsafe."""
 
 
+class ArtifactDeliveryError(ArtifactError):
+    """Raised when a delivery state transition is invalid."""
+
+
+class ArtifactDeliveryNotFoundError(ArtifactDeliveryError):
+    """Raised when a delivery record does not exist."""
+
+
 class ArtifactValidationError(ArtifactError):
     """Structured validation failure suitable for manager-tool output."""
 
