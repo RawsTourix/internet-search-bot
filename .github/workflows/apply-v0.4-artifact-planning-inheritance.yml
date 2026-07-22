@@ -1,0 +1,51 @@
+name: Apply v0.4 artifact planning inheritance
+
+on:
+  push:
+    branches: [feature]
+    paths:
+      - "scripts/patch_v0_4_artifact_planning_inheritance.py"
+      - ".github/workflows/apply-v0.4-artifact-planning-inheritance.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  patch-and-validate:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feature
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+
+      - name: Apply exact inheritance patch
+        run: python scripts/patch_v0_4_artifact_planning_inheritance.py
+
+      - name: Validate
+        run: |
+          python -m compileall src tests scripts
+          python -m unittest discover -s tests -p "test_artifact*.py" -v
+          python -m unittest discover -s tests -p "test_planning*.py" -v
+          python -m unittest discover -s tests -p "test_plan*.py" -v
+
+      - name: Publish target commit
+        run: |
+          rm scripts/patch_v0_4_artifact_planning_inheritance.py
+          rm .github/workflows/apply-v0.4-artifact-planning-inheritance.yml
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "v0.4-file-artifacts: layer artifact runtime below planning"
+          git push origin HEAD:feature
