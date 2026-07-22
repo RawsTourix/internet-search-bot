@@ -22,7 +22,11 @@ class StorageSerializationError(StorageError):
 
 
 class StorageContentTooLargeError(StorageError):
-    """Raised when a full read would exceed the configured memory limit."""
+    """Raised when a stream or full read exceeds a configured hard limit."""
+
+
+class StorageStreamSourceError(StorageError):
+    """Typed upstream iterator failure that must not be rewrapped by storage."""
 
 
 class UnsupportedStorageBackendError(StorageError):
