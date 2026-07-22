@@ -1,13 +1,12 @@
 import os
 import uuid
 import logging
-import asyncio
 from typing import Any
 from urllib.parse import urlparse
 
 import httpx
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, Request, HTTPException, status, Depends
+from fastapi import FastAPI, HTTPException, status, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from datetime import datetime
@@ -15,9 +14,14 @@ from logging.handlers import RotatingFileHandler
 
 from .adapters.telegram_adapter import TelegramAdapter
 from .adapters.web_adapter import WebAdapter
+from .api.api import API
+from .api.artifact_routes import create_artifact_router
+from .api.artifact_transport import (
+    ArtifactTransportFacade,
+    HttpAttachmentStreamProvider,
+)
 from .core.message_processor import MessageProcessor
 from .core.models import UnifiedMessage, WebMessage, MessageType, ClientType
-from .api.api import API
 
 from dotenv import load_dotenv
 
@@ -53,24 +57,25 @@ logger.addHandler(console_handler)
 # API Key Authentication
 from fastapi.security import APIKeyHeader
 
-# Настройка заголовка API ключей
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
 
-# Получение API ключей из переменных среды
+
 def get_api_keys():
-    """Возвращает список валидных API-ключей"""
+    """Возвращает список валидных client/internal API-ключей."""
     keys = []
-    
-    # Ключ для Telegram
-    if telegram_key := os.getenv("TELEGRAM_API_KEY", ""):
-        keys.append(telegram_key)
-    
+    for environment_name in (
+        "TELEGRAM_API_KEY",
+        "WEB_API_KEY",
+        "INTERNAL_API_KEY",
+    ):
+        value = os.getenv(environment_name, "").strip()
+        if value and value not in keys:
+            keys.append(value)
     if not keys:
         raise RuntimeError("Отсутствуют API-ключи в переменных среды")
-    
     return keys
 
-# Инициализация API ключей при старте приложения
+
 VALID_API_KEYS = get_api_keys()
 
 PROGRESS_CALLBACK_ALLOWED_PREFIXES = [
@@ -120,14 +125,16 @@ def is_allowed_progress_callback_url(url: str) -> bool:
     return False
 
 
-def make_http_progress_callback(message: UnifiedMessage):
-    metadata = message.metadata or {}
+def _make_http_progress_callback(
+    *,
+    metadata: dict[str, Any],
+    request_id: str,
+    client_type: str,
+):
     callback_url = metadata.get("progress_callback_url")
-
     if not callback_url:
         return None
-
-    if not is_allowed_progress_callback_url(callback_url):
+    if not is_allowed_progress_callback_url(str(callback_url)):
         logger.warning("Progress callback URL rejected by allowlist: %s", callback_url)
         return None
 
@@ -135,21 +142,19 @@ def make_http_progress_callback(message: UnifiedMessage):
         "chat_id": metadata.get("chat_id"),
         "message_id": metadata.get("status_message_id"),
     }
-    request_id = metadata.get("progress_request_id") or message.id
     callback_token = metadata.get("progress_callback_token")
 
     logger.debug(
-        "Progress callback enabled: request_id=%s target=%s url=%s",
+        "Progress callback enabled: request_id=%s target=%s",
         request_id,
         progress_target,
-        callback_url,
     )
 
     async def send_progress_event(event: dict[str, Any]):
         payload = {
             "type": "progress_event",
             "request_id": request_id,
-            "client_type": message.client_type.value,
+            "client_type": client_type,
             "target": progress_target,
             "event": event,
         }
@@ -160,7 +165,7 @@ def make_http_progress_callback(message: UnifiedMessage):
         try:
             async with httpx.AsyncClient(timeout=5.0) as client:
                 response = await client.post(
-                    callback_url,
+                    str(callback_url),
                     json=payload,
                     headers=headers,
                 )
@@ -170,31 +175,74 @@ def make_http_progress_callback(message: UnifiedMessage):
                     request_id,
                     event.get("type"),
                 )
-        except Exception as e:
-            logger.warning("Failed to send progress callback: %r", e)
+        except Exception as error:
+            logger.warning("Failed to send progress callback: %r", error)
 
     return send_progress_event
 
-# Функция для проверки аутентификации
+
+def make_http_progress_callback(message: UnifiedMessage):
+    metadata = message.metadata or {}
+    return _make_http_progress_callback(
+        metadata=metadata,
+        request_id=str(metadata.get("progress_request_id") or message.id),
+        client_type=message.client_type.value,
+    )
+
+
+def make_input_batch_progress_callback(batch):
+    route = batch.response_route
+    metadata = dict(route.metadata or {})
+    metadata.setdefault(
+        "progress_target",
+        {
+            "conversation_id": route.conversation_id,
+            "thread_id": route.thread_id,
+            "message_id": route.reply_to_message_id,
+        },
+    )
+    return _make_http_progress_callback(
+        metadata=metadata,
+        request_id=batch.input_batch_id,
+        client_type=batch.client_type.value,
+    )
+
+
 async def api_key_auth(api_key: str = Depends(API_KEY_HEADER)):
     if not api_key:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Missing API Key"
         )
-    
     if api_key not in VALID_API_KEYS:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN,
             detail="Invalid API Key"
         )
-    
     return api_key
+
 
 # Инициализация компонентов
 message_processor = MessageProcessor()
 telegram_adapter = TelegramAdapter(message_processor)
 web_adapter = WebAdapter(message_processor)
+
+attachment_providers = {}
+telegram_provider_url = os.getenv("TELEGRAM_FILE_PROVIDER_URL", "").strip()
+telegram_provider_token = os.getenv("TELEGRAM_FILE_PROVIDER_TOKEN", "").strip()
+if telegram_provider_url and telegram_provider_token:
+    attachment_providers["telegram"] = HttpAttachmentStreamProvider(
+        base_url=telegram_provider_url,
+        token=telegram_provider_token,
+        provider_name="telegram",
+    )
+
+artifact_transport = ArtifactTransportFacade(
+    api=API,
+    message_processor=message_processor,
+    providers=attachment_providers,
+)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -206,20 +254,18 @@ async def lifespan(app: FastAPI):
     await API.start()
 
     logger.info("Gateway успешно запущен")
-    
     yield
-    
+
     logger.info("Остановка Gateway...")
-    
     await API.stop()
     await web_adapter.shutdown()
     await telegram_adapter.shutdown()
 
-# CORS configuration
+
 origins = os.getenv("CORS_ORIGINS", "*").split(",")
 
 app = FastAPI(
-    title="Multi-Protocol Gateway", 
+    title="Multi-Protocol Gateway",
     version="1.0.0",
     lifespan=lifespan
 )
@@ -232,40 +278,52 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(
+    create_artifact_router(
+        facade=artifact_transport,
+        auth_dependency=api_key_auth,
+        progress_callback_factory=make_input_batch_progress_callback,
+    )
+)
+
+
 ##############################
 ## UNIFIED MESSAGE ENDPOINT ##
 ##############################
 
 @app.post("/message", dependencies=[Depends(api_key_auth)])
 async def unified_message_handler(message: UnifiedMessage):
-    """Единый эндпоинт для всех типов сообщений"""
+    """Совместимый text/command endpoint."""
     try:
         processor = {
             ClientType.TELEGRAM: telegram_adapter.handle_unified_message,
             ClientType.WEB: web_adapter.handle_unified_message,
         }[message.client_type]
-        
+
         progress_callback = make_http_progress_callback(message)
         response = await processor(
             message,
             progress_callback=progress_callback,
         )
-        return {"status": "ok",
-                "response": response.content,
-                "metadata": response.metadata}
+        return {
+            "status": "ok",
+            "response": response.content,
+            "metadata": response.metadata,
+        }
     except KeyError:
         raise HTTPException(status_code=400, detail="Unsupported client type")
-    except Exception as e:
-        logger.exception(f"Ошибка обработки сообщения: {e}")
+    except Exception as error:
+        logger.exception("Ошибка обработки сообщения: %r", error)
         raise HTTPException(status_code=500, detail="Internal server error")
+
 
 ##########################
 ## WEB MESSAGE ENDPOINT ##
 ##########################
 
-@app.post("/web/message")
+@app.post("/web/message", dependencies=[Depends(api_key_auth)])
 async def web_message_handler(message: WebMessage):
-    """Эндпоинт для веб-интерфейса."""
+    """Совместимый text-only endpoint веб-интерфейса."""
     try:
         session_id = message.session_id or str(uuid.uuid4())
 
@@ -277,9 +335,7 @@ async def web_message_handler(message: WebMessage):
             content=message.content,
             user_id=message.user_id,
             user_name=None,
-            metadata={
-                "session_id": session_id
-            }
+            metadata={"session_id": session_id}
         )
 
         response = await web_adapter.handle_unified_message(unified_message)
@@ -294,9 +350,10 @@ async def web_message_handler(message: WebMessage):
             media_type="application/json; charset=utf-8"
         )
 
-    except Exception as e:
-        logger.exception(f"Ошибка обработки web-сообщения: {e}")
+    except Exception as error:
+        logger.exception("Ошибка обработки web-сообщения: %r", error)
         raise HTTPException(status_code=500, detail="Internal server error")
+
 
 #################################
 ## HEALTH AND STATUS ENDPOINTS ##
@@ -311,13 +368,20 @@ async def health_check():
         "adapters": {
             "telegram": await telegram_adapter.health_check(),
             "web": await web_adapter.health_check(),
-        }
+        },
+        "artifacts": {
+            "enabled": API.artifact_config.enabled,
+            "ingress_enabled": API.ingress_config.enabled,
+            "attachment_providers": sorted(attachment_providers),
+        },
     }
+
 
 @app.get("/stats")
 async def get_stats():
     """Статистика Gateway"""
     return await message_processor.get_stats()
+
 
 @app.get("/")
 async def root():
