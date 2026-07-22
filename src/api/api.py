@@ -15,7 +15,11 @@ from .config import (
     safe_planning_config_summary,
     safe_runtime_config_summary,
 )
-from ..artifacts import create_artifact_services, load_artifact_config
+from ..artifacts import (
+    apply_local_workspace_server_policy,
+    create_artifact_services,
+    load_artifact_config,
+)
 from ..mcp.mcp_client import load_config
 from ..mcp.planning_runtime import FinalizingPlanningMCPClient
 from ..core.models import ClientType, AgentStatus, AgentResult
@@ -78,6 +82,10 @@ class Api:
             ) = load_config(config_path)
             self.planning_config = load_planning_config(config_path)
             self.artifact_config = load_artifact_config(config_path)
+            apply_local_workspace_server_policy(
+                self.server_configs,
+                self.artifact_config,
+            )
 
             # Логируем только безопасную сводку: конфигурация также содержит
             # api_key, Authorization headers и env-переменные MCP-серверов.
