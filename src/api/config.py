@@ -1,21 +1,17 @@
-import logging
 import os
 from typing import Any, Iterable
+
 from dotenv import load_dotenv
 
-# Загрузка переменных из .env
+
 load_dotenv()
 
-# Прокси
 HTTP_PROXY = os.getenv("HTTP_PROXY", "")
 HTTPS_PROXY = os.getenv("HTTPS_PROXY", "")
-
-# Путь к настройкам ботов
 AGENT_CONFIG_PATH = os.getenv("AGENT_CONFIG_PATH", "")
 
 
 def safe_llm_config_summary(config: Any) -> dict[str, Any]:
-    """Return only non-sensitive LLM fields suitable for application logs."""
     return {
         "model": config.model,
         "api_url": config.api_url,
@@ -27,7 +23,6 @@ def safe_llm_config_summary(config: Any) -> dict[str, Any]:
 
 
 def safe_mcp_server_config_summary(configs: Iterable[Any]) -> list[dict[str, Any]]:
-    """Return MCP connection metadata without headers, env, URLs or commands."""
     return [
         {
             "name": item.name,
@@ -42,16 +37,13 @@ def safe_mcp_server_config_summary(configs: Iterable[Any]) -> list[dict[str, Any
 
 
 def safe_memory_config_summary(config: Any) -> dict[str, Any]:
-    """Return the explicit non-sensitive memory settings used by runtime."""
     return {
         "enable_result_compaction": config.enable_result_compaction,
         "inline_result_max_input_ratio": config.inline_result_max_input_ratio,
         "single_pass_summary_max_input_ratio": (
             config.single_pass_summary_max_input_ratio
         ),
-        "result_summary_target_tokens": (
-            config.result_summary_target_tokens
-        ),
+        "result_summary_target_tokens": config.result_summary_target_tokens,
         "result_compaction_max_output_tokens": (
             config.result_compaction_max_output_tokens
         ),
@@ -65,14 +57,11 @@ def safe_memory_config_summary(config: Any) -> dict[str, Any]:
         "cycle_compaction_keep_recent_blocks": (
             config.cycle_compaction_keep_recent_blocks
         ),
-        "cycle_compaction_max_passes": (
-            config.cycle_compaction_max_passes
-        ),
+        "cycle_compaction_max_passes": config.cycle_compaction_max_passes,
     }
 
 
 def safe_runtime_config_summary(config: Any) -> dict[str, Any]:
-    """Return the non-sensitive runtime lifecycle settings."""
     return {
         "mcp_startup_timeout": config.mcp_startup_timeout,
         "mcp_transport_call_timeout": config.mcp_transport_call_timeout,
@@ -85,7 +74,6 @@ def safe_runtime_config_summary(config: Any) -> dict[str, Any]:
 
 
 def safe_planning_config_summary(config: Any) -> dict[str, Any]:
-    """Return bounded non-sensitive DAG planning limits."""
     return {
         "enabled": config.enabled,
         "max_nodes": config.max_nodes,
@@ -97,7 +85,6 @@ def safe_planning_config_summary(config: Any) -> dict[str, Any]:
 
 
 def safe_artifact_config_summary(config: Any) -> dict[str, Any]:
-    """Return bounded non-sensitive artifact feature settings."""
     return {
         "enabled": config.enabled,
         "max_artifacts_per_cycle": config.max_artifacts_per_cycle,
@@ -115,5 +102,8 @@ def safe_artifact_config_summary(config: Any) -> dict[str, Any]:
         "auto_select_deliverables": config.auto_select_deliverables,
         "local_workspace_server_count": len(
             config.local_workspace_server_names
+        ),
+        "delivery_claim_timeout_seconds": (
+            config.delivery_claim_timeout_seconds
         ),
     }
