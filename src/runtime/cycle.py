@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from ..artifacts.runtime import ArtifactRuntimeState
     from ..memory.models import CycleWorkingMemory
     from ..memory.token_estimation import TokenUsageSnapshot
     from ..planning.models import ActivePlanState, AgentActivity
@@ -32,6 +33,9 @@ class ActiveAgentCycle:
 
     result_refs: list[str] = field(default_factory=list)
     artifact_refs: list[str] = field(default_factory=list)
+    artifact_candidate_refs: list[str] = field(default_factory=list)
+    artifact_state: ArtifactRuntimeState | None = None
+    original_input_batch_id: str | None = None
 
     active_plan_id: str | None = None
     active_plan_revision: int | None = None
