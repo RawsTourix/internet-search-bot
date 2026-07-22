@@ -15,6 +15,7 @@ from src.ingress import (
     IngressAttachmentSlot,
     IngressConfigType,
     IngressConflictError,
+    IngressNotFoundError,
     InputGroupingMode,
     create_ingress_services,
 )
@@ -105,7 +106,7 @@ class ArtifactIngressGroupingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(first.state, "collecting")
         self.assertEqual(second.state, "collecting")
         self.assertEqual(first.input_batch_id, second.input_batch_id)
-        with self.assertRaises(Exception):
+        with self.assertRaises(IngressNotFoundError):
             await self.ingress.batch_store.get_committed(first.input_batch_id)
 
         batch, duplicate = await self.facade.commit_grouped_batch(
