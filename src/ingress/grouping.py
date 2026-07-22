@@ -78,13 +78,14 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
         *,
         session_id: str,
         reason: str,
-    ) -> CommittedInputBatch:
-        draft = await self.get_draft(input_batch_id)
-        if draft.session_id != session_id:
-            raise IngressConflictError("Input batch belongs to another session")
-        committed = await self.commit(input_batch_id, reason=reason)
-        await asyncio.to_thread(self._release_group_index_sync, draft)
-        return committed
+    ) -> tuple[CommittedInputBatch, bool]:
+        """Commit and release the group index under one re-entrant store lock."""
+        return await asyncio.to_thread(
+            self._commit_grouped_sync,
+            input_batch_id,
+            session_id,
+            reason,
+        )
 
     async def list_open_drafts(
         self,
@@ -119,6 +120,24 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
                 ):
                     ready.append(draft)
         return ready
+
+    def _commit_grouped_sync(
+        self,
+        input_batch_id: str,
+        session_id: str,
+        reason: str,
+    ) -> tuple[CommittedInputBatch, bool]:
+        with self._lock:
+            draft = self._load_draft_sync(input_batch_id)
+            if draft.session_id != session_id:
+                raise IngressConflictError(
+                    "Input batch belongs to another session"
+                )
+            committed_path = self.root / input_batch_id / "committed.json"
+            duplicate = committed_path.exists() or committed_path.is_symlink()
+            committed = self._commit_sync(input_batch_id, reason)
+            self._release_group_index_sync(draft)
+            return committed, duplicate
 
     def _get_or_append_sync(
         self,
