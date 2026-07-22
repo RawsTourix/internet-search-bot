@@ -13,6 +13,7 @@ from typing import Protocol, runtime_checkable
 from pydantic import ValidationError
 
 from ..storage.config import StorageConfigType
+from ..storage.errors import StorageSerializationError
 from ..storage.file_backend import _fsync_directory
 from ..storage.serializers import deserialize_model, serialize_model
 from .errors import (
@@ -78,7 +79,12 @@ class FileSystemArtifactCandidateStore(ArtifactCandidateStore):
         self._locks_guard = threading.Lock()
 
     async def create(self, candidate: ArtifactCandidate) -> ArtifactCandidate:
-        return await asyncio.to_thread(self._create_sync, candidate)
+        lock = self._acquire_lock(candidate.candidate_id)
+        try:
+            async with lock:
+                return await asyncio.to_thread(self._create_sync, candidate)
+        finally:
+            self._release_lock(candidate.candidate_id, lock)
 
     async def get(self, candidate_id: str) -> ArtifactCandidate:
         self._validate_id(candidate_id)
@@ -172,9 +178,6 @@ class FileSystemArtifactCandidateStore(ArtifactCandidateStore):
         self._validate_id(candidate_id)
         return self.root / candidate_id
 
-    def _metadata_path(self, candidate_id: str) -> Path:
-        return self._candidate_dir(candidate_id) / "metadata.json"
-
     def _create_sync(self, candidate: ArtifactCandidate) -> ArtifactCandidate:
         target = self._candidate_dir(candidate.candidate_id)
         if target.is_symlink():
@@ -186,14 +189,33 @@ class FileSystemArtifactCandidateStore(ArtifactCandidateStore):
             if existing == candidate:
                 return existing
             raise ArtifactCandidateError("Candidate ID already exists")
+
         temp = Path(tempfile.mkdtemp(prefix=".cand-", dir=self.root))
         try:
             path = temp / "metadata.json"
-            path.write_bytes(serialize_model(candidate))
+            try:
+                payload = serialize_model(
+                    candidate,
+                    object_type="artifact candidate",
+                    object_id=candidate.candidate_id,
+                )
+            except StorageSerializationError as error:
+                raise ArtifactStorageError(
+                    "Failed to serialize artifact candidate metadata"
+                ) from error
+            path.write_bytes(payload)
             self._fsync_file(path)
             os.replace(temp, target)
             _fsync_directory(self.root)
             return candidate
+        except ArtifactStorageError:
+            shutil.rmtree(temp, ignore_errors=True)
+            raise
+        except OSError as error:
+            shutil.rmtree(temp, ignore_errors=True)
+            raise ArtifactStorageError(
+                "Failed to publish artifact candidate metadata"
+            ) from error
         except BaseException:
             shutil.rmtree(temp, ignore_errors=True)
             raise
@@ -213,12 +235,30 @@ class FileSystemArtifactCandidateStore(ArtifactCandidateStore):
         )
         temporary = Path(temporary_name)
         try:
+            try:
+                payload = serialize_model(
+                    candidate,
+                    object_type="artifact candidate",
+                    object_id=candidate.candidate_id,
+                )
+            except StorageSerializationError as error:
+                raise ArtifactStorageError(
+                    "Failed to serialize artifact candidate metadata"
+                ) from error
             with os.fdopen(fd, "wb") as stream:
-                stream.write(serialize_model(candidate))
+                stream.write(payload)
                 stream.flush()
                 os.fsync(stream.fileno())
             os.replace(temporary, target)
             _fsync_directory(directory)
+        except ArtifactStorageError:
+            temporary.unlink(missing_ok=True)
+            raise
+        except OSError as error:
+            temporary.unlink(missing_ok=True)
+            raise ArtifactStorageError(
+                "Failed to replace artifact candidate metadata"
+            ) from error
         except BaseException:
             temporary.unlink(missing_ok=True)
             raise
@@ -238,8 +278,13 @@ class FileSystemArtifactCandidateStore(ArtifactCandidateStore):
                 "Failed to read artifact candidate metadata"
             ) from error
         try:
-            return deserialize_model(raw, ArtifactCandidate)
-        except (ValidationError, ValueError, TypeError) as error:
+            return deserialize_model(
+                raw,
+                ArtifactCandidate,
+                object_type="artifact candidate",
+                object_id=candidate_id,
+            )
+        except (StorageSerializationError, ValidationError, ValueError, TypeError) as error:
             raise ArtifactStorageError(
                 "Artifact candidate metadata is invalid"
             ) from error
