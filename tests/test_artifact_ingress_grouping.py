@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -129,6 +130,25 @@ class ArtifactIngressGroupingTests(unittest.IsolatedAsyncioTestCase):
             ),
             [],
         )
+
+    async def test_concurrent_commits_return_one_exact_manifest(self):
+        result = await self._submit_group_part(1)
+        outcomes = await asyncio.gather(
+            self.facade.commit_grouped_batch(
+                result.input_batch_id,
+                session_id="telegram:conversation:chat-1",
+            ),
+            self.facade.commit_grouped_batch(
+                result.input_batch_id,
+                session_id="telegram:conversation:chat-1",
+            ),
+        )
+
+        first_batch, first_duplicate = outcomes[0]
+        second_batch, second_duplicate = outcomes[1]
+        self.assertEqual(first_batch, second_batch)
+        self.assertEqual(first_batch.sequence_number, 1)
+        self.assertEqual({first_duplicate, second_duplicate}, {False, True})
 
     async def test_commit_enforces_session_authority(self):
         result = await self._submit_group_part(1)
