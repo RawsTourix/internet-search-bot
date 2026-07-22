@@ -18,15 +18,37 @@ jobs:
           python-version: "3.12"
           cache: pip
       - run: python -m pip install -r requirements.txt
-      - name: Compile
-        run: python -m compileall src tests scripts
-      - name: Artifact and ingress tests
-        run: python -m unittest discover -s tests -p "test_artifact*.py" -v
-      - name: Storage regression
-        run: python -m unittest discover -s tests -p "test_storage*.py" -v
-      - name: Planning regression
+      - name: Run validation suites
+        id: suites
+        shell: bash
         run: |
-          python -m unittest discover -s tests -p "test_plan*.py" -v
-          python -m unittest discover -s tests -p "test_planning*.py" -v
-      - name: API regression
-        run: python -m unittest discover -s tests -p "test_api*.py" -v
+          mkdir -p validation-logs
+          overall=0
+          run_suite() {
+            name="$1"
+            shift
+            set +e
+            "$@" > "validation-logs/${name}.log" 2>&1
+            code=$?
+            set -e
+            echo "$code" > "validation-logs/${name}.status"
+            if [ "$code" -ne 0 ]; then overall=1; fi
+          }
+          run_suite compile python -m compileall src tests scripts
+          run_suite artifacts python -m unittest discover -s tests -p "test_artifact*.py" -v
+          run_suite storage python -m unittest discover -s tests -p "test_storage*.py" -v
+          run_suite plans python -m unittest discover -s tests -p "test_plan*.py" -v
+          run_suite planning python -m unittest discover -s tests -p "test_planning*.py" -v
+          run_suite api python -m unittest discover -s tests -p "test_api*.py" -v
+          echo "overall=$overall" >> "$GITHUB_OUTPUT"
+      - name: Upload validation logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: v0.4-file-artifacts-validation
+          path: validation-logs
+          if-no-files-found: error
+      - name: Enforce validation status
+        if: always()
+        shell: bash
+        run: exit "${{ steps.suites.outputs.overall || '1' }}"
