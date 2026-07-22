@@ -19,6 +19,11 @@ from ..artifacts import (
     ArtifactStorageError,
     ArtifactValidationError,
 )
+from ..artifacts.candidate_tools import (
+    ARTIFACT_CANDIDATE_TOOL_DEFINITIONS,
+    ARTIFACT_CANDIDATE_TOOL_NAMES,
+    ArtifactCandidateToolController,
+)
 from ..artifacts.runtime import ArtifactRuntimeCoordinator
 from ..artifacts.tools import (
     ARTIFACT_NATIVE_TOOL_DEFINITIONS,
@@ -44,12 +49,20 @@ from .schema import inline_local_schema_refs
 
 
 _ARTIFACT_MUTATION_TOOL_NAMES = frozenset(
-    definition.name
-    for definition in ARTIFACT_NATIVE_TOOL_DEFINITIONS
-    if definition.mutation
+    {
+        definition.name
+        for definition in (
+            *ARTIFACT_NATIVE_TOOL_DEFINITIONS,
+            *ARTIFACT_CANDIDATE_TOOL_DEFINITIONS,
+        )
+        if definition.mutation
+    }
+)
+_ARTIFACT_ALL_TOOL_NAMES = frozenset(
+    set(ARTIFACT_NATIVE_TOOL_NAMES) | set(ARTIFACT_CANDIDATE_TOOL_NAMES)
 )
 _ARTIFACT_READ_TOOL_NAMES = (
-    ARTIFACT_NATIVE_TOOL_NAMES - _ARTIFACT_MUTATION_TOOL_NAMES
+    _ARTIFACT_ALL_TOOL_NAMES - _ARTIFACT_MUTATION_TOOL_NAMES
 )
 
 
@@ -112,6 +125,15 @@ class ArtifactMCPClient(MCPClient):
             if artifacts_enabled
             else None
         )
+        self.artifact_candidate_tool_controller = (
+            ArtifactCandidateToolController(
+                promotion_service=artifact_services.promotion_service,
+                candidate_store=artifact_services.candidate_store,
+                max_items=artifact_services.config.max_artifacts_per_cycle,
+            )
+            if artifacts_enabled
+            else None
+        )
         super().__init__(
             llm_config,
             storage_services=storage_services,
@@ -169,6 +191,38 @@ class ArtifactMCPClient(MCPClient):
                 description=definition.description,
                 parameters=inline_local_schema_refs(definition.parameters()),
                 handler=handler,
+                progress_key=definition.progress_key,
+            )
+
+        for definition in ARTIFACT_CANDIDATE_TOOL_DEFINITIONS:
+            async def candidate_handler(
+                arguments: dict[str, Any],
+                *,
+                tool_name: str = definition.name,
+            ) -> dict[str, Any]:
+                context = get_manager_context()
+                if (
+                    context is None
+                    or self.artifact_candidate_tool_controller is None
+                ):
+                    return {
+                        "type": "artifact_context_error",
+                        "message": "Artifact tool requires an active agent cycle.",
+                        "retryable": False,
+                    }
+                outcome = await self.artifact_candidate_tool_controller.execute(
+                    tool_name,
+                    arguments,
+                    context,
+                )
+                await self._record_artifact_outcome(outcome, context)
+                return outcome.payload
+
+            tools[definition.name] = ManagerToolSpec(
+                name=definition.name,
+                description=definition.description,
+                parameters=inline_local_schema_refs(definition.parameters()),
+                handler=candidate_handler,
                 progress_key=definition.progress_key,
             )
         return tools
@@ -433,6 +487,54 @@ class ArtifactMCPClient(MCPClient):
         public_tool_name: str,
         arguments: dict[str, Any],
     ):
+        if public_tool_name in ARTIFACT_CANDIDATE_TOOL_NAMES:
+            context = get_manager_context()
+            if (
+                context is None
+                or self.artifact_candidate_tool_controller is None
+            ):
+                payload = {
+                    "type": "artifact_context_error",
+                    "message": "Artifact tool requires an active agent cycle.",
+                    "retryable": False,
+                }
+            elif (
+                public_tool_name in _ARTIFACT_MUTATION_TOOL_NAMES
+                and self._active_plan_requires_node(context)
+            ):
+                state = context.active_cycle.active_plan_state
+                payload = {
+                    "type": "plan_node_required",
+                    "plan_id": getattr(state, "plan_id", None),
+                    "revision": getattr(state, "revision", None),
+                    "message": (
+                        "Before promoting an artifact candidate, start one "
+                        "ready plan node."
+                    ),
+                    "retryable": True,
+                }
+                self._trace_event(
+                    context.active_cycle.cycle_trace,
+                    "plan_tool_call_blocked",
+                    plan_id=payload["plan_id"],
+                    revision=payload["revision"],
+                    blocked_tool=public_tool_name,
+                )
+            else:
+                outcome = await self.artifact_candidate_tool_controller.execute(
+                    public_tool_name,
+                    arguments,
+                    context,
+                )
+                await self._record_artifact_outcome(outcome, context)
+                payload = outcome.payload
+                if outcome.payload.get("type") in {
+                    "artifact_created",
+                    "artifact_version_created",
+                }:
+                    await self._refresh_artifact_state(context)
+            return self._text_result(payload)
+
         if public_tool_name in ARTIFACT_NATIVE_TOOL_NAMES:
             context = get_manager_context()
             if context is None or self.artifact_tool_controller is None:
@@ -501,6 +603,7 @@ class ArtifactMCPClient(MCPClient):
                 if artifact.get(key) is not None:
                     safe_data[key] = artifact[key]
         for key in (
+            "source_candidate_id",
             "artifact_lineage_id",
             "expected_current_artifact_id",
             "current_artifact_id",
