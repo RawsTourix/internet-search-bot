@@ -22,9 +22,10 @@ from ..ingress import (
     InputSubmissionResult,
     resolve_input_grouping,
 )
+from ..storage.errors import StorageStreamSourceError
 
 
-class AttachmentProviderError(RuntimeError):
+class AttachmentProviderError(StorageStreamSourceError):
     """A closed attachment provider could not return exact source bytes."""
 
 
