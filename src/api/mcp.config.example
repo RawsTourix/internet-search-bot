@@ -90,7 +90,6 @@
         "cycle_compaction_keep_recent_blocks": 2,
         "cycle_compaction_max_passes": 3
     },
-
     "artifacts": {
         "enabled": true,
         "max_artifacts_per_cycle": 32,
@@ -106,6 +105,7 @@
         "max_runtime_artifact_summaries": 12,
         "allow_opaque_binary": true,
         "auto_select_deliverables": false,
+        "local_workspace_server_names": [],
         "max_container_entries_inspected": 2048,
         "max_workspace_bytes": 268435456,
         "workspace_ttl_seconds": 3600
