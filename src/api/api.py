@@ -1,10 +1,9 @@
-import os
 import logging
+import os
 from collections.abc import AsyncIterator, Mapping
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
-# Импорт модулей
 from .config import (
     AGENT_CONFIG_PATH,
     HTTP_PROXY,
@@ -20,66 +19,58 @@ from ..artifacts import (
     apply_local_workspace_server_policy,
     create_artifact_services,
     load_artifact_config,
+    recover_stale_delivery_claims,
 )
+from ..core.errors import APIError
+from ..core.models import AgentResult, AgentStatus, ClientType
 from ..ingress import (
     ClientInputEnvelope,
     InputSubmissionResult,
     create_ingress_services,
     load_ingress_config,
+    resolve_input_grouping,
 )
 from ..mcp.artifact_delivery_runtime import (
     FinalizingArtifactDeliveryPlanningMCPClient,
 )
 from ..mcp.mcp_client import load_config
-from ..core.models import ClientType, AgentStatus, AgentResult
-from ..core.errors import APIError
-from ..planning import (
-    create_planning_services,
-    load_planning_config,
-)
+from ..planning import create_planning_services, load_planning_config
 from ..planning.runtime_context import PlanningAwareContentStore
 from ..storage import StorageServices, create_storage_services
 
-# Настройка прокси
-os.environ['http_proxy'] = HTTP_PROXY
-os.environ['https_proxy'] = HTTPS_PROXY
 
-# Проверяем и создаем папку для логов
+os.environ["http_proxy"] = HTTP_PROXY
+os.environ["https_proxy"] = HTTPS_PROXY
+
 log_dir = "logging"
-if not os.path.exists(log_dir):
-    os.makedirs(log_dir, exist_ok=True)
-
-# Настройка логирования
-formatter = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
-
+os.makedirs(log_dir, exist_ok=True)
+formatter = logging.Formatter(
+    "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+)
 logger = logging.getLogger("API")
 logger.setLevel(logging.DEBUG)
-
-file_handler = RotatingFileHandler(
-    filename=os.path.join(log_dir, "api.log"),
-    maxBytes=8*1024*1024,  # 8 MB
-    encoding='utf-8'
-)
-file_handler.setFormatter(formatter)
-logger.addHandler(file_handler)
-
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-console_handler.setFormatter(formatter)
-
-logger.addHandler(file_handler)
-logger.addHandler(console_handler)
+if not logger.handlers:
+    file_handler = RotatingFileHandler(
+        filename=os.path.join(log_dir, "api.log"),
+        maxBytes=8 * 1024 * 1024,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(formatter)
+    logger.addHandler(file_handler)
+    console_handler = logging.StreamHandler()
+    console_handler.setLevel(logging.INFO)
+    console_handler.setFormatter(formatter)
+    logger.addHandler(console_handler)
 
 
 class Api:
-    """API для работы с агентом"""
+    """Composition root for the agent runtime and durable input/artifact layers."""
 
     def __init__(self, config_path):
-        """Инициализация Api"""
         try:
             logger.info(
-                "Загрузка конфигурации MCP-серверов, LLM, storage, memory, "
-                "runtime, planning, artifacts и ingress"
+                "Загрузка конфигурации MCP, LLM, storage, memory, runtime, "
+                "planning, artifacts и ingress"
             )
             (
                 self.server_configs,
@@ -96,19 +87,16 @@ class Api:
                 self.artifact_config,
             )
 
-            # Логируем только безопасную сводку: конфигурация также содержит
-            # api_key, Authorization headers и env-переменные MCP-серверов.
-            llm_log_summary = safe_llm_config_summary(self.llm_config)
+            llm_summary = safe_llm_config_summary(self.llm_config)
             logger.debug(
                 "LLM config: model=%s api_url=%s openai_compatible=%s "
-                "context_window_tokens=%s tokenizer_encoding=%s "
-                "final_audit=%s",
-                llm_log_summary["model"],
-                llm_log_summary["api_url"],
-                llm_log_summary["openai_compatible"],
-                llm_log_summary["context_window_tokens"],
-                llm_log_summary["tokenizer_encoding"],
-                llm_log_summary["final_audit"],
+                "context_window_tokens=%s tokenizer_encoding=%s final_audit=%s",
+                llm_summary["model"],
+                llm_summary["api_url"],
+                llm_summary["openai_compatible"],
+                llm_summary["context_window_tokens"],
+                llm_summary["tokenizer_encoding"],
+                llm_summary["final_audit"],
             )
             logger.debug(
                 "MCP servers configured: %s",
@@ -150,13 +138,13 @@ class Api:
                 self.ingress_config.max_batch_total_bytes,
             )
 
-            base_storage_services = create_storage_services(self.storage_config)
+            base_storage = create_storage_services(self.storage_config)
             self.storage_services = StorageServices(
-                config=base_storage_services.config,
+                config=base_storage.config,
                 content_store=PlanningAwareContentStore(
-                    base_storage_services.content_store
+                    base_storage.content_store
                 ),
-                artifact_store=base_storage_services.artifact_store,
+                artifact_store=base_storage.artifact_store,
             )
             self.artifact_services = create_artifact_services(
                 storage_config=self.storage_config,
@@ -174,9 +162,6 @@ class Api:
                 planning_config=self.planning_config,
             )
 
-            logger.info(
-                "Инициализация artifact/delivery/planning-aware MCP-клиента"
-            )
             self.mcp_client = FinalizingArtifactDeliveryPlanningMCPClient(
                 self.llm_config,
                 storage_services=self.storage_services,
@@ -185,16 +170,29 @@ class Api:
                 runtime_config=self.runtime_config,
                 planning_services=self.planning_services,
             )
-        except Exception as e:
-            raise APIError(f"Ошибка инициализации Api: {repr(e)}") from e
+        except Exception as error:
+            raise APIError(f"Ошибка инициализации Api: {error!r}") from error
 
     async def start(self):
-        """Подключение к MCP-серверам"""
+        """Recover durable transport state, then connect MCP servers."""
         try:
+            recovered = await recover_stale_delivery_claims(
+                self.artifact_services.delivery_store,
+                claim_timeout_seconds=(
+                    self.artifact_config.delivery_claim_timeout_seconds
+                ),
+            )
+            if recovered:
+                logger.warning(
+                    "Recovered %s stale delivery claims as unknown",
+                    len(recovered),
+                )
             logger.info("Подключение к MCP-серверам")
             await self.mcp_client.connect_to_servers(self.server_configs)
-        except Exception as e:
-            raise APIError(f"Ошибка подключения к MCP-серверам: {repr(e)}") from e
+        except Exception as error:
+            raise APIError(
+                f"Ошибка запуска API runtime: {error!r}"
+            ) from error
 
     async def submit_input(
         self,
@@ -203,12 +201,15 @@ class Api:
         session_id: str,
         upload_streams: Mapping[str, AsyncIterator[bytes]] | None = None,
     ) -> InputSubmissionResult:
-        """Persist a complete client envelope and atomically commit its batch."""
+        """Persist a client envelope using the shared semantic grouping policy."""
         try:
+            grouping = resolve_input_grouping(envelope)
             return await self.ingress_services.ingress_service.submit_atomic(
                 envelope,
                 session_id=session_id,
                 upload_streams=upload_streams,
+                grouping_mode=grouping.mode,
+                grouping_key=grouping.key,
             )
         except Exception as error:
             logger.error("Ошибка durable ingress: %r", error)
@@ -257,13 +258,7 @@ class Api:
         try:
             if not await self.mcp_client.list_tools():
                 logger.warning("Нет зарегистрированных инструментов")
-
-            logger.info("Вызов ИИ-агента")
-            logger.debug("message_chars: %s", len(message))
-            logger.debug("session_id: %s", session_id)
-            logger.debug("client_type: %s", client_type)
-
-            agent_result = await self.mcp_client.process_query(
+            result = await self.mcp_client.process_query(
                 message,
                 session_id=session_id,
                 client_type=client_type,
@@ -271,56 +266,34 @@ class Api:
                 progress_locale=progress_locale,
             )
             logger.info("Ответ получен")
-            return agent_result
-        except Exception as e:
-            logger.error(f"Ошибка при обращении к MCP-клиенту: {e}")
-
+            return result
+        except Exception as error:
+            logger.error("Ошибка при обращении к MCP-клиенту: %s", error)
             state = None
             try:
                 state = self.mcp_client.get_session_state(session_id)
             except Exception:
-                state = None
-
-            result_text = f"Ошибка при обработке запроса: {e}"
-
+                pass
             return AgentResult(
-                content=result_text,
+                content=f"Ошибка при обработке запроса: {error}",
                 status=AgentStatus.ERROR,
                 session_id=session_id,
                 iterations=state.iterations if state else 0,
                 tools_used=state.tools_used if state else [],
-                error=str(e),
+                error=str(error),
                 error_kind="critical_error",
                 can_resume=False,
-                progress_events=state.progress_events if state else []
+                progress_events=state.progress_events if state else [],
             )
 
     async def reset(self, session_id: str):
-        """Очистка памяти сессии"""
         self.mcp_client.clear_session(session_id)
 
     async def stop(self):
-        """Отключение от сервера главного бота"""
         try:
             await self.mcp_client.cleanup()
-        except Exception as e:
-            logger.error(f"Ошибка при отключении от сервера: {e}")
+        except Exception as error:
+            logger.error("Ошибка при отключении от сервера: %s", error)
 
 
 API = Api(AGENT_CONFIG_PATH)
-
-"""
-# Тестирование
-async def main():
-    try:
-        await API.start()
-        response = await API.call_agent("")
-        logger.info(f"response: {response}")
-    finally:
-        await API.stop()
-
-
-if __name__ == '__main__':
-    import asyncio
-    asyncio.run(main())
-"""
