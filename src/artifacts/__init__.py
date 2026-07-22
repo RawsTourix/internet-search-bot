@@ -1,5 +1,9 @@
 """Public API for the v0.4 artifact foundation."""
 
+from .candidate_store import (
+    ArtifactCandidateStore,
+    FileSystemArtifactCandidateStore,
+)
 from .config import ArtifactConfigType, load_artifact_config
 from .errors import (
     ArtifactAccessError,
@@ -59,6 +63,7 @@ __all__ = [
     "ArtifactCandidate",
     "ArtifactCandidateError",
     "ArtifactCandidateStatus",
+    "ArtifactCandidateStore",
     "ArtifactCapability",
     "ArtifactCapabilityError",
     "ArtifactConfigType",
@@ -89,6 +94,7 @@ __all__ = [
     "ArtifactVersionConflictError",
     "ArtifactVersionRef",
     "ExactTextPatchOperation",
+    "FileSystemArtifactCandidateStore",
     "FileSystemArtifactStore",
     "LegacyArtifactMigrator",
     "LegacyMigrationReport",
