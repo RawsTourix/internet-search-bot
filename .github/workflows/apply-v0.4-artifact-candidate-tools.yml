@@ -244,3 +244,5 @@ _ARTIFACT_READ_TOOL_NAMES = (
           git add src/mcp/artifact_client.py
           git commit -m "v0.4-file-artifacts: integrate candidate promotion manager tools"
           git push origin HEAD:feature
+
+# Triggered intentionally after the initial workflow creation commit.
