@@ -15,6 +15,10 @@ from ..core.message_processor import MessageProcessor
 from ..core.models import ClientType, UnifiedResponse
 from ..ingress import (
     ClientInputEnvelope,
+    CommittedInputBatch,
+    IngressConflictError,
+    IngressNotFoundError,
+    InputGroupingMode,
     InputSubmissionResult,
 )
 
@@ -156,6 +160,12 @@ class RunCommittedBatchRequest(BaseModel):
         return normalized
 
 
+class CommitGroupedBatchRequest(RunCommittedBatchRequest):
+    """Commit one already-ingested grouped draft and optionally run it."""
+
+    run: bool = False
+
+
 class ArtifactTransportFacade:
     """Coordinate Gateway IO while keeping transport outside artifact domain."""
 
@@ -209,6 +219,44 @@ class ArtifactTransportFacade:
             session_id=self.session_id_for(envelope),
             upload_streams=streams,
         )
+
+    async def commit_grouped_batch(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+    ) -> tuple[CommittedInputBatch, bool]:
+        """Commit one complete grouped draft; repeated calls are idempotent."""
+        store = self.api.ingress_services.batch_store
+        try:
+            committed = await store.get_committed(input_batch_id)
+        except IngressNotFoundError:
+            committed = None
+        if committed is not None:
+            if committed.session_id != session_id:
+                raise ArtifactAccessError(
+                    "Input batch belongs to another session"
+                )
+            return committed, True
+
+        draft = await store.get_draft(input_batch_id)
+        if draft.session_id != session_id:
+            raise ArtifactAccessError("Input batch belongs to another session")
+        if draft.grouping_mode == InputGroupingMode.ATOMIC:
+            raise IngressConflictError(
+                "Atomic input batches are committed during submission"
+            )
+        commit_batch = getattr(store, "commit_batch", None)
+        if commit_batch is None:
+            raise IngressConflictError(
+                "Grouped input batch store is not configured"
+            )
+        committed = await commit_batch(
+            input_batch_id,
+            session_id=session_id,
+            reason="explicit_client_commit",
+        )
+        return committed, False
 
     async def run_committed_batch(
         self,
