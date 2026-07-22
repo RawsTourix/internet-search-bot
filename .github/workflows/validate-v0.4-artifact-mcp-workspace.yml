@@ -7,6 +7,7 @@ on:
       - "src/artifacts/**"
       - "src/mcp/artifact_client.py"
       - "src/api/**"
+      - "src/agent/**"
       - "tests/test_artifact*.py"
       - "tests/test_api*.py"
       - "tests/test_server_manager.py"
