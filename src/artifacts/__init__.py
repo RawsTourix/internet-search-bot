@@ -5,11 +5,18 @@ from .candidate_store import (
     FileSystemArtifactCandidateStore,
 )
 from .config import ArtifactConfigType, load_artifact_config
+from .delivery import (
+    ArtifactDeliveryRecord,
+    ArtifactDeliveryService,
+    FileSystemArtifactDeliveryStore,
+)
 from .errors import (
     ArtifactAccessError,
     ArtifactCandidateError,
     ArtifactCapabilityError,
     ArtifactConfigValidationError,
+    ArtifactDeliveryError,
+    ArtifactDeliveryNotFoundError,
     ArtifactError,
     ArtifactIntegrityError,
     ArtifactLimitError,
@@ -79,7 +86,11 @@ __all__ = [
     "ArtifactConfigType",
     "ArtifactConfigValidationError",
     "ArtifactContentKind",
+    "ArtifactDeliveryError",
+    "ArtifactDeliveryNotFoundError",
+    "ArtifactDeliveryRecord",
     "ArtifactDeliveryRef",
+    "ArtifactDeliveryService",
     "ArtifactDeliveryState",
     "ArtifactError",
     "ArtifactFormatDetection",
@@ -110,6 +121,7 @@ __all__ = [
     "ArtifactWorkspaceManager",
     "ExactTextPatchOperation",
     "FileSystemArtifactCandidateStore",
+    "FileSystemArtifactDeliveryStore",
     "FileSystemArtifactStore",
     "LegacyArtifactMigrator",
     "LegacyMigrationReport",
