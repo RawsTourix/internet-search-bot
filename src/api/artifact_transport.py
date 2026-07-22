@@ -3,15 +3,11 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Mapping
-from dataclasses import dataclass
-from typing import Any, Protocol
-from urllib.parse import quote
+from typing import TYPE_CHECKING, Any, Protocol
 
-import httpx
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from ..artifacts import ArtifactAccessError, ArtifactDeliveryRef
-from ..core.message_processor import MessageProcessor
 from ..core.models import ClientType, UnifiedResponse
 from ..ingress import (
     ClientInputEnvelope,
@@ -23,6 +19,9 @@ from ..ingress import (
     resolve_input_grouping,
 )
 from ..storage.errors import StorageStreamSourceError
+
+if TYPE_CHECKING:
+    from ..core.message_processor import MessageProcessor
 
 
 class AttachmentProviderError(StorageStreamSourceError):
@@ -37,85 +36,6 @@ class AttachmentStreamProvider(Protocol):
         max_size_bytes: int,
     ) -> AsyncIterator[bytes]:
         ...
-
-
-@dataclass(slots=True)
-class HttpAttachmentStreamProvider:
-    """Fetch bytes from one fixed internal provider origin, never a client URL."""
-
-    base_url: str
-    token: str
-    provider_name: str
-    path_prefix: str = "/internal/files"
-    connect_timeout_seconds: float = 10.0
-    read_timeout_seconds: float = 120.0
-
-    async def open_stream(
-        self,
-        locator: str,
-        *,
-        max_size_bytes: int,
-    ) -> AsyncIterator[bytes]:
-        normalized = locator.strip()
-        if not normalized or any(character in normalized for character in "\r\n"):
-            raise AttachmentProviderError("Invalid attachment locator")
-        url = (
-            self.base_url.rstrip("/")
-            + self.path_prefix.rstrip("/")
-            + "/"
-            + quote(normalized, safe="")
-        )
-        headers = {"X-File-Provider-Token": self.token}
-        timeout = httpx.Timeout(
-            connect=self.connect_timeout_seconds,
-            read=self.read_timeout_seconds,
-            write=30.0,
-            pool=10.0,
-        )
-
-        async def iterator() -> AsyncIterator[bytes]:
-            total = 0
-            try:
-                async with httpx.AsyncClient(timeout=timeout) as client:
-                    async with client.stream("GET", url, headers=headers) as response:
-                        if response.status_code == 404:
-                            raise AttachmentProviderError(
-                                "Attachment provider object was not found"
-                            )
-                        response.raise_for_status()
-                        declared = response.headers.get("content-length")
-                        if declared is not None:
-                            try:
-                                declared_size = int(declared)
-                            except ValueError as error:
-                                raise AttachmentProviderError(
-                                    "Attachment provider returned invalid length"
-                                ) from error
-                            if declared_size > max_size_bytes:
-                                raise AttachmentProviderError(
-                                    "Attachment exceeds the configured size limit"
-                                )
-                        async for chunk in response.aiter_bytes(64 * 1024):
-                            if not chunk:
-                                continue
-                            total += len(chunk)
-                            if total > max_size_bytes:
-                                raise AttachmentProviderError(
-                                    "Attachment exceeds the configured size limit"
-                                )
-                            yield chunk
-            except AttachmentProviderError:
-                raise
-            except httpx.HTTPStatusError as error:
-                raise AttachmentProviderError(
-                    f"Attachment provider HTTP {error.response.status_code}"
-                ) from error
-            except httpx.HTTPError as error:
-                raise AttachmentProviderError(
-                    "Attachment provider transport failed"
-                ) from error
-
-        return iterator()
 
 
 class DeliveryReceiptRequest(BaseModel):
@@ -175,7 +95,7 @@ class ArtifactTransportFacade:
         self,
         *,
         api,
-        message_processor: MessageProcessor,
+        message_processor: "MessageProcessor",
         providers: Mapping[str, AttachmentStreamProvider] | None = None,
     ) -> None:
         self.api = api
@@ -187,9 +107,7 @@ class ArtifactTransportFacade:
         conversation = envelope.conversation.conversation_id
         thread = envelope.conversation.thread_id
         suffix = f":thread:{thread}" if thread else ""
-        return (
-            f"{envelope.client_type.value}:conversation:{conversation}{suffix}"
-        )
+        return f"{envelope.client_type.value}:conversation:{conversation}{suffix}"
 
     async def submit_envelope(
         self,
@@ -329,9 +247,7 @@ class ArtifactTransportFacade:
             session_id=session_id,
             client_type=client_type,
         )
-        return await self.api.artifact_services.delivery_service.claim(
-            delivery_id
-        )
+        return await self.api.artifact_services.delivery_service.claim(delivery_id)
 
     async def open_delivery(
         self,
