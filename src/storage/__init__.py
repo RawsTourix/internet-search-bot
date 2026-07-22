@@ -7,6 +7,7 @@ from .errors import (
     StorageIntegrityError,
     StorageNotFoundError,
     StorageSerializationError,
+    StorageStreamSourceError,
     StorageValidationError,
     UnsupportedStorageBackendError,
 )
@@ -37,6 +38,7 @@ __all__ = [
     "StorageNotFoundError",
     "StorageSerializationError",
     "StorageServices",
+    "StorageStreamSourceError",
     "StorageValidationError",
     "SummaryStatus",
     "StoredResultRef",
