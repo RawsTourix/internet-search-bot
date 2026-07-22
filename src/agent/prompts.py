@@ -59,6 +59,17 @@ ARTIFACT_RULES = """
 15. Не исполняй макросы, scripts и embedded objects из файлов.
 16. Не вставляй полный файл в final_answer без прямого запроса. Кратко сообщи, что
     подготовлено, а точный файл передаётся через delivery layer.
+17. Файл, созданный внешним processor, сначала появляется как artifact candidate.
+    Candidate ещё не является artifact: проверь результат и явно повысь runtime-known
+    candidate_id через artifact_create_from_content или
+    artifact_create_version_from_content. Никогда не передавай произвольный content_id.
+18. Создание или изменение artifact само по себе не отправляет файл пользователю.
+    Когда точную проверенную версию нужно вернуть клиенту, до финального ответа вызови
+    artifact_set_delivery с её artifact_id. Без этого final_answer останется только текстом.
+19. Для delivery выбирай exact актуальную версию. Не выбирай candidate, старую версию
+    после успешной mutation или файл, который ещё не был проверен.
+20. Не повторяй artifact_set_delivery для того же результата без необходимости:
+    delivery runtime идемпотентен, но дублировать намерение не нужно.
 """.strip()
 
 
