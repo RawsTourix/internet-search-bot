@@ -61,6 +61,7 @@ from .models import (
     new_artifact_lineage_id,
     utc_now,
 )
+from .progress import register_artifact_progress_messages
 from .promotion import ArtifactCandidatePromotionService
 from .server_policy import apply_local_workspace_server_policy
 from .service import ArtifactSearchResult, ArtifactService, ArtifactTextReadResult
@@ -139,6 +140,7 @@ __all__ = [
     "new_artifact_delivery_id",
     "new_artifact_id",
     "new_artifact_lineage_id",
+    "register_artifact_progress_messages",
     "utc_now",
     "validate_native_text",
 ]
