@@ -8,12 +8,14 @@ from .config import (
     AGENT_CONFIG_PATH,
     HTTP_PROXY,
     HTTPS_PROXY,
+    safe_artifact_config_summary,
     safe_llm_config_summary,
     safe_memory_config_summary,
     safe_mcp_server_config_summary,
     safe_planning_config_summary,
     safe_runtime_config_summary,
 )
+from ..artifacts import create_artifact_services, load_artifact_config
 from ..mcp.mcp_client import load_config
 from ..mcp.planning_runtime import FinalizingPlanningMCPClient
 from ..core.models import ClientType, AgentStatus, AgentResult
@@ -55,15 +57,17 @@ console_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+
 class Api:
     """API для работы с агентом"""
+
     def __init__(self, config_path):
         """Инициализация Api"""
         try:
             # Загрузка конфигурации
             logger.info(
                 "Загрузка конфигурации MCP-серверов, LLM, storage, "
-                "memory, runtime и planning"
+                "memory, runtime, planning и artifacts"
             )
             (
                 self.server_configs,
@@ -73,6 +77,7 @@ class Api:
                 self.runtime_config,
             ) = load_config(config_path)
             self.planning_config = load_planning_config(config_path)
+            self.artifact_config = load_artifact_config(config_path)
 
             # Логируем только безопасную сводку: конфигурация также содержит
             # api_key, Authorization headers и env-переменные MCP-серверов.
@@ -117,6 +122,10 @@ class Api:
                 "DAG planning: %s",
                 safe_planning_config_summary(self.planning_config),
             )
+            logger.info(
+                "Artifacts: %s",
+                safe_artifact_config_summary(self.artifact_config),
+            )
 
             base_storage_services = create_storage_services(self.storage_config)
             self.storage_services = StorageServices(
@@ -126,16 +135,22 @@ class Api:
                 ),
                 artifact_store=base_storage_services.artifact_store,
             )
+            self.artifact_services = create_artifact_services(
+                storage_config=self.storage_config,
+                artifact_config=self.artifact_config,
+                content_store=self.storage_services.content_store,
+            )
             self.planning_services = create_planning_services(
                 storage_config=self.storage_config,
                 planning_config=self.planning_config,
             )
 
             # Создание и запуск клиента
-            logger.info("Инициализация planning-aware MCP-клиента")
+            logger.info("Инициализация artifact/planning-aware MCP-клиента")
             self.mcp_client = FinalizingPlanningMCPClient(
                 self.llm_config,
                 storage_services=self.storage_services,
+                artifact_services=self.artifact_services,
                 memory_config=self.memory_config,
                 runtime_config=self.runtime_config,
                 planning_services=self.planning_services,
@@ -165,9 +180,9 @@ class Api:
                 logger.warning("Нет зарегистрированных инструментов")
 
             logger.info("Вызов ИИ-агента")
-            logger.debug(f"message: {message}")
-            logger.debug(f"session_id: {session_id}")
-            logger.debug(f"client_type: {client_type}")
+            logger.debug("message_chars: %s", len(message))
+            logger.debug("session_id: %s", session_id)
+            logger.debug("client_type: %s", client_type)
 
             agent_result = await self.mcp_client.process_query(
                 message,
@@ -200,17 +215,18 @@ class Api:
                 can_resume=False,
                 progress_events=state.progress_events if state else []
             )
-        
+
     async def reset(self, session_id: str):
         """Очистка памяти сессии"""
         self.mcp_client.clear_session(session_id)
-    
+
     async def stop(self):
         """Отключение от сервера главного бота"""
         try:
             await self.mcp_client.cleanup()
         except Exception as e:
             logger.error(f"Ошибка при отключении от сервера: {e}")
+
 
 API = Api(AGENT_CONFIG_PATH)
 
