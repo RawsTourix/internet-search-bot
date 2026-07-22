@@ -165,6 +165,24 @@ class ArtifactDeliveryMixin:
                     context.active_cycle.artifact_refs.append(artifact_id)
         return context
 
+    async def _refresh_artifact_state(
+        self,
+        context: ManagerToolContext,
+    ) -> None:
+        if (
+            self.artifact_services is not None
+            and self.artifact_config is not None
+            and self.artifact_config.enabled
+        ):
+            available = await self.artifact_services.candidate_store.list_cycle(
+                session_id=context.session_id,
+                cycle_id=context.cycle_id,
+            )
+            context.active_cycle.artifact_candidate_refs = [
+                item.candidate_id for item in available
+            ]
+        await super()._refresh_artifact_state(context)
+
     async def _call_registered_tool(
         self,
         public_tool_name: str,
