@@ -1,4 +1,10 @@
-"""CLI entry point for the optional legacy artifact-layout migration."""
+"""CLI entry point for the optional legacy artifact-layout migration.
+
+Use this only when ``storage/artifacts`` contains old ``art_*/file.bin``
+payload directories created before the lineage/content-store artifact model.
+The default invocation is a dry run; pass ``--apply`` only after reviewing the
+report. New or empty installations do not require this migration.
+"""
 
 from pathlib import Path
 import sys
