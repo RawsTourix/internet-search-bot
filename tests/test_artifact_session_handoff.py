@@ -81,7 +81,6 @@ class ArtifactSessionHandoffTests(unittest.IsolatedAsyncioTestCase):
                 "filename": "source.md",
                 "text": "STATUS: draft",
                 "format_id": "markdown",
-                "purpose": "input",
             },
         )
         artifact_id = json.loads(created.content[0].text)["artifact"]["artifact_id"]
