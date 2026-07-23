@@ -285,22 +285,39 @@ async def send_initial_status_message(update: Update, text: str):
         return None
 
 
-def _progress_metadata(update: Update, status_message: Any) -> dict[str, Any]:
-    message = update.effective_message
+def _progress_metadata(
+    update: Update,
+    status_message: Any,
+    *,
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    chat = getattr(update, "effective_chat", None)
+    message = getattr(update, "effective_message", None)
+    chat_id = getattr(chat, "id", None)
+    message_id = getattr(message, "message_id", None)
     metadata: dict[str, Any] = {
-        "chat_id": update.effective_chat.id,
-        "message_id": message.message_id,
         "progress_locale": detect_progress_locale(update),
     }
+    if chat_id is not None:
+        metadata["chat_id"] = chat_id
+    if message_id is not None:
+        metadata["message_id"] = message_id
     if status_message is not None:
-        metadata.update({
-            "status_message_id": status_message.message_id,
-            "progress_request_id": str(update.update_id),
-            "progress_target": {
-                "chat_id": update.effective_chat.id,
-                "message_id": status_message.message_id,
-            },
-        })
+        status_message_id = getattr(status_message, "message_id", None)
+        progress_request_id = request_id
+        if progress_request_id is None:
+            update_id = getattr(update, "update_id", None)
+            if update_id is not None:
+                progress_request_id = str(update_id)
+        if status_message_id is not None:
+            metadata["status_message_id"] = status_message_id
+        if progress_request_id is not None:
+            metadata["progress_request_id"] = str(progress_request_id)
+        if chat_id is not None and status_message_id is not None:
+            metadata["progress_target"] = {
+                "chat_id": chat_id,
+                "message_id": status_message_id,
+            }
     if TELEGRAM_PROGRESS_CALLBACK_URL:
         metadata["progress_callback_url"] = TELEGRAM_PROGRESS_CALLBACK_URL
     if TELEGRAM_PROGRESS_CALLBACK_TOKEN:
@@ -315,7 +332,11 @@ def attach_progress_metadata(
     status_message: Any,
 ) -> None:
     payload.setdefault("metadata", {}).update(
-        _progress_metadata(update, status_message)
+        _progress_metadata(
+            update,
+            status_message,
+            request_id=str(payload.get("id")) if payload.get("id") is not None else None,
+        )
     )
 
 
@@ -395,12 +416,14 @@ async def edit_telegram_message_with_retries(
             raise
         except (TimedOut, NetworkError) as error:
             last_error = error
-            if attempt >= max_retries or (
-                is_stale is not None and is_stale()
-            ):
+            if is_stale is not None and is_stale():
+                return None
+            if attempt >= max_retries:
                 break
             await asyncio.sleep(base_delay * (2 ** (attempt - 1)))
     if last_error is not None:
+        if is_stale is not None and is_stale():
+            return None
         raise last_error
 
 
