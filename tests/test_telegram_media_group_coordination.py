@@ -36,6 +36,35 @@ class TelegramMediaGroupCoordinationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(callback_started.wait(), timeout=1)
         await runner.cancel_all()
 
+    async def test_late_member_resets_quiet_period_and_is_awaited(self):
+        activity = MediaGroupActivityCoordinator()
+        runner = DebouncedBatchRunner(activity=activity)
+        callback_started = asyncio.Event()
+        key = "bot:chat:-:album"
+
+        async def callback():
+            callback_started.set()
+
+        await activity.member_started(key, filename="first.txt")
+        await activity.member_finished(key, filename="first.txt")
+        await runner.schedule(
+            key,
+            delay_seconds=0.05,
+            callback=callback,
+        )
+
+        await asyncio.sleep(0.02)
+        await activity.member_started(key, filename="late.txt")
+        await asyncio.sleep(0.06)
+        self.assertFalse(callback_started.is_set())
+
+        await activity.member_finished(key, filename="late.txt")
+        await asyncio.sleep(0.02)
+        self.assertFalse(callback_started.is_set())
+
+        await asyncio.wait_for(callback_started.wait(), timeout=1)
+        await runner.cancel_all()
+
     async def test_failed_member_suppresses_commit_callback(self):
         activity = MediaGroupActivityCoordinator()
         runner = DebouncedBatchRunner(activity=activity)
@@ -56,10 +85,15 @@ class TelegramMediaGroupCoordinationTests(unittest.IsolatedAsyncioTestCase):
             filename="failed.txt",
             error=RuntimeError("download failed"),
         )
-        await asyncio.sleep(0.05)
+
+        for _ in range(100):
+            if await activity.snapshot(key) is None:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            self.fail("failed media-group activity was not released")
 
         self.assertEqual(callback_calls, [])
-        self.assertIsNone(await activity.snapshot(key))
         await runner.cancel_all()
 
     async def test_rescheduled_worker_does_not_clear_live_activity(self):
