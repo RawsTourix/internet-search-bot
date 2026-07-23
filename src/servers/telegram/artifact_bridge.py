@@ -12,6 +12,7 @@ from tempfile import SpooledTemporaryFile
 from typing import Any
 
 import httpx
+from telegram import InputFile
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 from ...adapters.telegram_adapter import TelegramAdapter
@@ -415,6 +416,7 @@ class TelegramArtifactGatewayClient:
         )
         filename = "artifact.bin"
         sent_message: Any | None = None
+        telegram_send_started = False
         receipt: dict[str, Any] = {"provider": "telegram", "chat_id": chat_id}
         try:
             async with self._client(read_timeout=300.0) as client:
@@ -452,16 +454,33 @@ class TelegramArtifactGatewayClient:
                         )
 
             spool.seek(0)
+            document = _telegram_input_file(spool, filename)
             kwargs: dict[str, Any] = {
                 "chat_id": chat_id,
-                "document": spool,
-                "filename": filename,
+                "document": document,
+                "write_timeout": 120.0,
             }
             if message_thread_id is not None:
                 kwargs["message_thread_id"] = message_thread_id
             if reply_to_message_id is not None:
                 kwargs["reply_to_message_id"] = reply_to_message_id
-            sent_message = await bot.send_document(**kwargs)
+                kwargs["allow_sending_without_reply"] = True
+            telegram_send_started = True
+            try:
+                sent_message = await bot.send_document(**kwargs)
+            except BadRequest as error:
+                if reply_to_message_id is None or not _is_reply_target_error(error):
+                    raise
+                logger.warning(
+                    "Telegram rejected reply target for delivery %s; retrying "
+                    "the same file without reply metadata: %s",
+                    delivery_id,
+                    _safe_delivery_error(error),
+                )
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("reply_to_message_id", None)
+                retry_kwargs.pop("allow_sending_without_reply", None)
+                sent_message = await bot.send_document(**retry_kwargs)
             receipt["message_id"] = getattr(sent_message, "message_id", None)
             document = getattr(sent_message, "document", None)
             if document is not None:
@@ -503,11 +522,18 @@ class TelegramArtifactGatewayClient:
                 telegram_message_id=getattr(sent_message, "message_id", None),
             )
         except (TimedOut, NetworkError) as error:
+            safe_error = _safe_delivery_error(error)
+            logger.warning(
+                "Telegram delivery transport outcome is ambiguous: "
+                "delivery_id=%s error=%s",
+                delivery_id,
+                safe_error,
+            )
             try:
                 await self._fail(
                     delivery_id,
                     session_id,
-                    error=type(error).__name__,
+                    error=safe_error,
                     ambiguous=True,
                     receipt=receipt,
                 )
@@ -521,14 +547,20 @@ class TelegramArtifactGatewayClient:
                     if sent_message is not None
                     else None
                 ),
-                error=type(error).__name__,
+                error=safe_error,
             )
         except BadRequest as error:
+            safe_error = _safe_delivery_error(error)
+            logger.warning(
+                "Telegram rejected artifact delivery: delivery_id=%s error=%s",
+                delivery_id,
+                safe_error,
+            )
             try:
                 await self._fail(
                     delivery_id,
                     session_id,
-                    error=str(error),
+                    error=safe_error,
                     ambiguous=False,
                     receipt=receipt,
                 )
@@ -537,15 +569,23 @@ class TelegramArtifactGatewayClient:
             return TelegramDeliveryOutcome(
                 delivery_id=delivery_id,
                 state="failed",
-                error=str(error),
+                error=safe_error,
             )
         except Exception as error:
-            ambiguous = sent_message is not None
+            safe_error = _safe_delivery_error(error)
+            ambiguous = telegram_send_started
+            logger.exception(
+                "Telegram artifact delivery failed: delivery_id=%s "
+                "send_started=%s error=%s",
+                delivery_id,
+                telegram_send_started,
+                safe_error,
+            )
             try:
                 await self._fail(
                     delivery_id,
                     session_id,
-                    error=type(error).__name__,
+                    error=safe_error,
                     ambiguous=ambiguous,
                     receipt=receipt,
                 )
@@ -559,7 +599,7 @@ class TelegramArtifactGatewayClient:
                     if sent_message is not None
                     else None
                 ),
-                error=type(error).__name__,
+                error=safe_error,
             )
         finally:
             spool.close()
@@ -603,6 +643,41 @@ class TelegramArtifactGatewayClient:
                 },
             )
             response.raise_for_status()
+
+
+def _telegram_input_file(spool, filename: str) -> InputFile:
+    """Create an explicit PTB upload object while keeping the spool open."""
+
+    try:
+        return InputFile(
+            spool,
+            filename=filename,
+            read_file_handle=False,
+        )
+    except TypeError:
+        # Compatibility with PTB versions before read_file_handle was added.
+        return InputFile(spool, filename=filename)
+
+
+def _safe_delivery_error(error: BaseException) -> str:
+    message = re.sub(r"\s+", " ", str(error)).strip()
+    value = type(error).__name__
+    if message:
+        value += f": {message}"
+    return value[:2_000]
+
+
+def _is_reply_target_error(error: BadRequest) -> bool:
+    message = str(error).lower()
+    return any(
+        marker in message
+        for marker in (
+            "message to be replied",
+            "reply message",
+            "replied message",
+            "reply_to_message",
+        )
+    )
 
 
 def _optional_int(value: str | None) -> int | None:
