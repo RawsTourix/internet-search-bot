@@ -175,15 +175,17 @@ class ArtifactDeliveryMixin:
                 (),
             )
         )
+        added_refs: list[str] = []
         for artifact_id in inherited_refs:
             if artifact_id not in context.active_cycle.artifact_refs:
                 context.active_cycle.artifact_refs.append(artifact_id)
-        if inherited_refs:
+                added_refs.append(artifact_id)
+        if added_refs:
             self._trace_event(
                 context.active_cycle.cycle_trace,
                 "artifact_authority_inherited",
-                artifact_count=len(inherited_refs),
-                artifact_ids=inherited_refs,
+                artifact_count=len(added_refs),
+                artifact_ids=added_refs,
             )
 
         input_batch = get_artifact_request_input_batch()
