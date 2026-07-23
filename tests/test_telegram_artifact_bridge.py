@@ -6,7 +6,8 @@ from datetime import datetime, timezone
 from types import SimpleNamespace
 
 import httpx
-from telegram.error import TimedOut
+from telegram import InputFile
+from telegram.error import BadRequest, TimedOut
 
 from src.servers.telegram.artifact_bridge import (
     DebouncedBatchRunner,
@@ -18,14 +19,27 @@ from src.servers.telegram.artifact_bridge import (
 
 
 class FakeBot:
-    def __init__(self, *, send_error=None):
+    def __init__(self, *, send_error=None, send_errors=None):
         self.send_error = send_error
+        self.send_errors = list(send_errors or [])
         self.sent = []
+        self.calls = []
 
     async def send_document(self, **kwargs):
+        self.calls.append(dict(kwargs))
+        if self.send_errors:
+            error = self.send_errors.pop(0)
+            if error is not None:
+                raise error
         if self.send_error is not None:
             raise self.send_error
-        payload = kwargs["document"].read()
+        document = kwargs["document"]
+        if isinstance(document, InputFile):
+            payload = document.input_file_content
+            if hasattr(payload, "read"):
+                payload = payload.read()
+        else:
+            payload = document.read()
         self.sent.append({**kwargs, "payload": payload})
         return SimpleNamespace(
             message_id=77,
@@ -229,13 +243,54 @@ class TelegramArtifactBridgeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outcomes[0].state, "delivered")
         self.assertEqual(bot.sent[0]["payload"], data)
-        self.assertEqual(bot.sent[0]["filename"], "report.md")
+        self.assertIsInstance(bot.sent[0]["document"], InputFile)
+        self.assertEqual(bot.sent[0]["document"].filename, "report.md")
+        self.assertTrue(bot.sent[0]["allow_sending_without_reply"])
         complete = next(
             request for request in requests
             if request.url.path.endswith("/complete")
         )
         receipt = json.loads(complete.content)
         self.assertEqual(receipt["receipt"]["message_id"], 77)
+
+    async def test_missing_reply_target_retries_without_reply_metadata(self):
+        data = b"report"
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+
+        async def handler(request):
+            if request.url.path.endswith("/content"):
+                return httpx.Response(
+                    200,
+                    content=data,
+                    headers={
+                        "Content-Length": str(len(data)),
+                        "X-Content-Hash": digest,
+                    },
+                )
+            if request.url.path.endswith("/complete"):
+                return httpx.Response(200, json={"state": "delivered"})
+            return httpx.Response(404)
+
+        bot = FakeBot(send_errors=[
+            BadRequest("Message to be replied not found"),
+            None,
+        ])
+        client = TelegramArtifactGatewayClient(
+            gateway_url="https://gateway.example",
+            api_key="key",
+            transport=httpx.MockTransport(handler),
+        )
+        outcomes = await client.deliver_selected(
+            bot=bot,
+            artifacts=[{"delivery_id": "dlv_" + "e" * 32, "state": "selected"}],
+            session_id="telegram:conversation:1",
+            chat_id=1,
+            reply_to_message_id=10,
+        )
+        self.assertEqual(outcomes[0].state, "delivered")
+        self.assertEqual(len(bot.calls), 2)
+        self.assertEqual(bot.calls[0]["reply_to_message_id"], 10)
+        self.assertNotIn("reply_to_message_id", bot.calls[1])
 
     async def test_send_timeout_is_ambiguous_and_never_retried(self):
         data = b"file"
@@ -272,6 +327,42 @@ class TelegramArtifactBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcomes[0].state, "unknown")
         self.assertTrue(failures[0]["ambiguous"])
         self.assertEqual(len(bot.sent), 0)
+
+    async def test_generic_send_failure_is_ambiguous_and_keeps_details(self):
+        data = b"file"
+        digest = "sha256:" + hashlib.sha256(data).hexdigest()
+        failures = []
+
+        async def handler(request):
+            if request.url.path.endswith("/content"):
+                return httpx.Response(
+                    200,
+                    content=data,
+                    headers={
+                        "Content-Length": str(len(data)),
+                        "X-Content-Hash": digest,
+                    },
+                )
+            if request.url.path.endswith("/failed"):
+                failures.append(json.loads(request.content))
+                return httpx.Response(200, json={"state": "unknown"})
+            return httpx.Response(404)
+
+        bot = FakeBot(send_error=RuntimeError("upload backend rejected file handle"))
+        client = TelegramArtifactGatewayClient(
+            gateway_url="https://gateway.example",
+            api_key="key",
+            transport=httpx.MockTransport(handler),
+        )
+        outcomes = await client.deliver_selected(
+            bot=bot,
+            artifacts=[{"delivery_id": "dlv_" + "f" * 32, "state": "selected"}],
+            session_id="telegram:conversation:1",
+            chat_id=1,
+        )
+        self.assertEqual(outcomes[0].state, "unknown")
+        self.assertTrue(failures[0]["ambiguous"])
+        self.assertIn("upload backend rejected file handle", failures[0]["error"])
 
     async def test_successful_send_with_lost_complete_receipt_becomes_unknown(self):
         data = b"file"
