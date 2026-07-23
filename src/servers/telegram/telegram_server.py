@@ -25,7 +25,6 @@ from telegram.ext import (
 )
 
 from .artifact_bridge import (
-    DebouncedBatchRunner,
     TelegramArtifactBridgeError,
     TelegramArtifactGatewayClient,
     build_telegram_input_envelope,
@@ -43,11 +42,16 @@ from .config import (
     TELEGRAM_FILE_PROVIDER_TOKEN,
     TELEGRAM_FINAL_DELIVERY_MODE,
     TELEGRAM_FINAL_EDIT_MAX_LENGTH,
-    TELEGRAM_MEDIA_GROUP_COMMIT_DELAY_SECONDS,
+    TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS,
+    TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS,
     TELEGRAM_PROGRESS_CALLBACK_TOKEN,
     TELEGRAM_PROGRESS_CALLBACK_URL,
     WEBHOOK_DOMAIN,
     WEBHOOK_SECRET,
+)
+from .media_group_runner import (
+    LifetimeBoundDebouncedBatchRunner,
+    LifetimeMediaGroupActivityCoordinator,
 )
 from .runtime_state import KeyedAsyncLockPool
 from ...utils.telegram_formatting import (
@@ -79,12 +83,17 @@ if not logger.handlers:
 
 
 application = Application.builder().token(BOT_TOKEN).build()
+media_group_activity = LifetimeMediaGroupActivityCoordinator()
 artifact_gateway = TelegramArtifactGatewayClient(
     gateway_url=GATEWAY_URL,
     api_key=TELEGRAM_API_KEY,
     delivery_spool_memory_bytes=TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES,
+    media_group_activity=media_group_activity,
 )
-media_group_runner = DebouncedBatchRunner()
+media_group_runner = LifetimeBoundDebouncedBatchRunner(
+    activity=media_group_activity,
+    maximum_lifetime_seconds=TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS,
+)
 standalone_lock_pool = KeyedAsyncLockPool()
 
 progress_edit_state: dict[str, dict[str, Any]] = {}
@@ -105,6 +114,7 @@ class PendingMediaGroup:
     status_message: Any
     response_metadata: dict[str, Any]
     failed: bool = False
+    terminal_notified: bool = False
 
 
 FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
@@ -764,6 +774,46 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+async def _claim_group_failure(group: PendingMediaGroup) -> bool:
+    async with media_groups_guard:
+        if group.terminal_notified or media_groups.get(group.key) is not group:
+            return False
+        group.failed = True
+        group.terminal_notified = True
+        media_groups.pop(group.key, None)
+        return True
+
+
+async def _expire_group(group: PendingMediaGroup) -> None:
+    if not await _claim_group_failure(group):
+        return
+    logger.error(
+        "telegram_media_group_lifetime_exceeded group_key=%s "
+        "input_batch_id=%s maximum_lifetime_seconds=%s",
+        group.key,
+        group.input_batch_id,
+        TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS,
+    )
+    if normalize_locale(group.progress_locale) == "en":
+        text = (
+            "The album could not be processed because file collection exceeded "
+            f"{TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS:g} seconds. No partial "
+            "batch was committed. Please send the files again."
+        )
+    else:
+        text = (
+            "Не удалось обработать альбом: загрузка файлов заняла больше "
+            f"{TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS:g} секунд. Частичный "
+            "пакет не был передан агенту. Повторите отправку файлов."
+        )
+    await finish_status_or_send_reply(
+        update=group.update,
+        status_message=group.status_message,
+        text=text,
+        delivery_mode="send_new",
+    )
+
+
 async def _finish_group(group: PendingMediaGroup) -> None:
     try:
         if group.failed or group.input_batch_id is None:
@@ -924,8 +974,15 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             envelope,
             progress_locale=progress_locale,
         )
+        if group.failed:
+            logger.info(
+                "telegram_media_group_member_ignored_after_terminal "
+                "group_key=%s message_id=%s",
+                group_key,
+                message.message_id,
+            )
+            return
         if submission.get("status") == "failed":
-            group.failed = True
             raise TelegramArtifactBridgeError("Ingress rejected a media-group item")
         if submission.get("status") == "committed" and submission.get("duplicate"):
             if created_group:
@@ -945,21 +1002,20 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         group.input_batch_id = batch_id
         scheduled = await media_group_runner.schedule(
             group_key,
-            delay_seconds=TELEGRAM_MEDIA_GROUP_COMMIT_DELAY_SECONDS,
+            delay_seconds=TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS,
             callback=lambda: _finish_group(group),
+            timeout_callback=lambda: _expire_group(group),
             reset=not bool(submission.get("duplicate")),
         )
         if not scheduled and not submission.get("duplicate"):
             logger.warning(
-                "Late media-group item arrived while commit was already running: %s",
+                "Late media-group item arrived after commit started: %s",
                 group_key,
             )
     except Exception as error:
-        group.failed = True
         logger.exception("Telegram media-group member failed: %r", error)
-        async with media_groups_guard:
-            if media_groups.get(group_key) is group:
-                media_groups.pop(group_key, None)
+        if not await _claim_group_failure(group):
+            return
         await _deliver_agent_result(
             update=group.update,
             status_message=group.status_message,
