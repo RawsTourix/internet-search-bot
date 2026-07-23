@@ -7,6 +7,10 @@ from src.servers.telegram.artifact_bridge import (
     MediaGroupActivityCoordinator,
     telegram_media_group_key,
 )
+from src.servers.telegram.media_group_runner import (
+    LifetimeBoundDebouncedBatchRunner,
+    LifetimeMediaGroupActivityCoordinator,
+)
 
 
 class TelegramMediaGroupCoordinationTests(unittest.IsolatedAsyncioTestCase):
@@ -127,6 +131,62 @@ class TelegramMediaGroupCoordinationTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(callback_started.wait(), timeout=1)
         await runner.cancel_all()
 
+    async def test_maximum_lifetime_calls_timeout_without_commit(self):
+        activity = LifetimeMediaGroupActivityCoordinator()
+        runner = LifetimeBoundDebouncedBatchRunner(
+            activity=activity,
+            maximum_lifetime_seconds=0.06,
+        )
+        commit_called = asyncio.Event()
+        timeout_called = asyncio.Event()
+        key = "bot:chat:-:stalled-album"
+
+        async def commit_callback():
+            commit_called.set()
+
+        async def timeout_callback():
+            timeout_called.set()
+
+        await activity.member_started(key, filename="stalled.txt")
+        await runner.schedule(
+            key,
+            delay_seconds=0.01,
+            callback=commit_callback,
+            timeout_callback=timeout_callback,
+        )
+
+        await asyncio.wait_for(timeout_called.wait(), timeout=1)
+        self.assertFalse(commit_called.is_set())
+        self.assertIsNone(await activity.snapshot(key))
+
+        # A transport request may finish after the local lifetime expires. Its
+        # terminal callback must not recreate the already-closed group state.
+        await activity.member_finished(key, filename="stalled.txt")
+        self.assertIsNone(await activity.snapshot(key))
+        await runner.cancel_all()
+
+    async def test_lifetime_is_measured_from_first_member_not_first_schedule(self):
+        activity = LifetimeMediaGroupActivityCoordinator()
+        runner = LifetimeBoundDebouncedBatchRunner(
+            activity=activity,
+            maximum_lifetime_seconds=0.08,
+        )
+        timeout_called = asyncio.Event()
+        key = "bot:chat:-:slow-first-member"
+
+        await activity.member_started(key, filename="slow.txt")
+        await asyncio.sleep(0.05)
+
+        await runner.schedule(
+            key,
+            delay_seconds=0.01,
+            callback=lambda: asyncio.sleep(0),
+            timeout_callback=lambda: _set_event(timeout_called),
+        )
+
+        await asyncio.wait_for(timeout_called.wait(), timeout=1)
+        await runner.cancel_all()
+
     def test_envelope_key_matches_telegram_server_group_key(self):
         envelope = SimpleNamespace(
             source_group_id="album-42",
@@ -140,6 +200,10 @@ class TelegramMediaGroupCoordinationTests(unittest.IsolatedAsyncioTestCase):
             telegram_media_group_key(envelope),
             "default:1062062174:-:album-42",
         )
+
+
+async def _set_event(event: asyncio.Event) -> None:
+    event.set()
 
 
 if __name__ == "__main__":
