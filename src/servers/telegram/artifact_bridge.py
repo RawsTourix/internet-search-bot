@@ -6,8 +6,9 @@ import asyncio
 import hashlib
 import logging
 import re
+import time
 from collections.abc import AsyncIterator, Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from tempfile import SpooledTemporaryFile
 from typing import Any
 
@@ -18,7 +19,7 @@ from telegram.error import BadRequest, NetworkError, TimedOut
 from ...adapters.telegram_adapter import TelegramAdapter
 
 
-logger = logging.getLogger("TelegramArtifactBridge")
+logger = logging.getLogger("TelegramServer.ArtifactBridge")
 
 
 class TelegramArtifactBridgeError(RuntimeError):
@@ -39,9 +40,174 @@ class TelegramDeliveryOutcome:
     error: str | None = None
 
 
+@dataclass(slots=True)
+class _MediaGroupActivity:
+    in_flight: int = 0
+    received: int = 0
+    completed: int = 0
+    failed: bool = False
+    last_error: str | None = None
+    last_activity: float = field(default_factory=time.monotonic)
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+class MediaGroupActivityCoordinator:
+    """Coordinate Telegram album quiet time with active ingress submissions."""
+
+    def __init__(self) -> None:
+        self._states: dict[str, _MediaGroupActivity] = {}
+        self._lock = asyncio.Lock()
+
+    async def member_started(self, key: str, *, filename: str | None = None) -> None:
+        async with self._lock:
+            state = self._states.setdefault(key, _MediaGroupActivity())
+            state.in_flight += 1
+            state.received += 1
+            state.last_activity = time.monotonic()
+            state.changed.set()
+            logger.info(
+                "telegram_media_group_member_started group_key=%s filename=%s "
+                "received=%s in_flight=%s completed=%s failed=%s",
+                key,
+                filename,
+                state.received,
+                state.in_flight,
+                state.completed,
+                state.failed,
+            )
+
+    async def member_finished(
+        self,
+        key: str,
+        *,
+        filename: str | None = None,
+        error: BaseException | str | None = None,
+    ) -> None:
+        async with self._lock:
+            state = self._states.setdefault(key, _MediaGroupActivity())
+            state.in_flight = max(0, state.in_flight - 1)
+            state.completed += 1
+            state.last_activity = time.monotonic()
+            if error is not None:
+                state.failed = True
+                state.last_error = _safe_activity_error(error)
+            state.changed.set()
+            log = logger.warning if error is not None else logger.info
+            log(
+                "telegram_media_group_member_finished group_key=%s filename=%s "
+                "received=%s in_flight=%s completed=%s failed=%s error=%s",
+                key,
+                filename,
+                state.received,
+                state.in_flight,
+                state.completed,
+                state.failed,
+                state.last_error,
+            )
+
+    async def wait_until_ready(
+        self,
+        key: str,
+        *,
+        quiet_period_seconds: float,
+    ) -> bool:
+        """Wait until every known member finishes and a new quiet period elapses."""
+
+        quiet_period = max(0.0, quiet_period_seconds)
+        deferred_logged = False
+        while True:
+            async with self._lock:
+                state = self._states.get(key)
+                if state is None:
+                    return True
+                now = time.monotonic()
+                quiet_remaining = max(
+                    0.0,
+                    quiet_period - (now - state.last_activity),
+                )
+                if state.in_flight == 0 and state.failed:
+                    logger.warning(
+                        "telegram_media_group_callback_suppressed group_key=%s "
+                        "received=%s completed=%s error=%s",
+                        key,
+                        state.received,
+                        state.completed,
+                        state.last_error,
+                    )
+                    return False
+                if state.in_flight == 0 and quiet_remaining <= 0:
+                    logger.info(
+                        "telegram_media_group_ready group_key=%s received=%s "
+                        "completed=%s quiet_period_seconds=%s",
+                        key,
+                        state.received,
+                        state.completed,
+                        quiet_period,
+                    )
+                    return True
+                if not deferred_logged:
+                    logger.info(
+                        "telegram_media_group_commit_deferred group_key=%s "
+                        "received=%s completed=%s in_flight=%s "
+                        "quiet_remaining_seconds=%.3f",
+                        key,
+                        state.received,
+                        state.completed,
+                        state.in_flight,
+                        quiet_remaining,
+                    )
+                    deferred_logged = True
+                changed = state.changed
+                changed.clear()
+                timeout = quiet_remaining if state.in_flight == 0 else None
+            try:
+                if timeout is None:
+                    await changed.wait()
+                else:
+                    await asyncio.wait_for(changed.wait(), timeout=timeout)
+            except asyncio.TimeoutError:
+                pass
+
+    async def clear(self, key: str) -> None:
+        async with self._lock:
+            self._states.pop(key, None)
+
+    async def snapshot(self, key: str) -> dict[str, Any] | None:
+        async with self._lock:
+            state = self._states.get(key)
+            if state is None:
+                return None
+            return {
+                "received": state.received,
+                "completed": state.completed,
+                "in_flight": state.in_flight,
+                "failed": state.failed,
+                "last_error": state.last_error,
+            }
+
+
+_media_group_activity = MediaGroupActivityCoordinator()
+
+
 def telegram_session_id(chat_id: int | str, thread_id: int | str | None) -> str:
     suffix = f":thread:{thread_id}" if thread_id is not None else ""
     return f"telegram:conversation:{chat_id}{suffix}"
+
+
+def telegram_media_group_key(envelope: Any) -> str | None:
+    group_id = str(getattr(envelope, "source_group_id", "") or "").strip()
+    if not group_id:
+        return None
+    instance_id = str(getattr(envelope, "client_instance_id", "") or "").strip()
+    conversation = getattr(envelope, "conversation", None)
+    conversation_id = str(
+        getattr(conversation, "conversation_id", "") or ""
+    ).strip()
+    thread_id = getattr(conversation, "thread_id", None)
+    thread = str(thread_id) if thread_id is not None else "-"
+    if not instance_id or not conversation_id:
+        return None
+    return f"{instance_id}:{conversation_id}:{thread}:{group_id}"
 
 
 def _safe_filename(value: str | None, fallback: str) -> str:
@@ -196,12 +362,16 @@ def build_telegram_input_envelope(
 
 
 class DebouncedBatchRunner:
-    """Debounce media groups without cancelling a callback already running."""
+    """Close an album after quiet time without racing active submissions."""
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        activity: MediaGroupActivityCoordinator | None = None,
+    ) -> None:
         self._tasks: dict[str, asyncio.Task[None]] = {}
         self._running: set[str] = set()
         self._lock = asyncio.Lock()
+        self._activity = activity or _media_group_activity
 
     async def schedule(
         self,
@@ -237,16 +407,28 @@ class DebouncedBatchRunner:
                 if self._tasks.get(key) is not asyncio.current_task():
                     return
                 self._running.add(key)
-            await callback()
+            ready = await self._activity.wait_until_ready(
+                key,
+                quiet_period_seconds=delay_seconds,
+            )
+            if ready:
+                await callback()
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Debounced Telegram media-group callback failed")
+            logger.exception(
+                "telegram_media_group_callback_failed group_key=%s",
+                key,
+            )
         finally:
+            should_clear_activity = False
             async with self._lock:
                 self._running.discard(key)
                 if self._tasks.get(key) is asyncio.current_task():
                     self._tasks.pop(key, None)
+                    should_clear_activity = True
+            if should_clear_activity:
+                await self._activity.clear(key)
 
     async def cancel_all(self) -> None:
         async with self._lock:
@@ -272,11 +454,13 @@ class TelegramArtifactGatewayClient:
         api_key: str,
         transport: httpx.AsyncBaseTransport | None = None,
         delivery_spool_memory_bytes: int = 8 * 1024 * 1024,
+        media_group_activity: MediaGroupActivityCoordinator | None = None,
     ) -> None:
         self.gateway_url = gateway_url.rstrip("/")
         self.api_key = api_key
         self.transport = transport
         self.delivery_spool_memory_bytes = delivery_spool_memory_bytes
+        self.media_group_activity = media_group_activity or _media_group_activity
 
     def _client(self, *, read_timeout: float = 1800.0) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -296,17 +480,56 @@ class TelegramArtifactGatewayClient:
         *,
         progress_locale: str,
     ) -> dict[str, Any]:
-        async with self._client(read_timeout=180.0) as client:
-            response = await client.post(
-                f"{self.gateway_url}/ingress/events",
-                params={"run": "false", "progress_locale": progress_locale},
-                json=envelope.model_dump(mode="json"),
+        group_key = telegram_media_group_key(envelope)
+        filename = _envelope_filename(envelope)
+        if group_key is not None:
+            await self.media_group_activity.member_started(
+                group_key,
+                filename=filename,
             )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise TelegramArtifactBridgeError("Gateway ingress response is invalid")
-            return payload
+        failure: BaseException | str | None = None
+        try:
+            async with self._client(read_timeout=180.0) as client:
+                response = await client.post(
+                    f"{self.gateway_url}/ingress/events",
+                    params={"run": "false", "progress_locale": progress_locale},
+                    json=envelope.model_dump(mode="json"),
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise TelegramArtifactBridgeError(
+                        "Gateway ingress response is invalid"
+                    )
+                if payload.get("status") == "failed":
+                    failure = str(payload.get("error_code") or "ingress_failed")
+                logger.info(
+                    "telegram_ingress_submission_finished group_key=%s "
+                    "input_batch_id=%s filename=%s status=%s duplicate=%s",
+                    group_key,
+                    payload.get("input_batch_id"),
+                    filename,
+                    payload.get("status"),
+                    payload.get("duplicate"),
+                )
+                return payload
+        except BaseException as error:
+            failure = error
+            logger.exception(
+                "telegram_ingress_submission_failed group_key=%s filename=%s "
+                "error=%s",
+                group_key,
+                filename,
+                _safe_activity_error(error),
+            )
+            raise
+        finally:
+            if group_key is not None:
+                await self.media_group_activity.member_finished(
+                    group_key,
+                    filename=filename,
+                    error=failure,
+                )
 
     async def commit_and_run(
         self,
@@ -315,20 +538,42 @@ class TelegramArtifactGatewayClient:
         session_id: str,
         progress_locale: str,
     ) -> dict[str, Any]:
-        async with self._client() as client:
-            response = await client.post(
-                f"{self.gateway_url}/input-batches/{input_batch_id}/commit",
-                json={
-                    "session_id": session_id,
-                    "progress_locale": progress_locale,
-                    "run": True,
-                },
+        logger.info(
+            "telegram_media_group_commit_started input_batch_id=%s session_id=%s",
+            input_batch_id,
+            session_id,
+        )
+        try:
+            async with self._client() as client:
+                response = await client.post(
+                    f"{self.gateway_url}/input-batches/{input_batch_id}/commit",
+                    json={
+                        "session_id": session_id,
+                        "progress_locale": progress_locale,
+                        "run": True,
+                    },
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if not isinstance(payload, dict):
+                    raise TelegramArtifactBridgeError(
+                        "Gateway commit response is invalid"
+                    )
+                logger.info(
+                    "telegram_media_group_commit_finished input_batch_id=%s "
+                    "status=%s duplicate=%s",
+                    input_batch_id,
+                    payload.get("status"),
+                    payload.get("duplicate"),
+                )
+                return payload
+        except Exception as error:
+            logger.exception(
+                "telegram_media_group_commit_failed input_batch_id=%s error=%s",
+                input_batch_id,
+                _safe_activity_error(error),
             )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise TelegramArtifactBridgeError("Gateway commit response is invalid")
-            return payload
+            raise
 
     async def open_telegram_file(
         self,
@@ -359,8 +604,14 @@ class TelegramArtifactGatewayClient:
                             if chunk:
                                 yield chunk
             except httpx.HTTPError as error:
+                logger.exception(
+                    "telegram_file_download_failed file_id_length=%s "
+                    "error_type=%s",
+                    len(file_id),
+                    type(error).__name__,
+                )
                 raise TelegramArtifactBridgeError(
-                    "Telegram file download failed"
+                    f"Telegram file download failed: {type(error).__name__}"
                 ) from error
 
         return TelegramFileStream(size_bytes=size, iterator=iterator())
@@ -643,6 +894,21 @@ class TelegramArtifactGatewayClient:
                 },
             )
             response.raise_for_status()
+
+
+def _envelope_filename(envelope: Any) -> str | None:
+    slots = list(getattr(envelope, "attachment_slots", None) or [])
+    if not slots:
+        return None
+    return getattr(slots[0], "original_filename", None)
+
+
+def _safe_activity_error(error: BaseException | str) -> str:
+    if isinstance(error, BaseException):
+        value = f"{type(error).__name__}: {error}"
+    else:
+        value = str(error)
+    return re.sub(r"\s+", " ", value).strip()[:2_000]
 
 
 def _telegram_input_file(spool, filename: str) -> InputFile:
