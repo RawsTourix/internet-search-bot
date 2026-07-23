@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import time
 from collections.abc import AsyncIterator, Mapping
 
 from ..artifacts import (
@@ -33,6 +35,9 @@ from .store import (
     IngressConflictError,
     IngressNotFoundError,
 )
+
+
+logger = logging.getLogger("API.Ingress")
 
 
 class IngressValidationError(RuntimeError):
@@ -73,6 +78,19 @@ class ArtifactIngressService:
         grouping_key: str | None = None,
     ) -> InputSubmissionResult:
         """Ingest one event; grouped Telegram drafts remain uncommitted."""
+        started = time.monotonic()
+        logger.info(
+            "api_ingress_event_started session_id=%s client_type=%s "
+            "source_message_id=%s source_group_id=%s grouping_mode=%s "
+            "attachment_count=%s text_part_count=%s",
+            session_id,
+            envelope.client_type.value,
+            envelope.source_message_id,
+            envelope.source_group_id,
+            grouping_mode.value,
+            len(envelope.attachment_slots),
+            len(envelope.text_parts),
+        )
         if not self.config.enabled:
             raise IngressValidationError(
                 "ingress_disabled",
@@ -89,6 +107,15 @@ class ArtifactIngressService:
                 or f"{event.client_type.value}:{event.event_id}"
             ),
         )
+        logger.info(
+            "api_ingress_draft_resolved input_batch_id=%s event_id=%s "
+            "draft_state=%s duplicate_event=%s duplicate_batch=%s",
+            draft.input_batch_id,
+            event.event_id,
+            draft.state.value,
+            duplicate_event,
+            duplicate_batch,
+        )
 
         try:
             committed = await self.batch_store.get_committed(
@@ -97,22 +124,26 @@ class ArtifactIngressService:
         except IngressNotFoundError:
             committed = None
         if committed is not None:
-            return InputSubmissionResult(
+            result = InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=committed.input_batch_id,
                 state="committed",
                 duplicate=True,
                 committed_batch=committed,
             )
+            self._log_submission_result(result, started=started)
+            return result
 
         if draft.state == InputBatchDraftState.FAILED:
-            return InputSubmissionResult(
+            result = InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=draft.input_batch_id,
                 state="failed",
                 duplicate=duplicate_event or duplicate_batch,
                 error_code=draft.failure_code,
             )
+            self._log_submission_result(result, started=started)
+            return result
 
         streams = dict(upload_streams or {})
         expected_slot_ids = {
@@ -123,13 +154,15 @@ class ArtifactIngressService:
                 draft.input_batch_id,
                 code="unexpected_upload_slot",
             )
-            return InputSubmissionResult(
+            result = InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=draft.input_batch_id,
                 state="failed",
                 duplicate=duplicate_event or duplicate_batch,
                 error_code="unexpected_upload_slot",
             )
+            self._log_submission_result(result, started=started)
+            return result
 
         await self.batch_store.begin_ingestion(draft.input_batch_id)
         total_bytes = sum(
@@ -149,6 +182,14 @@ class ArtifactIngressService:
                     if item.slot_id == slot.slot_id
                 )
                 if existing.state == InputAttachmentState.STORED:
+                    logger.info(
+                        "api_ingress_attachment_reused input_batch_id=%s "
+                        "event_id=%s slot_id=%s filename=%s",
+                        draft.input_batch_id,
+                        event.event_id,
+                        slot.slot_id,
+                        slot.original_filename,
+                    )
                     continue
                 stream = streams.get(slot.slot_id)
                 if stream is None:
@@ -160,12 +201,47 @@ class ArtifactIngressService:
                     draft.input_batch_id,
                     slot.slot_id,
                 )
-                size = await self._ingest_slot(
-                    event=event,
-                    input_batch_id=draft.input_batch_id,
-                    session_id=session_id,
-                    slot=slot,
-                    stream=stream,
+                logger.info(
+                    "api_ingress_attachment_started input_batch_id=%s "
+                    "event_id=%s slot_id=%s filename=%s declared_size=%s",
+                    draft.input_batch_id,
+                    event.event_id,
+                    slot.slot_id,
+                    slot.original_filename,
+                    slot.declared_size_bytes,
+                )
+                slot_started = time.monotonic()
+                try:
+                    size = await self._ingest_slot(
+                        event=event,
+                        input_batch_id=draft.input_batch_id,
+                        session_id=session_id,
+                        slot=slot,
+                        stream=stream,
+                    )
+                except Exception as error:
+                    logger.exception(
+                        "api_ingress_attachment_failed input_batch_id=%s "
+                        "event_id=%s slot_id=%s filename=%s error_type=%s "
+                        "duration_ms=%s",
+                        draft.input_batch_id,
+                        event.event_id,
+                        slot.slot_id,
+                        slot.original_filename,
+                        type(error).__name__,
+                        round((time.monotonic() - slot_started) * 1000),
+                    )
+                    raise
+                logger.info(
+                    "api_ingress_attachment_stored input_batch_id=%s "
+                    "event_id=%s slot_id=%s filename=%s size_bytes=%s "
+                    "duration_ms=%s",
+                    draft.input_batch_id,
+                    event.event_id,
+                    slot.slot_id,
+                    slot.original_filename,
+                    size,
+                    round((time.monotonic() - slot_started) * 1000),
                 )
                 total_bytes += size
                 if total_bytes > self.config.max_batch_total_bytes:
@@ -185,12 +261,14 @@ class ArtifactIngressService:
                         "Grouped input requires a grouped batch store"
                     )
                 await mark_collecting(draft.input_batch_id)
-                return InputSubmissionResult(
+                result = InputSubmissionResult(
                     event_id=event.event_id,
                     input_batch_id=draft.input_batch_id,
                     state="collecting",
                     duplicate=duplicate_event or duplicate_batch,
                 )
+                self._log_submission_result(result, started=started)
+                return result
 
             committed = await self.batch_store.commit(
                 draft.input_batch_id,
@@ -200,39 +278,53 @@ class ArtifactIngressService:
                     else "immediate_text"
                 ),
             )
-            return InputSubmissionResult(
+            result = InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=committed.input_batch_id,
                 state="committed",
                 duplicate=duplicate_event or duplicate_batch,
                 committed_batch=committed,
             )
+            self._log_submission_result(result, started=started)
+            return result
         except IngressValidationError as error:
             await self.batch_store.fail(
                 draft.input_batch_id,
                 code=error.code,
             )
-            return InputSubmissionResult(
+            result = InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=draft.input_batch_id,
                 state="failed",
                 duplicate=duplicate_event or duplicate_batch,
                 error_code=error.code,
             )
+            self._log_submission_result(result, started=started)
+            return result
         except (ArtifactValidationError, ArtifactLimitError) as error:
             code = getattr(error, "code", "artifact_ingress_validation_failed")
             await self.batch_store.fail(
                 draft.input_batch_id,
                 code=str(code),
             )
-            return InputSubmissionResult(
+            result = InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=draft.input_batch_id,
                 state="failed",
                 duplicate=duplicate_event or duplicate_batch,
                 error_code=str(code),
             )
-        except (ArtifactStorageError, ArtifactIntegrityError):
+            self._log_submission_result(result, started=started)
+            return result
+        except (ArtifactStorageError, ArtifactIntegrityError) as error:
+            logger.exception(
+                "api_ingress_storage_failed input_batch_id=%s event_id=%s "
+                "error_type=%s duration_ms=%s",
+                draft.input_batch_id,
+                event.event_id,
+                type(error).__name__,
+                round((time.monotonic() - started) * 1000),
+            )
             # The draft remains non-committed and invisible to the agent.
             raise
 
@@ -245,6 +337,19 @@ class ArtifactIngressService:
     ) -> CommittedInputBatch:
         """Explicitly seal a grouped draft after client grouping is complete."""
         draft = await self.batch_store.get_draft(input_batch_id)
+        counts = _attachment_state_counts(draft)
+        logger.info(
+            "api_ingress_commit_requested input_batch_id=%s session_id=%s "
+            "reason=%s draft_state=%s stored=%s ingesting=%s pending=%s failed=%s",
+            input_batch_id,
+            session_id,
+            reason,
+            draft.state.value,
+            counts["stored"],
+            counts["ingesting"],
+            counts["pending"],
+            counts["failed"],
+        )
         if draft.session_id != session_id:
             raise IngressConflictError("Input batch belongs to another session")
         if draft.state == InputBatchDraftState.FAILED:
@@ -253,17 +358,38 @@ class ArtifactIngressService:
             item.state != InputAttachmentState.STORED
             for item in draft.attachment_parts
         ):
+            logger.warning(
+                "api_ingress_commit_deferred input_batch_id=%s stored=%s "
+                "ingesting=%s pending=%s failed=%s",
+                input_batch_id,
+                counts["stored"],
+                counts["ingesting"],
+                counts["pending"],
+                counts["failed"],
+            )
             raise IngressConflictError(
                 "All attachment slots must be stored before commit"
             )
         grouped_commit = getattr(self.batch_store, "commit_batch", None)
         if grouped_commit is not None:
-            return await grouped_commit(
+            committed, _ = await grouped_commit(
                 input_batch_id,
                 session_id=session_id,
                 reason=reason,
             )
-        return await self.batch_store.commit(input_batch_id, reason=reason)
+        else:
+            committed = await self.batch_store.commit(
+                input_batch_id,
+                reason=reason,
+            )
+        logger.info(
+            "api_ingress_commit_finished input_batch_id=%s artifact_count=%s "
+            "text_part_count=%s",
+            input_batch_id,
+            len(committed.artifact_refs),
+            len(committed.text_parts),
+        )
+        return committed
 
     async def commit_ready_drafts(self) -> list[CommittedInputBatch]:
         """Recovery/sweeper helper; it commits bytes but never starts the agent."""
@@ -415,3 +541,32 @@ class ArtifactIngressService:
                 "declared_input_batch_too_large",
                 "Declared attachment sizes exceed the batch limit.",
             )
+
+    @staticmethod
+    def _log_submission_result(
+        result: InputSubmissionResult,
+        *,
+        started: float,
+    ) -> None:
+        logger.info(
+            "api_ingress_event_finished input_batch_id=%s event_id=%s "
+            "state=%s duplicate=%s error_code=%s duration_ms=%s",
+            result.input_batch_id,
+            result.event_id,
+            result.state,
+            result.duplicate,
+            result.error_code,
+            round((time.monotonic() - started) * 1000),
+        )
+
+
+def _attachment_state_counts(draft) -> dict[str, int]:
+    counts = {"stored": 0, "ingesting": 0, "pending": 0, "failed": 0}
+    for item in draft.attachment_parts:
+        raw = getattr(item.state, "value", item.state)
+        state = str(raw)
+        if state in counts:
+            counts[state] += 1
+        else:
+            counts["pending"] += 1
+    return counts
