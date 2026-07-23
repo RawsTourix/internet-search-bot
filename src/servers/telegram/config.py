@@ -39,15 +39,25 @@ TELEGRAM_BOT_INSTANCE_ID = os.getenv(
 # Quiet period only closes the known album composition. Active uploads are
 # tracked separately and must finish before the commit callback can run.
 TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS = float(
-    os.getenv(
-        "TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS",
-        os.getenv("TELEGRAM_MEDIA_GROUP_COMMIT_DELAY_SECONDS", "2.5"),
+    os.getenv("TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS", "2.5")
+)
+# Emergency ceiling for one Telegram album workflow. Expiry never commits a
+# partial batch; the group ends with a transport-level error instead.
+TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS = float(
+    os.getenv("TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS", "300")
+)
+if TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS <= 0:
+    raise ValueError("TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS must be positive")
+if TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS <= 0:
+    raise ValueError("TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS must be positive")
+if (
+    TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS
+    < TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS
+):
+    raise ValueError(
+        "TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS must not be shorter than "
+        "TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS"
     )
-)
-# Compatibility alias for existing deployments and imports.
-TELEGRAM_MEDIA_GROUP_COMMIT_DELAY_SECONDS = (
-    TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS
-)
 
 TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES = int(
     os.getenv("TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES", str(8 * 1024 * 1024))
