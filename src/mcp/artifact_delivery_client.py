@@ -39,6 +39,7 @@ class ArtifactDeliveryMixin:
             artifact_services is not None
             and artifact_services.config.enabled
         )
+        self._session_artifact_handoffs: dict[str, list[str]] = {}
         self.artifact_delivery_tool_controller = (
             ArtifactDeliveryToolController(artifact_services.delivery_service)
             if artifacts_enabled
@@ -126,6 +127,29 @@ class ArtifactDeliveryMixin:
             reset_artifact_request_cycle_identity(identity_token)
             reset_artifact_request_client_type(client_token)
 
+    def _append_dialog_turn(self, session, **kwargs: Any) -> None:
+        """Persist a bounded exact artifact handoff for the next session turn."""
+
+        super()._append_dialog_turn(session, **kwargs)
+        context = get_manager_context()
+        if context is None:
+            return
+
+        maximum = (
+            self.artifact_config.max_artifacts_per_cycle
+            if self.artifact_config is not None
+            else 32
+        )
+        refs = list(dict.fromkeys(context.active_cycle.artifact_refs))[-maximum:]
+        handoffs = getattr(self, "_session_artifact_handoffs", None)
+        if handoffs is None:
+            handoffs = {}
+            self._session_artifact_handoffs = handoffs
+        if refs:
+            handoffs[context.session_id] = refs
+        else:
+            handoffs.pop(context.session_id, None)
+
     def _activate_manager_context(
         self,
         *,
@@ -144,6 +168,23 @@ class ArtifactDeliveryMixin:
         set_artifact_request_cycle_identity(
             (context.session_id, context.cycle_id)
         )
+
+        inherited_refs = list(
+            getattr(self, "_session_artifact_handoffs", {}).get(
+                context.session_id,
+                (),
+            )
+        )
+        for artifact_id in inherited_refs:
+            if artifact_id not in context.active_cycle.artifact_refs:
+                context.active_cycle.artifact_refs.append(artifact_id)
+        if inherited_refs:
+            self._trace_event(
+                context.active_cycle.cycle_trace,
+                "artifact_authority_inherited",
+                artifact_count=len(inherited_refs),
+                artifact_ids=inherited_refs,
+            )
 
         input_batch = get_artifact_request_input_batch()
         if input_batch is not None:
@@ -231,6 +272,39 @@ class ArtifactDeliveryMixin:
             return self._text_result(payload)
 
         return await super()._call_registered_tool(public_tool_name, arguments)
+
+    def _build_final_evidence_pack(self, **kwargs: Any) -> dict[str, Any]:
+        evidence = super()._build_final_evidence_pack(**kwargs)
+        context = get_manager_context()
+        if context is None or context.active_cycle.artifact_state is None:
+            return evidence
+
+        state = context.active_cycle.artifact_state
+        evidence["artifact_state"] = state.model_dump(mode="json")
+        if state.deliveries:
+            evidence["artifact_delivery_state_contract"] = {
+                "selected": (
+                    "The exact artifact was selected for client delivery, but "
+                    "transport delivery has not happened yet."
+                ),
+                "delivering": (
+                    "The client transport claimed the delivery, but completion "
+                    "has not been confirmed yet."
+                ),
+                "delivered": (
+                    "The client transport confirmed successful delivery."
+                ),
+                "failed": "The client transport confirmed delivery failure.",
+                "unknown": (
+                    "Transport outcome is ambiguous and must not be described as "
+                    "successfully delivered."
+                ),
+                "rule": (
+                    "Never say that a file was sent or delivered when the latest "
+                    "known state is only selected or delivering."
+                ),
+            }
+        return evidence
 
     async def _record_delivery_outcome(
         self,
