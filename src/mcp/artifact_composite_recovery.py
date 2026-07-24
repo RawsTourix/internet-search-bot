@@ -12,6 +12,17 @@ from mcp.types import TextContent
 from .manager_runtime_context import get_manager_context
 
 
+_ARTIFACT_BATCH_RECOVERY_INSTRUCTIONS = """
+Artifact batch recovery:
+- If an artifact result says recommended_action="split_artifact_batch" or
+  do_not_repeat_same_batch=true, never repeat the same artifact_ids as one batch.
+  Use the supplied suggested_batches in order.
+- result_handling is an argument only of mcp_call_tool. Never pass it to native
+  artifact_read_text, artifact_search_text or other artifact manager tools.
+- An exact immutable artifact batch returns the same content when repeated.
+""".strip()
+
+
 class ArtifactCompositeRecoveryMixin:
     """Recover from non-inline batches without repeating immutable results."""
 
@@ -19,6 +30,14 @@ class ArtifactCompositeRecoveryMixin:
         "artifact_read_text",
         "artifact_search_text",
     })
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.instructions = (
+            self.instructions.rstrip()
+            + "\n\n"
+            + _ARTIFACT_BATCH_RECOVERY_INSTRUCTIONS
+        )
 
     async def _call_registered_tool(
         self,
