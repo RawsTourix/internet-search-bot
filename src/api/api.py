@@ -222,9 +222,31 @@ class Api:
         session_id: str,
         upload_streams: Mapping[str, AsyncIterator[bytes]] | None = None,
     ) -> InputSubmissionResult:
-        """Persist a client envelope using the shared semantic grouping policy."""
+        """Persist a client envelope using the shared logical-input policy."""
         try:
-            grouping = resolve_input_grouping(envelope)
+            list_open = getattr(
+                self.ingress_services.batch_store,
+                "list_open_drafts",
+                None,
+            )
+            open_drafts = (
+                await list_open(session_id=session_id)
+                if list_open is not None
+                else []
+            )
+            grouping = resolve_input_grouping(
+                envelope,
+                open_drafts=open_drafts,
+            )
+            logger.info(
+                "Input grouping resolved: client=%s session_id=%s mode=%s "
+                "joined_input_batch_id=%s source_message_id=%s",
+                envelope.client_type.value,
+                session_id,
+                grouping.mode.value,
+                grouping.joined_input_batch_id,
+                envelope.source_message_id,
+            )
             return await self.ingress_services.ingress_service.submit_atomic(
                 envelope,
                 session_id=session_id,
