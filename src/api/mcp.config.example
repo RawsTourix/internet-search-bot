@@ -113,6 +113,18 @@
         "workspace_ttl_seconds": 3600,
         "delivery_claim_timeout_seconds": 900
     },
+    "ingress": {
+        "enabled": true,
+        "max_events_per_batch": 64,
+        "max_attachments_per_batch": 32,
+        "max_batch_total_bytes": 268435456,
+        "max_text_parts_per_batch": 64,
+        "max_text_part_chars": 100000,
+        "media_group_quiet_timeout_seconds": 0.8,
+        "media_group_sealing_grace_seconds": 0.5,
+        "media_group_maximum_wait_seconds": 300,
+        "standalone_attachment_maximum_wait_seconds": 2
+    },
     "planning": {
         "enabled": true,
         "max_nodes": 32,
