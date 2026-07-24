@@ -32,6 +32,15 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
         grouping_mode: InputGroupingMode = InputGroupingMode.ATOMIC,
         grouping_key: str | None = None,
     ) -> InputSubmissionResult:
+        if not self.config.enabled:
+            return await super().submit_atomic(
+                envelope,
+                session_id=session_id,
+                upload_streams=upload_streams,
+                grouping_mode=grouping_mode,
+                grouping_key=grouping_key,
+            )
+
         list_open = getattr(self.batch_store, "list_open_drafts", None)
         open_drafts = (
             await list_open(session_id=session_id)
