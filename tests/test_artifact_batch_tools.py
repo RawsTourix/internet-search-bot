@@ -129,6 +129,23 @@ class ArtifactBatchToolTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(outcome.payload["items"][2]["status"], "ok")
 
+    async def test_read_limit_marks_exact_content_as_incomplete(self):
+        artifact = await self._create(1)
+        self.services.config.max_read_chars = 5
+
+        outcome = await self.controller.execute(
+            "artifact_read_text",
+            {"artifact_ids": [artifact["artifact_id"]]},
+            self.context,
+        )
+
+        item = outcome.payload["items"][0]
+        self.assertEqual(item["status"], "ok")
+        self.assertEqual(item["text"], "alpha")
+        self.assertFalse(item["eof"])
+        self.assertFalse(item["complete"])
+        self.assertTrue(item["needs_retrieval"])
+
     async def test_duplicate_read_executes_basic_operation_once(self):
         artifact = await self._create(1)
         original = self.services.artifact_service.read_text
@@ -271,6 +288,32 @@ class ArtifactBatchToolTests(unittest.IsolatedAsyncioTestCase):
             outcome.payload["items"][1]["code"],
             "invalid_artifact_id",
         )
+
+    async def test_search_limit_marks_results_as_incomplete(self):
+        artifact = await self.controller.execute(
+            "artifact_create_text",
+            {
+                "filename": "search-limit.md",
+                "text": "alpha alpha alpha",
+                "format_id": "markdown",
+            },
+            self.context,
+        )
+        self.services.config.max_search_matches = 2
+
+        outcome = await self.controller.execute(
+            "artifact_search_text",
+            {
+                "artifact_ids": [artifact.payload["artifact"]["artifact_id"]],
+                "query": "alpha",
+            },
+            self.context,
+        )
+
+        item = outcome.payload["items"][0]
+        self.assertEqual(len(item["matches"]), 2)
+        self.assertFalse(item["complete"])
+        self.assertTrue(item["needs_retrieval"])
 
 
 if __name__ == "__main__":
