@@ -1,4 +1,7 @@
+import json
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 from src.memory import TokenEstimateConfidence, TokenEstimateSource
 from src.mcp.artifact_composite_budget import (
@@ -37,6 +40,11 @@ class _BudgetSubject(ArtifactCompositeBudgetMixin, _BudgetBase):
 class _RecoveryBase:
     def __init__(self, visible):
         self.visible = visible
+        self.super_calls = 0
+
+    async def _call_registered_tool(self, public_tool_name, arguments):
+        self.super_calls += 1
+        return SimpleNamespace(content=[])
 
     def _prepare_structured_tool_result_representation(self, **kwargs):
         return dict(self.visible)
@@ -46,7 +54,7 @@ class _RecoverySubject(ArtifactCompositeRecoveryMixin, _RecoveryBase):
     pass
 
 
-class ArtifactCompositeRecoveryTests(unittest.TestCase):
+class ArtifactCompositeRecoveryTests(unittest.IsolatedAsyncioTestCase):
     def test_high_confidence_model_estimator_replaces_raw_char_estimate(self):
         primary = _Estimator(
             source=TokenEstimateSource.MODEL_TOKENIZER,
@@ -134,6 +142,47 @@ class ArtifactCompositeRecoveryTests(unittest.TestCase):
             result_metadata={},
         )
         self.assertNotIn("recommended_action", visible)
+
+    async def test_identical_batch_is_rejected_after_stored_only_result(self):
+        artifact_ids = [f"art_{index:032x}" for index in range(6)]
+        subject = _RecoverySubject({
+            "representation": "stored_only",
+            "needs_retrieval": True,
+            "items": [
+                {
+                    "request_index": index,
+                    "requested_artifact_id": artifact_id,
+                    "status": "ok",
+                }
+                for index, artifact_id in enumerate(artifact_ids)
+            ],
+        })
+        context = SimpleNamespace(
+            active_cycle=SimpleNamespace(
+                blocked_artifact_batch_signatures=[],
+                cycle_trace=[],
+            )
+        )
+        with patch(
+            "src.mcp.artifact_composite_recovery.get_manager_context",
+            return_value=context,
+        ):
+            subject._prepare_structured_tool_result_representation(
+                effective_tool_name="artifact_read_text",
+                tool_payload={},
+                stored_result_ref=None,
+                summary=None,
+                decision=None,
+                result_metadata={},
+            )
+            result = await subject._call_registered_tool(
+                "artifact_read_text",
+                {"artifact_ids": artifact_ids},
+            )
+        payload = json.loads(result.content[0].text)
+        self.assertEqual(payload["type"], "artifact_batch_repetition_rejected")
+        self.assertEqual(result.execution_disposition, "rejected")
+        self.assertEqual(subject.super_calls, 0)
 
 
 if __name__ == "__main__":
