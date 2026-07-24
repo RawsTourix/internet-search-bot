@@ -3,16 +3,79 @@
 from __future__ import annotations
 
 import json
+import math
 from typing import Any
 
+from ..memory import (
+    TokenEstimateConfidence,
+    TokenEstimateSource,
+)
 from .artifact_composite_compaction import (
     ArtifactCompositeCompactionMixin,
     build_artifact_composite_compaction_prompt,
 )
 
 
+class _SafetyMarginedResultTokenEstimator:
+    """Use the configured model tokenizer with a conservative admission margin."""
+
+    source = TokenEstimateSource.MODEL_TOKENIZER
+    confidence = TokenEstimateConfidence.HIGH
+
+    def __init__(
+        self,
+        primary,
+        *,
+        multiplier: float = 1.20,
+        fixed_overhead_tokens: int = 32,
+    ) -> None:
+        self.primary = primary
+        self.multiplier = multiplier
+        self.fixed_overhead_tokens = fixed_overhead_tokens
+
+    def _margin(self, estimate: int) -> int:
+        return max(
+            1,
+            int(math.ceil(max(1, estimate) * self.multiplier))
+            + self.fixed_overhead_tokens,
+        )
+
+    def estimate_text(self, text: str) -> int:
+        return self._margin(self.primary.estimate_text(text))
+
+    def estimate_messages(self, messages: list[dict[str, Any]]) -> int:
+        return self._margin(self.primary.estimate_messages(messages))
+
+    def estimate_request(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> int:
+        return self._margin(
+            self.primary.estimate_request(messages=messages, tools=tools)
+        )
+
+
 class ArtifactCompositeBudgetMixin:
-    """Estimate the real prompt overhead of the specialized compactor."""
+    """Estimate composite results and the real specialized prompt overhead.
+
+    Raw-result fidelity checks keep the strict conservative estimator. Admission
+    to the configured model's compactor uses the model tokenizer when it is
+    available with high confidence, plus an explicit safety margin. Heuristic
+    estimators continue to fall back to the existing conservative policy.
+    """
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        estimator = getattr(self, "request_token_estimator", None)
+        if (
+            getattr(estimator, "source", None)
+            == TokenEstimateSource.MODEL_TOKENIZER
+            and getattr(estimator, "confidence", None)
+            == TokenEstimateConfidence.HIGH
+        ):
+            self.token_estimator = _SafetyMarginedResultTokenEstimator(estimator)
 
     def _result_summary_request_overhead_tokens(
         self,
