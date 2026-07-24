@@ -105,15 +105,16 @@ class ArtifactSessionHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(artifact_id, second_cycle.artifact_refs)
         result = await self.client._call_registered_tool(
             "artifact_read_text",
-            {
-                "artifact_id": artifact_id,
-                "offset_chars": 0,
-                "limit_chars": 100,
-            },
+            {"artifact_ids": [artifact_id]},
         )
         payload = json.loads(result.content[0].text)
-        self.assertEqual(payload["type"], "artifact_text")
-        self.assertEqual(payload["text"], "STATUS: draft")
+        self.assertEqual(payload["type"], "artifact_batch_read")
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(
+            payload["items"][0]["artifact"]["artifact_id"],
+            artifact_id,
+        )
+        self.assertEqual(payload["items"][0]["text"], "STATUS: draft")
         self.assertTrue(any(
             event.get("type") == "artifact_authority_inherited"
             for event in second_cycle.cycle_trace

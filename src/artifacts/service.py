@@ -14,6 +14,7 @@ from .config import ArtifactConfigType
 from .errors import (
     ArtifactAccessError,
     ArtifactCapabilityError,
+    ArtifactFilenameConflictError,
     ArtifactLimitError,
     ArtifactNotFoundError,
     ArtifactValidationError,
@@ -25,13 +26,22 @@ from .format_registry import (
 from .interfaces import ArtifactStore
 from .models import (
     ArtifactAccessContext,
+    ArtifactCatalogCapabilities,
+    ArtifactCatalogItem,
+    ArtifactCatalogResult,
     ArtifactCapability,
+    ArtifactDeliveryRef,
+    ArtifactDeliveryState,
+    ArtifactFilenameResolution,
+    ArtifactFilenameResolutionStatus,
     ArtifactLineage,
+    ArtifactLineageStatus,
     ArtifactProvenance,
     ArtifactPurpose,
     ArtifactVersion,
     ArtifactVersionRef,
     ExactTextPatchOperation,
+    normalize_artifact_filename,
 )
 from .text_operations import apply_exact_text_patch, enforce_text_size
 from .validators import validate_native_text
@@ -131,6 +141,162 @@ class ArtifactService:
         lineage, version = await self._authorized_version(artifact_id, access)
         return self._build_ref(lineage, version)
 
+    async def catalog_artifacts(
+        self,
+        *,
+        access: ArtifactAccessContext,
+        artifact_ids: Iterable[str] = (),
+        artifact_lineage_ids: Iterable[str] = (),
+        filenames: Iterable[str] = (),
+        purpose_filter: Iterable[ArtifactPurpose] = (),
+        format_filter: Iterable[str] = (),
+        current_only: bool = True,
+        include_versions: bool = False,
+        include_archived: bool = False,
+        offset: int = 0,
+        limit: int = 20,
+        read_artifact_ids: Iterable[str] = (),
+        deliveries: Iterable[ArtifactDeliveryRef] = (),
+    ) -> ArtifactCatalogResult:
+        """Build an authoritative bounded catalog for the current authority."""
+
+        if offset < 0:
+            raise ArtifactValidationError(
+                "invalid_artifact_offset",
+                "Artifact list offset must not be negative.",
+            )
+        if limit <= 0:
+            raise ArtifactValidationError(
+                "invalid_artifact_limit",
+                "Artifact list limit must be positive.",
+            )
+        bounded_limit = min(limit, self.config.max_artifacts_per_cycle)
+        requested_artifact_ids = set(artifact_ids)
+        requested_lineage_ids = set(artifact_lineage_ids)
+        requested_filenames = [
+            normalize_artifact_filename(value) for value in filenames
+        ]
+        requested_filename_set = set(requested_filenames)
+        purposes = set(purpose_filter)
+        formats = {
+            value.strip().lower()
+            for value in format_filter
+            if value.strip()
+        }
+        read_ids = set(read_artifact_ids)
+        delivery_by_artifact = {
+            item.artifact_id: item for item in deliveries
+        }
+        allowed_lineages = await self._allowed_lineage_ids(access)
+
+        all_items: list[ArtifactCatalogItem] = []
+        available_filenames: list[str] = []
+        resolution_candidates: dict[str, list[ArtifactCatalogItem]] = {
+            filename: [] for filename in requested_filenames
+        }
+        included_lineage_ids: set[str] = set()
+        lineages = await self.artifact_store.list_lineages(
+            session_id=access.session_id,
+            include_archived=include_archived,
+        )
+        for lineage in lineages:
+            if lineage.artifact_lineage_id not in allowed_lineages:
+                continue
+            if (
+                not include_archived
+                and lineage.status != ArtifactLineageStatus.ACTIVE
+            ):
+                continue
+            versions = await self.artifact_store.list_versions(
+                lineage.artifact_lineage_id
+            )
+            current = versions[-1]
+            available_filenames.append(current.filename)
+            current_item = self._build_catalog_item(
+                lineage,
+                current,
+                read_ids=read_ids,
+                delivery=delivery_by_artifact.get(current.artifact_id),
+                current_cycle_id=access.cycle_id,
+            )
+            if current.filename in resolution_candidates:
+                resolution_candidates[current.filename].append(current_item)
+
+            if purposes and lineage.purpose not in purposes:
+                continue
+            if requested_lineage_ids and (
+                lineage.artifact_lineage_id not in requested_lineage_ids
+            ):
+                continue
+
+            selected_versions = (
+                versions
+                if include_versions or not current_only
+                else [current]
+            )
+            for version in selected_versions:
+                if requested_artifact_ids and (
+                    version.artifact_id not in requested_artifact_ids
+                ):
+                    continue
+                if requested_filename_set and (
+                    version.filename not in requested_filename_set
+                ):
+                    continue
+                if formats and version.format_id not in formats:
+                    continue
+                item = self._build_catalog_item(
+                    lineage,
+                    version,
+                    read_ids=read_ids,
+                    delivery=delivery_by_artifact.get(version.artifact_id),
+                    current_cycle_id=access.cycle_id,
+                )
+                all_items.append(item)
+                included_lineage_ids.add(lineage.artifact_lineage_id)
+
+        all_items.sort(
+            key=lambda item: (
+                item.filename.lower(),
+                item.artifact_lineage_id,
+                item.version,
+            )
+        )
+        page = all_items[offset : offset + bounded_limit]
+        resolutions: list[ArtifactFilenameResolution] = []
+        for filename in requested_filenames:
+            candidates = resolution_candidates[filename]
+            if len(candidates) == 1:
+                status = ArtifactFilenameResolutionStatus.OK
+            elif candidates:
+                status = ArtifactFilenameResolutionStatus.AMBIGUOUS
+            else:
+                status = ArtifactFilenameResolutionStatus.NOT_FOUND
+            suggestions = (
+                self._filename_suggestions(
+                    filename,
+                    available_filenames=available_filenames,
+                )
+                if status == ArtifactFilenameResolutionStatus.NOT_FOUND
+                else []
+            )
+            resolutions.append(ArtifactFilenameResolution(
+                filename=filename,
+                status=status,
+                candidates=candidates,
+                suggestions=suggestions,
+            ))
+
+        return ArtifactCatalogResult(
+            available_count=len(all_items),
+            lineage_count=len(included_lineage_ids),
+            offset=offset,
+            limit=bounded_limit,
+            items=page,
+            items_truncated=offset + len(page) < len(all_items),
+            filename_resolutions=resolutions,
+        )
+
     async def read_text(
         self,
         artifact_id: str,
@@ -221,7 +387,17 @@ class ArtifactService:
         purpose: ArtifactPurpose = ArtifactPurpose.WORKING,
         title: str | None = None,
         metadata: dict[str, Any] | None = None,
+        access: ArtifactAccessContext | None = None,
     ) -> ArtifactVersionRef:
+        filename = normalize_artifact_filename(filename)
+        creation_access = access or await self._session_access_context(
+            session_id=session_id,
+            cycle_id=cycle_id,
+        )
+        await self.ensure_new_lineage_filename_available(
+            creation_access,
+            filename,
+        )
         spec = self._require_capability(
             format_id,
             ArtifactCapability.READ_TEXT,
@@ -265,6 +441,46 @@ class ArtifactService:
             },
         )
         return self._build_ref(lineage, version)
+
+    async def find_active_by_filename(
+        self,
+        access: ArtifactAccessContext,
+        filename: str,
+    ) -> list[ArtifactVersionRef]:
+        """Return exact current candidates without expanding authority."""
+
+        normalized = normalize_artifact_filename(filename)
+        allowed_lineages = await self._allowed_lineage_ids(access)
+        result: list[ArtifactVersionRef] = []
+        for lineage in await self.artifact_store.list_lineages(
+            session_id=access.session_id,
+            include_archived=False,
+        ):
+            if lineage.artifact_lineage_id not in allowed_lineages:
+                continue
+            version = await self.artifact_store.get_current_version(
+                lineage.artifact_lineage_id
+            )
+            if version.filename == normalized:
+                result.append(self._build_ref(lineage, version))
+        return result
+
+    async def ensure_new_lineage_filename_available(
+        self,
+        access: ArtifactAccessContext,
+        filename: str,
+    ) -> None:
+        """Reject an agent-created lineage before any new content is saved."""
+
+        normalized = normalize_artifact_filename(filename)
+        candidates = await self.find_active_by_filename(access, normalized)
+        if candidates:
+            raise ArtifactFilenameConflictError(
+                normalized,
+                current_candidates=[
+                    item.model_dump(mode="json") for item in candidates
+                ],
+            )
 
     async def replace_text(
         self,
@@ -443,6 +659,24 @@ class ArtifactService:
                 result.add(lineage.artifact_lineage_id)
         return result
 
+    async def _session_access_context(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+    ) -> ArtifactAccessContext:
+        lineages = await self.artifact_store.list_lineages(
+            session_id=session_id,
+            include_archived=False,
+        )
+        return ArtifactAccessContext(
+            session_id=session_id,
+            cycle_id=cycle_id,
+            allowed_artifact_ids=[
+                lineage.current_artifact_id for lineage in lineages
+            ],
+        )
+
     def _build_ref(
         self,
         lineage: ArtifactLineage,
@@ -461,6 +695,83 @@ class ArtifactService:
             purpose=lineage.purpose,
             capabilities=sorted(spec.capabilities, key=lambda item: item.value),
         )
+
+    def _build_catalog_item(
+        self,
+        lineage: ArtifactLineage,
+        version: ArtifactVersion,
+        *,
+        read_ids: set[str],
+        delivery: ArtifactDeliveryRef | None,
+        current_cycle_id: str,
+    ) -> ArtifactCatalogItem:
+        spec = self.format_registry.get(version.format_id)
+        capabilities = spec.capabilities
+        origin_map = {
+            "user_upload": "input",
+            "agent_created": "agent",
+            "agent_edit": "agent",
+            "tool_output": "tool",
+            "conversion": "tool",
+            "migration": "runtime",
+        }
+        return ArtifactCatalogItem(
+            artifact_id=version.artifact_id,
+            artifact_lineage_id=lineage.artifact_lineage_id,
+            version=version.version,
+            versions_count=len(lineage.committed_artifact_ids),
+            filename=version.filename,
+            title=lineage.title,
+            purpose=lineage.purpose,
+            origin=origin_map[version.provenance.origin],
+            format_id=version.format_id,
+            mime_type=version.detected_mime_type,
+            size_bytes=version.size_bytes,
+            content_hash=version.content_hash,
+            is_current=lineage.current_artifact_id == version.artifact_id,
+            read_in_current_cycle=version.artifact_id in read_ids,
+            created_in_current_cycle=(
+                version.created_cycle_id == current_cycle_id
+            ),
+            selected_for_delivery=(
+                delivery is not None
+                and delivery.state != ArtifactDeliveryState.CANCELLED
+            ),
+            delivery_state=(delivery.state if delivery is not None else None),
+            capabilities=ArtifactCatalogCapabilities(
+                read_text=ArtifactCapability.READ_TEXT in capabilities,
+                search_text=ArtifactCapability.SEARCH_TEXT in capabilities,
+                replace_text=ArtifactCapability.REPLACE_TEXT in capabilities,
+                patch_text=ArtifactCapability.PATCH_TEXT in capabilities,
+                deliver=ArtifactCapability.DELIVER in capabilities,
+                bind_to_tool=(
+                    ArtifactCapability.PROCESS_EXTERNALLY in capabilities
+                ),
+            ),
+        )
+
+    @staticmethod
+    def _filename_suggestions(
+        filename: str,
+        *,
+        available_filenames: Iterable[str],
+        limit: int = 5,
+    ) -> list[str]:
+        """Return bounded case-insensitive hints without resolving them."""
+
+        folded = filename.casefold()
+        suggestions: list[str] = []
+        for candidate in sorted(set(available_filenames)):
+            candidate_folded = candidate.casefold()
+            if (
+                candidate_folded == folded
+                or folded in candidate_folded
+                or candidate_folded in folded
+            ):
+                suggestions.append(candidate)
+            if len(suggestions) >= limit:
+                break
+        return suggestions
 
     def _require_capability(
         self,

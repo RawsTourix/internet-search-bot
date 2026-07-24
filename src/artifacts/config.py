@@ -38,6 +38,12 @@ class ArtifactConfigType(BaseModel):
     max_patch_new_text_chars: int = Field(default=50_000, ge=0)
 
     max_runtime_artifact_summaries: int = Field(default=12, ge=1)
+    # Internal process-safety limits. They are not exposed in manager schemas.
+    max_concurrent_artifact_reads: int = Field(default=4, ge=1)
+    max_composite_result_bytes: int = Field(
+        default=8 * 1024 * 1024,
+        ge=1,
+    )
 
     allow_opaque_binary: bool = True
     auto_select_deliverables: bool = False
@@ -75,6 +81,11 @@ class ArtifactConfigType(BaseModel):
         if self.max_workspace_bytes < self.max_artifact_size_bytes:
             raise ValueError(
                 "max_workspace_bytes must be at least max_artifact_size_bytes"
+            )
+        if self.max_concurrent_artifact_reads > self.max_artifacts_per_cycle:
+            raise ValueError(
+                "max_concurrent_artifact_reads must not exceed "
+                "max_artifacts_per_cycle"
             )
         return self
 

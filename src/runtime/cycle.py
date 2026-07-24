@@ -33,6 +33,7 @@ class ActiveAgentCycle:
 
     result_refs: list[str] = field(default_factory=list)
     artifact_refs: list[str] = field(default_factory=list)
+    read_artifact_refs: list[str] = field(default_factory=list)
     artifact_candidate_refs: list[str] = field(default_factory=list)
     artifact_state: ArtifactRuntimeState | None = None
     original_input_batch_id: str | None = None

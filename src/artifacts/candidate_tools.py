@@ -13,6 +13,7 @@ from .errors import (
     ArtifactAccessError,
     ArtifactCandidateError,
     ArtifactCapabilityError,
+    ArtifactFilenameConflictError,
     ArtifactIntegrityError,
     ArtifactLimitError,
     ArtifactNotFoundError,
@@ -22,7 +23,12 @@ from .errors import (
 )
 from .models import ArtifactAccessContext, ArtifactPurpose
 from .promotion import ArtifactCandidatePromotionService
-from .tools import ArtifactToolDefinition, ArtifactToolOutcome
+from .tools import (
+    ArtifactResultPolicy,
+    ArtifactToolDefinition,
+    ArtifactToolOutcome,
+    ToolExecutionDisposition,
+)
 
 
 ARTIFACT_CANDIDATE_TOOL_NAMES = frozenset({
@@ -124,6 +130,8 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="error",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         try:
             parsed = definition.input_model.model_validate(arguments)
@@ -141,6 +149,34 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="warning",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
+            )
+        except ArtifactFilenameConflictError as error:
+            return ArtifactToolOutcome(
+                payload={
+                    "type": "artifact_filename_conflict",
+                    "status": "rejected",
+                    "filename": error.filename,
+                    "candidates": error.current_candidates,
+                    "message": error.safe_message,
+                    "retryable": error.retryable,
+                    "suggested_actions": [
+                        "Choose another filename.",
+                        (
+                            "Use artifact_replace_text with an exact current "
+                            "artifact_id."
+                        ),
+                        (
+                            "Use artifact_patch_text with an exact current "
+                            "artifact_id."
+                        ),
+                    ],
+                },
+                event_type="artifact_validation_failed",
+                severity="warning",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ArtifactVersionConflictError as error:
             return ArtifactToolOutcome(
@@ -158,6 +194,8 @@ class ArtifactCandidateToolController:
                 event_type="artifact_version_conflict",
                 severity="warning",
                 visibility="user",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ArtifactValidationError as error:
             return ArtifactToolOutcome(
@@ -170,6 +208,8 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="warning",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ArtifactAccessError:
             return ArtifactToolOutcome(
@@ -183,6 +223,8 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="error",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ArtifactNotFoundError:
             return ArtifactToolOutcome(
@@ -193,6 +235,8 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="warning",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ArtifactCandidateError as error:
             return ArtifactToolOutcome(
@@ -203,6 +247,8 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="warning",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ArtifactCapabilityError as error:
             return ArtifactToolOutcome(
@@ -213,6 +259,8 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="warning",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ArtifactLimitError as error:
             return ArtifactToolOutcome(
@@ -223,6 +271,8 @@ class ArtifactCandidateToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="warning",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except (ArtifactStorageError, ArtifactIntegrityError):
             raise
@@ -285,6 +335,7 @@ class ArtifactCandidateToolController:
             purpose=parsed.purpose,
             filename=parsed.filename,
             title=parsed.title,
+            access=self._access(context),
             plan_id=cycle.active_plan_id,
             plan_revision=cycle.active_plan_revision,
             plan_node_id=cycle.active_plan_node_id,
@@ -299,6 +350,7 @@ class ArtifactCandidateToolController:
             event_type="artifact_created",
             severity="success",
             visibility="user",
+            result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
         )
 
     async def _create_version(
@@ -330,6 +382,7 @@ class ArtifactCandidateToolController:
             event_type="artifact_version_created",
             severity="success",
             visibility="user",
+            result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
         )
 
     def _ensure_cycle_capacity(self, context: ManagerToolContext) -> None:

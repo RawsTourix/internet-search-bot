@@ -28,8 +28,10 @@ from ..artifacts.runtime import ArtifactRuntimeCoordinator
 from ..artifacts.tools import (
     ARTIFACT_NATIVE_TOOL_DEFINITIONS,
     ARTIFACT_NATIVE_TOOL_NAMES,
+    ArtifactResultPolicy,
     ArtifactToolController,
     ArtifactToolOutcome,
+    ToolExecutionDisposition,
 )
 from ..storage import StorageServices
 from .manager_context import ManagerToolContext
@@ -61,9 +63,10 @@ _ARTIFACT_MUTATION_TOOL_NAMES = frozenset(
 _ARTIFACT_ALL_TOOL_NAMES = frozenset(
     set(ARTIFACT_NATIVE_TOOL_NAMES) | set(ARTIFACT_CANDIDATE_TOOL_NAMES)
 )
-_ARTIFACT_READ_TOOL_NAMES = (
-    _ARTIFACT_ALL_TOOL_NAMES - _ARTIFACT_MUTATION_TOOL_NAMES
-)
+_ARTIFACT_CONTROL_PLANE_TOOL_NAMES = frozenset({
+    "artifact_list",
+    "artifact_candidate_list",
+})
 
 
 class ArtifactAwareMCPCallInput(BaseModel):
@@ -96,7 +99,7 @@ class ArtifactMCPClient(MCPClient):
 
     CONTROL_PLANE_MANAGER_TOOLS = frozenset(
         set(MCPClient.CONTROL_PLANE_MANAGER_TOOLS)
-        | set(_ARTIFACT_READ_TOOL_NAMES)
+        | set(_ARTIFACT_CONTROL_PLANE_TOOL_NAMES)
     )
 
     def __init__(
@@ -116,7 +119,10 @@ class ArtifactMCPClient(MCPClient):
             and artifact_services.config.enabled
         )
         self.artifact_tool_controller = (
-            ArtifactToolController(artifact_services.artifact_service)
+            ArtifactToolController(
+                artifact_services.artifact_service,
+                artifact_services.delivery_service,
+            )
             if artifacts_enabled
             else None
         )
@@ -488,6 +494,7 @@ class ArtifactMCPClient(MCPClient):
         arguments: dict[str, Any],
     ):
         if public_tool_name in ARTIFACT_CANDIDATE_TOOL_NAMES:
+            outcome: ArtifactToolOutcome | None = None
             context = get_manager_context()
             if (
                 context is None
@@ -498,6 +505,8 @@ class ArtifactMCPClient(MCPClient):
                     "message": "Artifact tool requires an active agent cycle.",
                     "retryable": False,
                 }
+                disposition = ToolExecutionDisposition.REJECTED
+                result_policy = ArtifactResultPolicy.INLINE_RECEIPT
             elif (
                 public_tool_name in _ARTIFACT_MUTATION_TOOL_NAMES
                 and self._active_plan_requires_node(context)
@@ -520,6 +529,8 @@ class ArtifactMCPClient(MCPClient):
                     revision=payload["revision"],
                     blocked_tool=public_tool_name,
                 )
+                disposition = ToolExecutionDisposition.REJECTED
+                result_policy = ArtifactResultPolicy.INLINE_RECEIPT
             else:
                 outcome = await self.artifact_candidate_tool_controller.execute(
                     public_tool_name,
@@ -528,14 +539,21 @@ class ArtifactMCPClient(MCPClient):
                 )
                 await self._record_artifact_outcome(outcome, context)
                 payload = outcome.payload
+                disposition = outcome.disposition
+                result_policy = outcome.result_policy
                 if outcome.payload.get("type") in {
                     "artifact_created",
                     "artifact_version_created",
                 }:
                     await self._refresh_artifact_state(context)
-            return self._text_result(payload)
+            return self._text_result(
+                payload,
+                disposition=disposition,
+                result_policy=result_policy,
+            )
 
         if public_tool_name in ARTIFACT_NATIVE_TOOL_NAMES:
+            outcome = None
             context = get_manager_context()
             if context is None or self.artifact_tool_controller is None:
                 payload = {
@@ -543,6 +561,8 @@ class ArtifactMCPClient(MCPClient):
                     "message": "Artifact tool requires an active agent cycle.",
                     "retryable": False,
                 }
+                disposition = ToolExecutionDisposition.REJECTED
+                result_policy = ArtifactResultPolicy.INLINE_RECEIPT
             elif (
                 public_tool_name in _ARTIFACT_MUTATION_TOOL_NAMES
                 and self._active_plan_requires_node(context)
@@ -564,6 +584,8 @@ class ArtifactMCPClient(MCPClient):
                     revision=payload["revision"],
                     blocked_tool=public_tool_name,
                 )
+                disposition = ToolExecutionDisposition.REJECTED
+                result_policy = ArtifactResultPolicy.INLINE_RECEIPT
             else:
                 outcome = await self.artifact_tool_controller.execute(
                     public_tool_name,
@@ -572,12 +594,18 @@ class ArtifactMCPClient(MCPClient):
                 )
                 await self._record_artifact_outcome(outcome, context)
                 payload = outcome.payload
+                disposition = outcome.disposition
+                result_policy = outcome.result_policy
                 if outcome.payload.get("type") in {
                     "artifact_created",
                     "artifact_version_created",
-                }:
+                } or outcome.event_type == "artifact_read_completed":
                     await self._refresh_artifact_state(context)
-            return self._text_result(payload)
+            return self._text_result(
+                payload,
+                disposition=disposition,
+                result_policy=result_policy,
+            )
 
         return await super()._call_registered_tool(public_tool_name, arguments)
 
@@ -612,6 +640,33 @@ class ArtifactMCPClient(MCPClient):
         ):
             if payload.get(key) is not None:
                 safe_data[key] = payload[key]
+        if outcome.event_type == "artifact_read_completed":
+            items = payload.get("items") or []
+            successful = [
+                item
+                for item in items
+                if isinstance(item, dict) and item.get("status") == "ok"
+            ]
+            complete_ids = list(dict.fromkeys(
+                str(item.get("requested_artifact_id"))
+                for item in successful
+                if item.get("complete") is True
+            ))
+            partial_ids = list(dict.fromkeys(
+                str(item.get("requested_artifact_id"))
+                for item in successful
+                if item.get("complete") is not True
+            ))
+            safe_data.update({
+                "artifact_ids": list(dict.fromkeys(
+                    str(item.get("requested_artifact_id"))
+                    for item in successful
+                )),
+                "successful_count": payload.get("successful_count", 0),
+                "failed_count": payload.get("failed_count", 0),
+                "complete_artifact_ids": complete_ids,
+                "partial_artifact_ids": partial_ids,
+            })
 
         self._trace_event(
             context.active_cycle.cycle_trace,
@@ -676,6 +731,106 @@ class ArtifactMCPClient(MCPClient):
             pass
         return super()._tool_result_payload(tool_name, tool_result)
 
+    def _prepare_structured_tool_result_representation(
+        self,
+        *,
+        effective_tool_name: str,
+        tool_payload: dict[str, Any],
+        stored_result_ref,
+        summary,
+        decision,
+        result_metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        if (
+            result_metadata.get("result_policy")
+            != ArtifactResultPolicy.STRUCTURED_COMPOSITE.value
+            or tool_payload.get("type")
+            not in {"artifact_batch_read", "artifact_batch_search"}
+        ):
+            return super()._prepare_structured_tool_result_representation(
+                effective_tool_name=effective_tool_name,
+                tool_payload=tool_payload,
+                stored_result_ref=stored_result_ref,
+                summary=summary,
+                decision=decision,
+                result_metadata=result_metadata,
+            )
+
+        representation = (
+            "summarized"
+            if stored_result_ref.summary_status == "summarized"
+            else "stored_only"
+        )
+        bounded_items: list[dict[str, Any]] = []
+        for item in tool_payload.get("items") or []:
+            if not isinstance(item, dict):
+                continue
+            if item.get("status") != "ok":
+                bounded_items.append({
+                    key: item.get(key)
+                    for key in (
+                        "request_index",
+                        "requested_artifact_id",
+                        "status",
+                        "code",
+                        "message",
+                        "retryable",
+                        "suggested_action",
+                    )
+                    if item.get(key) is not None
+                })
+                continue
+            artifact = item.get("artifact")
+            artifact_boundary = {}
+            if isinstance(artifact, dict):
+                artifact_boundary = {
+                    key: artifact.get(key)
+                    for key in (
+                        "artifact_id",
+                        "artifact_lineage_id",
+                        "version",
+                        "filename",
+                        "format_id",
+                    )
+                    if artifact.get(key) is not None
+                }
+            bounded_items.append({
+                "request_index": item.get("request_index"),
+                "requested_artifact_id": item.get(
+                    "requested_artifact_id"
+                ),
+                "status": "ok",
+                "artifact": artifact_boundary,
+                "representation": representation,
+                "exact_content_available": False,
+                "complete": False,
+                "needs_retrieval": True,
+            })
+
+        visible = {
+            key: tool_payload.get(key)
+            for key in (
+                "type",
+                "status",
+                "requested_count",
+                "successful_count",
+                "failed_count",
+                "query",
+            )
+            if tool_payload.get(key) is not None
+        }
+        visible.update({
+            "representation": representation,
+            "complete": False,
+            "needs_retrieval": True,
+            "items": bounded_items,
+            "result_ref": stored_result_ref.model_dump(),
+            "summary": stored_result_ref.summary,
+            "key_facts": list(stored_result_ref.key_facts),
+            "limitations": list(stored_result_ref.limitations),
+        })
+        return visible
+
     def _build_final_evidence_pack(self, **kwargs: Any) -> dict[str, Any]:
         evidence = super()._build_final_evidence_pack(**kwargs)
         context = get_manager_context()
@@ -698,9 +853,18 @@ class ArtifactMCPClient(MCPClient):
         return status == "active" and state.current_node is None
 
     @staticmethod
-    def _text_result(payload: dict[str, Any]):
+    def _text_result(
+        payload: dict[str, Any],
+        *,
+        disposition: ToolExecutionDisposition = (
+            ToolExecutionDisposition.SUCCEEDED
+        ),
+        result_policy: ArtifactResultPolicy = ArtifactResultPolicy.DEFAULT,
+    ):
         return SimpleNamespace(
-            content=[TextContent(type="text", text=dumps_json(payload))]
+            content=[TextContent(type="text", text=dumps_json(payload))],
+            execution_disposition=disposition.value,
+            result_policy=result_policy.value,
         )
 
 

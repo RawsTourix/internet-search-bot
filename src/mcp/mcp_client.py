@@ -53,6 +53,7 @@ from ..memory import (
     ResultCompactionRequest,
     ResultCompactionService,
     ResultCompactionSummary,
+    ResultBudgetDecision,
     ResultContextBudgetPolicy,
     ResultFidelityPolicy,
     ResultHandling,
@@ -1251,6 +1252,7 @@ class MCPClient:
         return any(
             event.get("type") in {
                 "tool_error",
+                "tool_failed",
                 "tool_result_processing_error",
             }
             for event in cycle_trace
@@ -1410,7 +1412,7 @@ class MCPClient:
                 evidence["tool_results"].append(evidence_item)
                 continue
 
-            if event_type == "tool_error":
+            if event_type in {"tool_error", "tool_failed"}:
                 evidence["tool_errors"].append(dict(event))
                 continue
 
@@ -3020,6 +3022,7 @@ class MCPClient:
         progress_callback,
         request_tools: list[dict[str, Any]] | None = None,
         usage_snapshot: TokenUsageSnapshot | None = None,
+        result_metadata: dict[str, Any] | None = None,
     ) -> ResultProcessingOutcome:
         canonical_result = self._extract_canonical_tool_result(
             tool_payload=tool_payload,
@@ -3063,6 +3066,26 @@ class MCPClient:
             result_size_bytes=result_size_bytes,
             summary_request_overhead_tokens=summary_overhead_tokens,
         )
+        trusted_result_policy = str(
+            (result_metadata or {}).get("result_policy") or "default"
+        )
+
+        if trusted_result_policy == "inline_receipt":
+            hard_inline_safe = (
+                decision.candidate_context_tokens
+                < decision.usable_input_tokens
+                and result_size_bytes
+                <= self.storage_services.config.max_in_memory_content_bytes
+            )
+            if hard_inline_safe:
+                decision = replace(
+                    decision,
+                    representation="inline",
+                    reason="trusted_small_receipt_inline",
+                    runtime_override=(
+                        decision.representation != "inline"
+                    ),
+                )
 
         if self._is_control_plane_manager_tool(outer_tool_name):
             hard_inline_safe = (
@@ -3333,6 +3356,7 @@ class MCPClient:
         )
 
         summary_failed = False
+        summary = None
         if decision.representation == "store_only":
             stored_ref = (
                 self.result_compaction_service.build_store_only_ref(
@@ -3501,7 +3525,17 @@ class MCPClient:
                     visibility="internal",
                 )
 
-        visible_payload = stored_ref.model_dump()
+        visible_payload = (
+            self._prepare_structured_tool_result_representation(
+                effective_tool_name=effective_tool_name,
+                tool_payload=tool_payload,
+                stored_result_ref=stored_ref,
+                summary=summary,
+                decision=decision,
+                result_metadata=result_metadata or {},
+            )
+            or stored_ref.model_dump()
+        )
         self._trace_event(
             cycle_trace,
             "tool_result_stored",
@@ -3540,6 +3574,20 @@ class MCPClient:
             stored_result_ref=stored_ref,
             summary_failed=summary_failed,
         )
+
+    def _prepare_structured_tool_result_representation(
+        self,
+        *,
+        effective_tool_name: str,
+        tool_payload: dict[str, Any],
+        stored_result_ref,
+        summary,
+        decision: ResultBudgetDecision,
+        result_metadata: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """Extension point for typed results that must preserve boundaries."""
+
+        return None
 
     def _try_parse_textual_tool_call(
         self,
@@ -4073,6 +4121,18 @@ class MCPClient:
                                 self._call_registered_tool(tool_name, arguments),
                                 timeout=self.tool_call_timeout
                             )
+                            result_metadata = {
+                                "execution_disposition": getattr(
+                                    result,
+                                    "execution_disposition",
+                                    "succeeded",
+                                ),
+                                "result_policy": getattr(
+                                    result,
+                                    "result_policy",
+                                    "default",
+                                ),
+                            }
                             
                             # Преобразуем результат в текст
                             tool_result = self._format_tool_result(result.content)
@@ -4100,6 +4160,7 @@ class MCPClient:
                                     usage_snapshot=(
                                         active_cycle.token_usage_snapshot
                                     ),
+                                    result_metadata=result_metadata,
                                 )
                             )
                             tool_result_count += 1
@@ -4123,15 +4184,22 @@ class MCPClient:
                                 == "tool_result_processing_error"
                             )
 
-                            if result_unavailable:
+                            execution_disposition = result_metadata[
+                                "execution_disposition"
+                            ]
+                            if result_unavailable or execution_disposition == "failed":
                                 await self._emit_progress_event(
                                     state=state,
                                     session_id=session_id,
                                     cycle_id=cycle_id,
                                     progress_callback=progress_callback,
                                     cycle_trace=cycle_trace,
-                                    event_type="tool_error",
-                                    message_key="tool_result_unavailable",
+                                    event_type="tool_failed",
+                                    message_key=(
+                                        "tool_result_unavailable"
+                                        if result_unavailable
+                                        else "tool_failed"
+                                    ),
                                     message_kwargs={
                                         "tool_name": (
                                             target_tool_name or tool_name
@@ -4149,6 +4217,28 @@ class MCPClient:
                                         "result_available": False,
                                         "retry_recommended": False,
                                     },
+                                )
+                            elif execution_disposition == "rejected":
+                                await self._emit_progress_event(
+                                    state=state,
+                                    session_id=session_id,
+                                    cycle_id=cycle_id,
+                                    progress_callback=progress_callback,
+                                    cycle_trace=cycle_trace,
+                                    event_type="tool_rejected",
+                                    message_kwargs={
+                                        "tool_name": (
+                                            target_tool_name or tool_name
+                                        ),
+                                    },
+                                    tool_name=manager_tool_name,
+                                    target_tool_name=target_tool_name,
+                                    server_name=(
+                                        self._resolve_progress_server_name(
+                                            target_tool_name
+                                        )
+                                    ),
+                                    severity="warning",
                                 )
                             else:
                                 # Отслеживание прогресса
@@ -4206,7 +4296,7 @@ class MCPClient:
                                 cycle_id=cycle_id,
                                 progress_callback=progress_callback,
                                 cycle_trace=cycle_trace,
-                                event_type="tool_error",
+                                event_type="tool_failed",
                                 message_key="tool_timeout",
                                 message_kwargs={
                                     "tool_name": target_tool_name or tool_name,
@@ -4257,7 +4347,7 @@ class MCPClient:
                                 cycle_id=cycle_id,
                                 progress_callback=progress_callback,
                                 cycle_trace=cycle_trace,
-                                event_type="tool_error",
+                                event_type="tool_failed",
                                 message_kwargs={
                                     "tool_name": target_tool_name or tool_name,
                                 },

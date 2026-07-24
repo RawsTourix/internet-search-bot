@@ -899,7 +899,7 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
             json.dumps(archive_trace, ensure_ascii=False),
         )
 
-    async def test_process_query_marks_unavailable_result_as_tool_error(self):
+    async def test_process_query_marks_unavailable_result_as_tool_failed(self):
         raw = "LOST_RAW_SENTINEL_" + "x" * 2_000
         tool_call = {
             "id": "call-lost",
@@ -947,12 +947,12 @@ class ResultCompactionIntegrationTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.content, "Finished with limitation")
         progress_types = [event["type"] for event in result.progress_events]
         self.assertIn("result_persist_failed", progress_types)
-        self.assertIn("tool_error", progress_types)
+        self.assertIn("tool_failed", progress_types)
         self.assertNotIn("tool_done", progress_types)
         tool_error = next(
             event
             for event in result.progress_events
-            if event["type"] == "tool_error"
+            if event["type"] == "tool_failed"
         )
         self.assertIn("unavailable", tool_error["message"])
         self.assertFalse(tool_error["data"]["result_available"])

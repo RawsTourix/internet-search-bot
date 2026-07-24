@@ -94,3 +94,23 @@ class ArtifactVersionConflictError(ArtifactError):
         self.current_version = current_version
         self.current_ref = dict(current_ref or {})
         self.retryable = True
+
+
+class ArtifactFilenameConflictError(ArtifactError):
+    """A new agent-created lineage conflicts with an accessible filename."""
+
+    def __init__(
+        self,
+        filename: str,
+        *,
+        current_candidates: list[dict[str, Any]],
+    ) -> None:
+        message = (
+            "An active artifact with this filename is already accessible. "
+            "Choose another filename or mutate one exact current artifact."
+        )
+        super().__init__(message)
+        self.filename = filename
+        self.current_candidates = [dict(item) for item in current_candidates]
+        self.safe_message = message
+        self.retryable = True

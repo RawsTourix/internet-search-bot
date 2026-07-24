@@ -103,6 +103,8 @@
         "max_patch_old_text_chars": 20000,
         "max_patch_new_text_chars": 50000,
         "max_runtime_artifact_summaries": 12,
+        "max_concurrent_artifact_reads": 4,
+        "max_composite_result_bytes": 8388608,
         "allow_opaque_binary": true,
         "auto_select_deliverables": false,
         "local_workspace_server_names": [],

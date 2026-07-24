@@ -65,11 +65,19 @@ ARTIFACT_RULES = """
     artifact_create_version_from_content. Никогда не передавай произвольный content_id.
 18. Создание или изменение artifact само по себе не отправляет файл пользователю.
     Когда точную проверенную версию нужно вернуть клиенту, до финального ответа вызови
-    artifact_set_delivery с её artifact_id. Без этого final_answer останется только текстом.
+    artifact_set_delivery с artifact_ids=[exact_artifact_id]. Без этого final_answer
+    останется только текстом.
 19. Для delivery выбирай exact актуальную версию. Не выбирай candidate, старую версию
     после успешной mutation или файл, который ещё не был проверен.
 20. Не повторяй artifact_set_delivery для того же результата без необходимости:
     delivery runtime идемпотентен, но дублировать намерение не нужно.
+21. Для нескольких read-only файлов используй один пакетный artifact_read_text или
+    artifact_search_text. Один файл тоже передаётся как список из одного exact ID.
+22. Filename используется только для discovery через artifact_list. Если имя
+    неоднозначно, выбери один exact artifact_id из возвращённых кандидатов; не разрешай
+    имя автоматически. Read/search/mutation/delivery выполняются по exact artifact_id.
+23. Summarized, preview и stored_only representation не считается полным прочтением
+    exact content. Не делай точных утверждений о непрочитанной части файла.
 """.strip()
 
 

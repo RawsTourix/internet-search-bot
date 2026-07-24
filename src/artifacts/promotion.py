@@ -52,6 +52,7 @@ class ArtifactCandidatePromotionService:
         purpose: ArtifactPurpose,
         filename: str | None = None,
         title: str | None = None,
+        access: ArtifactAccessContext | None = None,
         plan_id: str | None = None,
         plan_revision: int | None = None,
         plan_node_id: str | None = None,
@@ -73,6 +74,17 @@ class ArtifactCandidatePromotionService:
                     await self._repair_terminal_state(candidate, recovered.artifact_id)
                     return recovered
 
+                creation_access = (
+                    access
+                    or await self.artifact_service._session_access_context(
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                    )
+                )
+                await self.artifact_service.ensure_new_lineage_filename_available(
+                    creation_access,
+                    filename or candidate.suggested_filename,
+                )
                 await self._validate_candidate_content(candidate)
                 lineage, version = await self.artifact_service.artifact_store.create_lineage(
                     session_id=session_id,

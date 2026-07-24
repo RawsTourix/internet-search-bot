@@ -31,12 +31,24 @@ class ArtifactConfigTests(unittest.TestCase):
             config.max_artifact_size_bytes,
         )
         self.assertFalse(config.auto_select_deliverables)
+        self.assertEqual(config.max_concurrent_artifact_reads, 4)
+        self.assertEqual(
+            config.max_composite_result_bytes,
+            8 * 1024 * 1024,
+        )
 
     def test_unknown_and_invalid_values_are_rejected(self):
         with self.assertRaises(ValidationError):
             ArtifactConfigType(unknown=True)
         with self.assertRaises(ValidationError):
             ArtifactConfigType(max_artifacts_per_cycle=0)
+        with self.assertRaises(ValidationError):
+            ArtifactConfigType(
+                max_artifacts_per_cycle=2,
+                max_concurrent_artifact_reads=3,
+            )
+        with self.assertRaises(ValidationError):
+            ArtifactConfigType(max_composite_result_bytes=0)
         with self.assertRaises(ValidationError):
             ArtifactConfigType(
                 max_inline_text_chars=101,

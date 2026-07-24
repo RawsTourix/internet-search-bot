@@ -31,7 +31,10 @@ class ArtifactManagerToolTests(unittest.IsolatedAsyncioTestCase):
             content_store=storage.content_store,
         )
         self.services = services
-        self.controller = ArtifactToolController(services.artifact_service)
+        self.controller = ArtifactToolController(
+            services.artifact_service,
+            services.delivery_service,
+        )
         self.cycle = ActiveAgentCycle(
             cycle_id="cycle-1",
             session_id="session-1",
@@ -90,15 +93,12 @@ class ArtifactManagerToolTests(unittest.IsolatedAsyncioTestCase):
 
         read = await self.controller.execute(
             "artifact_read_text",
-            {
-                "artifact_id": artifact_id,
-                "offset_chars": 0,
-                "limit_chars": 100,
-            },
+            {"artifact_ids": [artifact_id]},
             self.context,
         )
-        self.assertEqual(read.payload["type"], "artifact_text")
-        self.assertEqual(read.payload["text"], "alpha beta")
+        self.assertEqual(read.payload["type"], "artifact_batch_read")
+        self.assertEqual(read.payload["status"], "ok")
+        self.assertEqual(read.payload["items"][0]["text"], "alpha beta")
 
         patched = await self.controller.execute(
             "artifact_patch_text",
@@ -124,9 +124,22 @@ class ArtifactManagerToolTests(unittest.IsolatedAsyncioTestCase):
             {"limit": 10},
             self.context,
         )
-        self.assertEqual(listed.payload["type"], "artifact_list")
-        self.assertEqual(listed.payload["count"], 1)
+        self.assertEqual(listed.payload["type"], "artifact_catalog")
+        self.assertEqual(listed.payload["available_count"], 1)
         self.assertEqual(listed.payload["items"][0]["artifact_id"], next_id)
+        self.assertEqual(listed.payload["items"][0]["versions_count"], 2)
+        self.assertFalse(listed.payload["items"][0]["read_in_current_cycle"])
+        history = await self.controller.execute(
+            "artifact_list",
+            {"include_versions": True},
+            self.context,
+        )
+        first = next(
+            item
+            for item in history.payload["items"]
+            if item["artifact_id"] == artifact_id
+        )
+        self.assertTrue(first["read_in_current_cycle"])
 
     async def test_stale_mutation_returns_current_exact_ref(self):
         created = await self._create()
@@ -162,20 +175,36 @@ class ArtifactManagerToolTests(unittest.IsolatedAsyncioTestCase):
     async def test_invalid_arguments_and_access_are_structured(self):
         invalid = await self.controller.execute(
             "artifact_read_text",
-            {"artifact_id": "not-an-id", "extra": True},
+            {"artifact_ids": ["not-an-id"], "extra": True},
             self.context,
         )
         self.assertEqual(invalid.payload["code"], "invalid_tool_arguments")
 
-        other_cycle = await self.controller.execute(
-            "artifact_get",
-            {"artifact_id": "art_" + "0" * 32},
+        partial = await self.controller.execute(
+            "artifact_read_text",
+            {"artifact_ids": ["art_" + "0" * 32]},
             self.context,
         )
+        self.assertEqual(partial.payload["status"], "rejected")
         self.assertIn(
-            other_cycle.payload["type"],
+            partial.payload["items"][0]["code"],
             {"artifact_not_found", "artifact_access_error"},
         )
+
+    def test_llm_schemas_use_only_new_manager_contract(self):
+        definitions = {
+            item.name: item for item in ARTIFACT_NATIVE_TOOL_DEFINITIONS
+        }
+        self.assertNotIn("artifact_get", ARTIFACT_NATIVE_TOOL_NAMES)
+        read_schema = definitions["artifact_read_text"].parameters()
+        search_schema = definitions["artifact_search_text"].parameters()
+        self.assertIn("artifact_ids", read_schema["properties"])
+        self.assertNotIn("artifact_id", read_schema["properties"])
+        self.assertNotIn("offset_chars", read_schema["properties"])
+        self.assertNotIn("limit_chars", read_schema["properties"])
+        self.assertIn("artifact_ids", search_schema["properties"])
+        self.assertNotIn("artifact_id", search_schema["properties"])
+        self.assertNotIn("limit", search_schema["properties"])
 
     async def test_cycle_capacity_blocks_mutation_before_persistence(self):
         self.services.config.max_artifacts_per_cycle = 1

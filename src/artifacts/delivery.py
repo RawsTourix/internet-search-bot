@@ -185,6 +185,12 @@ class FileSystemArtifactDeliveryStore:
     async def select(self, record: ArtifactDeliveryRecord) -> ArtifactDeliveryRecord:
         return await asyncio.to_thread(self._select_sync, record)
 
+    async def select_many(
+        self,
+        records: list[ArtifactDeliveryRecord],
+    ) -> list[ArtifactDeliveryRecord]:
+        return await asyncio.to_thread(self._select_many_sync, records)
+
     async def get(self, delivery_id: str) -> ArtifactDeliveryRecord:
         return await asyncio.to_thread(self._load_sync, delivery_id)
 
@@ -220,32 +226,175 @@ class FileSystemArtifactDeliveryStore:
             dict(receipt or {}),
         )
 
+    async def cancel_many(
+        self,
+        delivery_ids: list[str],
+    ) -> list[ArtifactDeliveryRecord]:
+        return await asyncio.to_thread(
+            self._cancel_many_sync,
+            delivery_ids,
+        )
+
     def _select_sync(self, record: ArtifactDeliveryRecord) -> ArtifactDeliveryRecord:
+        return self._select_many_sync([record])[0]
+
+    def _select_many_sync(
+        self,
+        records: list[ArtifactDeliveryRecord],
+    ) -> list[ArtifactDeliveryRecord]:
+        if not records:
+            return []
         with self._lock:
-            records = self._list_cycle_sync(record.session_id, record.cycle_id, set())
-            for existing in records:
+            first = records[0]
+            if any(
+                item.session_id != first.session_id
+                or item.cycle_id != first.cycle_id
+                or item.client_type != first.client_type
+                for item in records
+            ):
+                raise ArtifactDeliveryError(
+                    "Batch delivery records must share one runtime authority"
+                )
+            lineage_targets: dict[str, str] = {}
+            for item in records:
+                existing_target = lineage_targets.get(
+                    item.artifact_lineage_id
+                )
                 if (
-                    existing.artifact_id == record.artifact_id
-                    and existing.client_type == record.client_type
-                    and existing.state != ArtifactDeliveryState.CANCELLED
+                    existing_target is not None
+                    and existing_target != item.artifact_id
                 ):
-                    return existing
+                    raise ArtifactDeliveryError(
+                        "A delivery batch cannot select multiple versions "
+                        "of one lineage"
+                    )
+                lineage_targets[item.artifact_lineage_id] = item.artifact_id
 
-            for existing in records:
-                if (
-                    existing.artifact_lineage_id == record.artifact_lineage_id
-                    and existing.client_type == record.client_type
-                    and existing.artifact_id != record.artifact_id
-                    and existing.state == ArtifactDeliveryState.SELECTED
-                ):
-                    cancelled = existing.model_copy(update={
+            existing_records = self._list_cycle_sync(
+                first.session_id,
+                first.cycle_id,
+                set(),
+            )
+            updates: dict[str, tuple[ArtifactDeliveryRecord, bool]] = {}
+            selected_by_artifact: dict[str, ArtifactDeliveryRecord] = {}
+            for item in records:
+                existing_exact = next(
+                    (
+                        existing
+                        for existing in existing_records
+                        if existing.artifact_id == item.artifact_id
+                        and existing.client_type == item.client_type
+                        and existing.state
+                        != ArtifactDeliveryState.CANCELLED
+                    ),
+                    None,
+                )
+                if existing_exact is not None:
+                    selected_by_artifact[item.artifact_id] = existing_exact
+                    continue
+
+                for existing in existing_records:
+                    if (
+                        existing.artifact_lineage_id
+                        == item.artifact_lineage_id
+                        and existing.client_type == item.client_type
+                        and existing.artifact_id != item.artifact_id
+                        and existing.state
+                        == ArtifactDeliveryState.SELECTED
+                    ):
+                        updates[existing.delivery_id] = (
+                            existing.model_copy(update={
+                                "state": ArtifactDeliveryState.CANCELLED,
+                                "updated_at": utc_now(),
+                            }),
+                            True,
+                        )
+                updates[item.delivery_id] = (item, False)
+                selected_by_artifact[item.artifact_id] = item
+
+            self._commit_batch_sync(updates)
+            return [
+                selected_by_artifact[item.artifact_id] for item in records
+            ]
+
+    def _cancel_many_sync(
+        self,
+        delivery_ids: list[str],
+    ) -> list[ArtifactDeliveryRecord]:
+        if not delivery_ids:
+            return []
+        with self._lock:
+            unique_ids = list(dict.fromkeys(delivery_ids))
+            current_by_id = {
+                delivery_id: self._load_sync(delivery_id)
+                for delivery_id in unique_ids
+            }
+            cancellable = {
+                ArtifactDeliveryState.SELECTED,
+                ArtifactDeliveryState.FAILED,
+                ArtifactDeliveryState.UNKNOWN,
+            }
+            for current in current_by_id.values():
+                if current.state not in cancellable:
+                    raise ArtifactDeliveryError(
+                        f"Cannot cancel delivery in state {current.state.value}"
+                    )
+            now = utc_now()
+            updates = {
+                delivery_id: (
+                    current.model_copy(update={
                         "state": ArtifactDeliveryState.CANCELLED,
-                        "updated_at": utc_now(),
-                    })
-                    self._write_sync(cancelled, replace=True)
+                        "updated_at": now,
+                    }),
+                    True,
+                )
+                for delivery_id, current in current_by_id.items()
+            }
+            self._commit_batch_sync(updates)
+            cancelled = {
+                delivery_id: record
+                for delivery_id, (record, _) in updates.items()
+            }
+            return [cancelled[delivery_id] for delivery_id in delivery_ids]
 
-            self._write_sync(record, replace=False)
-            return record
+    def _commit_batch_sync(
+        self,
+        updates: dict[str, tuple[ArtifactDeliveryRecord, bool]],
+    ) -> None:
+        if not updates:
+            return
+        backups: dict[Path, bytes | None] = {}
+        for delivery_id in updates:
+            path = self.root / f"{delivery_id}.json"
+            try:
+                backups[path] = (
+                    path.read_bytes()
+                    if path.exists() and not path.is_symlink()
+                    else None
+                )
+            except OSError as error:
+                raise ArtifactStorageError(
+                    "Failed to prepare atomic delivery batch"
+                ) from error
+        try:
+            for record, replace in updates.values():
+                self._write_sync(record, replace=replace)
+        except BaseException:
+            self._restore_batch_sync(backups)
+            raise
+
+    @staticmethod
+    def _restore_batch_sync(backups: dict[Path, bytes | None]) -> None:
+        for path, payload in backups.items():
+            try:
+                if payload is None:
+                    path.unlink(missing_ok=True)
+                else:
+                    path.write_bytes(payload)
+            except OSError as error:
+                raise ArtifactStorageError(
+                    "Failed to roll back delivery batch"
+                ) from error
 
     def _transition_sync(
         self,
@@ -409,40 +558,84 @@ class ArtifactDeliveryService:
         access: ArtifactAccessContext,
         client_type: str,
     ) -> ArtifactDeliveryRef:
-        artifact = await self.artifact_service.get_artifact(
-            artifact_id,
-            access=access,
-        )
-        if ArtifactCapability.DELIVER not in artifact.capabilities:
-            raise ArtifactAccessError("Artifact format is not deliverable")
-        version = await self.artifact_service.artifact_store.get_version(artifact_id)
-        metadata = await self.content_store.get_metadata(version.content_id)
-        if (
-            metadata.size_bytes != artifact.size_bytes
-            or metadata.content_hash != artifact.content_hash
-        ):
-            raise ArtifactIntegrityError(
-                "Artifact metadata and content metadata disagree before delivery"
+        return (
+            await self.select_many(
+                artifact_ids=[artifact_id],
+                access=access,
+                client_type=client_type,
             )
+        )[0]
+
+    async def select_many(
+        self,
+        *,
+        artifact_ids: list[str],
+        access: ArtifactAccessContext,
+        client_type: str,
+    ) -> list[ArtifactDeliveryRef]:
+        """Validate the whole batch before one store-level commit."""
+
+        unique_ids = list(dict.fromkeys(artifact_ids))
+        records: list[ArtifactDeliveryRecord] = []
+        lineage_targets: dict[str, str] = {}
         now = utc_now()
-        record = ArtifactDeliveryRecord(
-            delivery_id=new_artifact_delivery_id(),
-            session_id=access.session_id,
-            cycle_id=access.cycle_id,
-            artifact_id=artifact.artifact_id,
-            artifact_lineage_id=artifact.artifact_lineage_id,
-            content_id=version.content_id,
-            filename=artifact.filename,
-            format_id=artifact.format_id,
-            mime_type=artifact.mime_type,
-            size_bytes=artifact.size_bytes,
-            content_hash=artifact.content_hash,
-            client_type=client_type,
-            state=ArtifactDeliveryState.SELECTED,
-            created_at=now,
-            updated_at=now,
-        )
-        return (await self.store.select(record)).public_ref()
+        for artifact_id in unique_ids:
+            artifact = await self.artifact_service.get_artifact(
+                artifact_id,
+                access=access,
+            )
+            if ArtifactCapability.DELIVER not in artifact.capabilities:
+                raise ArtifactAccessError("Artifact format is not deliverable")
+            existing_target = lineage_targets.get(
+                artifact.artifact_lineage_id
+            )
+            if (
+                existing_target is not None
+                and existing_target != artifact.artifact_id
+            ):
+                raise ArtifactDeliveryError(
+                    "A delivery batch cannot select multiple versions "
+                    "of one lineage"
+                )
+            lineage_targets[artifact.artifact_lineage_id] = (
+                artifact.artifact_id
+            )
+            version = await self.artifact_service.artifact_store.get_version(
+                artifact_id
+            )
+            metadata = await self.content_store.get_metadata(
+                version.content_id
+            )
+            if (
+                metadata.size_bytes != artifact.size_bytes
+                or metadata.content_hash != artifact.content_hash
+            ):
+                raise ArtifactIntegrityError(
+                    "Artifact metadata and content metadata disagree "
+                    "before delivery"
+                )
+            records.append(ArtifactDeliveryRecord(
+                delivery_id=new_artifact_delivery_id(),
+                session_id=access.session_id,
+                cycle_id=access.cycle_id,
+                artifact_id=artifact.artifact_id,
+                artifact_lineage_id=artifact.artifact_lineage_id,
+                content_id=version.content_id,
+                filename=artifact.filename,
+                format_id=artifact.format_id,
+                mime_type=artifact.mime_type,
+                size_bytes=artifact.size_bytes,
+                content_hash=artifact.content_hash,
+                client_type=client_type,
+                state=ArtifactDeliveryState.SELECTED,
+                created_at=now,
+                updated_at=now,
+            ))
+        selected = await self.store.select_many(records)
+        by_artifact_id = {
+            item.artifact_id: item.public_ref() for item in selected
+        }
+        return [by_artifact_id[artifact_id] for artifact_id in artifact_ids]
 
     async def list_cycle_refs(
         self,
@@ -527,6 +720,61 @@ class ArtifactDeliveryService:
             },
         )
         return record.public_ref()
+
+    async def cancel_many_by_artifact_ids(
+        self,
+        *,
+        artifact_ids: list[str],
+        access: ArtifactAccessContext,
+        client_type: str,
+    ) -> list[ArtifactDeliveryRef]:
+        """Atomically cancel all requested exact artifact selections."""
+
+        unique_ids = list(dict.fromkeys(artifact_ids))
+        for artifact_id in unique_ids:
+            await self.artifact_service.get_artifact(
+                artifact_id,
+                access=access,
+            )
+        records = await self.store.list_cycle(
+            session_id=access.session_id,
+            cycle_id=access.cycle_id,
+        )
+        delivery_ids_by_artifact: dict[str, str] = {}
+        cancellable = {
+            ArtifactDeliveryState.SELECTED,
+            ArtifactDeliveryState.FAILED,
+            ArtifactDeliveryState.UNKNOWN,
+        }
+        for artifact_id in unique_ids:
+            matches = [
+                item
+                for item in records
+                if item.artifact_id == artifact_id
+                and item.client_type == client_type
+                and item.state != ArtifactDeliveryState.CANCELLED
+            ]
+            if not matches:
+                raise ArtifactDeliveryNotFoundError(
+                    "No delivery selection exists for this artifact"
+                )
+            latest = matches[-1]
+            if latest.state not in cancellable:
+                raise ArtifactDeliveryError(
+                    f"Cannot cancel delivery in state {latest.state.value}"
+                )
+            delivery_ids_by_artifact[artifact_id] = latest.delivery_id
+        cancelled = await self.store.cancel_many([
+            delivery_ids_by_artifact[artifact_id]
+            for artifact_id in unique_ids
+        ])
+        by_delivery_id = {
+            item.delivery_id: item.public_ref() for item in cancelled
+        }
+        return [
+            by_delivery_id[delivery_ids_by_artifact[artifact_id]]
+            for artifact_id in artifact_ids
+        ]
 
     async def iter_content(
         self,

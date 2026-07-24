@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, Mock
 
 from src.artifacts import ArtifactConfigType, create_artifact_services
 from src.artifacts.tools import ARTIFACT_NATIVE_TOOL_NAMES
@@ -21,7 +22,7 @@ _MUTATIONS = {
     "artifact_replace_text",
     "artifact_patch_text",
 }
-_READS = set(ARTIFACT_NATIVE_TOOL_NAMES) - _MUTATIONS
+_CONTROL_PLANE = {"artifact_list"}
 
 
 def llm_config():
@@ -30,7 +31,7 @@ def llm_config():
         api_key="test",
         model="test-model",
         max_tokens=256,
-        context_window_tokens=4096,
+        context_window_tokens=40_000,
     )
 
 
@@ -107,7 +108,10 @@ class ArtifactRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             artifact_id,
         )
         runtime_payload = self.client._iteration_runtime_payload(self.state)
-        self.assertEqual(runtime_payload["artifact_state"]["count"], 1)
+        self.assertEqual(
+            runtime_payload["artifact_state"]["available_count"],
+            1,
+        )
         self.assertTrue(any(
             event.get("type") == "artifact_created"
             for event in self.state.progress_events
@@ -119,8 +123,8 @@ class ArtifactRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_tool_result_payload_marks_artifact_data_untrusted(self):
         parsed = self.client._tool_result_payload(
-            "artifact_get",
-            json.dumps({"type": "artifact_metadata", "artifact": {}}),
+            "artifact_list",
+            json.dumps({"type": "artifact_catalog", "items": []}),
         )
         self.assertFalse(parsed["trusted"])
         self.assertIn("untrusted", parsed["security_note"])
@@ -146,7 +150,7 @@ class ArtifactRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         finally:
             await client.cleanup()
 
-    async def test_planning_client_keeps_artifact_read_control_plane_only(self):
+    async def test_planning_client_compacts_content_but_not_catalog(self):
         root = Path(self.temporary.name)
         storage_config = StorageConfigType(root_dir=str(root / "planning-storage"))
         storage = create_storage_services(storage_config)
@@ -168,7 +172,17 @@ class ArtifactRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
         try:
             self.assertTrue(ARTIFACT_NATIVE_TOOL_NAMES.issubset(client.manager_tools))
             self.assertTrue(PLAN_TOOL_NAMES.issubset(client.manager_tools))
-            self.assertTrue(_READS.issubset(client.CONTROL_PLANE_MANAGER_TOOLS))
+            self.assertTrue(
+                _CONTROL_PLANE.issubset(client.CONTROL_PLANE_MANAGER_TOOLS)
+            )
+            self.assertNotIn(
+                "artifact_read_text",
+                client.CONTROL_PLANE_MANAGER_TOOLS,
+            )
+            self.assertNotIn(
+                "artifact_search_text",
+                client.CONTROL_PLANE_MANAGER_TOOLS,
+            )
             self.assertTrue(_MUTATIONS.isdisjoint(client.CONTROL_PLANE_MANAGER_TOOLS))
         finally:
             await client.cleanup()
@@ -235,16 +249,60 @@ class ArtifactRuntimeIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
             blocked_payload = json.loads(blocked.content[0].text)
             self.assertEqual(blocked_payload["type"], "plan_node_required")
+            self.assertEqual(blocked.execution_disposition, "rejected")
 
             readable = await client._call_registered_tool(
                 "artifact_list",
                 {"limit": 10},
             )
             readable_payload = json.loads(readable.content[0].text)
-            self.assertEqual(readable_payload["type"], "artifact_list")
+            self.assertEqual(readable_payload["type"], "artifact_catalog")
         finally:
             set_manager_context(self.context)
             await client.cleanup()
+
+    async def test_rejected_batch_emits_tool_rejected_without_tool_done(self):
+        tool_call = {
+            "id": "call-invalid-read",
+            "type": "function",
+            "function": {
+                "name": "artifact_read_text",
+                "arguments": json.dumps({"artifact_ids": []}),
+            },
+        }
+        final_response = {
+            "content": json.dumps({
+                "type": "agent_action",
+                "status": "done",
+                "action": "answer",
+                "agent_request": None,
+                "final_answer": "The read request was rejected.",
+                "question_to_user": None,
+                "error_message": None,
+            }),
+        }
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            {"content": None, "tool_calls": [tool_call]},
+            final_response,
+        ])
+        self.client._archive_agent_cycle = Mock()
+
+        result = await self.client.process_query(
+            "Read an invalid batch",
+            session_id="progress-session",
+            progress_locale="en",
+        )
+
+        progress_types = [item["type"] for item in result.progress_events]
+        self.assertIn("artifact_validation_failed", progress_types)
+        self.assertIn("tool_rejected", progress_types)
+        self.assertNotIn("tool_done", progress_types)
+        rejected = next(
+            item
+            for item in result.progress_events
+            if item["type"] == "tool_rejected"
+        )
+        self.assertEqual(rejected["severity"], "warning")
 
 
 if __name__ == "__main__":

@@ -16,6 +16,7 @@ _ARTIFACT_PROGRESS_MESSAGES = {
         "artifact_delivery_done": "✅ Файл отправлен: {filename}",
         "artifact_delivery_failed": "⚠️ Не удалось отправить файл: {filename}",
         "artifact_delivery_unknown": "⚠️ Результат отправки файла неизвестен: {filename}",
+        "artifact_read_completed": "📖 Чтение файлов завершено.",
     },
     "en": {
         "artifact_candidate_list": "📦 Checking available file-processing results…",
@@ -29,6 +30,7 @@ _ARTIFACT_PROGRESS_MESSAGES = {
         "artifact_delivery_done": "✅ File sent: {filename}",
         "artifact_delivery_failed": "⚠️ Failed to send file: {filename}",
         "artifact_delivery_unknown": "⚠️ File delivery result is unknown: {filename}",
+        "artifact_read_completed": "📖 File reading completed.",
     },
 }
 

@@ -1,14 +1,18 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import Mock
 
 from src.artifacts import (
     ArtifactAccessContext,
     ArtifactConfigType,
     ArtifactDeliveryError,
+    ArtifactDeliveryNotFoundError,
     ArtifactDeliveryState,
+    ArtifactNotFoundError,
     ArtifactProvenance,
     ArtifactPurpose,
+    ArtifactStorageError,
     create_artifact_services,
 )
 from src.storage import StorageConfigType, create_storage_services
@@ -34,15 +38,17 @@ class ArtifactDeliveryTests(unittest.IsolatedAsyncioTestCase):
             cycle_id="cycle-1",
             allowed_artifact_ids=[],
         )
+        self.artifact_number = 0
 
     async def asyncTearDown(self):
         self.temporary.cleanup()
 
     async def _artifact(self, text: str = "report"):
+        self.artifact_number += 1
         item = await self.services.artifact_service.create_text(
             session_id="session-1",
             cycle_id="cycle-1",
-            filename="report.md",
+            filename=f"report-{self.artifact_number}.md",
             text=text,
             format_id="markdown",
             purpose=ArtifactPurpose.DELIVERABLE,
@@ -186,6 +192,104 @@ class ArtifactDeliveryTests(unittest.IsolatedAsyncioTestCase):
         ):
             chunks.append(chunk)
         self.assertEqual(b"".join(chunks), b"alpha beta gamma")
+
+    async def test_batch_selection_is_atomic_and_ordered(self):
+        artifacts = [await self._artifact(f"report {index}") for index in range(4)]
+        selected = await self.services.delivery_service.select_many(
+            artifact_ids=[item.artifact_id for item in artifacts],
+            access=self.access,
+            client_type="telegram",
+        )
+
+        self.assertEqual(
+            [item.artifact_id for item in selected],
+            [item.artifact_id for item in artifacts],
+        )
+        records = await self.services.delivery_store.list_cycle(
+            session_id="session-1",
+            cycle_id="cycle-1",
+        )
+        self.assertEqual(len(records), 4)
+        self.assertTrue(all(
+            item.state == ArtifactDeliveryState.SELECTED for item in records
+        ))
+
+    async def test_invalid_batch_target_leaves_store_unchanged(self):
+        artifacts = [await self._artifact(f"report {index}") for index in range(3)]
+        unknown = "art_" + "0" * 32
+
+        with self.assertRaises(ArtifactNotFoundError):
+            await self.services.delivery_service.select_many(
+                artifact_ids=[
+                    *(item.artifact_id for item in artifacts),
+                    unknown,
+                ],
+                access=self.access,
+                client_type="telegram",
+            )
+
+        records = await self.services.delivery_store.list_cycle(
+            session_id="session-1",
+            cycle_id="cycle-1",
+        )
+        self.assertEqual(records, [])
+
+    async def test_batch_write_failure_rolls_back_every_record(self):
+        artifacts = [await self._artifact(f"report {index}") for index in range(3)]
+        store = self.services.delivery_store
+        original_write = store._write_sync
+        calls = 0
+
+        def fail_second_write(record, *, replace):
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise ArtifactStorageError("simulated batch write failure")
+            return original_write(record, replace=replace)
+
+        store._write_sync = Mock(side_effect=fail_second_write)
+        with self.assertRaises(ArtifactStorageError):
+            await self.services.delivery_service.select_many(
+                artifact_ids=[item.artifact_id for item in artifacts],
+                access=self.access,
+                client_type="telegram",
+            )
+
+        records = await store.list_cycle(
+            session_id="session-1",
+            cycle_id="cycle-1",
+        )
+        self.assertEqual(records, [])
+
+    async def test_batch_cancel_rejection_keeps_all_selections(self):
+        first = await self._artifact("first")
+        second = await self._artifact("second")
+        unselected = await self._artifact("unselected")
+        await self.services.delivery_service.select_many(
+            artifact_ids=[first.artifact_id, second.artifact_id],
+            access=self.access,
+            client_type="web",
+        )
+
+        with self.assertRaises(ArtifactDeliveryNotFoundError):
+            await self.services.delivery_service.cancel_many_by_artifact_ids(
+                artifact_ids=[
+                    first.artifact_id,
+                    second.artifact_id,
+                    unselected.artifact_id,
+                ],
+                access=self.access,
+                client_type="web",
+            )
+
+        refs = await self.services.delivery_service.list_cycle_refs(
+            session_id="session-1",
+            cycle_id="cycle-1",
+        )
+        self.assertEqual(len(refs), 2)
+        self.assertTrue(all(
+            item.state == ArtifactDeliveryState.SELECTED for item in refs
+        ))
 
 
 if __name__ == "__main__":

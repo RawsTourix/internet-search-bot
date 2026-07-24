@@ -19,7 +19,6 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "agent_plan_remove_node": "🗺️ Удаляю неактуальный этап…",
         "agent_plan_cancel": "🗺️ Отменяю план работы…",
         "artifact_list": "📁 Проверяю доступные файлы…",
-        "artifact_get": "📄 Получаю сведения о файле…",
         "artifact_read_text": "📖 Читаю содержимое файла…",
         "artifact_search_text": "🔎 Ищу данные в файле…",
         "artifact_create_text": "📝 Создаю файл…",
@@ -27,6 +26,8 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "artifact_patch_text": "📝 Вношу точные изменения в файл…",
         "tool_start": "🔧 Запускаю инструмент {tool_name}…",
         "tool_done": "✅ Инструмент {tool_name} завершил работу.",
+        "tool_rejected": "⚠️ Инструмент {tool_name} отклонил операцию.",
+        "tool_failed": "❌ Инструмент {tool_name} завершился с ошибкой.",
         "tool_error": "⚠️ Инструмент {tool_name} завершился с ошибкой.",
         "tool_timeout": "⚠️ Инструмент {tool_name} завершился по таймауту.",
         "tool_result_unavailable": (
@@ -133,7 +134,6 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "agent_plan_remove_node": "🗺️ Removing an obsolete stage…",
         "agent_plan_cancel": "🗺️ Cancelling the work plan…",
         "artifact_list": "📁 Checking available files…",
-        "artifact_get": "📄 Reading file metadata…",
         "artifact_read_text": "📖 Reading file content…",
         "artifact_search_text": "🔎 Searching the file…",
         "artifact_create_text": "📝 Creating a file…",
@@ -141,6 +141,8 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
         "artifact_patch_text": "📝 Applying exact file changes…",
         "tool_start": "🔧 Running tool {tool_name}…",
         "tool_done": "✅ Tool {tool_name} finished.",
+        "tool_rejected": "⚠️ Tool {tool_name} rejected the operation.",
+        "tool_failed": "❌ Tool {tool_name} failed.",
         "tool_error": "⚠️ Tool {tool_name} failed.",
         "tool_timeout": "⚠️ Tool {tool_name} timed out.",
         "tool_result_unavailable": (
@@ -253,6 +255,18 @@ PROGRESS_MESSAGE_DEFAULT_KWARGS: dict[str, dict[str, dict[str, str]]] = {
         },
     },
     "tool_done": {
+        "tool_name": {
+            "ru": "инструмент",
+            "en": "tool",
+        },
+    },
+    "tool_rejected": {
+        "tool_name": {
+            "ru": "инструмент",
+            "en": "tool",
+        },
+    },
+    "tool_failed": {
         "tool_name": {
             "ru": "инструмент",
             "en": "tool",

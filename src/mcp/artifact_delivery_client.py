@@ -12,6 +12,10 @@ from ..artifacts.delivery_tools import (
 )
 from ..artifacts.errors import ArtifactAccessError
 from ..artifacts.runtime import ArtifactRuntimeCoordinator
+from ..artifacts.tools import (
+    ArtifactResultPolicy,
+    ToolExecutionDisposition,
+)
 from .artifact_client import ArtifactMCPClient
 from .artifact_request_context import (
     get_artifact_request_client_type,
@@ -232,6 +236,7 @@ class ArtifactDeliveryMixin:
         arguments: dict[str, Any],
     ):
         if public_tool_name in ARTIFACT_DELIVERY_TOOL_NAMES:
+            outcome = None
             context = get_manager_context()
             if context is None or self.artifact_delivery_tool_controller is None:
                 payload = {
@@ -239,6 +244,8 @@ class ArtifactDeliveryMixin:
                     "message": "Artifact tool requires an active agent cycle.",
                     "retryable": False,
                 }
+                disposition = ToolExecutionDisposition.REJECTED
+                result_policy = ArtifactResultPolicy.INLINE_RECEIPT
             elif self._active_plan_requires_node(context):
                 state = context.active_cycle.active_plan_state
                 payload = {
@@ -258,6 +265,8 @@ class ArtifactDeliveryMixin:
                     revision=payload["revision"],
                     blocked_tool=public_tool_name,
                 )
+                disposition = ToolExecutionDisposition.REJECTED
+                result_policy = ArtifactResultPolicy.INLINE_RECEIPT
             else:
                 outcome = await self.artifact_delivery_tool_controller.execute(
                     public_tool_name,
@@ -266,12 +275,18 @@ class ArtifactDeliveryMixin:
                 )
                 await self._record_delivery_outcome(outcome, context)
                 payload = outcome.payload
+                disposition = outcome.disposition
+                result_policy = outcome.result_policy
                 if payload.get("type") in {
-                    "artifact_delivery_selected",
-                    "artifact_delivery_cancelled",
+                    "artifact_delivery_batch_selected",
+                    "artifact_delivery_batch_cancelled",
                 }:
                     await self._refresh_artifact_state(context)
-            return self._text_result(payload)
+            return self._text_result(
+                payload,
+                disposition=disposition,
+                result_policy=result_policy,
+            )
 
         return await super()._call_registered_tool(public_tool_name, arguments)
 
@@ -315,9 +330,11 @@ class ArtifactDeliveryMixin:
     ) -> None:
         if outcome.event_type is None:
             return
-        delivery = outcome.payload.get("delivery")
         safe_data: dict[str, Any] = {}
-        if isinstance(delivery, dict):
+        deliveries = outcome.payload.get("items") or []
+        for delivery in deliveries:
+            if not isinstance(delivery, dict):
+                continue
             for key in (
                 "delivery_id",
                 "artifact_id",
@@ -328,7 +345,20 @@ class ArtifactDeliveryMixin:
                 "state",
             ):
                 if delivery.get(key) is not None:
-                    safe_data[key] = delivery[key]
+                    safe_data.setdefault(f"{key}s", []).append(delivery[key])
+        if deliveries:
+            safe_data["requested_count"] = outcome.payload.get(
+                "requested_count",
+                len(deliveries),
+            )
+            safe_data["selected_count"] = outcome.payload.get(
+                "selected_count",
+                0,
+            )
+            safe_data["cancelled_count"] = outcome.payload.get(
+                "cancelled_count",
+                0,
+            )
         self._trace_event(
             context.active_cycle.cycle_trace,
             outcome.event_type,
@@ -344,7 +374,11 @@ class ArtifactDeliveryMixin:
             severity=outcome.severity,
             visibility=outcome.visibility,
             data=safe_data,
-            message_kwargs={"filename": str(safe_data.get("filename") or "")},
+            message_kwargs={
+                "filename": str(
+                    (safe_data.get("filenames") or [""])[0]
+                )
+            },
         )
 
 

@@ -231,6 +231,7 @@ class PlanningMCPClient(ArtifactMCPClient):
                     "message": "Planning tool requires an active agent cycle.",
                     "retryable": False,
                 }
+                disposition = "rejected"
             else:
                 outcome = await self.plan_tool_controller.execute(
                     public_tool_name,
@@ -239,7 +240,18 @@ class PlanningMCPClient(ArtifactMCPClient):
                 )
                 await self._record_planning_outcome(outcome, context)
                 payload = outcome.payload
-            return self._text_result(payload)
+                disposition = (
+                    "rejected"
+                    if outcome.event_type in {
+                        "plan_validation_failed",
+                        "plan_revision_conflict",
+                    }
+                    else "succeeded"
+                )
+            return self._text_result(
+                payload,
+                disposition=disposition,
+            )
 
         if public_tool_name == "mcp_call_tool" and context is not None:
             state = context.active_cycle.active_plan_state
@@ -267,7 +279,10 @@ class PlanningMCPClient(ArtifactMCPClient):
                     plan_id=state.plan_id,
                     revision=state.revision,
                 )
-                return self._text_result(payload)
+                return self._text_result(
+                    payload,
+                    disposition="rejected",
+                )
 
         return await super()._call_registered_tool(public_tool_name, arguments)
 
@@ -575,7 +590,18 @@ class PlanningMCPClient(ArtifactMCPClient):
         }[state.current_node.kind]
 
     @staticmethod
-    def _text_result(payload: dict[str, Any]):
+    def _text_result(
+        payload: dict[str, Any],
+        *,
+        disposition: Any = "succeeded",
+        result_policy: Any = "default",
+    ):
         return SimpleNamespace(
-            content=[TextContent(type="text", text=dumps_json(payload))]
+            content=[TextContent(type="text", text=dumps_json(payload))],
+            execution_disposition=getattr(
+                disposition,
+                "value",
+                disposition,
+            ),
+            result_policy=getattr(result_policy, "value", result_policy),
         )

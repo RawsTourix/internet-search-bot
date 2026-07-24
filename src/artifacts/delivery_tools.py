@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, ValidationError
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+)
 
 from ..mcp.artifact_request_context import get_artifact_request_client_type
 from ..mcp.manager_context import ManagerToolContext
@@ -16,9 +22,20 @@ from .errors import (
     ArtifactIntegrityError,
     ArtifactNotFoundError,
     ArtifactStorageError,
+    ArtifactValidationError,
 )
-from .models import ArtifactAccessContext, ArtifactDeliveryState
-from .tools import ArtifactToolDefinition, ArtifactToolOutcome
+from .models import (
+    ArtifactAccessContext,
+    ArtifactDeliveryBatchItem,
+    ArtifactDeliveryBatchResult,
+    is_artifact_id,
+)
+from .tools import (
+    ArtifactResultPolicy,
+    ArtifactToolDefinition,
+    ArtifactToolOutcome,
+    ToolExecutionDisposition,
+)
 
 
 ARTIFACT_DELIVERY_TOOL_NAMES = frozenset({"artifact_set_delivery"})
@@ -27,17 +44,29 @@ ARTIFACT_DELIVERY_TOOL_NAMES = frozenset({"artifact_set_delivery"})
 class ArtifactSetDeliveryInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    artifact_id: str
+    artifact_ids: list[str] = Field(min_length=1)
     selected: bool = True
+
+    @field_validator("artifact_ids")
+    @classmethod
+    def normalize_artifact_ids(cls, values: list[str]) -> list[str]:
+        result: list[str] = []
+        for value in values:
+            normalized = value.strip()
+            if not normalized:
+                raise ValueError("artifact_ids must not contain empty strings")
+            result.append(normalized)
+        return result
 
 
 ARTIFACT_DELIVERY_TOOL_DEFINITIONS = (
     ArtifactToolDefinition(
         name="artifact_set_delivery",
         description=(
-            "Выбрать exact immutable artifact version для доставки текущему "
-            "клиенту либо отменить ещё не начатую доставку. Инструмент не "
-            "передаёт bytes и не управляет Telegram/Web напрямую."
+            "Атомарно выбрать список exact immutable artifact_ids для "
+            "доставки текущему клиенту либо отменить весь список. Один файл "
+            "тоже передаётся списком. selected означает durable selection, "
+            "а не подтверждённую transport delivery."
         ),
         input_model=ArtifactSetDeliveryInput,
         progress_key="artifact_set_delivery",
@@ -66,9 +95,37 @@ class ArtifactDeliveryToolController:
                 },
                 event_type="artifact_validation_failed",
                 severity="error",
+                disposition=ToolExecutionDisposition.REJECTED,
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         try:
             parsed = ArtifactSetDeliveryInput.model_validate(arguments)
+            if (
+                len(parsed.artifact_ids)
+                > self.service.config.max_artifacts_per_cycle
+            ):
+                return self._rejected(
+                    parsed.artifact_ids,
+                    code="artifact_limit_error",
+                    message=(
+                        "Artifact delivery batch exceeds "
+                        "max_artifacts_per_cycle."
+                    ),
+                    retryable=True,
+                )
+            if any(
+                not is_artifact_id(artifact_id)
+                for artifact_id in parsed.artifact_ids
+            ):
+                return self._rejected(
+                    parsed.artifact_ids,
+                    code="invalid_artifact_id",
+                    message=(
+                        "One or more artifact IDs are invalid. Call "
+                        "artifact_list and retry with exact artifact_ids."
+                    ),
+                    retryable=True,
+                )
             raw_client_type = (
                 context.client_type
                 if context.client_type is not None
@@ -76,14 +133,13 @@ class ArtifactDeliveryToolController:
             )
             client_type = getattr(raw_client_type, "value", raw_client_type)
             if not isinstance(client_type, str) or not client_type.strip():
-                return ArtifactToolOutcome(
-                    payload={
-                        "type": "artifact_delivery_context_error",
-                        "message": "Current client type is unavailable for delivery.",
-                        "retryable": False,
-                    },
-                    event_type="artifact_validation_failed",
-                    severity="error",
+                return self._rejected(
+                    parsed.artifact_ids,
+                    code="artifact_delivery_context_error",
+                    message=(
+                        "Current client type is unavailable for delivery."
+                    ),
+                    retryable=False,
                 )
             access = ArtifactAccessContext(
                 session_id=context.session_id,
@@ -91,88 +147,160 @@ class ArtifactDeliveryToolController:
                 allowed_artifact_ids=context.active_cycle.artifact_refs,
             )
             if parsed.selected:
-                delivery = await self.service.select(
-                    artifact_id=parsed.artifact_id,
+                deliveries = await self.service.select_many(
+                    artifact_ids=parsed.artifact_ids,
                     access=access,
                     client_type=client_type,
                 )
+                result = ArtifactDeliveryBatchResult(
+                    type="artifact_delivery_batch_selected",
+                    status="selected",
+                    requested_count=len(parsed.artifact_ids),
+                    selected_count=len(parsed.artifact_ids),
+                    cancelled_count=0,
+                    items=[
+                        ArtifactDeliveryBatchItem(
+                            request_index=index,
+                            requested_artifact_id=artifact_id,
+                            status="selected",
+                            artifact_id=delivery.artifact_id,
+                            filename=delivery.filename,
+                            delivery_id=delivery.delivery_id,
+                            state=delivery.state,
+                        )
+                        for index, (artifact_id, delivery) in enumerate(
+                            zip(
+                                parsed.artifact_ids,
+                                deliveries,
+                                strict=True,
+                            )
+                        )
+                    ],
+                )
                 return ArtifactToolOutcome(
-                    payload={
-                        "type": "artifact_delivery_selected",
-                        "delivery": delivery.model_dump(mode="json"),
-                    },
+                    payload=result.model_dump(mode="json"),
                     event_type="artifact_delivery_selected",
                     severity="success",
                     visibility="user",
+                    result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
                 )
 
-            records = await self.service.store.list_cycle(
-                session_id=context.session_id,
-                cycle_id=context.cycle_id,
+            deliveries = await self.service.cancel_many_by_artifact_ids(
+                artifact_ids=parsed.artifact_ids,
+                access=access,
+                client_type=client_type,
             )
-            matches = [
-                item
-                for item in records
-                if item.artifact_id == parsed.artifact_id
-                and item.client_type == client_type
-                and item.state != ArtifactDeliveryState.CANCELLED
-            ]
-            if not matches:
-                raise ArtifactDeliveryNotFoundError(
-                    "No delivery selection exists for this artifact"
-                )
-            latest = matches[-1]
-            cancelled = await self.service.cancel(latest.delivery_id)
+            result = ArtifactDeliveryBatchResult(
+                type="artifact_delivery_batch_cancelled",
+                status="cancelled",
+                requested_count=len(parsed.artifact_ids),
+                selected_count=0,
+                cancelled_count=len(parsed.artifact_ids),
+                items=[
+                    ArtifactDeliveryBatchItem(
+                        request_index=index,
+                        requested_artifact_id=artifact_id,
+                        status="cancelled",
+                        artifact_id=delivery.artifact_id,
+                        filename=delivery.filename,
+                        delivery_id=delivery.delivery_id,
+                        state=delivery.state,
+                    )
+                    for index, (artifact_id, delivery) in enumerate(
+                        zip(
+                            parsed.artifact_ids,
+                            deliveries,
+                            strict=True,
+                        )
+                    )
+                ],
+            )
             return ArtifactToolOutcome(
-                payload={
-                    "type": "artifact_delivery_cancelled",
-                    "delivery": cancelled.model_dump(mode="json"),
-                },
+                payload=result.model_dump(mode="json"),
                 event_type="artifact_delivery_cancelled",
                 severity="success",
                 visibility="user",
+                result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
             )
         except ValidationError as error:
-            return ArtifactToolOutcome(
-                payload={
-                    "type": "artifact_validation_error",
-                    "code": "invalid_tool_arguments",
-                    "message": "Artifact delivery arguments do not match the schema.",
-                    "retryable": True,
-                    "details": {"issue_count": error.error_count()},
-                },
-                event_type="artifact_validation_failed",
-                severity="warning",
+            return self._rejected(
+                [],
+                code="invalid_tool_arguments",
+                message=(
+                    "Artifact delivery arguments do not match the schema "
+                    f"({error.error_count()} issue(s))."
+                ),
+                retryable=True,
             )
-        except (ArtifactNotFoundError, ArtifactDeliveryNotFoundError):
-            return ArtifactToolOutcome(
-                payload={
-                    "type": "artifact_delivery_not_found",
-                    "message": "Artifact delivery target was not found.",
-                    "retryable": False,
-                },
-                event_type="artifact_validation_failed",
-                severity="warning",
+        except (
+            ArtifactNotFoundError,
+            ArtifactDeliveryNotFoundError,
+            ArtifactAccessError,
+        ):
+            return self._rejected(
+                parsed.artifact_ids,
+                code="artifact_access_error",
+                message=(
+                    "One or more delivery targets are not accessible from "
+                    "the current runtime authority."
+                ),
+                retryable=True,
             )
-        except ArtifactAccessError:
-            return ArtifactToolOutcome(
-                payload={
-                    "type": "artifact_access_error",
-                    "message": "Artifact is outside the current runtime authority.",
-                    "retryable": False,
-                },
-                event_type="artifact_validation_failed",
-                severity="error",
+        except ArtifactValidationError as error:
+            return self._rejected(
+                parsed.artifact_ids,
+                code=error.code,
+                message=error.safe_message,
+                retryable=error.retryable,
             )
         except ArtifactDeliveryError as error:
-            return ArtifactToolOutcome(
-                payload={
-                    "type": "artifact_delivery_error",
-                    "message": str(error),
-                    "retryable": False,
-                },
-                event_type="artifact_validation_failed",
-                severity="warning",
+            return self._rejected(
+                parsed.artifact_ids,
+                code="artifact_delivery_error",
+                message=str(error),
+                retryable=False,
             )
         except (ArtifactStorageError, ArtifactIntegrityError):
             raise
+
+    @staticmethod
+    def _rejected(
+        artifact_ids: list[str],
+        *,
+        code: str,
+        message: str,
+        retryable: bool,
+    ) -> ArtifactToolOutcome:
+        result = ArtifactDeliveryBatchResult(
+            type="artifact_delivery_batch_rejected",
+            status="rejected",
+            requested_count=len(artifact_ids),
+            selected_count=0,
+            cancelled_count=0,
+            items=[
+                ArtifactDeliveryBatchItem(
+                    request_index=index,
+                    requested_artifact_id=artifact_id,
+                    status="rejected",
+                    code=(
+                        code
+                        if code == "invalid_artifact_id"
+                        and not is_artifact_id(artifact_id)
+                        else "atomic_batch_rejected"
+                    ),
+                    message=message,
+                    retryable=retryable,
+                    suggested_action=(
+                        "Call artifact_list and retry with exact artifact_ids."
+                    ),
+                )
+                for index, artifact_id in enumerate(artifact_ids)
+            ],
+        )
+        return ArtifactToolOutcome(
+            payload=result.model_dump(mode="json"),
+            event_type="artifact_validation_failed",
+            severity="warning",
+            disposition=ToolExecutionDisposition.REJECTED,
+            result_policy=ArtifactResultPolicy.INLINE_RECEIPT,
+        )

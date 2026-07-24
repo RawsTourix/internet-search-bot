@@ -17,7 +17,7 @@ from pydantic import (
     model_validator,
 )
 
-from ..storage.models import is_content_id
+from ..storage.models import ContentMatch, is_content_id
 
 
 _ARTIFACT_LINEAGE_ID_RE = re.compile(r"^aln_[0-9a-f]{32}$")
@@ -100,6 +100,14 @@ def _sanitize_filename(value: str) -> str:
     if not cleaned or cleaned in {".", ".."}:
         raise ValueError("filename must not be empty")
     return cleaned
+
+
+def normalize_artifact_filename(value: str) -> str:
+    """Apply the canonical artifact filename sanitization policy."""
+
+    if not isinstance(value, str):
+        raise ValueError("filename must be a string")
+    return _sanitize_filename(value)
 
 
 def _dedupe_ids(values: list[str]) -> list[str]:
@@ -716,3 +724,283 @@ class ArtifactDeliveryRef(_ArtifactModel):
     @classmethod
     def validate_content_hash(cls, value: str) -> str:
         return _validate_hash(value)
+
+
+class ArtifactBatchStatus(str, Enum):
+    OK = "ok"
+    PARTIAL = "partial"
+    REJECTED = "rejected"
+
+
+class ArtifactBatchItemStatus(str, Enum):
+    OK = "ok"
+    INVALID_ARTIFACT_ID = "invalid_artifact_id"
+    ARTIFACT_NOT_FOUND = "artifact_not_found"
+    ARTIFACT_ACCESS_ERROR = "artifact_access_error"
+    ARTIFACT_CAPABILITY_ERROR = "artifact_capability_error"
+    ARTIFACT_LIMIT_ERROR = "artifact_limit_error"
+    ARTIFACT_TEXT_DECODE_ERROR = "artifact_text_decode_error"
+    ARTIFACT_VALIDATION_ERROR = "artifact_validation_error"
+    ATOMIC_BATCH_REJECTED = "atomic_batch_rejected"
+
+
+class ArtifactResultRepresentation(str, Enum):
+    INLINE = "inline"
+    SUMMARIZED = "summarized"
+    PREVIEW = "preview"
+    STORED_ONLY = "stored_only"
+
+
+class ArtifactReadItem(_ArtifactModel):
+    request_index: int = Field(ge=0)
+    requested_artifact_id: str
+    status: ArtifactBatchItemStatus
+
+    artifact: ArtifactVersionRef | None = None
+    text: str | None = None
+    offset_chars: int | None = Field(default=None, ge=0)
+    length_chars: int | None = Field(default=None, ge=0)
+    total_chars: int | None = Field(default=None, ge=0)
+    eof: bool | None = None
+
+    representation: ArtifactResultRepresentation | None = None
+    exact_content_available: bool = False
+    complete: bool = False
+    needs_retrieval: bool = False
+
+    code: str | None = None
+    message: str | None = None
+    retryable: bool | None = None
+    suggested_action: str | None = None
+
+    @field_validator("requested_artifact_id")
+    @classmethod
+    def normalize_requested_id(cls, value: str) -> str:
+        return _normalize_required(value, "requested_artifact_id")
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "ArtifactReadItem":
+        if self.status == ArtifactBatchItemStatus.OK:
+            if (
+                self.artifact is None
+                or self.text is None
+                or self.offset_chars is None
+                or self.length_chars is None
+                or self.total_chars is None
+                or self.eof is None
+                or self.representation is None
+            ):
+                raise ValueError("successful read item requires exact read fields")
+            if self.code is not None or self.message is not None:
+                raise ValueError("successful read item must not contain an error")
+        else:
+            if not self.code or not self.message or self.retryable is None:
+                raise ValueError("failed read item requires structured error fields")
+        return self
+
+
+class ArtifactSearchItem(_ArtifactModel):
+    request_index: int = Field(ge=0)
+    requested_artifact_id: str
+    status: ArtifactBatchItemStatus
+
+    artifact: ArtifactVersionRef | None = None
+    matches: list[ContentMatch] | None = None
+    representation: ArtifactResultRepresentation | None = None
+    exact_content_available: bool = False
+    complete: bool = False
+    needs_retrieval: bool = False
+
+    code: str | None = None
+    message: str | None = None
+    retryable: bool | None = None
+    suggested_action: str | None = None
+
+    @field_validator("requested_artifact_id")
+    @classmethod
+    def normalize_requested_id(cls, value: str) -> str:
+        return _normalize_required(value, "requested_artifact_id")
+
+    @model_validator(mode="after")
+    def validate_shape(self) -> "ArtifactSearchItem":
+        if self.status == ArtifactBatchItemStatus.OK:
+            if (
+                self.artifact is None
+                or self.matches is None
+                or self.representation is None
+            ):
+                raise ValueError(
+                    "successful search item requires exact search fields"
+                )
+            if self.code is not None or self.message is not None:
+                raise ValueError("successful search item must not contain an error")
+        else:
+            if not self.code or not self.message or self.retryable is None:
+                raise ValueError("failed search item requires structured error fields")
+        return self
+
+
+class ArtifactBatchReadResult(_ArtifactModel):
+    type: Literal["artifact_batch_read"] = "artifact_batch_read"
+    status: ArtifactBatchStatus
+    requested_count: int = Field(ge=0)
+    successful_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
+    items: list[ArtifactReadItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> "ArtifactBatchReadResult":
+        if self.requested_count != len(self.items):
+            raise ValueError("requested_count must match read items")
+        if self.successful_count + self.failed_count != self.requested_count:
+            raise ValueError("read result counts must match requested_count")
+        return self
+
+
+class ArtifactBatchSearchResult(_ArtifactModel):
+    type: Literal["artifact_batch_search"] = "artifact_batch_search"
+    status: ArtifactBatchStatus
+    requested_count: int = Field(ge=0)
+    successful_count: int = Field(ge=0)
+    failed_count: int = Field(ge=0)
+    query: str
+    items: list[ArtifactSearchItem] = Field(default_factory=list)
+
+    @field_validator("query")
+    @classmethod
+    def normalize_query(cls, value: str) -> str:
+        return _normalize_required(value, "query")
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> "ArtifactBatchSearchResult":
+        if self.requested_count != len(self.items):
+            raise ValueError("requested_count must match search items")
+        if self.successful_count + self.failed_count != self.requested_count:
+            raise ValueError("search result counts must match requested_count")
+        return self
+
+
+class ArtifactCatalogCapabilities(_ArtifactModel):
+    read_text: bool = False
+    search_text: bool = False
+    replace_text: bool = False
+    patch_text: bool = False
+    deliver: bool = False
+    bind_to_tool: bool = False
+
+
+class ArtifactCatalogItem(_ArtifactModel):
+    artifact_id: str
+    artifact_lineage_id: str
+    version: int = Field(ge=1)
+    versions_count: int = Field(ge=1)
+
+    filename: str
+    title: str | None = None
+    purpose: ArtifactPurpose
+    origin: Literal["input", "agent", "tool", "runtime"]
+    format_id: str
+    mime_type: str
+    size_bytes: int = Field(ge=0)
+    content_hash: str
+
+    is_current: bool
+    read_in_current_cycle: bool
+    created_in_current_cycle: bool
+    selected_for_delivery: bool
+    delivery_state: ArtifactDeliveryState | None = None
+    capabilities: ArtifactCatalogCapabilities
+
+    @field_validator("artifact_id")
+    @classmethod
+    def validate_artifact_id(cls, value: str) -> str:
+        if not is_artifact_id(value):
+            raise ValueError("invalid artifact_id")
+        return value
+
+    @field_validator("artifact_lineage_id")
+    @classmethod
+    def validate_lineage_id(cls, value: str) -> str:
+        if not is_artifact_lineage_id(value):
+            raise ValueError("invalid artifact_lineage_id")
+        return value
+
+    @field_validator("filename", mode="before")
+    @classmethod
+    def sanitize_filename(cls, value: str) -> str:
+        return normalize_artifact_filename(value)
+
+    @field_validator("content_hash")
+    @classmethod
+    def validate_content_hash(cls, value: str) -> str:
+        return _validate_hash(value)
+
+
+class ArtifactFilenameResolutionStatus(str, Enum):
+    OK = "ok"
+    NOT_FOUND = "not_found"
+    AMBIGUOUS = "ambiguous"
+
+
+class ArtifactFilenameResolution(_ArtifactModel):
+    filename: str
+    status: ArtifactFilenameResolutionStatus
+    candidates: list[ArtifactCatalogItem] = Field(default_factory=list)
+    suggestions: list[str] = Field(default_factory=list)
+
+    @field_validator("filename", mode="before")
+    @classmethod
+    def sanitize_filename(cls, value: str) -> str:
+        return normalize_artifact_filename(value)
+
+
+class ArtifactCatalogResult(_ArtifactModel):
+    type: Literal["artifact_catalog"] = "artifact_catalog"
+    status: ArtifactBatchStatus = ArtifactBatchStatus.OK
+    available_count: int = Field(ge=0)
+    lineage_count: int = Field(ge=0)
+    offset: int = Field(ge=0)
+    limit: int = Field(ge=1)
+    items: list[ArtifactCatalogItem] = Field(default_factory=list)
+    items_truncated: bool = False
+    filename_resolutions: list[ArtifactFilenameResolution] = Field(
+        default_factory=list
+    )
+
+
+class ArtifactDeliveryBatchItem(_ArtifactModel):
+    request_index: int = Field(ge=0)
+    requested_artifact_id: str
+    status: Literal["selected", "cancelled", "rejected"]
+    artifact_id: str | None = None
+    filename: str | None = None
+    delivery_id: str | None = None
+    state: ArtifactDeliveryState | None = None
+    code: str | None = None
+    message: str | None = None
+    retryable: bool | None = None
+    suggested_action: str | None = None
+
+    @field_validator("requested_artifact_id")
+    @classmethod
+    def normalize_requested_id(cls, value: str) -> str:
+        return _normalize_required(value, "requested_artifact_id")
+
+
+class ArtifactDeliveryBatchResult(_ArtifactModel):
+    type: Literal[
+        "artifact_delivery_batch_selected",
+        "artifact_delivery_batch_cancelled",
+        "artifact_delivery_batch_rejected",
+    ]
+    status: Literal["selected", "cancelled", "rejected"]
+    requested_count: int = Field(ge=0)
+    selected_count: int = Field(ge=0)
+    cancelled_count: int = Field(ge=0)
+    items: list[ArtifactDeliveryBatchItem] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_counts(self) -> "ArtifactDeliveryBatchResult":
+        if self.requested_count != len(self.items):
+            raise ValueError("requested_count must match delivery items")
+        return self
