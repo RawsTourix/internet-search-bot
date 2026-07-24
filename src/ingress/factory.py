@@ -5,7 +5,7 @@ from ..artifacts import ArtifactServices
 from ..storage import StorageConfigType
 from ..storage.interfaces import ContentStore
 from .config import IngressConfigType
-from .grouping import FileSystemGroupedInputBatchStore
+from .coordinated_store import FileSystemCoordinatedInputBatchStore
 from .service import ArtifactIngressService
 from .store import FileSystemIngressEventStore, FileSystemInputBatchStore
 from .unified_service import UnifiedArtifactIngressService
@@ -27,7 +27,7 @@ def create_ingress_services(
     artifact_services: ArtifactServices,
 ) -> IngressServices:
     event_store = FileSystemIngressEventStore(storage_config)
-    batch_store = FileSystemGroupedInputBatchStore(
+    batch_store = FileSystemCoordinatedInputBatchStore(
         storage_config,
         ingress_config,
     )
