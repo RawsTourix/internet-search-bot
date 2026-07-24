@@ -8,7 +8,7 @@ from .models import ClientType, MessageType, UnifiedMessage, UnifiedResponse
 from .response_metadata import agent_result_metadata
 from .session_ids import resolve_message_session_id
 from ..api.api import API
-from ..ingress import CommittedInputBatch
+from ..ingress import CommittedInputBatch, legacy_message_to_input_envelope
 
 
 log_dir = "logging"
@@ -33,7 +33,12 @@ if not logger.handlers:
 
 
 class MessageProcessor:
-    """Central processor for compatibility messages and committed batches."""
+    """Central compatibility boundary for messages and committed batches.
+
+    Legacy text messages are normalized into the same durable ingress contract
+    as files. Commands remain explicit control boundaries until the full
+    ``v0.4-input-runtime`` admission/control layer replaces this wrapper.
+    """
 
     def __init__(self):
         self.stats = {
@@ -133,15 +138,41 @@ class MessageProcessor:
         elif message.message_type == MessageType.TEXT:
             try:
                 metadata = message.metadata or {}
-                result = await API.call_agent(
-                    message.content,
-                    session_id=self._build_session_id(message),
-                    client_type=message.client_type,
-                    progress_callback=progress_callback,
-                    progress_locale=metadata.get("progress_locale", "ru"),
+                session_id = self._build_session_id(message)
+                envelope = legacy_message_to_input_envelope(message)
+                submission = await API.submit_input(
+                    envelope,
+                    session_id=session_id,
                 )
-                response_content = result.content
-                response_metadata = self._agent_result_metadata(result)
+                response_metadata = {
+                    "input_batch_id": submission.input_batch_id,
+                    "input_state": submission.state,
+                    "duplicate": submission.duplicate,
+                }
+                if submission.state == "collecting":
+                    response_content = (
+                        "Сообщение добавлено к открытому пакету. Обработка "
+                        "начнётся после завершения приёма всех его частей."
+                    )
+                elif submission.committed_batch is None:
+                    response_content = (
+                        "Сообщение принято, но входной пакет пока не готов к "
+                        "обработке."
+                    )
+                elif submission.duplicate:
+                    response_content = (
+                        "Это сообщение уже было принято ранее; повторный запуск "
+                        "агента пропущен."
+                    )
+                else:
+                    result = await API.call_agent_batch(
+                        submission.input_batch_id,
+                        session_id=session_id,
+                        progress_callback=progress_callback,
+                        progress_locale=metadata.get("progress_locale", "ru"),
+                    )
+                    response_content = result.content
+                    response_metadata.update(self._agent_result_metadata(result))
             except Exception as error:
                 response_content = f"Сообщение не обработано: {error}"
 
