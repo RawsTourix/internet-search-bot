@@ -3,7 +3,6 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from src.artifacts import ArtifactConfigType, create_artifact_services
@@ -17,6 +16,7 @@ from src.ingress import (
     ClientSenderRef,
     IngressAttachmentSlot,
     IngressConfigType,
+    IngressConflictError,
     IngressTextPart,
     InputGroupingAmbiguityError,
     InputSubmissionResult,
@@ -34,8 +34,10 @@ async def chunks(*values: bytes):
 class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temporary = tempfile.TemporaryDirectory()
-        root = Path(self.temporary.name)
-        self.storage_config = StorageConfigType(root_dir=str(root / "storage"))
+        self.root = Path(self.temporary.name)
+        self.storage_config = StorageConfigType(
+            root_dir=str(self.root / "storage")
+        )
         self.storage = create_storage_services(self.storage_config)
         self.artifacts = create_artifact_services(
             storage_config=self.storage_config,
@@ -50,7 +52,7 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
             storage_config=self.storage_config,
             ingress_config=IngressConfigType(
                 max_batch_total_bytes=2 * 1024 * 1024,
-                media_group_quiet_timeout_seconds=0.04,
+                media_group_quiet_timeout_seconds=0.12,
                 media_group_sealing_grace_seconds=0.0,
                 media_group_maximum_wait_seconds=1.0,
             ),
@@ -67,6 +69,7 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
         message_id: str,
         group_id: str,
         sender_id: str = "user-1",
+        sender_name: str | None = None,
         filename: str = "source.md",
     ) -> ClientInputEnvelope:
         slot_id = f"slot-{message_id}"
@@ -75,7 +78,10 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
             client_type=ClientType.TELEGRAM,
             client_instance_id="bot-1",
             conversation=ClientConversationRef(conversation_id="chat-1"),
-            sender=ClientSenderRef(principal_id=sender_id),
+            sender=ClientSenderRef(
+                principal_id=sender_id,
+                display_name=sender_name,
+            ),
             source_update_id=f"update-{message_id}",
             source_message_id=message_id,
             source_group_id=group_id,
@@ -104,6 +110,7 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
         *,
         message_id: str,
         sender_id: str = "user-1",
+        sender_name: str | None = None,
         text: str = "Process all files",
     ) -> ClientInputEnvelope:
         return ClientInputEnvelope(
@@ -111,7 +118,10 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
             client_type=ClientType.TELEGRAM,
             client_instance_id="bot-1",
             conversation=ClientConversationRef(conversation_id="chat-1"),
-            sender=ClientSenderRef(principal_id=sender_id),
+            sender=ClientSenderRef(
+                principal_id=sender_id,
+                display_name=sender_name,
+            ),
             source_update_id=f"update-{message_id}",
             source_message_id=message_id,
             occurred_at=datetime.now(timezone.utc),
@@ -157,8 +167,26 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertFalse(duplicate)
         self.assertEqual(len(batch.artifact_refs), 1)
-        self.assertEqual([part.text for part in batch.text_parts], ["Process all files"])
+        self.assertEqual(
+            [part.text for part in batch.text_parts],
+            ["Process all files"],
+        )
         self.assertEqual(len(batch.source_event_ids), 2)
+
+    async def test_display_name_change_does_not_change_sender_authority(self):
+        first = await self._submit_file(self._file_envelope(
+            message_id="1",
+            group_id="album-a",
+            sender_name="Old Name",
+        ))
+        text = await self.ingress.ingress_service.submit_atomic(
+            self._text_envelope(
+                message_id="2",
+                sender_name="New Name",
+            ),
+            session_id="telegram:conversation:chat-1",
+        )
+        self.assertEqual(text.input_batch_id, first.input_batch_id)
 
     async def test_different_sender_does_not_join_open_draft(self):
         first = await self._submit_file(
@@ -197,15 +225,86 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
                 reason="test_commit",
             )
         )
-        await asyncio.sleep(0.02)
+        await asyncio.sleep(0.03)
         await self.ingress.ingress_service.submit_atomic(
             self._text_envelope(message_id="2"),
             session_id="telegram:conversation:chat-1",
         )
-        await asyncio.sleep(0.025)
+        await asyncio.sleep(0.05)
         self.assertFalse(commit_task.done())
         batch, _ = await asyncio.wait_for(commit_task, timeout=1)
-        self.assertEqual([part.text for part in batch.text_parts], ["Process all files"])
+        self.assertEqual(
+            [part.text for part in batch.text_parts],
+            ["Process all files"],
+        )
+
+    async def test_open_draft_limit_conflict_is_not_bypassed_by_atomic_batch(self):
+        limited_storage_config = StorageConfigType(
+            root_dir=str(self.root / "limited-storage")
+        )
+        limited_storage = create_storage_services(limited_storage_config)
+        limited_artifacts = create_artifact_services(
+            storage_config=limited_storage_config,
+            artifact_config=ArtifactConfigType(
+                max_artifact_size_bytes=1024 * 1024,
+                max_patchable_text_bytes=1024 * 1024,
+                max_workspace_bytes=2 * 1024 * 1024,
+            ),
+            content_store=limited_storage.content_store,
+        )
+        limited = create_ingress_services(
+            storage_config=limited_storage_config,
+            ingress_config=IngressConfigType(
+                max_text_parts_per_batch=1,
+                media_group_quiet_timeout_seconds=0.2,
+                media_group_sealing_grace_seconds=0.0,
+                media_group_maximum_wait_seconds=1.0,
+            ),
+            content_store=limited_storage.content_store,
+            artifact_services=limited_artifacts,
+        )
+        file_envelope = self._file_envelope(
+            message_id="limit-1",
+            group_id="limit-album",
+        )
+        first = await limited.ingress_service.submit_atomic(
+            file_envelope,
+            session_id="telegram:conversation:chat-1",
+            upload_streams={
+                file_envelope.attachment_slots[0].slot_id: chunks(b"hello")
+            },
+        )
+        await limited.ingress_service.submit_atomic(
+            self._text_envelope(message_id="limit-2", text="First instruction"),
+            session_id="telegram:conversation:chat-1",
+        )
+        with self.assertRaises(IngressConflictError):
+            await limited.ingress_service.submit_atomic(
+                self._text_envelope(
+                    message_id="limit-3",
+                    text="Second instruction",
+                ),
+                session_id="telegram:conversation:chat-1",
+            )
+        drafts = await limited.batch_store.list_open_drafts(
+            session_id="telegram:conversation:chat-1"
+        )
+        self.assertEqual(len(drafts), 1)
+        self.assertEqual(drafts[0].input_batch_id, first.input_batch_id)
+        self.assertEqual(
+            [part.text for part in drafts[0].text_parts],
+            ["First instruction"],
+        )
+
+    def test_ingress_default_lifetime_covers_long_media_groups(self):
+        config = IngressConfigType()
+        self.assertEqual(config.media_group_maximum_wait_seconds, 300.0)
+        with self.assertRaises(ValueError):
+            IngressConfigType(
+                media_group_quiet_timeout_seconds=2.0,
+                media_group_sealing_grace_seconds=1.0,
+                media_group_maximum_wait_seconds=2.5,
+            )
 
     def test_legacy_message_normalizes_to_semantic_envelope(self):
         message = UnifiedMessage(
