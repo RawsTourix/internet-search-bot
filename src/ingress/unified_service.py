@@ -8,6 +8,7 @@ from collections.abc import AsyncIterator, Mapping
 from .models import ClientInputEnvelope, InputGroupingMode, InputSubmissionResult
 from .routing import resolve_input_grouping
 from .service import ArtifactIngressService
+from .store import IngressConflictError
 
 
 logger = logging.getLogger("API.Ingress.Grouping")
@@ -64,6 +65,73 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
                 decision.mode.value,
                 decision.joined_input_batch_id,
             )
+
+        if decision.joined_input_batch_id is not None:
+            self._validate_envelope_limits(envelope)
+            event, duplicate_event = await self.event_store.save_if_absent(envelope)
+            existing_draft, existing_committed = await self.batch_store.find_by_event(
+                event.event_id
+            )
+            if existing_committed is not None:
+                return InputSubmissionResult(
+                    event_id=event.event_id,
+                    input_batch_id=existing_committed.input_batch_id,
+                    state="committed",
+                    duplicate=True,
+                    committed_batch=existing_committed,
+                )
+            if existing_draft is not None:
+                return InputSubmissionResult(
+                    event_id=event.event_id,
+                    input_batch_id=existing_draft.input_batch_id,
+                    state="collecting",
+                    duplicate=True,
+                )
+
+            append_exact = getattr(self.batch_store, "append_event_to_batch", None)
+            if append_exact is None:
+                raise IngressConflictError(
+                    "Exact input draft joins are not supported by the batch store"
+                )
+            try:
+                draft = await append_exact(
+                    decision.joined_input_batch_id,
+                    event,
+                )
+            except IngressConflictError:
+                # The selected draft may have committed between policy resolution
+                # and the locked append. A late text fragment becomes a new atomic
+                # batch; an immutable committed batch is never reopened.
+                logger.info(
+                    "ingress_exact_join_raced_with_commit session_id=%s "
+                    "source_message_id=%s target_input_batch_id=%s",
+                    session_id,
+                    envelope.source_message_id,
+                    decision.joined_input_batch_id,
+                )
+                return await super().submit_atomic(
+                    envelope,
+                    session_id=session_id,
+                    upload_streams=upload_streams,
+                    grouping_mode=InputGroupingMode.ATOMIC,
+                    grouping_key=None,
+                )
+
+            logger.info(
+                "ingress_event_joined_exact_draft input_batch_id=%s event_id=%s "
+                "text_part_count=%s attachment_count=%s",
+                draft.input_batch_id,
+                event.event_id,
+                len(event.text_parts),
+                len(event.attachment_slots),
+            )
+            return InputSubmissionResult(
+                event_id=event.event_id,
+                input_batch_id=draft.input_batch_id,
+                state="collecting",
+                duplicate=duplicate_event,
+            )
+
         return await super().submit_atomic(
             envelope,
             session_id=session_id,
