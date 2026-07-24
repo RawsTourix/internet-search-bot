@@ -1,7 +1,6 @@
 """Composition root for the filesystem ingress foundation."""
 
 from dataclasses import dataclass
-
 from ..artifacts import ArtifactServices
 from ..storage import StorageConfigType
 from ..storage.interfaces import ContentStore
@@ -9,6 +8,7 @@ from .config import IngressConfigType
 from .grouping import FileSystemGroupedInputBatchStore
 from .service import ArtifactIngressService
 from .store import FileSystemIngressEventStore, FileSystemInputBatchStore
+from .unified_service import UnifiedArtifactIngressService
 
 
 @dataclass(slots=True)
@@ -31,7 +31,7 @@ def create_ingress_services(
         storage_config,
         ingress_config,
     )
-    ingress_service = ArtifactIngressService(
+    ingress_service = UnifiedArtifactIngressService(
         config=ingress_config,
         artifact_config=artifact_services.config,
         content_store=content_store,
