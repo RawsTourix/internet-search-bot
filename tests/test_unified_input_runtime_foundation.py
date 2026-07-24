@@ -1,0 +1,265 @@
+import asyncio
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, patch
+
+from src.artifacts import ArtifactConfigType, create_artifact_services
+from src.core.message_processor import MessageProcessor
+from src.core.models import ClientType, MessageType, UnifiedMessage
+from src.ingress import (
+    ClientAttachmentLocator,
+    ClientConversationRef,
+    ClientInputEnvelope,
+    ClientResponseRoute,
+    ClientSenderRef,
+    IngressAttachmentSlot,
+    IngressConfigType,
+    IngressTextPart,
+    InputGroupingAmbiguityError,
+    InputSubmissionResult,
+    create_ingress_services,
+    legacy_message_to_input_envelope,
+)
+from src.storage import StorageConfigType, create_storage_services
+
+
+async def chunks(*values: bytes):
+    for value in values:
+        yield value
+
+
+class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        root = Path(self.temporary.name)
+        self.storage_config = StorageConfigType(root_dir=str(root / "storage"))
+        self.storage = create_storage_services(self.storage_config)
+        self.artifacts = create_artifact_services(
+            storage_config=self.storage_config,
+            artifact_config=ArtifactConfigType(
+                max_artifact_size_bytes=1024 * 1024,
+                max_patchable_text_bytes=1024 * 1024,
+                max_workspace_bytes=2 * 1024 * 1024,
+            ),
+            content_store=self.storage.content_store,
+        )
+        self.ingress = create_ingress_services(
+            storage_config=self.storage_config,
+            ingress_config=IngressConfigType(
+                max_batch_total_bytes=2 * 1024 * 1024,
+                media_group_quiet_timeout_seconds=0.04,
+                media_group_sealing_grace_seconds=0.0,
+                media_group_maximum_wait_seconds=1.0,
+            ),
+            content_store=self.storage.content_store,
+            artifact_services=self.artifacts,
+        )
+
+    async def asyncTearDown(self):
+        self.temporary.cleanup()
+
+    def _file_envelope(
+        self,
+        *,
+        message_id: str,
+        group_id: str,
+        sender_id: str = "user-1",
+        filename: str = "source.md",
+    ) -> ClientInputEnvelope:
+        slot_id = f"slot-{message_id}"
+        return ClientInputEnvelope(
+            idempotency_key=f"telegram:bot:update:{message_id}",
+            client_type=ClientType.TELEGRAM,
+            client_instance_id="bot-1",
+            conversation=ClientConversationRef(conversation_id="chat-1"),
+            sender=ClientSenderRef(principal_id=sender_id),
+            source_update_id=f"update-{message_id}",
+            source_message_id=message_id,
+            source_group_id=group_id,
+            occurred_at=datetime.now(timezone.utc),
+            text_parts=[],
+            attachment_slots=[IngressAttachmentSlot(
+                slot_id=slot_id,
+                media_kind="document",
+                original_filename=filename,
+                declared_mime_type="text/markdown",
+                declared_size_bytes=5,
+                transport_locator=ClientAttachmentLocator(
+                    provider="telegram",
+                    locator=f"file-{message_id}",
+                ),
+            )],
+            response_route=ClientResponseRoute(
+                route_type="telegram",
+                conversation_id="chat-1",
+                reply_to_message_id=message_id,
+            ),
+        )
+
+    def _text_envelope(
+        self,
+        *,
+        message_id: str,
+        sender_id: str = "user-1",
+        text: str = "Process all files",
+    ) -> ClientInputEnvelope:
+        return ClientInputEnvelope(
+            idempotency_key=f"telegram:bot:update:{message_id}",
+            client_type=ClientType.TELEGRAM,
+            client_instance_id="bot-1",
+            conversation=ClientConversationRef(conversation_id="chat-1"),
+            sender=ClientSenderRef(principal_id=sender_id),
+            source_update_id=f"update-{message_id}",
+            source_message_id=message_id,
+            occurred_at=datetime.now(timezone.utc),
+            text_parts=[IngressTextPart(
+                part_id=f"text-{message_id}",
+                kind="message_text",
+                text=text,
+                attachment_slot_ids=[],
+            )],
+            attachment_slots=[],
+            response_route=ClientResponseRoute(
+                route_type="telegram",
+                conversation_id="chat-1",
+                reply_to_message_id=message_id,
+            ),
+        )
+
+    async def _submit_file(self, envelope: ClientInputEnvelope):
+        slot_id = envelope.attachment_slots[0].slot_id
+        return await self.ingress.ingress_service.submit_atomic(
+            envelope,
+            session_id="telegram:conversation:chat-1",
+            upload_streams={slot_id: chunks(b"hello")},
+        )
+
+    async def test_text_joins_the_only_open_media_group_draft(self):
+        first = await self._submit_file(
+            self._file_envelope(message_id="1", group_id="album-a")
+        )
+        self.assertEqual(first.state, "collecting")
+
+        text = await self.ingress.ingress_service.submit_atomic(
+            self._text_envelope(message_id="2"),
+            session_id="telegram:conversation:chat-1",
+        )
+        self.assertEqual(text.state, "collecting")
+        self.assertEqual(text.input_batch_id, first.input_batch_id)
+
+        batch, duplicate = await self.ingress.batch_store.commit_batch(
+            first.input_batch_id,
+            session_id="telegram:conversation:chat-1",
+            reason="test_commit",
+        )
+        self.assertFalse(duplicate)
+        self.assertEqual(len(batch.artifact_refs), 1)
+        self.assertEqual([part.text for part in batch.text_parts], ["Process all files"])
+        self.assertEqual(len(batch.source_event_ids), 2)
+
+    async def test_different_sender_does_not_join_open_draft(self):
+        first = await self._submit_file(
+            self._file_envelope(message_id="1", group_id="album-a")
+        )
+        other = await self.ingress.ingress_service.submit_atomic(
+            self._text_envelope(message_id="2", sender_id="user-2"),
+            session_id="telegram:conversation:chat-1",
+        )
+        self.assertEqual(other.state, "committed")
+        self.assertNotEqual(other.input_batch_id, first.input_batch_id)
+        draft = await self.ingress.batch_store.get_draft(first.input_batch_id)
+        self.assertEqual(draft.text_parts, [])
+
+    async def test_ambiguous_open_drafts_are_not_guessed(self):
+        await self._submit_file(
+            self._file_envelope(message_id="1", group_id="album-a")
+        )
+        await self._submit_file(
+            self._file_envelope(message_id="2", group_id="album-b")
+        )
+        with self.assertRaises(InputGroupingAmbiguityError):
+            await self.ingress.ingress_service.submit_atomic(
+                self._text_envelope(message_id="3"),
+                session_id="telegram:conversation:chat-1",
+            )
+
+    async def test_text_resets_durable_quiet_deadline_before_commit(self):
+        first = await self._submit_file(
+            self._file_envelope(message_id="1", group_id="album-a")
+        )
+        commit_task = asyncio.create_task(
+            self.ingress.batch_store.commit_batch(
+                first.input_batch_id,
+                session_id="telegram:conversation:chat-1",
+                reason="test_commit",
+            )
+        )
+        await asyncio.sleep(0.02)
+        await self.ingress.ingress_service.submit_atomic(
+            self._text_envelope(message_id="2"),
+            session_id="telegram:conversation:chat-1",
+        )
+        await asyncio.sleep(0.025)
+        self.assertFalse(commit_task.done())
+        batch, _ = await asyncio.wait_for(commit_task, timeout=1)
+        self.assertEqual([part.text for part in batch.text_parts], ["Process all files"])
+
+    def test_legacy_message_normalizes_to_semantic_envelope(self):
+        message = UnifiedMessage(
+            id="legacy-1",
+            client_type=ClientType.TELEGRAM,
+            message_type=MessageType.TEXT,
+            content="Process the album",
+            user_id="user-1",
+            user_name="User",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "chat_id": "chat-1",
+                "message_id": "42",
+                "session_id": "telegram:conversation:chat-1",
+            },
+        )
+        envelope = legacy_message_to_input_envelope(message)
+        self.assertEqual(envelope.conversation.conversation_id, "chat-1")
+        self.assertEqual(envelope.sender.principal_id, "user-1")
+        self.assertEqual(envelope.text_parts[0].kind, "message_text")
+        self.assertEqual(envelope.text_parts[0].text, "Process the album")
+        self.assertTrue(envelope.metadata["legacy_compatibility_wrapper"])
+
+    async def test_message_processor_does_not_run_agent_for_collecting_batch(self):
+        processor = MessageProcessor()
+        message = UnifiedMessage(
+            id="legacy-1",
+            client_type=ClientType.TELEGRAM,
+            message_type=MessageType.TEXT,
+            content="Process the album",
+            user_id="user-1",
+            timestamp=datetime.now(timezone.utc),
+            metadata={
+                "chat_id": "chat-1",
+                "message_id": "42",
+                "session_id": "telegram:conversation:chat-1",
+            },
+        )
+        submission = InputSubmissionResult(
+            event_id="evt_" + "0" * 32,
+            input_batch_id="ibat_" + "0" * 32,
+            state="collecting",
+        )
+        with patch(
+            "src.core.message_processor.API.submit_input",
+            new=AsyncMock(return_value=submission),
+        ), patch(
+            "src.core.message_processor.API.call_agent_batch",
+            new=AsyncMock(),
+        ) as call_agent:
+            response = await processor.process_message(message)
+        self.assertIn("добавлено к открытому пакету", response.content)
+        call_agent.assert_not_awaited()
+
+
+if __name__ == "__main__":
+    unittest.main()
