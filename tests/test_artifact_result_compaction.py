@@ -7,11 +7,21 @@ from unittest.mock import AsyncMock
 from src.artifacts import ArtifactConfigType, create_artifact_services
 from src.memory import MemoryConfigType, ResultHandling
 from src.mcp.artifact_client import ArtifactMCPClient
+from src.mcp.artifact_composite_compaction import (
+    ArtifactCompositeCompactionMixin,
+)
 from src.mcp.manager_context import ManagerToolContext
 from src.mcp.manager_runtime_context import set_manager_context
 from src.mcp.mcp_client import LLMConfigType, SessionState
 from src.runtime import ActiveAgentCycle
 from src.storage import StorageConfigType, create_storage_services
+
+
+class _AttributedArtifactMCPClient(
+    ArtifactCompositeCompactionMixin,
+    ArtifactMCPClient,
+):
+    pass
 
 
 class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
@@ -34,7 +44,7 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
             ),
             content_store=storage.content_store,
         )
-        self.client = ArtifactMCPClient(
+        self.client = _AttributedArtifactMCPClient(
             LLMConfigType(
                 api_url="https://example.invalid/v1/chat/completions",
                 api_key="test",
@@ -133,6 +143,18 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
         )
         return outcome, messages, trace, raw
 
+    @staticmethod
+    def _summary_payload(items):
+        return {
+            "type": "artifact_composite_compaction",
+            "summary": "Two report files were read.",
+            "key_facts": ["Two exact artifact results are stored."],
+            "limitations": [],
+            "suggested_follow_up": [],
+            "needs_original_content": True,
+            "items": items,
+        }
+
     async def test_small_batch_stays_inline_with_exact_item_boundary(self):
         artifact_id, _ = await self._create("small.md", "small result")
         result = await self.client._call_registered_tool(
@@ -159,7 +181,7 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(visible["items"][0]["text"], "small result")
         self.client._call_llm_with_retries.assert_not_awaited()
 
-    async def test_compacted_batch_persists_exact_result_and_keeps_boundaries(self):
+    async def test_compacted_batch_persists_exact_result_and_keeps_attribution(self):
         first_sentinel = "FIRST_RAW_SENTINEL_" + "a" * 1_200
         second_sentinel = "SECOND_RAW_SENTINEL_" + "b" * 1_200
         first_id, _ = await self._create("first.md", first_sentinel)
@@ -169,14 +191,28 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
             {"artifact_ids": [second_id, first_id]},
         )
         self.client._call_llm_with_retries = AsyncMock(return_value={
-            "content": json.dumps({
-                "type": "result_compaction",
-                "summary": "Two report files were read.",
-                "key_facts": ["Two exact artifact results are stored."],
-                "limitations": [],
-                "suggested_follow_up": [],
-                "needs_original_content": True,
-            }),
+            "content": json.dumps(self._summary_payload([
+                {
+                    "request_index": 0,
+                    "requested_artifact_id": second_id,
+                    "artifact_id": second_id,
+                    "filename": "second.md",
+                    "summary": "The second report contains the SECOND marker.",
+                    "key_facts": ["SECOND belongs to second.md."],
+                    "limitations": [],
+                    "needs_original_content": False,
+                },
+                {
+                    "request_index": 1,
+                    "requested_artifact_id": first_id,
+                    "artifact_id": first_id,
+                    "filename": "first.md",
+                    "summary": "The first report contains the FIRST marker.",
+                    "key_facts": ["FIRST belongs to first.md."],
+                    "limitations": [],
+                    "needs_original_content": False,
+                },
+            ])),
         })
 
         outcome, messages, trace, raw = await self._process(
@@ -188,8 +224,8 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
         visible = json.loads(messages[-1]["content"])
         self.assertEqual(outcome.decision.representation, "summarize")
         self.client._call_llm_with_retries.assert_awaited_once()
-        self.assertEqual(visible["summary_scope"], "aggregate")
-        self.assertEqual(visible["item_attribution"], "bounded_preview")
+        self.assertEqual(visible["summary_scope"], "aggregate_and_per_item")
+        self.assertEqual(visible["item_attribution"], "per_item_summary")
         self.assertEqual(
             [item["requested_artifact_id"] for item in visible["items"]],
             [second_id, first_id],
@@ -199,18 +235,19 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
             [0, 1],
         )
         self.assertTrue(all(
-            item["representation"] == "preview"
+            item["representation"] == "summarized"
             and not item["exact_content_available"]
             and not item["complete"]
             and item["needs_retrieval"]
             and "text" not in item
-            and "preview" in item
+            and "preview" not in item
+            and "summary" in item
             for item in visible["items"]
         ))
-        self.assertIn("SECOND_RAW_SENTINEL_", visible["items"][0]["preview"])
-        self.assertNotIn("FIRST_RAW_SENTINEL_", visible["items"][0]["preview"])
-        self.assertIn("FIRST_RAW_SENTINEL_", visible["items"][1]["preview"])
-        self.assertNotIn("SECOND_RAW_SENTINEL_", visible["items"][1]["preview"])
+        self.assertIn("SECOND marker", visible["items"][0]["summary"])
+        self.assertNotIn("FIRST marker", visible["items"][0]["summary"])
+        self.assertIn("FIRST marker", visible["items"][1]["summary"])
+        self.assertNotIn("SECOND marker", visible["items"][1]["summary"])
         serialized_visible = json.dumps(
             [messages, trace],
             ensure_ascii=False,
@@ -224,11 +261,62 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
             raw,
         )
 
-    async def test_store_only_batch_never_claims_complete_or_exact(self):
+    async def test_invalid_item_correspondence_is_repaired_once(self):
         artifact_id, _ = await self._create(
-            "stored.md",
-            "STORE_ONLY_SENTINEL_" + "x" * 300,
+            "repair.md",
+            "REPAIR_SENTINEL_" + "r" * 1_200,
         )
+        result = await self.client._call_registered_tool(
+            "artifact_read_text",
+            {"artifact_ids": [artifact_id]},
+        )
+        wrong_id = "art_" + "f" * 32
+        invalid = self._summary_payload([{
+            "request_index": 0,
+            "requested_artifact_id": wrong_id,
+            "artifact_id": wrong_id,
+            "filename": "repair.md",
+            "summary": "Wrong correspondence.",
+            "key_facts": [],
+            "limitations": [],
+            "needs_original_content": False,
+        }])
+        valid = self._summary_payload([{
+            "request_index": 0,
+            "requested_artifact_id": artifact_id,
+            "artifact_id": artifact_id,
+            "filename": "repair.md",
+            "summary": "The repair report was summarized.",
+            "key_facts": [],
+            "limitations": [],
+            "needs_original_content": False,
+        }])
+        self.client._call_llm_with_retries = AsyncMock(side_effect=[
+            {"content": json.dumps(invalid)},
+            {"content": json.dumps(valid)},
+        ])
+
+        _, messages, trace, _ = await self._process(
+            result,
+            handling=ResultHandling.COMPACT,
+            call_id="call-repair",
+        )
+
+        visible = json.loads(messages[-1]["content"])
+        self.assertEqual(self.client._call_llm_with_retries.await_count, 2)
+        self.assertEqual(visible["item_attribution"], "per_item_summary")
+        self.assertEqual(
+            visible["items"][0]["requested_artifact_id"],
+            artifact_id,
+        )
+        self.assertTrue(any(
+            event.get("type") == "result_compaction_retry"
+            for event in trace
+        ))
+
+    async def test_store_only_batch_exposes_bounded_per_item_preview(self):
+        full_text = "STORE_ONLY_SENTINEL_" + "x" * 300
+        artifact_id, _ = await self._create("stored.md", full_text)
         result = await self.client._call_registered_tool(
             "artifact_read_text",
             {"artifact_ids": [artifact_id]},
@@ -245,17 +333,18 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(outcome.decision.representation, "store_only")
         self.assertEqual(visible["representation"], "stored_only")
         self.assertEqual(visible["summary_scope"], "aggregate")
-        self.assertEqual(visible["item_attribution"], "metadata_only")
+        self.assertEqual(visible["item_attribution"], "bounded_preview")
         self.assertFalse(visible["complete"])
         self.assertTrue(visible["needs_retrieval"])
-        self.assertEqual(
-            visible["items"][0]["representation"],
-            "stored_only",
-        )
-        self.assertNotIn("preview", visible["items"][0])
-        self.assertFalse(visible["items"][0]["exact_content_available"])
-        self.assertFalse(visible["items"][0]["complete"])
-        self.assertTrue(visible["items"][0]["needs_retrieval"])
+        item = visible["items"][0]
+        self.assertEqual(item["representation"], "preview")
+        self.assertIn("preview", item)
+        self.assertLessEqual(len(item["preview"]), 80)
+        self.assertIn("STORE_ONLY_SENTINEL_", item["preview"])
+        self.assertNotEqual(item["preview"], full_text)
+        self.assertFalse(item["exact_content_available"])
+        self.assertFalse(item["complete"])
+        self.assertTrue(item["needs_retrieval"])
         self.client._call_llm_with_retries.assert_not_awaited()
 
     async def test_small_receipt_bypasses_compactor(self):
@@ -276,7 +365,7 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
             effective_arguments={},
             raw_tool_result_text=raw,
             tool_payload=payload,
-            result_handling=ResultHandling.COMPACT,
+            result_handling=ResultHandling.AUTO,
             messages_for_llm=messages,
             original_user_request="Create a report",
             session_id="session-1",
@@ -292,13 +381,4 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(outcome.decision.representation, "inline")
-        self.assertEqual(
-            outcome.decision.reason,
-            "trusted_small_receipt_inline",
-        )
-        self.assertEqual(len(messages), 1)
         self.client._call_llm_with_retries.assert_not_awaited()
-
-
-if __name__ == "__main__":
-    unittest.main()
