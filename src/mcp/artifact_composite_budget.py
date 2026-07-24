@@ -25,7 +25,10 @@ class ArtifactCompositeBudgetMixin:
         size_chars: int,
         size_tokens_estimate: int,
     ) -> int:
-        if effective_tool_name not in ArtifactCompositeCompactionMixin._ARTIFACT_COMPOSITE_TYPES:
+        if (
+            effective_tool_name
+            not in ArtifactCompositeCompactionMixin._ARTIFACT_COMPOSITE_TYPES
+        ):
             return super()._result_summary_request_overhead_tokens(
                 original_user_request=original_user_request,
                 current_goal=current_goal,
@@ -49,10 +52,22 @@ class ArtifactCompositeBudgetMixin:
                 self.result_budget_policy.summary_target_tokens
             ),
         )
+        artifact_ids = effective_arguments.get("artifact_ids") or []
+        if not isinstance(artifact_ids, list):
+            artifact_ids = []
+        expected_items = [
+            {
+                "request_index": index,
+                "requested_artifact_id": str(artifact_id),
+                "artifact_id": str(artifact_id),
+                "filename": "artifact",
+            }
+            for index, artifact_id in enumerate(artifact_ids)
+        ]
         request_payload = {
             "type": "artifact_composite_compaction_request",
             "request": request.model_dump(mode="json"),
-            "expected_items": [],
+            "expected_items": expected_items,
         }
         messages_without_raw = [
             {
