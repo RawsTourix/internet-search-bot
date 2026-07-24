@@ -5,13 +5,28 @@ from __future__ import annotations
 import logging
 from collections.abc import AsyncIterator, Mapping
 
-from .models import ClientInputEnvelope, InputGroupingMode, InputSubmissionResult
+from .models import (
+    ClientInputEnvelope,
+    InputBatchDraftState,
+    InputGroupingMode,
+    InputSubmissionResult,
+)
 from .routing import resolve_input_grouping
 from .service import ArtifactIngressService
-from .store import IngressConflictError
+from .store import (
+    IngressConflictError,
+    IngressNotFoundError,
+)
 
 
 logger = logging.getLogger("API.Ingress.Grouping")
+
+_OPEN_DRAFT_STATES = {
+    InputBatchDraftState.COLLECTING,
+    InputBatchDraftState.SEALING,
+    InputBatchDraftState.INGESTING,
+    InputBatchDraftState.READY_TO_COMMIT,
+}
 
 
 class UnifiedArtifactIngressService(ArtifactIngressService):
@@ -107,10 +122,19 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
                     decision.joined_input_batch_id,
                     event,
                 )
-            except IngressConflictError:
-                # The selected draft may have committed between policy resolution
-                # and the locked append. A late text fragment becomes a new atomic
-                # batch; an immutable committed batch is never reopened.
+            except IngressConflictError as error:
+                # Only a true close/commit race may become a new atomic batch.
+                # Validation, authority and per-batch limit conflicts on an open
+                # draft must remain visible instead of being silently bypassed.
+                try:
+                    latest = await self.batch_store.get_draft(
+                        decision.joined_input_batch_id
+                    )
+                except IngressNotFoundError:
+                    latest = None
+                if latest is not None and latest.state in _OPEN_DRAFT_STATES:
+                    raise error
+
                 logger.info(
                     "ingress_exact_join_raced_with_commit session_id=%s "
                     "source_message_id=%s target_input_batch_id=%s",
