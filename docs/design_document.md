@@ -5212,11 +5212,47 @@ capabilities.
 
 ## 98. Artifact manager functions и runtime state
 
-Command-oriented tools:
+### 98.1. Разделение manager-команд и базовых операций
+
+Artifact manager tools являются LLM-facing командами верхнего уровня. Их контракт
+оптимизируется под работу агента и не обязан повторять сигнатуры внутренних
+одиночных операций `ArtifactService`.
+
+```text
+LLM-facing manager command
+→ разрешение и проверка exact artifact refs
+→ одна или несколько базовых операций
+→ composite tool result
+→ общий result representation / compaction pipeline
+```
+
+Внутренние базовые операции остаются атомарными и работают с одной точной
+`ArtifactVersion`:
+
+```text
+list metadata
+get exact version
+read one exact text artifact
+search one exact text artifact
+create one artifact
+replace one current version
+patch one current version
+select one exact version for delivery
+```
+
+Manager-команда может делегировать несколько независимых операций этим базовым
+функциям. Для immutable read/search допустимо bounded parallel execution.
+Мутации одной lineage выполняются последовательно и сохраняют optimistic
+concurrency по `current_artifact_id`.
+
+Artifact storage, manager-команды и result compaction не объединяются в один
+класс. Базовое чтение возвращает точный результат, а решение `inline`,
+`persist`, `summarize` или `needs_retrieval` принимает общий runtime layer.
+
+### 98.2. Набор LLM-facing manager tools
 
 ```text
 artifact_list
-artifact_get
 artifact_read_text
 artifact_search_text
 artifact_create_text
@@ -5227,43 +5263,458 @@ artifact_create_version_from_content
 artifact_set_delivery
 ```
 
-Правила:
+Отдельные инструменты `artifact_read_many_text`,
+`artifact_search_many_text`, `artifact_set_delivery_many` и
+`artifact_resolve` не вводятся.
 
-- tools не принимают session/cycle/client type/local path;
-- runtime проверяет current-cycle access set;
-- read/search bounded и возвращают offsets/excerpts;
-- exact patch использует `old_text`, `new_text`, `expected_occurrences`;
-- fuzzy/line-number patch отсутствует;
-- mutation создаёт новую immutable version;
-- unknown refs и stale head отклоняются;
-- `purpose=deliverable` может автоматически выбрать current version для delivery;
-- обновление deliverable переносит selection на новый committed head.
+`artifact_read_text`, `artifact_search_text` и `artifact_set_delivery`
+изначально являются пакетными manager-командами. Один artifact передаётся как
+список из одного exact ID.
 
-`runtime_iteration_state` получает bounded `artifact_state`:
+`artifact_get` не является обязательной отдельной командой, если расширенный
+`artifact_list` способен вернуть authoritative metadata точной версии,
+lineage head и version history по явному запросу.
+
+Manager tools не принимают `session_id`, `cycle_id`, `client_type` или local
+path. Runtime выводит authority и current access set из доверенного
+`ManagerToolContext`, а не из LLM arguments.
+
+### 98.3. Canonical identity и workflow выбора файла
+
+```text
+artifact_id
+→ exact immutable artifact version
+
+artifact_lineage_id
+→ logical history с current head
+
+filename
+→ пользовательская метка и discovery attribute,
+   но не уникальный authoritative identifier
+```
+
+Операции чтения, поиска, изменения и доставки используют exact
+`artifact_id`. Агент не должен выдумывать ID, строить его из filename или
+неявно считать найденную lineage current.
+
+Нормальный workflow:
+
+```text
+artifact_state / artifact_list
+→ выбрать exact artifact_id
+→ выполнить read/search/mutation/delivery
+```
+
+Filename используется через `artifact_list` для discovery. Автоматический
+fuzzy resolve внутри каждой manager-команды запрещён: одинаковые имена могут
+принадлежать разным lineage, а одна lineage может иметь несколько версий с
+одним filename.
+
+`artifact_list` может принимать exact-фильтры:
 
 ```json
 {
-  "available_count": 3,
+  "artifact_ids": ["art_..."],
+  "artifact_lineage_ids": ["aln_..."],
+  "filenames": ["report.md"],
+  "current_only": true,
+  "include_versions": false
+}
+```
+
+Если filename однозначно соответствует одной доступной current lineage,
+`artifact_list` возвращает её exact current `artifact_id`.
+
+Если имя неоднозначно, возвращаются все кандидаты без автоматического выбора:
+
+```json
+{
+  "status": "ambiguous",
+  "filename": "report.md",
+  "candidates": [
+    {
+      "artifact_id": "art_...",
+      "artifact_lineage_id": "aln_...",
+      "version": 1,
+      "is_current": true,
+      "origin": "input"
+    },
+    {
+      "artifact_id": "art_...",
+      "artifact_lineage_id": "aln_...",
+      "version": 2,
+      "is_current": true,
+      "origin": "agent"
+    }
+  ]
+}
+```
+
+Если exact filename не найден, команда может вернуть безопасные suggestions,
+но не должна выполнять предложенный вариант автоматически.
+
+### 98.4. Расширенный `artifact_list`
+
+`artifact_list` является основным catalog/discovery tool агента и возвращает
+bounded authoritative projection рабочего пространства:
+
+```json
+{
+  "available_count": 13,
+  "lineage_count": 12,
   "items": [
     {
       "artifact_id": "art_...",
       "artifact_lineage_id": "aln_...",
       "version": 2,
+      "versions_count": 2,
       "filename": "report.md",
+      "title": "Project report",
       "purpose": "deliverable",
+      "origin": "agent",
       "format_id": "markdown",
       "size_bytes": 12400,
       "is_current": true,
-      "selected_for_delivery": true
+      "read_in_current_cycle": true,
+      "created_in_current_cycle": true,
+      "selected_for_delivery": true,
+      "delivery_state": "selected",
+      "capabilities": {
+        "read_text": true,
+        "search_text": true,
+        "replace_text": true,
+        "patch_text": true,
+        "deliver": true,
+        "bind_to_tool": true
+      }
     }
   ],
   "items_truncated": false
 }
 ```
 
-Content, full provenance и version history автоматически в LLM context не
-попадают. Compactor сохраняет только runtime-owned artifact refs; authoritative
-state восстанавливается из store после resume/compaction.
+Поля `read_in_current_cycle`, `created_in_current_cycle` и delivery projection
+являются runtime projections, а не mutable свойствами immutable
+`ArtifactVersion`.
+
+После cycle compaction authoritative `artifact_state` заново строится из
+store и runtime trace. LLM-summary не является источником истины для списка
+файлов, lineage head, version или delivery selection.
+
+### 98.5. Пакетное чтение и поиск
+
+`artifact_read_text` принимает список exact IDs:
+
+```json
+{
+  "artifact_ids": [
+    "art_...",
+    "art_...",
+    "art_..."
+  ]
+}
+```
+
+`artifact_search_text` аналогично принимает список exact IDs и один
+детерминированный search request.
+
+Manager:
+
+```text
+1. проверяет размер списка;
+2. проверяет current-cycle authority для каждого exact ID;
+3. проверяет format capabilities;
+4. удаляет повторяющиеся exact IDs с сохранением correspondence;
+5. выполняет независимые immutable reads/searches с bounded concurrency;
+6. сохраняет порядок исходного запроса;
+7. возвращает composite per-item result.
+```
+
+Read/search допускают partial success:
+
+```json
+{
+  "status": "partial",
+  "requested_count": 3,
+  "successful_count": 2,
+  "items": [
+    {
+      "request_index": 0,
+      "status": "ok",
+      "artifact_id": "art_...",
+      "filename": "brief.md",
+      "representation": "inline",
+      "text": "..."
+    },
+    {
+      "request_index": 1,
+      "status": "invalid_artifact_id",
+      "requested_artifact_id": "art_invalid",
+      "suggested_action": "Call artifact_list and retry with an exact artifact_id."
+    },
+    {
+      "request_index": 2,
+      "status": "ok",
+      "artifact_id": "art_...",
+      "filename": "budget.json",
+      "representation": "inline",
+      "text": "..."
+    }
+  ]
+}
+```
+
+Ошибка одного элемента не уничтожает уже полученные read-only результаты
+остальных элементов.
+
+LLM-facing schema не содержит `limit_chars_per_artifact` или
+`max_total_chars`. Абсолютные лимиты чтения, batch size, concurrency и
+памяти являются внутренней технической защитой runtime.
+
+В `v0.4` direct native-text read остаётся bounded. Если точный результат не
+может безопасно попасть в основной контекст, canonical content сначала
+сохраняется, после чего общий result representation layer применяет текущую
+result-compaction policy.
+
+### 98.6. Composite result representation и compaction
+
+Пакетный manager result сохраняет границы отдельных artifacts:
+
+```text
+CompositeArtifactToolResult
+├─ ArtifactReadItem 1
+├─ ArtifactReadItem 2
+└─ ArtifactReadItem N
+```
+
+Result representation layer рассматривает каждый item отдельно, но учитывает
+общий context budget:
+
+```text
+small item
+→ inline exact content
+
+large item, помещающийся в отдельный compaction request
+→ canonical original persisted
+→ explicit summary representation
+
+oversized item
+→ canonical original persisted
+→ preview + needs_retrieval=true
+→ нельзя выдавать summary как полное прочтение
+```
+
+Ответ явно сообщает:
+
+```text
+representation: inline | summarized | preview | stored_only
+exact_content_available: true | false
+complete: true | false
+needs_retrieval: true | false
+content_id / result_id при наличии
+```
+
+Базовая artifact-функция не вызывает LLM-компактор самостоятельно. Это
+исключает сценарий, при котором пакет из десяти файлов безусловно создаёт
+десять независимых compactor-вызовов.
+
+Небольшие детерминированные mutation/delivery receipts не требуют
+LLM-summary. Runtime может нормализовать их в короткое inline-представление:
+
+```json
+{
+  "status": "created",
+  "artifact_id": "art_...",
+  "artifact_lineage_id": "aln_...",
+  "version": 1,
+  "filename": "result.md",
+  "size_bytes": 1234
+}
+```
+
+### 98.7. Пакетный выбор delivery
+
+`artifact_set_delivery` принимает список exact IDs:
+
+```json
+{
+  "artifact_ids": [
+    "art_...",
+    "art_...",
+    "art_..."
+  ],
+  "selected": true
+}
+```
+
+Delivery selection является атомарной manager-командой:
+
+```text
+resolve and validate all exact versions
+→ если любой элемент недоступен/невалиден:
+     не изменять selection ни для одного элемента
+→ иначе:
+     применить весь набор идемпотентно
+```
+
+Причина атомарности: агент не должен считать, что выбрал четыре файла, если
+фактически выбран только частичный набор.
+
+Повторный `selected=true` для уже выбранной exact version является
+идемпотентным и не создаёт дублирующий delivery lifecycle.
+
+Ответ возвращает per-item receipts и aggregate state:
+
+```json
+{
+  "status": "selected",
+  "selected_count": 3,
+  "items": [
+    {
+      "artifact_id": "art_...",
+      "filename": "summary.md",
+      "delivery_id": "dlv_...",
+      "state": "selected"
+    }
+  ]
+}
+```
+
+`selected` означает только durable selection для последующей доставки.
+`delivered` можно утверждать только после client transport receipt.
+
+Если service policy включает `auto_select_deliverables`, commit artifact с
+`purpose=deliverable` может идемпотентно выбрать его exact current version.
+При создании следующей версии selection переносится только на новый committed
+head и не должен указывать на orphan/stale version.
+
+### 98.8. Создание, одинаковые filenames и version mutations
+
+User ingress может содержать несколько независимых files с одинаковым
+filename. Они получают разные lineage и exact IDs.
+
+`artifact_create_text` и `artifact_create_from_content` создают новую lineage.
+Если в current access set уже существует active artifact с таким filename,
+создание не должно:
+
+```text
+- перезаписывать существующий content;
+- автоматически присоединяться к существующей lineage;
+- молча выбирать один из одноимённых artifacts.
+```
+
+Возвращается `artifact_filename_conflict` с exact кандидатами и безопасными
+вариантами:
+
+```text
+1. выбрать другое filename;
+2. использовать artifact_replace_text для exact current artifact_id;
+3. использовать artifact_patch_text для exact current artifact_id.
+```
+
+Новая версия существующего логического файла создаётся только mutation-командой
+или `artifact_create_version_from_content`.
+
+`artifact_replace_text`, `artifact_patch_text` и
+`artifact_create_version_from_content` остаются одноцелевыми командами и
+требуют exact current `artifact_id` как optimistic concurrency token:
+
+```text
+art_v2 current
+→ mutation(current_artifact_id=art_v2)
+→ art_v3 в той же aln_*
+→ art_v2 остаётся immutable и доступным
+```
+
+`artifact_patch_text` использует `old_text`, `new_text` и
+`expected_occurrences`; fuzzy- и line-number patch отсутствуют.
+
+Batch mutation одной или нескольких lineage не входит в базовый контракт
+`v0.4`: частично применённые изменения сложнее безопасно откатывать и
+объяснять агенту. Несколько независимых mutations выполняются отдельными
+командами либо позднее координируются DAG/scheduler layer.
+
+### 98.9. Progress, errors и recovery guidance
+
+Manager tool result и ProgressEvent должны различать:
+
+```text
+tool_done      → операция успешно выполнена;
+tool_rejected  → validation/authority/version conflict;
+tool_failed    → неожиданная или инфраструктурная ошибка.
+```
+
+`artifact_validation_failed` не должен сопровождаться пользовательским
+`tool_done` с severity=`success`.
+
+Expected ошибки возвращаются как typed structured result и содержат безопасный
+recovery path:
+
+```text
+invalid_artifact_id
+→ вызвать artifact_list и повторить exact command
+
+artifact_filename_ambiguous
+→ выбрать один exact candidate
+
+artifact_version_conflict
+→ перечитать current lineage head и повторно сформировать mutation
+
+artifact_capability_error
+→ использовать подходящий MCP processor либо сообщить ограничение
+```
+
+### 98.10. Граница v0.4, v0.5 и v0.6
+
+`v0.4` гарантирует:
+
+```text
+- exact ArtifactRef / ContentRef;
+- immutable versions и linear lineage;
+- authoritative current head;
+- пакетные exact read/search/delivery manager-команды;
+- bounded in-process native-text processing;
+- canonical original persistence;
+- generic result representation и compaction;
+- honest needs_retrieval для неполного representation.
+```
+
+`v0.4` не должна имитировать будущий RAG публичными параметрами чтения,
+ручным делением больших документов на символы или ложным полным summary.
+
+`v0.5` добавляет:
+
+```text
+- PostgreSQL workspace metadata;
+- session/cross-cycle artifact discovery с exact authorization;
+- lazy extraction по ArtifactRef / ContentRef;
+- format-aware chunks и ranges;
+- persistent chunk cache;
+- keyword/semantic/hybrid retrieval;
+- provenance-aware retrieval events;
+- обработку oversized sources по частям;
+- final grounding по фактически retrieved или inline evidence.
+```
+
+Сначала выбирается exact artifact version; только затем RAG получает chunks
+этой версии. Vector search не определяет lineage head и не заменяет exact
+version lookup.
+
+`v0.6` добавляет:
+
+```text
+- extraction/chunking/embeddings workers;
+- background hierarchical summarization;
+- durable queues, retries и deadlines;
+- distributed locks;
+- safe parallel DAG nodes;
+- тяжёлую обработку вне Agent Runtime process.
+```
+
+LLM-facing contracts `artifact_list`, `artifact_read_text`,
+`artifact_search_text` и `artifact_set_delivery` должны сохраняться при
+переходе от local filesystem implementation к PostgreSQL/RAG и затем к
+worker-backed services.
 
 ---
 
@@ -5427,6 +5878,10 @@ tools.
     файл проанализирован.
 12. Artifact operations не меняют DAG lifecycle скрыто. Узел завершается отдельной
     plan transition с exact artifact refs после фактической проверки результата.
+13. Для нескольких read-only artifacts использовать один пакетный read/search call.
+14. Filename используется для discovery через `artifact_list`; substantive
+    operations выполняются по exact `artifact_id`.
+15. Summarized/preview result не считается полным прочтением exact content.
 
 ---
 
@@ -5594,6 +6049,8 @@ artifacts:
   max_inline_text_chars / max_read_chars / max_search_matches
   max_patch_operations
   max_runtime_artifact_summaries
+  max_concurrent_artifact_reads
+  max_composite_result_bytes
   allow_opaque_binary
   auto_select_deliverables
 
@@ -5614,6 +6071,11 @@ telegram_input:
 
 Concrete timing/size values определяются тестами и client capabilities, но сами
 лимиты обязательны.
+
+`max_read_chars`, `max_artifacts_per_cycle`,
+`max_runtime_artifact_summaries`, `max_concurrent_artifact_reads` и
+`max_composite_result_bytes` являются внутренними process-safety limits. LLM не
+вычисляет и не передаёт их при обычном чтении.
 
 Acceptance `v0.4-file-artifacts`:
 
@@ -5821,6 +6283,39 @@ DOCX processor returns modified bytes
 → content candidate
 → explicit new version
 → no arbitrary local path in LLM context
+```
+
+### Artifact manager commands
+
+```text
+ten small native-text artifacts
+→ one batch artifact_read_text call
+→ all exact results returned with preserved per-item boundaries
+```
+
+```text
+one invalid ID in read batch
+→ valid read-only items returned
+→ invalid item contains recovery guidance
+```
+
+```text
+one invalid ID in delivery batch
+→ no selections changed
+→ atomic rejection
+```
+
+```text
+duplicate filename across lineages
+→ artifact_list reports ambiguity
+→ no implicit current version selection
+```
+
+```text
+cycle compaction
+→ authoritative artifact catalog, read state and delivery state rebuilt from
+  runtime/store
+→ LLM summary is not the source of truth
 ```
 
 ### Active-cycle input
