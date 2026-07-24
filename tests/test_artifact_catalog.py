@@ -176,6 +176,19 @@ class ArtifactCatalogTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(exact.payload["items"][0]["is_current"])
         self.assertEqual(exact.payload["items"][0]["versions_count"], 2)
 
+        historical = await self.controller.execute(
+            "artifact_list",
+            {"artifact_ids": [first["artifact_id"]]},
+            self.context,
+        )
+        self.assertEqual(historical.payload["available_count"], 1)
+        self.assertEqual(
+            historical.payload["items"][0]["artifact_id"],
+            first["artifact_id"],
+        )
+        self.assertFalse(historical.payload["items"][0]["is_current"])
+        self.assertEqual(historical.payload["items"][0]["versions_count"], 2)
+
         await self.services.artifact_store.archive_lineage(
             first["artifact_lineage_id"],
             expected_current_artifact_id=second["artifact_id"],
