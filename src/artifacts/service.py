@@ -229,16 +229,19 @@ class ArtifactService:
             ):
                 continue
 
-            selected_versions = (
-                versions
-                if include_versions or not current_only
-                else [current]
-            )
+            if requested_artifact_ids:
+                selected_versions = [
+                    version
+                    for version in versions
+                    if version.artifact_id in requested_artifact_ids
+                ]
+            else:
+                selected_versions = (
+                    versions
+                    if include_versions or not current_only
+                    else [current]
+                )
             for version in selected_versions:
-                if requested_artifact_ids and (
-                    version.artifact_id not in requested_artifact_ids
-                ):
-                    continue
                 if requested_filename_set and (
                     version.filename not in requested_filename_set
                 ):
