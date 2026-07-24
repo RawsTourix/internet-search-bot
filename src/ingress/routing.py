@@ -78,7 +78,7 @@ def _compatible_open_attachment_drafts(
             continue
         if draft.conversation != envelope.conversation:
             continue
-        if draft.sender != envelope.sender:
+        if draft.sender.principal_id != envelope.sender.principal_id:
             continue
         result.append(draft)
     return result
