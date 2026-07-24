@@ -6,7 +6,14 @@ import asyncio
 from datetime import datetime, timezone
 
 from .grouping import FileSystemGroupedInputBatchStore, _OPEN_STATES
-from .models import ClientIngressEvent, InputBatchDraft, InputGroupingMode
+from .models import (
+    ClientIngressEvent,
+    InputAttachmentPart,
+    InputBatchDraft,
+    InputBatchDraftState,
+    InputGroupingMode,
+    utc_now,
+)
 from .store import IngressConflictError
 
 
@@ -36,6 +43,82 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
                     "Input batch is no longer open for additional events"
                 )
             return self._append_event_sync(draft, event)
+
+    def _append_event_sync(
+        self,
+        draft: InputBatchDraft,
+        event: ClientIngressEvent,
+    ) -> InputBatchDraft:
+        """Append by stable principal identity, not mutable display metadata."""
+
+        if event.event_id in draft.source_event_ids:
+            return draft
+        if len(draft.source_event_ids) >= self.ingress_config.max_events_per_batch:
+            raise IngressConflictError("Input batch event limit exceeded")
+        if draft.client_type != event.client_type:
+            raise IngressConflictError("Grouped input client type mismatch")
+        if (
+            draft.conversation != event.conversation
+            or draft.sender.principal_id != event.sender.principal_id
+        ):
+            raise IngressConflictError("Grouped input authority mismatch")
+
+        existing_part_ids = {item.part_id for item in draft.text_parts}
+        existing_slot_ids = {item.slot_id for item in draft.attachment_parts}
+        new_part_ids = {item.part_id for item in event.text_parts}
+        new_slot_ids = {item.slot_id for item in event.attachment_slots}
+        if existing_part_ids & new_part_ids:
+            raise IngressConflictError("Grouped input text part ID collision")
+        if existing_slot_ids & new_slot_ids:
+            raise IngressConflictError("Grouped input attachment slot collision")
+        if (
+            len(draft.text_parts) + len(event.text_parts)
+            > self.ingress_config.max_text_parts_per_batch
+        ):
+            raise IngressConflictError("Input batch text part limit exceeded")
+        if (
+            len(draft.attachment_parts) + len(event.attachment_slots)
+            > self.ingress_config.max_attachments_per_batch
+        ):
+            raise IngressConflictError("Input batch attachment limit exceeded")
+
+        now = utc_now()
+        updated = draft.model_copy(update={
+            "source_event_ids": [*draft.source_event_ids, event.event_id],
+            "text_parts": [*draft.text_parts, *event.text_parts],
+            "attachment_parts": [
+                *draft.attachment_parts,
+                *[
+                    InputAttachmentPart(
+                        slot_id=slot.slot_id,
+                        original_filename=slot.original_filename,
+                        declared_mime_type=slot.declared_mime_type,
+                        declared_size_bytes=slot.declared_size_bytes,
+                    )
+                    for slot in event.attachment_slots
+                ],
+            ],
+            "last_event_at": event.occurred_at,
+            "updated_at": now,
+            "state": InputBatchDraftState.COLLECTING,
+        })
+        updated = InputBatchDraft.model_validate(
+            updated.model_dump(mode="python")
+        )
+        updated = self._apply_deadlines_sync(updated, reset_quiet=True)
+        self._write_json(
+            self.root / updated.input_batch_id / "draft.json",
+            updated.model_dump(mode="json"),
+        )
+        self._write_json(
+            self.event_index_dir / f"{event.event_id}.json",
+            {
+                "schema_version": 1,
+                "event_id": event.event_id,
+                "input_batch_id": updated.input_batch_id,
+            },
+        )
+        return updated
 
     async def commit_batch(
         self,
