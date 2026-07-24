@@ -37,6 +37,7 @@ class ActiveAgentCycle:
     artifact_candidate_refs: list[str] = field(default_factory=list)
     artifact_state: ArtifactRuntimeState | None = None
     original_input_batch_id: str | None = None
+    blocked_artifact_batch_signatures: list[str] = field(default_factory=list)
 
     active_plan_id: str | None = None
     active_plan_revision: int | None = None
