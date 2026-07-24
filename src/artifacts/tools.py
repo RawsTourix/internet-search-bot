@@ -522,7 +522,7 @@ class ArtifactToolController:
                 representation=ArtifactResultRepresentation.INLINE,
                 exact_content_available=True,
                 complete=result.eof,
-                needs_retrieval=False,
+                needs_retrieval=not result.eof,
             ))
         items = self._apply_composite_process_limit(items)
         successful_count = sum(
@@ -592,6 +592,9 @@ class ArtifactToolController:
                     result,
                 ))
                 continue
+            search_complete = (
+                len(result.matches) < self.service.config.max_search_matches
+            )
             items.append(ArtifactSearchItem(
                 request_index=request_index,
                 requested_artifact_id=artifact_id,
@@ -600,8 +603,8 @@ class ArtifactToolController:
                 matches=result.matches,
                 representation=ArtifactResultRepresentation.INLINE,
                 exact_content_available=True,
-                complete=True,
-                needs_retrieval=False,
+                complete=search_complete,
+                needs_retrieval=not search_complete,
             ))
         items = self._apply_search_composite_process_limit(items)
         successful_count = sum(
