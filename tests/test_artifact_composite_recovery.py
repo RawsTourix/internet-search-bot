@@ -41,6 +41,7 @@ class _RecoveryBase:
     def __init__(self, visible):
         self.visible = visible
         self.super_calls = 0
+        self.instructions = "base instructions"
 
     async def _call_registered_tool(self, public_tool_name, arguments):
         self.super_calls += 1
@@ -94,6 +95,11 @@ class ArtifactCompositeRecoveryTests(unittest.IsolatedAsyncioTestCase):
             fallback=fallback,
         )
         self.assertIs(subject.token_estimator, fallback)
+
+    def test_recovery_instructions_are_added_to_system_instructions(self):
+        subject = _RecoverySubject({})
+        self.assertIn("split_artifact_batch", subject.instructions)
+        self.assertIn("result_handling", subject.instructions)
 
     def test_stored_only_batch_recommends_smaller_exact_batches(self):
         artifact_ids = [f"art_{index:032x}" for index in range(10)]
