@@ -1,5 +1,6 @@
 """Public API for transport-neutral file ingress."""
 
+from .compat import legacy_message_to_input_envelope
 from .config import (
     IngressConfigType,
     IngressConfigValidationError,
@@ -28,7 +29,11 @@ from .models import (
     new_ingress_event_id,
     new_input_batch_id,
 )
-from .routing import InputGroupingDecision, resolve_input_grouping
+from .routing import (
+    InputGroupingAmbiguityError,
+    InputGroupingDecision,
+    resolve_input_grouping,
+)
 from .service import ArtifactIngressService, IngressValidationError
 from .store import (
     FileSystemIngressEventStore,
@@ -61,12 +66,14 @@ __all__ = [
     "InputAttachmentState",
     "InputBatchDraft",
     "InputBatchDraftState",
+    "InputGroupingAmbiguityError",
     "InputGroupingDecision",
     "InputGroupingMode",
     "InputSubmissionResult",
     "create_ingress_services",
     "is_ingress_event_id",
     "is_input_batch_id",
+    "legacy_message_to_input_envelope",
     "load_ingress_config",
     "new_ingress_event_id",
     "new_input_batch_id",
