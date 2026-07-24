@@ -188,6 +188,8 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
         visible = json.loads(messages[-1]["content"])
         self.assertEqual(outcome.decision.representation, "summarize")
         self.client._call_llm_with_retries.assert_awaited_once()
+        self.assertEqual(visible["summary_scope"], "aggregate")
+        self.assertEqual(visible["item_attribution"], "bounded_preview")
         self.assertEqual(
             [item["requested_artifact_id"] for item in visible["items"]],
             [second_id, first_id],
@@ -197,13 +199,18 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
             [0, 1],
         )
         self.assertTrue(all(
-            item["representation"] == "summarized"
+            item["representation"] == "preview"
             and not item["exact_content_available"]
             and not item["complete"]
             and item["needs_retrieval"]
             and "text" not in item
+            and "preview" in item
             for item in visible["items"]
         ))
+        self.assertIn("SECOND_RAW_SENTINEL_", visible["items"][0]["preview"])
+        self.assertNotIn("FIRST_RAW_SENTINEL_", visible["items"][0]["preview"])
+        self.assertIn("FIRST_RAW_SENTINEL_", visible["items"][1]["preview"])
+        self.assertNotIn("SECOND_RAW_SENTINEL_", visible["items"][1]["preview"])
         serialized_visible = json.dumps(
             [messages, trace],
             ensure_ascii=False,
@@ -237,8 +244,15 @@ class ArtifactResultCompactionTests(unittest.IsolatedAsyncioTestCase):
         visible = json.loads(messages[-1]["content"])
         self.assertEqual(outcome.decision.representation, "store_only")
         self.assertEqual(visible["representation"], "stored_only")
+        self.assertEqual(visible["summary_scope"], "aggregate")
+        self.assertEqual(visible["item_attribution"], "metadata_only")
         self.assertFalse(visible["complete"])
         self.assertTrue(visible["needs_retrieval"])
+        self.assertEqual(
+            visible["items"][0]["representation"],
+            "stored_only",
+        )
+        self.assertNotIn("preview", visible["items"][0])
         self.assertFalse(visible["items"][0]["exact_content_available"])
         self.assertFalse(visible["items"][0]["complete"])
         self.assertTrue(visible["items"][0]["needs_retrieval"])
