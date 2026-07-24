@@ -761,10 +761,30 @@ class ArtifactMCPClient(MCPClient):
             if stored_result_ref.summary_status == "summarized"
             else "stored_only"
         )
+        raw_items = [
+            item
+            for item in (tool_payload.get("items") or [])
+            if isinstance(item, dict)
+        ]
+        successful_count = sum(
+            item.get("status") == "ok" for item in raw_items
+        )
+        total_preview_chars = max(
+            1,
+            int(getattr(
+                getattr(self, "memory_config", None),
+                "result_preview_max_chars",
+                1000,
+            )),
+        )
+        per_item_preview_chars = max(
+            1,
+            total_preview_chars // max(1, successful_count),
+        )
+        include_previews = representation == "summarized"
+
         bounded_items: list[dict[str, Any]] = []
-        for item in tool_payload.get("items") or []:
-            if not isinstance(item, dict):
-                continue
+        for item in raw_items:
             if item.get("status") != "ok":
                 bounded_items.append({
                     key: item.get(key)
@@ -794,18 +814,28 @@ class ArtifactMCPClient(MCPClient):
                     )
                     if artifact.get(key) is not None
                 }
-            bounded_items.append({
+            bounded_item = {
                 "request_index": item.get("request_index"),
                 "requested_artifact_id": item.get(
                     "requested_artifact_id"
                 ),
                 "status": "ok",
                 "artifact": artifact_boundary,
-                "representation": representation,
+                "representation": (
+                    "preview" if include_previews else "stored_only"
+                ),
                 "exact_content_available": False,
                 "complete": False,
                 "needs_retrieval": True,
-            })
+            }
+            if include_previews:
+                preview = self._artifact_item_preview(
+                    item,
+                    max_chars=per_item_preview_chars,
+                )
+                if preview is not None:
+                    bounded_item["preview"] = preview
+            bounded_items.append(bounded_item)
 
         visible = {
             key: tool_payload.get(key)
@@ -821,6 +851,10 @@ class ArtifactMCPClient(MCPClient):
         }
         visible.update({
             "representation": representation,
+            "summary_scope": "aggregate",
+            "item_attribution": (
+                "bounded_preview" if include_previews else "metadata_only"
+            ),
             "complete": False,
             "needs_retrieval": True,
             "items": bounded_items,
@@ -830,6 +864,24 @@ class ArtifactMCPClient(MCPClient):
             "limitations": list(stored_result_ref.limitations),
         })
         return visible
+
+    @staticmethod
+    def _artifact_item_preview(
+        item: dict[str, Any],
+        *,
+        max_chars: int,
+    ) -> str | None:
+        text = item.get("text")
+        if isinstance(text, str):
+            preview = text
+        else:
+            matches = item.get("matches")
+            if not isinstance(matches, list):
+                return None
+            preview = dumps_json({"matches": matches})
+        if len(preview) <= max_chars:
+            return preview
+        return preview[:max_chars] + "…"
 
     def _build_final_evidence_pack(self, **kwargs: Any) -> dict[str, Any]:
         evidence = super()._build_final_evidence_pack(**kwargs)
