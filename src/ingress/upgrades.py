@@ -26,6 +26,9 @@ def upgrade_ingress_event(payload: dict[str, Any]) -> dict[str, Any]:
             capability_snapshot_ref=None,
             capability_snapshot=None,
             response_anchor_candidates=[],
+            response_anchor_override=None,
+            reply_context=None,
+            legacy_derived=True,
         )
         version = 2
     if version != CURRENT_INGRESS_SCHEMA_VERSION:
@@ -43,6 +46,8 @@ def upgrade_input_batch_draft(payload: dict[str, Any]) -> dict[str, Any]:
             locale=None,
             capability_snapshot=None,
             response_anchor=None,
+            reply_contexts=[],
+            legacy_derived=True,
         )
         version = 2
     if version != CURRENT_INGRESS_SCHEMA_VERSION:
@@ -60,6 +65,8 @@ def upgrade_committed_input_batch(payload: dict[str, Any]) -> dict[str, Any]:
             locale=None,
             capability_snapshot=None,
             response_anchor=None,
+            reply_contexts=[],
+            legacy_derived=True,
             artifact_manifest={
                 "items": [],
                 "available_count": len(result.get("artifact_refs", [])),

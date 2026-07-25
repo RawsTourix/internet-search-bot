@@ -16,6 +16,10 @@ from .models import (
 )
 from .store import IngressConflictError
 from ..interaction.anchors import ResponseAnchorSelector
+from .semantic_limits import (
+    SemanticInputLimitError,
+    validate_semantic_parts,
+)
 
 
 class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
@@ -79,6 +83,10 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
             raise IngressConflictError("Grouped input text part ID collision")
         if existing_slot_ids & new_slot_ids:
             raise IngressConflictError("Grouped input attachment slot collision")
+        existing_semantic_ids = {item.part_id for item in draft.semantic_parts}
+        new_semantic_ids = {item.part_id for item in event.semantic_parts}
+        if existing_semantic_ids & new_semantic_ids:
+            raise IngressConflictError("Grouped input semantic part ID collision")
         if (
             len(draft.text_parts) + len(event.text_parts)
             > self.ingress_config.max_text_parts_per_batch
@@ -89,6 +97,13 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
             > self.ingress_config.max_attachments_per_batch
         ):
             raise IngressConflictError("Input batch attachment limit exceeded")
+        try:
+            validate_semantic_parts(
+                [*draft.semantic_parts, *event.semantic_parts],
+                self.ingress_config,
+            )
+        except SemanticInputLimitError as error:
+            raise IngressConflictError(str(error)) from error
 
         now = utc_now()
         response_anchor = draft.response_anchor
@@ -103,6 +118,14 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
             "source_event_ids": [*draft.source_event_ids, event.event_id],
             "text_parts": [*draft.text_parts, *event.text_parts],
             "semantic_parts": [*draft.semantic_parts, *event.semantic_parts],
+            "reply_contexts": [
+                *draft.reply_contexts,
+                *(
+                    [event.reply_context]
+                    if event.reply_context is not None
+                    else []
+                ),
+            ],
             "attachment_parts": [
                 *draft.attachment_parts,
                 *[

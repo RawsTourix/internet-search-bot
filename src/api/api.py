@@ -183,6 +183,16 @@ class Api:
                 output_root.resolve(strict=False),
                 atomic_writes=self.storage_config.atomic_writes,
             )
+            from ..interaction.output_completion import (
+                OutputDeliveryCompletionService,
+            )
+
+            self.output_completion = OutputDeliveryCompletionService(
+                output_store=self.output_store,
+                artifact_delivery_store=(
+                    self.artifact_services.delivery_store
+                ),
+            )
             self.output_renderer = CapabilityOutputRenderer(
                 self.ingress_services.localization_service,
                 max_delivery_groups=(

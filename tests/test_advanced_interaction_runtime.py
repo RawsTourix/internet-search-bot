@@ -54,6 +54,7 @@ from src.interaction.errors import (
 from src.interaction.ids import new_output_part_id
 from src.interaction.output_models import (
     ArtifactOutputPart,
+    ImageOutputPart,
     LocationOutputPart,
     OutputBatchKind,
     OutputBatchState,
@@ -156,6 +157,33 @@ class AdvancedInteractionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(localization.render(message, locale="ru"), "22 файла")
         self.assertEqual(localization.render(message, locale="en"), "22 files")
+        status = LocalizationMessage(
+            message_key="input_batch.collecting",
+            params={"file_count": 10, "text_part_count": 1},
+        )
+        self.assertIn("10", localization.render(status, locale="ru"))
+        self.assertIn("10", localization.render(status, locale="en"))
+        self.assertEqual(
+            localization.render(
+                LocalizationMessage(message_key="missing.semantic.key"),
+                locale="en",
+            ),
+            "missing.semantic.key",
+        )
+        for message_key in (
+            "output.done",
+            "output.delivery_incomplete",
+            "output.delivery_unknown",
+            "input.duplicate",
+            "input.unsupported_type",
+        ):
+            for locale in ("ru", "en"):
+                self.assertTrue(
+                    localization.render(
+                        LocalizationMessage(message_key=message_key),
+                        locale=locale,
+                    ).strip()
+                )
         self.assertEqual(
             localization.resolve_locale(
                 explicit_locale=None,
@@ -348,17 +376,17 @@ class AdvancedInteractionRuntimeTests(unittest.IsolatedAsyncioTestCase):
             completed_at=now,
         )
         completed = await store.complete(receipt)
-        self.assertEqual(completed.state, OutputBatchState.FAILED)
+        self.assertEqual(completed.state, OutputBatchState.UNKNOWN)
         self.assertEqual(await store.list_recoverable(), [])
         replay = await store.complete(receipt)
-        self.assertEqual(replay.state, OutputBatchState.FAILED)
+        self.assertEqual(replay.state, OutputBatchState.UNKNOWN)
 
     async def test_receipt_must_cover_committed_parts_in_order(self):
         store = FileSystemOutputBatchStore(self.root)
         batch, _ = await store.commit(self._text_batch("result"))
         _, attempt_id = await store.claim_delivery(batch.output_batch_id)
         now = datetime.now(UTC)
-        with self.assertRaises(OutputBatchConflictError):
+        with self.assertRaises((OutputBatchConflictError, ValidationError)):
             await store.complete(OutputDeliveryReceipt(
                 output_batch_id=batch.output_batch_id,
                 attempt_id=attempt_id,
@@ -381,7 +409,7 @@ class AdvancedInteractionRuntimeTests(unittest.IsolatedAsyncioTestCase):
             now=now,
         )
         self.assertEqual(len(reconciled), 1)
-        self.assertEqual(reconciled[0].state, OutputBatchState.FAILED)
+        self.assertEqual(reconciled[0].state, OutputBatchState.UNKNOWN)
         self.assertEqual(await store.list_recoverable(), [])
 
     async def test_final_assembly_keeps_text_then_selected_artifact_order(self):
@@ -500,7 +528,8 @@ class AdvancedInteractionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         }
         upgraded_draft = upgrade_input_batch_draft(draft_payload)
         self.assertNotIn("artifact_manifest", upgraded_draft)
-        InputBatchDraft.model_validate(upgraded_draft)
+        upgraded_draft_model = InputBatchDraft.model_validate(upgraded_draft)
+        self.assertTrue(upgraded_draft_model.legacy_derived)
 
         committed_payload = {
             "schema_version": 1,
@@ -520,6 +549,72 @@ class AdvancedInteractionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         batch = CommittedInputBatch.model_validate(upgraded_committed)
         self.assertEqual(batch.artifact_manifest.available_count, 1)
         self.assertTrue(batch.artifact_manifest.truncated)
+        self.assertTrue(batch.legacy_derived)
+
+    async def test_semantic_artifact_subtype_binds_exact_selected_delivery(self):
+        storage_config = StorageConfigType(
+            root_dir=str(self.root / "semantic-subtype")
+        )
+        storage = create_storage_services(storage_config)
+        artifacts = create_artifact_services(
+            storage_config=storage_config,
+            artifact_config=ArtifactConfigType(),
+            content_store=storage.content_store,
+        )
+        created = await artifacts.artifact_service.create_text(
+            session_id="session-1",
+            cycle_id="cycle-1",
+            filename="image.md",
+            text="image bytes",
+            format_id="markdown",
+            purpose=ArtifactPurpose.DELIVERABLE,
+            provenance=ArtifactProvenance(
+                origin="agent_created",
+                creator="agent",
+                operation="semantic_subtype_test",
+            ),
+        )
+        selected = await artifacts.delivery_service.select(
+            artifact_id=created.artifact_id,
+            access=ArtifactAccessContext(
+                session_id="session-1",
+                cycle_id="cycle-1",
+                allowed_artifact_ids=[created.artifact_id],
+            ),
+            client_type="telegram",
+        )
+        assembler = OutputBatchAssembler(
+            config=OutputRuntimeConfig(),
+            delivery_store=artifacts.delivery_store,
+            output_store=FileSystemOutputBatchStore(
+                Path(storage_config.root_dir)
+            ),
+        )
+        result = AgentResult(
+            content="",
+            status=AgentStatus.DONE,
+            session_id="session-1",
+            cycle_id="cycle-1",
+            semantic_outputs=[{
+                "type": "image_output",
+                "part_id": new_output_part_id(),
+                "index": 0,
+                "artifact_id": created.artifact_id,
+                "delivery_id": selected.delivery_id,
+                "filename": "untrusted-name.png",
+                "mime_type": "image/png",
+                "size_bytes": 1,
+                "caption": "preserved caption",
+            }],
+        )
+        batch = await assembler.assemble_final(
+            result=result,
+            input_batch=self._committed_batch(),
+        )
+        self.assertEqual(len(batch.parts), 1)
+        self.assertIsInstance(batch.parts[0], ImageOutputPart)
+        self.assertEqual(batch.parts[0].caption, "preserved caption")
+        self.assertEqual(batch.parts[0].filename, selected.filename)
 
     def _text_batch(self, text: str):
         return build_ready_output_batch(

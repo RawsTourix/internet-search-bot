@@ -242,6 +242,10 @@ class ClientCapabilityRegistry:
                 continue
             if spec.introduced_contract_version > self.contract_version:
                 continue
+            if spec.transport_scope and spec.transport_scope != client_type:
+                raise CapabilityValidationError(
+                    f"Capability {capability_id} is outside client scope"
+                )
             features.append(capability_id)
 
         limits: dict[str, CapabilityValue] = {}
@@ -251,6 +255,10 @@ class ClientCapabilityRegistry:
                 if reject_unknown:
                     raise CapabilityValidationError(f"Unknown limit: {limit_id}")
                 continue
+            if spec.transport_scope and spec.transport_scope != client_type:
+                raise CapabilityValidationError(
+                    f"Limit {limit_id} is outside client scope"
+                )
             self._validate_limit(spec, value)
             limits[limit_id] = value
 
@@ -453,6 +461,15 @@ def build_telegram_capability_declaration(
         "input.forward_provenance",
         "output.text",
         "output.artifact.document",
+        "output.media.image",
+        "output.media.audio",
+        "output.media.voice",
+        "output.media.video",
+        "output.media.video_note",
+        "output.media.animation",
+        "output.media.sticker",
+        "output.location",
+        "output.contact",
         "presentation.reply_anchor",
         "presentation.status_updates",
         "transport.streaming_upload",

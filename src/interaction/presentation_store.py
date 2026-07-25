@@ -84,7 +84,8 @@ class FileSystemInputPresentationStore:
             if index_path.exists():
                 pointer = self._read(index_path)
                 record = self._load(pointer["presentation_id"])
-                return record, False
+                if record.state != PresentationState.EXPIRED:
+                    return record, False
             record = InputBatchPresentationRef.reserve(
                 input_batch_id=input_batch_id,
                 client_binding_id=client_binding_id,
@@ -127,14 +128,57 @@ class FileSystemInputPresentationStore:
         token: str,
         now: datetime | None = None,
     ) -> InputBatchPresentationRef:
-        if not await self.verify_token(presentation_id, token):
-            raise PresentationConflictError("presentation token does not match")
-        return await self._mutate(
+        return await asyncio.to_thread(
+            self._bind_sync,
             presentation_id,
-            state=PresentationState.BOUND,
-            client_message_id=client_message_id,
-            now=now,
+            client_message_id,
+            token,
+            now,
         )
+
+    def _bind_sync(
+        self,
+        presentation_id: str,
+        client_message_id: str,
+        token: str,
+        now: datetime | None,
+    ) -> InputBatchPresentationRef:
+        with self._lock:
+            current = self._load(presentation_id)
+            import hmac
+
+            if not hmac.compare_digest(
+                current.token_hash,
+                hash_presentation_token(token),
+            ):
+                raise PresentationConflictError(
+                    "presentation token does not match"
+                )
+            if current.state != PresentationState.RESERVED:
+                raise PresentationConflictError(
+                    f"presentation cannot be bound from {current.state.value}"
+                )
+            normalized_message_id = str(client_message_id).strip()
+            if not normalized_message_id:
+                raise PresentationConflictError(
+                    "client_message_id must not be empty"
+                )
+            timestamp = now or utc_now()
+            terminal = current.pending_terminal_state
+            payload = current.model_dump()
+            payload.update(
+                client_message_id=normalized_message_id,
+                state=terminal or PresentationState.BOUND,
+                pending_terminal_state=None,
+                updated_at=timestamp,
+                closed_at=timestamp if terminal is not None else None,
+            )
+            updated = InputBatchPresentationRef.model_validate(payload)
+            self._write(
+                self.records / f"{presentation_id}.json",
+                updated.model_dump(mode="json"),
+            )
+            return updated
 
     async def update(
         self,
@@ -177,6 +221,43 @@ class FileSystemInputPresentationStore:
             closed_at=now or utc_now(),
             now=now,
         )
+
+    async def defer_terminal(
+        self,
+        presentation_id: str,
+        *,
+        state: PresentationState,
+        error_code: str | None = None,
+        now: datetime | None = None,
+    ) -> InputBatchPresentationRef:
+        if state not in {PresentationState.CLOSED, PresentationState.FAILED}:
+            raise ValueError("deferred terminal state must be closed or failed")
+        return await self._mutate(
+            presentation_id,
+            pending_terminal_state=state,
+            error_code=error_code,
+            now=now,
+        )
+
+    async def list_for_input_batch(
+        self,
+        input_batch_id: str,
+    ) -> list[InputBatchPresentationRef]:
+        return await asyncio.to_thread(
+            self._list_for_input_batch_sync,
+            input_batch_id,
+        )
+
+    def _list_for_input_batch_sync(
+        self,
+        input_batch_id: str,
+    ) -> list[InputBatchPresentationRef]:
+        result: list[InputBatchPresentationRef] = []
+        for path in sorted(self.records.glob("iprs_*.json")):
+            record = InputBatchPresentationRef.model_validate(self._read(path))
+            if record.input_batch_id == input_batch_id:
+                result.append(record)
+        return result
 
     async def list_recoverable(self) -> list[InputBatchPresentationRef]:
         return await asyncio.to_thread(self._list_recoverable_sync)

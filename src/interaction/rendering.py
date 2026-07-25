@@ -6,6 +6,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from ..localization.service import LocalizationService
+from ..localization.models import LocalizationMessage
+from .config import LocalizationConfigType
 from .capabilities import ClientCapabilitySnapshot
 from .errors import InteractionValidationError
 from .ids import new_output_delivery_group_id
@@ -71,7 +73,14 @@ def _operation_for(
     )
     for part_type, feature, operation in mappings:
         if isinstance(part, part_type):
-            return operation if _has(snapshot, feature) else TransportOperationKind.TEXT
+            if _has(snapshot, feature):
+                return operation
+            if (
+                not isinstance(part, TextOutputPart)
+                and _has(snapshot, "output.text")
+            ):
+                return TransportOperationKind.TEXT
+            return TransportOperationKind.UNSUPPORTED
     return TransportOperationKind.UNSUPPORTED
 
 
@@ -85,7 +94,9 @@ class CapabilityOutputRenderer:
         max_delivery_groups: int = 64,
         prefer_document_groups: bool = True,
     ) -> None:
-        self.localization = localization
+        self.localization = localization or LocalizationService.from_directory(
+            config=LocalizationConfigType()
+        )
         self.max_delivery_groups = max_delivery_groups
         self.prefer_document_groups = prefer_document_groups
 
@@ -171,29 +182,36 @@ class CapabilityOutputRenderer:
         )
 
     def _fallback_text(self, part: OutputPart, *, locale: str) -> str:
-        english = locale.lower().startswith("en")
         if isinstance(part, StatusOutputPart):
             if self.localization is not None:
                 return self.localization.render(part.message, locale=locale)
             return part.message.message_key
         if isinstance(part, LocationOutputPart):
-            label = "Location" if english else "Местоположение"
-            title = f"{part.title}: " if part.title else ""
-            return (
-                f"{label}: {title}{part.latitude:.6f}, "
-                f"{part.longitude:.6f}"
+            message = LocalizationMessage(
+                message_key="fallback.location",
+                params={
+                    "title": f"{part.title}: " if part.title else "",
+                    "latitude": f"{part.latitude:.6f}",
+                    "longitude": f"{part.longitude:.6f}",
+                },
             )
-        if isinstance(part, ContactOutputPart):
-            label = "Contact" if english else "Контакт"
+        elif isinstance(part, ContactOutputPart):
             name = " ".join(
                 value for value in (part.first_name, part.last_name) if value
             )
-            return f"{label}: {name}, {part.phone_number}"
-        if isinstance(part, ArtifactOutputPart):
-            label = "File" if english else "Файл"
-            return f"{label}: {part.filename}"
-        return (
-            "This result type is unavailable in the current client."
-            if english
-            else "Этот тип результата недоступен в текущем клиенте."
-        )
+            message = LocalizationMessage(
+                message_key="fallback.contact",
+                params={"name": name, "phone_number": part.phone_number},
+            )
+        elif isinstance(part, ArtifactOutputPart):
+            message = LocalizationMessage(
+                message_key="fallback.artifact",
+                params={"filename": part.filename},
+            )
+        else:
+            message = LocalizationMessage(
+                message_key="output.unsupported_part"
+            )
+        if self.localization is None:
+            return message.message_key
+        return self.localization.render(message, locale=locale)

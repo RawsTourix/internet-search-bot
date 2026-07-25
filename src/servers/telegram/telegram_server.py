@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable
+from types import SimpleNamespace
 
 import httpx
 from fastapi import FastAPI, HTTPException, Request, status
@@ -24,6 +25,10 @@ from telegram.ext import (
     filters,
 )
 from ...adapters.telegram_resolvers import TelegramInputResolverRegistry
+from ...interaction.config import LocalizationConfigType
+from ...interaction.output_models import OutputBatch, OutputDeliveryPlan
+from ...localization.models import LocalizationMessage
+from ...localization.service import LocalizationService
 
 from .artifact_bridge import (
     TelegramArtifactBridgeError,
@@ -54,9 +59,17 @@ from .media_group_runner import (
     LifetimeBoundDebouncedBatchRunner,
     LifetimeMediaGroupActivityCoordinator,
 )
+from .output_plan_executor import (
+    TelegramExecutionContext,
+    TelegramOutputPlanExecutor,
+)
 
 
 telegram_input_resolvers = TelegramInputResolverRegistry()
+telegram_output_executor = TelegramOutputPlanExecutor()
+telegram_localization = LocalizationService.from_directory(
+    config=LocalizationConfigType()
+)
 from .runtime_state import KeyedAsyncLockPool
 from ...utils.telegram_formatting import (
     markdown_to_plain_text,
@@ -121,54 +134,6 @@ class PendingMediaGroup:
     terminal_notified: bool = False
 
 
-FINAL_ERROR_MESSAGES: dict[str, dict[str, str]] = {
-    "ru": {
-        "infrastructure_interruption": (
-            "⚠️ Задача прервана из-за инфраструктурной ошибки.\n\n"
-            "Тип: {error_type}\nИтерация: {iteration}\n"
-            "Состояние задачи сохранено, её можно продолжить позже."
-        ),
-        "context_limit_interruption": (
-            "⚠️ Задача приостановлена: рабочий контекст достиг предельного "
-            "размера.\n\nТип: {error_type}\nИтерация: {iteration}\n"
-            "Состояние задачи сохранено для продолжения."
-        ),
-        "llm_configuration_error": (
-            "⚠️ Задача остановлена из-за ошибки конфигурации LLM.\n\n"
-            "Тип: {error_type}\nИтерация: {iteration}\n"
-            "Проверь API URL, endpoint, model name или настройки провайдера."
-        ),
-        "agent_error": (
-            "⚠️ Агент завершил задачу с ошибкой.\n\n"
-            "Тип: {error_type}\nИтерация: {iteration}\n"
-            "Подробности: {error_message}"
-        ),
-    },
-    "en": {
-        "infrastructure_interruption": (
-            "⚠️ The task was interrupted by an infrastructure error.\n\n"
-            "Type: {error_type}\nIteration: {iteration}\n"
-            "The task state has been saved and can be resumed later."
-        ),
-        "context_limit_interruption": (
-            "⚠️ The task was paused because the working context reached its "
-            "limit.\n\nType: {error_type}\nIteration: {iteration}\n"
-            "The task state has been saved for continuation."
-        ),
-        "llm_configuration_error": (
-            "⚠️ The task stopped because of an LLM configuration error.\n\n"
-            "Type: {error_type}\nIteration: {iteration}\n"
-            "Check the API URL, endpoint, model name, or provider settings."
-        ),
-        "agent_error": (
-            "⚠️ The agent finished with an error.\n\n"
-            "Type: {error_type}\nIteration: {iteration}\n"
-            "Details: {error_message}"
-        ),
-    },
-}
-
-
 def detect_progress_locale(update: Update) -> str:
     language_code = getattr(update.effective_user, "language_code", None)
     return "en" if language_code and language_code.lower().startswith("en") else "ru"
@@ -231,38 +196,48 @@ def format_agent_error_for_telegram(
     error_type = extract_error_type_summary(error_message)
     http_status = extract_llm_http_status(error_type)
     if error_kind == "context_limit_interruption":
-        key = "context_limit_interruption"
+        key = "error.context_limit"
     elif error_kind == "llm_configuration_error" or (
         error_kind != "infrastructure_interruption"
         and http_status in {400, 401, 403, 404, 422}
     ):
-        key = "llm_configuration_error"
+        key = "error.llm_configuration"
     elif (
         error_kind == "infrastructure_interruption"
         or "LLMTransportError" in error_type
         or "LLMTimeoutError" in error_type
         or http_status in {429, 500, 502, 503, 504}
     ):
-        key = "infrastructure_interruption"
+        key = "error.infrastructure_interruption"
     else:
-        key = "agent_error"
-    return FINAL_ERROR_MESSAGES[locale_name][key].format(
+        key = "error.agent"
+    return _localized(
+        key,
+        locale=locale_name,
         error_type=error_type,
         iteration=iterations,
         error_message=error_message,
     )
 
 
-def _safe_transport_error(error: BaseException) -> str:
+def _safe_transport_error(
+    error: BaseException,
+    *,
+    locale: str = "ru",
+) -> str:
     if isinstance(error, httpx.HTTPStatusError):
-        return f"Gateway вернул HTTP {error.response.status_code}."
+        return _localized(
+            "error.transport_http",
+            locale=locale,
+            status_code=error.response.status_code,
+        )
     if isinstance(error, (httpx.TimeoutException, TimedOut)):
-        return "Истекло время ожидания обработки файла."
+        return _localized("error.transport_timeout", locale=locale)
     if isinstance(error, (httpx.RequestError, NetworkError)):
-        return "Не удалось связаться с сервисом обработки файлов."
+        return _localized("error.transport_unavailable", locale=locale)
     if isinstance(error, TelegramArtifactBridgeError):
-        return "Не удалось безопасно обработать файл. Повторите отправку позже."
-    return "Во время обработки файла произошла внутренняя ошибка."
+        return _localized("error.unsafe_file", locale=locale)
+    return _localized("error.internal", locale=locale)
 
 
 async def send_to_gateway(payload: dict) -> tuple[bool, str, dict[str, Any]]:
@@ -283,7 +258,10 @@ async def send_to_gateway(payload: dict) -> tuple[bool, str, dict[str, Any]]:
             data = response.json()
             return (
                 True,
-                data.get("response", "Успешно отправлено в Gateway"),
+                data.get(
+                    "response",
+                    _localized("gateway.request_accepted", locale="ru"),
+                ),
                 data.get("metadata", {}) or {},
             )
     except Exception as error:
@@ -319,6 +297,64 @@ async def bind_input_presentation_status(
             "Failed to bind InputBatch presentation status: %s",
             type(error).__name__,
         )
+
+
+def _presentation_text(submission: dict[str, Any]) -> str:
+    event = submission.get("presentation_event") or {}
+    key = str(event.get("message_key") or "")
+    params = event.get("params") or {}
+    locale = normalize_locale(event.get("locale"))
+    if not key:
+        key = "input_batch.updated"
+    return _localized(
+        key,
+        locale=locale,
+        **params,
+    )
+
+
+async def apply_input_ack_policy(
+    *,
+    update: Update,
+    submission: dict[str, Any],
+    session_id: str,
+) -> Any | None:
+    """Execute the structured ingress acknowledgement without creating spam."""
+    policy = str(submission.get("ack_policy") or "silent")
+    ref = submission.get("presentation_ref") or {}
+    text = _presentation_text(submission)
+    if policy == "create":
+        status_message = await send_initial_status_message(update, text)
+        await bind_input_presentation_status(
+            submission=submission,
+            status_message=status_message,
+            session_id=session_id,
+        )
+        return status_message
+    message_id = ref.get("client_message_id")
+    if policy == "update_existing" and message_id is not None:
+        try:
+            await application.bot.edit_message_text(
+                chat_id=update.effective_chat.id,
+                message_id=int(message_id),
+                text=text,
+            )
+        except (BadRequest, TimedOut, NetworkError) as error:
+            logger.warning(
+                "Input presentation update failed: %s",
+                type(error).__name__,
+            )
+        return SimpleNamespace(message_id=int(message_id))
+    if policy == "throttled_update" and message_id is not None:
+        enqueue_progress_message(
+            chat_id=update.effective_chat.id,
+            message_id=int(message_id),
+            text=text,
+        )
+        return SimpleNamespace(message_id=int(message_id))
+    if message_id is not None:
+        return SimpleNamespace(message_id=int(message_id))
+    return None
 
 
 def _progress_metadata(
@@ -672,152 +708,88 @@ async def _deliver_agent_result(
     locale_name = normalize_locale(
         metadata.get("progress_locale") or detect_progress_locale(update)
     )
-    artifacts = metadata.get("artifacts") or []
     output_batch = metadata.get("output_batch") or {}
-    snapshot = output_batch.get("capability_snapshot") or {}
-    limits = snapshot.get("limits") or {}
     anchor = output_batch.get("response_anchor") or {}
     try:
         reply_message_id = int(anchor.get("client_message_id"))
     except (TypeError, ValueError):
         reply_message_id = update.effective_message.message_id
-    max_document_group_items = int(
-        limits.get(
-            "transport.telegram.output.document_group.max_items",
-            10,
-        )
-    )
     output_batch_id = str(output_batch.get("output_batch_id") or "")
-    output_attempt_id: str | None = None
-    claim: dict[str, Any] = {}
-    if output_batch_id and success and not is_agent_error(metadata):
+    if success and not is_agent_error(metadata):
+        if not output_batch_id:
+            await finish_status_or_send_reply(
+                update=update,
+                status_message=status_message,
+                text=(message or "").strip() or _localized(
+                    "output.done",
+                    locale=locale_name,
+                ),
+                delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
+            )
+            return
         claim = await artifact_gateway.claim_output_batch(
             output_batch_id,
             session_id=session_id,
         )
-        output_attempt_id = str(claim.get("attempt_id") or "") or None
-    if success and not is_agent_error(metadata):
-        final_text = (message or "").strip() or (
-            "Файл готов." if artifacts else "Готово."
-        )
-        rendered_texts = [
-            str(group.get("rendered_text") or "").strip()
-            for group in (
-                claim.get("delivery_plan", {}).get("groups", [])
-                if isinstance(claim, dict)
-                else []
-            )
-            if (
-                isinstance(group, dict)
-                and group.get("rendered_text")
-                and str(group.get("rendered_text")).strip() != final_text
-            )
-        ]
-        if rendered_texts:
-            final_text = "\n\n".join(
-                [final_text, *dict.fromkeys(rendered_texts)]
-            )
-        outcomes = await artifact_gateway.deliver_selected(
-            bot=application.bot,
-            artifacts=list(artifacts),
-            session_id=session_id,
-            chat_id=update.effective_chat.id,
-            message_thread_id=getattr(
-                update.effective_message,
-                "message_thread_id",
-                None,
+        batch = OutputBatch.model_validate(claim.get("output_batch"))
+        plan = OutputDeliveryPlan.model_validate(claim.get("delivery_plan"))
+        attempt_id = str(claim.get("attempt_id") or "")
+        receipt = await telegram_output_executor.execute(
+            batch=batch,
+            plan=plan,
+            attempt_id=attempt_id,
+            context=TelegramExecutionContext(
+                bot=application.bot,
+                gateway=artifact_gateway,
+                session_id=session_id,
+                chat_id=update.effective_chat.id,
+                message_thread_id=getattr(
+                    update.effective_message,
+                    "message_thread_id",
+                    None,
+                ),
+                reply_to_message_id=reply_message_id,
+                status_message_id=getattr(
+                    status_message,
+                    "message_id",
+                    None,
+                ),
             ),
-            reply_to_message_id=reply_message_id,
-            max_document_group_items=max_document_group_items,
         )
-        delivery_incomplete = any(
-            item.state in {"failed", "unknown"} for item in outcomes
-        )
-        final_message = await finish_status_or_send_reply(
-            update=update,
-            status_message=status_message,
-            text=(
-                final_text
-                if not delivery_incomplete
-                else (
-                    "Result delivery is incomplete."
-                    if locale_name == "en"
-                    else "Результат доставлен не полностью."
-                )
-            ),
-            delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
-        )
-        final_message_id = getattr(final_message, "message_id", None)
-        if output_attempt_id is not None:
-            outcome_by_delivery = {
-                item.delivery_id: item for item in outcomes
-            }
-            now = datetime.now(timezone.utc).isoformat()
-            part_receipts = []
-            for part in output_batch.get("parts") or []:
-                if not isinstance(part, dict):
-                    continue
-                delivery_id = part.get("delivery_id")
-                outcome = outcome_by_delivery.get(str(delivery_id))
-                part_state = (
-                    outcome.state
-                    if outcome is not None
-                    else "delivered"
-                )
-                receipt = {
-                    "part_id": part.get("part_id"),
-                    "index": int(part.get("index", 0)),
-                    "state": part_state,
-                    "delivery_id": delivery_id,
-                    "client_message_ids": (
-                        [str(outcome.telegram_message_id)]
-                        if outcome is not None
-                        and outcome.telegram_message_id is not None
-                        else (
-                            [str(final_message_id)]
-                            if final_message_id is not None
-                            else []
-                        )
-                    ),
-                    "error_category": (
-                        outcome.error if outcome is not None else None
-                    ),
-                    "delivered_at": (
-                        now if part_state == "delivered" else None
-                    ),
-                }
-                part_receipts.append(receipt)
-            states = [item["state"] for item in part_receipts]
-            aggregate_state = (
-                "unknown"
-                if "unknown" in states
-                else "delivered"
-                if states and all(item == "delivered" for item in states)
-                else "partially_delivered"
-                if "delivered" in states
-                else "failed"
-            )
-            await artifact_gateway.complete_output_batch(
+        try:
+            completed = await artifact_gateway.complete_output_batch(
                 output_batch_id,
                 session_id=session_id,
-                receipt={
-                    "output_batch_id": output_batch_id,
-                    "attempt_id": output_attempt_id,
-                    "state": aggregate_state,
-                    "part_receipts": part_receipts,
-                    "started_at": (
-                        claim.get("output_batch", {}).get("ready_at")
-                        or now
-                    ),
-                    "completed_at": now,
-                },
+                receipt=receipt.model_dump(mode="json"),
             )
-        if delivery_incomplete:
-            await send_telegram_markdown_reply(
-                update,
-                "⚠️ Не все подготовленные файлы удалось подтвердить как "
-                "доставленные. Они сохранены в журнале доставки.",
+        except Exception:
+            logger.exception(
+                "OutputBatch receipt persistence failed: %s",
+                output_batch_id,
             )
+            await finish_status_or_send_reply(
+                update=update,
+                status_message=status_message,
+                text=_localized(
+                    "output.receipt_persistence_failed",
+                    locale=locale_name,
+                ),
+                delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
+            )
+            return
+        terminal_state = str(completed.get("state") or receipt.state.value)
+        key = {
+            "delivered": "output.done",
+            "partially_delivered": "output.delivery_incomplete",
+            "failed": "output_batch.failed",
+            "unknown": "output.delivery_unknown",
+        }.get(terminal_state, "output.delivery_unknown")
+        await finish_status_or_send_reply(
+            update=update,
+            status_message=status_message,
+            text=_localized(key, locale=locale_name),
+            delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
+        )
         return
     text = (
         format_agent_error_for_telegram(
@@ -826,7 +798,11 @@ async def _deliver_agent_result(
             locale_name=locale_name,
         )
         if success
-        else f"**Произошла ошибка при обработке запроса:**\n{message}"
+        else _localized(
+            "error.request",
+            locale=locale_name,
+            message=message,
+        )
     )
     await finish_status_or_send_reply(
         update=update,
@@ -834,6 +810,28 @@ async def _deliver_agent_result(
         text=text,
         delivery_mode="send_new",
     )
+
+
+def _localized(
+    message_key: str,
+    *,
+    locale: str,
+    **params: Any,
+) -> str:
+    try:
+        return telegram_localization.render(
+            LocalizationMessage(
+                message_key=message_key,
+                params=params,
+            ),
+            locale=locale,
+        )
+    except Exception:
+        logger.exception(
+            "Localization unavailable for Telegram key=%s",
+            message_key,
+        )
+        return message_key
 
 
 def _session_for_update(update: Update) -> str:
@@ -864,7 +862,10 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     }
     status_message = await send_initial_status_message(
         update,
-        "Команда принята. Обрабатываю…",
+        _localized(
+            "input.command_received",
+            locale=detect_progress_locale(update),
+        ),
     )
     attach_progress_metadata(
         payload=payload,
@@ -883,38 +884,60 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    payload = {
-        "id": str(uuid.uuid4()),
-        "timestamp": datetime.now().isoformat(),
-        "client_type": "telegram",
-        "message_type": "text",
-        "content": update.effective_message.text or "",
-        "user_id": str(update.effective_user.id),
-        "user_name": update.effective_user.full_name,
-        "metadata": {
-            "chat_id": update.effective_chat.id,
-            "message_id": update.effective_message.message_id,
-            "session_id": _session_for_update(update),
-        },
-    }
-    status_message = await send_initial_status_message(
-        update,
-        "Сообщение принято. Обрабатываю…",
-    )
-    attach_progress_metadata(
-        payload=payload,
-        update=update,
-        status_message=status_message,
-    )
-    success, message, metadata = await send_to_gateway(payload)
-    await _deliver_agent_result(
-        update=update,
-        status_message=status_message,
-        success=success,
-        message=message,
-        metadata=metadata,
-        session_id=_session_for_update(update),
-    )
+    session_id = _session_for_update(update)
+    progress_locale = detect_progress_locale(update)
+    try:
+        semantic_parts = await telegram_input_resolvers.resolve(
+            update.effective_message
+        )
+        envelope = build_telegram_input_envelope(
+            update,
+            bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
+            semantic_parts=semantic_parts,
+        )
+        submission = await artifact_gateway.submit_envelope(
+            envelope,
+            progress_locale=progress_locale,
+        )
+        status_message = await apply_input_ack_policy(
+            update=update,
+            submission=submission,
+            session_id=session_id,
+        )
+        if submission.get("status") != "committed":
+            return
+        if submission.get("duplicate"):
+            return
+        batch_id = str(submission.get("input_batch_id") or "")
+        if not batch_id:
+            raise TelegramArtifactBridgeError(
+                "Gateway returned no input batch ID"
+            )
+        payload = await artifact_gateway.run_committed(
+            batch_id,
+            session_id=session_id,
+            progress_locale=progress_locale,
+        )
+        metadata = payload.get("metadata", {}) or {}
+        metadata.setdefault("progress_locale", progress_locale)
+        await _deliver_agent_result(
+            update=update,
+            status_message=status_message,
+            success=True,
+            message=str(payload.get("response") or ""),
+            metadata=metadata,
+            session_id=session_id,
+        )
+    except Exception as error:
+        logger.exception("Telegram semantic text input failed: %r", error)
+        await _deliver_agent_result(
+            update=update,
+            status_message=None,
+            success=False,
+            message=_safe_transport_error(error, locale=progress_locale),
+            metadata={"progress_locale": progress_locale},
+            session_id=session_id,
+        )
 
 
 async def _claim_group_failure(group: PendingMediaGroup) -> bool:
@@ -937,18 +960,11 @@ async def _expire_group(group: PendingMediaGroup) -> None:
         group.input_batch_id,
         TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS,
     )
-    if normalize_locale(group.progress_locale) == "en":
-        text = (
-            "The album could not be processed because file collection exceeded "
-            f"{TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS:g} seconds. No partial "
-            "batch was committed. Please send the files again."
-        )
-    else:
-        text = (
-            "Не удалось обработать альбом: загрузка файлов заняла больше "
-            f"{TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS:g} секунд. Частичный "
-            "пакет не был передан агенту. Повторите отправку файлов."
-        )
+    text = _localized(
+        "input.album_timeout",
+        locale=group.progress_locale,
+        timeout_seconds=f"{TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS:g}",
+    )
     await finish_status_or_send_reply(
         update=group.update,
         status_message=group.status_message,
@@ -970,7 +986,10 @@ async def _finish_group(group: PendingMediaGroup) -> None:
             await finish_status_or_send_reply(
                 update=group.update,
                 status_message=group.status_message,
-                text="Этот альбом уже был обработан; повторный запуск пропущен.",
+                text=_localized(
+                    "input.album_duplicate",
+                    locale=group.progress_locale,
+                ),
                 delivery_mode="send_new",
             )
             return
@@ -990,7 +1009,10 @@ async def _finish_group(group: PendingMediaGroup) -> None:
             update=group.update,
             status_message=group.status_message,
             success=False,
-            message=_safe_transport_error(error),
+            message=_safe_transport_error(
+                error,
+                locale=group.progress_locale,
+            ),
             metadata={"progress_locale": group.progress_locale},
             session_id=group.session_id,
         )
@@ -1003,7 +1025,10 @@ async def _finish_group(group: PendingMediaGroup) -> None:
 async def _process_standalone_attachment(update: Update) -> None:
     status_message = await send_initial_status_message(
         update,
-        "Файл принят. Загружаю и обрабатываю…",
+        _localized(
+            "input.file_received",
+            locale=detect_progress_locale(update),
+        ),
     )
     progress_locale = detect_progress_locale(update)
     session_id = _session_for_update(update)
@@ -1039,7 +1064,10 @@ async def _process_standalone_attachment(update: Update) -> None:
             await finish_status_or_send_reply(
                 update=update,
                 status_message=status_message,
-                text="Этот файл уже был принят ранее; повторный запуск пропущен.",
+                text=_localized(
+                    "input.duplicate",
+                    locale=progress_locale,
+                ),
                 delivery_mode="send_new",
             )
             return
@@ -1055,7 +1083,10 @@ async def _process_standalone_attachment(update: Update) -> None:
             await finish_status_or_send_reply(
                 update=update,
                 status_message=status_message,
-                text="Этот файл уже был обработан; повторный запуск пропущен.",
+                text=_localized(
+                    "input.duplicate",
+                    locale=progress_locale,
+                ),
                 delivery_mode="send_new",
             )
             return
@@ -1075,7 +1106,7 @@ async def _process_standalone_attachment(update: Update) -> None:
             update=update,
             status_message=status_message,
             success=False,
-            message=_safe_transport_error(error),
+            message=_safe_transport_error(error, locale=progress_locale),
             metadata={"progress_locale": progress_locale},
             session_id=session_id,
         )
@@ -1086,7 +1117,12 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if not extract_telegram_attachments(message):
         semantic_parts = await telegram_input_resolvers.resolve(message)
         if not semantic_parts:
-            await message.reply_text("Этот тип вложения пока не поддерживается.")
+            await message.reply_text(
+                _localized(
+                    "input.unsupported_type",
+                    locale=detect_progress_locale(update),
+                )
+            )
             return
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id is None:
@@ -1111,7 +1147,10 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
         if group is None:
             status_message = await send_initial_status_message(
                 update,
-                "Альбом принят. Жду остальные файлы…",
+                _localized(
+                    "input.album_collecting",
+                    locale=progress_locale,
+                ),
             )
             group = PendingMediaGroup(
                 key=group_key,
@@ -1164,7 +1203,10 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 await finish_status_or_send_reply(
                     update=update,
                     status_message=group.status_message,
-                    text="Этот альбом уже был обработан; повторный запуск пропущен.",
+                    text=_localized(
+                        "input.album_duplicate",
+                        locale=progress_locale,
+                    ),
                     delivery_mode="send_new",
                 )
             return
@@ -1192,7 +1234,7 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             update=group.update,
             status_message=group.status_message,
             success=False,
-            message=_safe_transport_error(error),
+            message=_safe_transport_error(error, locale=progress_locale),
             metadata={"progress_locale": group.progress_locale},
             session_id=group.session_id,
         )

@@ -21,6 +21,12 @@ class IngressConfigType(BaseModel):
     max_batch_total_bytes: int = Field(default=256 * 1024 * 1024, ge=1)
     max_text_parts_per_batch: int = Field(default=64, ge=0)
     max_text_part_chars: int = Field(default=100_000, ge=1)
+    max_semantic_parts_per_batch: int = Field(default=128, ge=0)
+    max_semantic_metadata_bytes_per_part: int = Field(default=16 * 1024, ge=1)
+    max_semantic_total_bytes: int = Field(default=512 * 1024, ge=1)
+    max_poll_options: int = Field(default=20, ge=1)
+    max_poll_option_chars: int = Field(default=1_000, ge=1)
+    max_vcard_chars: int = Field(default=16_384, ge=1)
 
     media_group_quiet_timeout_seconds: float = Field(default=0.8, gt=0)
     media_group_sealing_grace_seconds: float = Field(default=0.5, ge=0)
@@ -29,7 +35,11 @@ class IngressConfigType(BaseModel):
 
     @model_validator(mode="after")
     def validate_part_limits(self) -> "IngressConfigType":
-        if self.max_attachments_per_batch == 0 and self.max_text_parts_per_batch == 0:
+        if (
+            self.max_attachments_per_batch == 0
+            and self.max_text_parts_per_batch == 0
+            and self.max_semantic_parts_per_batch == 0
+        ):
             raise ValueError("ingress must allow text parts or attachments")
         minimum_group_lifetime = (
             self.media_group_quiet_timeout_seconds

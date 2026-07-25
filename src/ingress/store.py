@@ -207,7 +207,11 @@ class FileSystemIngressEventStore(_AtomicJsonStore):
             route = envelope.response_route.model_copy(
                 update={"reply_to_message_id": None}
             )
-            candidates = list(envelope.response_anchor_candidates)
+            candidates = (
+                [envelope.response_anchor_override]
+                if envelope.response_anchor_override is not None
+                else list(envelope.response_anchor_candidates)
+            )
             if not candidates:
                 candidates = [self._default_anchor_candidate(envelope)]
             event = ClientIngressEvent(
@@ -289,10 +293,14 @@ class FileSystemIngressEventStore(_AtomicJsonStore):
     def _default_anchor_candidate(
         envelope: ClientInputEnvelope,
     ) -> ClientResponseAnchorCandidate:
-        if envelope.reply_to_message_id:
-            kind = ClientResponseAnchorKind.EXPLICIT
-            message_id = envelope.reply_to_message_id
-        elif any(item.kind == "message_text" for item in envelope.text_parts):
+        if any(item.kind == "message_text" for item in envelope.text_parts):
+            kind = ClientResponseAnchorKind.INSTRUCTION
+            message_id = envelope.source_message_id
+        elif any(
+            getattr(item, "type", None) == "text_input"
+            and getattr(item, "role", None) == "message_text"
+            for item in envelope.semantic_parts
+        ):
             kind = ClientResponseAnchorKind.INSTRUCTION
             message_id = envelope.source_message_id
         elif any(item.kind == "caption" for item in envelope.text_parts):
@@ -478,6 +486,11 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 capability_snapshot=event.capability_snapshot,
                 response_anchor=ResponseAnchorSelector().select(
                     event.response_anchor_candidates
+                ),
+                reply_contexts=(
+                    [event.reply_context]
+                    if event.reply_context is not None
+                    else []
                 ),
                 opened_at=now,
                 last_event_at=event.occurred_at,
@@ -710,6 +723,7 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 admission_mode=draft.admission_mode,
                 response_route=draft.response_route,
                 response_anchor=draft.response_anchor,
+                reply_contexts=list(draft.reply_contexts),
                 locale=draft.locale,
                 capability_snapshot=draft.capability_snapshot,
                 artifact_manifest=ArtifactInputManifest(
@@ -720,6 +734,7 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 committed_at=committed_at,
                 commit_reason=reason,
                 content_fingerprint=_fingerprint(fingerprint_payload),
+                legacy_derived=draft.legacy_derived,
             )
             self._write_json(
                 committed_path,

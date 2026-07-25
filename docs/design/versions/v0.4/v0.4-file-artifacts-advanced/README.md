@@ -42,11 +42,15 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 - server-owned capability registry и immutable snapshots;
 - общая ru/en локализация;
 - deterministic response anchor и один presentation handle на InputBatch;
+- независимый presentation transport lifecycle с late bind и terminal intent;
 - discriminated semantic `InputPart`/`OutputPart`;
+- bounded semantic input и отдельный incoming reply provenance;
 - bounded input artifact manifest и явный `ArtifactPurpose`;
 - стабильный `selection_index` для deliverables;
 - commit-once `OutputBatch`, capability renderer и агрегированные receipts;
-- Telegram document groups с сохранением порядка и conservative `unknown`;
+- authoritative `OutputDeliveryPlan` executor для native Telegram operations;
+- atomic aggregate completion delivery records, attempt receipt и OutputBatch;
+- отдельное terminal-состояние `unknown` с explicit reconciliation;
 - process-restart recovery без автоматического повтора non-idempotent delivery.
 
 Runtime-конфигурация находится в корне

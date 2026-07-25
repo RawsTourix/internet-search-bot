@@ -50,6 +50,7 @@ class InputBatchPresentationRef(BaseModel):
     token_hash: str
     client_message_id: str | None = None
     state: PresentationState = PresentationState.RESERVED
+    pending_terminal_state: PresentationState | None = None
     message: LocalizationMessage
     locale: str
     file_count: int = Field(default=0, ge=0)
@@ -101,6 +102,16 @@ class InputBatchPresentationRef(BaseModel):
             raise ValueError("terminal presentation state requires closed_at")
         if self.state == PresentationState.BOUND and not self.client_message_id:
             raise ValueError("bound presentation requires client_message_id")
+        if self.pending_terminal_state is not None:
+            if self.pending_terminal_state not in {
+                PresentationState.CLOSED,
+                PresentationState.FAILED,
+            }:
+                raise ValueError("invalid pending presentation terminal state")
+            if self.state != PresentationState.RESERVED:
+                raise ValueError(
+                    "pending terminal state is only valid before transport binding"
+                )
         return self
 
     @classmethod

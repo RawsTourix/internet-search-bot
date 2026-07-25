@@ -18,6 +18,7 @@ from .capabilities import (
     ClientCapabilityDeclaration,
     ClientCapabilityRegistry,
     ClientCapabilitySnapshot,
+    capability_fingerprint,
 )
 from .config import ClientCapabilitiesConfig
 from .errors import (
@@ -133,10 +134,87 @@ class FileSystemCapabilitySnapshotStore:
             raise CapabilityNotFoundError("Invalid capability snapshot ID")
         path = self.snapshots_dir / f"{snapshot_id}.json"
         try:
-            return ClientCapabilitySnapshot.model_validate(self._read_json(path))
+            snapshot = ClientCapabilitySnapshot.model_validate(
+                self._read_json(path)
+            )
+            if snapshot.capability_snapshot_id != snapshot_id:
+                raise InteractionIntegrityError(
+                    "Capability snapshot identity mismatch"
+                )
+            if (
+                snapshot.capability_contract_version
+                != self.registry.contract_version
+            ):
+                raise InteractionIntegrityError(
+                    "Capability contract version mismatch"
+                )
+            if len(snapshot.features) > self.config.max_feature_count:
+                raise InteractionIntegrityError(
+                    "Capability snapshot feature count exceeds policy"
+                )
+            if len(snapshot.limits) > self.config.max_limit_count:
+                raise InteractionIntegrityError(
+                    "Capability snapshot limit count exceeds policy"
+                )
+            expected_fingerprint = capability_fingerprint(
+                contract_version=snapshot.capability_contract_version,
+                client_type=snapshot.client_type,
+                client_instance_id=snapshot.client_instance_id,
+                client_version=snapshot.client_version,
+                features=snapshot.features,
+                limits=dict(snapshot.limits),
+            )
+            if snapshot.fingerprint != expected_fingerprint:
+                raise InteractionIntegrityError(
+                    "Capability snapshot fingerprint mismatch"
+                )
+            declaration = ClientCapabilityDeclaration(
+                capability_contract_version=(
+                    snapshot.capability_contract_version
+                ),
+                client_version=snapshot.client_version,
+                features=snapshot.features,
+                limits=dict(snapshot.limits),
+            )
+            validated = self.registry.resolve(
+                declaration,
+                client_type=snapshot.client_type,
+                client_instance_id=snapshot.client_instance_id,
+                reject_unknown=True,
+                max_feature_count=self.config.max_feature_count,
+                max_limit_count=self.config.max_limit_count,
+                captured_at=snapshot.captured_at,
+            )
+            if (
+                validated.features != snapshot.features
+                or dict(validated.limits) != dict(snapshot.limits)
+                or validated.fingerprint != snapshot.fingerprint
+            ):
+                raise InteractionIntegrityError(
+                    "Capability snapshot registry validation failed"
+                )
+            digest = snapshot.fingerprint.removeprefix("sha256:")
+            index = self._read_json(
+                self.fingerprints_dir / f"{digest}.json"
+            )
+            if (
+                index.get("fingerprint") != snapshot.fingerprint
+                or index.get("capability_snapshot_id") != snapshot_id
+            ):
+                raise InteractionIntegrityError(
+                    "Capability fingerprint index mismatch"
+                )
+            return snapshot
         except CapabilityNotFoundError:
             raise
-        except (ValidationError, ValueError, TypeError) as error:
+        except InteractionIntegrityError:
+            raise
+        except (
+            CapabilityValidationError,
+            ValidationError,
+            ValueError,
+            TypeError,
+        ) as error:
             raise InteractionIntegrityError(
                 "Invalid capability snapshot metadata"
             ) from error

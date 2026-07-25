@@ -15,6 +15,7 @@ from ..core.models import ClientType
 from ..interaction.anchors import (
     ClientResponseAnchor,
     ClientResponseAnchorCandidate,
+    ClientResponseAnchorKind,
 )
 from ..interaction.capabilities import (
     ClientCapabilityDeclaration,
@@ -173,6 +174,24 @@ class ClientResponseRoute(_IngressModel):
         return _optional(value)
 
 
+class ClientReplyContext(_IngressModel):
+    """Untrusted provenance for the message the client user replied to."""
+
+    replied_to_message_id: str
+    replied_to_sender_id: str | None = None
+    replied_to_excerpt: str | None = None
+
+    @field_validator("replied_to_message_id")
+    @classmethod
+    def validate_message_id(cls, value: str) -> str:
+        return _required(value, "replied_to_message_id")
+
+    @field_validator("replied_to_sender_id", "replied_to_excerpt")
+    @classmethod
+    def normalize_context(cls, value: str | None) -> str | None:
+        return _optional(value)
+
+
 class IngressTextPart(_IngressModel):
     part_id: str
     kind: Literal["message_text", "caption"]
@@ -256,6 +275,7 @@ class ClientInputEnvelope(_IngressModel):
     source_message_id: str
     source_group_id: str | None = None
     reply_to_message_id: str | None = None
+    reply_context: ClientReplyContext | None = None
 
     occurred_at: datetime
     text_parts: list[IngressTextPart] = Field(default_factory=list)
@@ -269,6 +289,7 @@ class ClientInputEnvelope(_IngressModel):
     response_anchor_candidates: list[ClientResponseAnchorCandidate] = Field(
         default_factory=list
     )
+    response_anchor_override: ClientResponseAnchorCandidate | None = None
     admission_mode: InputAdmissionMode = InputAdmissionMode.AUTO
     response_route: ClientResponseRoute
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -314,6 +335,25 @@ class ClientInputEnvelope(_IngressModel):
         for part in self.text_parts:
             if any(slot_id not in known for slot_id in part.attachment_slot_ids):
                 raise ValueError("text part references unknown attachment slot")
+        semantic_ids = [item.part_id for item in self.semantic_parts]
+        if len(semantic_ids) != len(set(semantic_ids)):
+            raise ValueError("semantic part IDs must be unique")
+        if self.response_anchor_override is not None:
+            if (
+                self.response_anchor_override.kind
+                != ClientResponseAnchorKind.EXPLICIT
+            ):
+                raise ValueError(
+                    "response anchor override must use explicit kind"
+                )
+            source_message_id = self.response_anchor_override.source_message_id
+            if (
+                source_message_id is not None
+                and source_message_id != self.source_message_id
+            ):
+                raise ValueError(
+                    "response anchor override source is outside current event"
+                )
         return self
 
 
@@ -331,6 +371,7 @@ class ClientIngressEvent(_IngressModel):
     source_message_id: str
     source_group_id: str | None = None
     reply_to_message_id: str | None = None
+    reply_context: ClientReplyContext | None = None
     occurred_at: datetime
     received_at: datetime
     text_parts: list[IngressTextPart] = Field(default_factory=list)
@@ -344,9 +385,11 @@ class ClientIngressEvent(_IngressModel):
     response_anchor_candidates: list[ClientResponseAnchorCandidate] = Field(
         default_factory=list
     )
+    response_anchor_override: ClientResponseAnchorCandidate | None = None
     admission_mode: InputAdmissionMode = InputAdmissionMode.AUTO
     response_route: ClientResponseRoute
     metadata: dict[str, Any] = Field(default_factory=dict)
+    legacy_derived: bool = False
 
     @field_validator("event_id")
     @classmethod
@@ -441,6 +484,7 @@ class InputBatchDraft(_IngressModel):
     locale: str | None = None
     capability_snapshot: ClientCapabilitySnapshot | None = None
     response_anchor: ClientResponseAnchor | None = None
+    reply_contexts: list[ClientReplyContext] = Field(default_factory=list)
     admission_mode: InputAdmissionMode = InputAdmissionMode.AUTO
     response_route: ClientResponseRoute
     opened_at: datetime
@@ -450,6 +494,7 @@ class InputBatchDraft(_IngressModel):
     sealing_deadline: datetime | None = None
     maximum_deadline: datetime | None = None
     failure_code: str | None = None
+    legacy_derived: bool = False
 
     @field_validator("input_batch_id")
     @classmethod
@@ -503,6 +548,7 @@ class CommittedInputBatch(_IngressModel):
     admission_mode: InputAdmissionMode
     response_route: ClientResponseRoute
     response_anchor: ClientResponseAnchor | None = None
+    reply_contexts: list[ClientReplyContext] = Field(default_factory=list)
     locale: str | None = None
     capability_snapshot: ClientCapabilitySnapshot | None = None
     artifact_manifest: ArtifactInputManifest = Field(
@@ -515,6 +561,7 @@ class CommittedInputBatch(_IngressModel):
     committed_at: datetime
     commit_reason: str
     content_fingerprint: str
+    legacy_derived: bool = False
 
     @field_validator("input_batch_id", "continuation_of_batch_id", "correction_of_batch_id")
     @classmethod
@@ -577,6 +624,10 @@ class CommittedInputBatch(_IngressModel):
             "semantic_parts": [
                 item.model_dump(mode="json", exclude={"metadata"})
                 for item in self.semantic_parts
+            ],
+            "reply_contexts": [
+                item.model_dump(mode="json")
+                for item in self.reply_contexts
             ],
             "locale": self.locale,
             "admission_mode": self.admission_mode.value,

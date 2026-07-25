@@ -27,6 +27,7 @@ from ..interaction.capabilities import (
 )
 from ..interaction.capability_store import FileSystemCapabilitySnapshotStore
 from ..interaction.presentation_service import InputPresentationCoordinator
+from ..interaction.presentation import PresentationAckPolicy
 from ..localization.service import LocalizationService
 from .config import IngressConfigType
 from .models import (
@@ -42,6 +43,10 @@ from .store import (
     FileSystemInputBatchStore,
     IngressConflictError,
     IngressNotFoundError,
+)
+from .semantic_limits import (
+    SemanticInputLimitError,
+    validate_semantic_parts,
 )
 
 
@@ -360,14 +365,14 @@ class ArtifactIngressService:
             # The draft remains non-committed and invisible to the agent.
             raise
 
-    async def commit_batch(
+    async def commit_batch_application_result(
         self,
         input_batch_id: str,
         *,
         session_id: str,
         reason: str,
-    ) -> CommittedInputBatch:
-        """Explicitly seal a grouped draft after client grouping is complete."""
+    ) -> tuple[CommittedInputBatch, bool, tuple | None]:
+        """Seal a grouped draft and return its presentation application result."""
         draft = await self.batch_store.get_draft(input_batch_id)
         counts = _attachment_state_counts(draft)
         logger.info(
@@ -404,7 +409,7 @@ class ArtifactIngressService:
             )
         grouped_commit = getattr(self.batch_store, "commit_batch", None)
         if grouped_commit is not None:
-            committed, _ = await grouped_commit(
+            committed, duplicate = await grouped_commit(
                 input_batch_id,
                 session_id=session_id,
                 reason=reason,
@@ -414,12 +419,53 @@ class ArtifactIngressService:
                 input_batch_id,
                 reason=reason,
             )
+            duplicate = False
         logger.info(
             "api_ingress_commit_finished input_batch_id=%s artifact_count=%s "
             "text_part_count=%s",
             input_batch_id,
             len(committed.artifact_refs),
             len(committed.text_parts),
+        )
+        presentation_result = None
+        if self.presentation_coordinator is not None:
+            presentation_result = (
+                await self.presentation_coordinator.finalize_batch(
+                    input_batch_id=input_batch_id,
+                    state="committed",
+                    file_count=len(draft.attachment_parts),
+                    text_part_count=len(draft.text_parts),
+                    response_anchor=committed.response_anchor,
+                )
+            )
+        return committed, duplicate, presentation_result
+
+    async def commit_batch_result(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+        reason: str,
+    ) -> tuple[CommittedInputBatch, bool]:
+        """Compatibility projection of the grouped application commit result."""
+        committed, duplicate, _ = await self.commit_batch_application_result(
+            input_batch_id,
+            session_id=session_id,
+            reason=reason,
+        )
+        return committed, duplicate
+
+    async def commit_batch(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+        reason: str,
+    ) -> CommittedInputBatch:
+        committed, _ = await self.commit_batch_result(
+            input_batch_id,
+            session_id=session_id,
+            reason=reason,
         )
         return committed
 
@@ -575,6 +621,13 @@ class ArtifactIngressService:
                 "declared_input_batch_too_large",
                 "Declared attachment sizes exceed the batch limit.",
             )
+        try:
+            validate_semantic_parts(envelope.semantic_parts, self.config)
+        except SemanticInputLimitError as error:
+            raise IngressValidationError(
+                "semantic_input_limit_exceeded",
+                str(error),
+            ) from error
 
     async def _resolve_interaction(self, envelope: ClientInputEnvelope):
         locale = (
@@ -664,6 +717,19 @@ class ArtifactIngressService:
                 text_part_count=len(draft.text_parts),
                 response_anchor=draft.response_anchor,
             )
+            if (
+                ack
+                in {
+                    PresentationAckPolicy.UPDATE_EXISTING,
+                    PresentationAckPolicy.THROTTLED_UPDATE,
+                }
+                and (
+                    draft.capability_snapshot is None
+                    or "presentation.message_edit"
+                    not in draft.capability_snapshot.features
+                )
+            ):
+                ack = PresentationAckPolicy.SILENT
             updates.update(
                 ack_policy=ack,
                 presentation_event=event,

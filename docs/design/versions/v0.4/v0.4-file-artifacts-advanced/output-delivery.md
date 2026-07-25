@@ -68,6 +68,7 @@ class OutputBatch(BaseModel):
         "partially_delivered",
         "delivered",
         "failed",
+        "unknown",
         "cancelled",
     ]
 
@@ -108,6 +109,12 @@ final AgentAction text
 Agent result и selected delivery records остаются authoritative sources.
 
 LLM final text не является source of truth delivery state.
+
+Semantic artifact intent связывается с exact authoritative
+`artifact_id`/`delivery_id`: store определяет filename, MIME, size и identity,
+а intent сохраняет более точный subtype и presentation fields. Generic
+`ArtifactOutputPart` создаётся только при отсутствии более точного semantic
+intent.
 
 ### AF-9.5. Ordered delivery
 
@@ -158,6 +165,20 @@ incompatible media classes
 Transport limit берётся из capability snapshot, а не hardcoded business logic
 OutputBatch.
 
+Фактическая transport-цепочка:
+
+```text
+OutputBatch.parts
+→ CapabilityOutputRenderer.plan()
+→ OutputDeliveryPlan.groups по group.index
+→ TelegramOutputPlanExecutor
+→ exact part receipts
+→ atomic aggregate completion
+```
+
+Compatibility projection `AgentResult.artifacts` не определяет ни порядок, ни
+способ Telegram-доставки.
+
 ### AF-10.2. Group delivery receipts
 
 Одна transport group создаёт aggregate attempt, но сохраняет part-level
@@ -184,6 +205,12 @@ class OutputDeliveryReceipt(BaseModel):
 - state;
 - error category;
 - delivered_at.
+
+Receipt завершает attempt атомарно на application-уровне: authority всех
+`part_id`/`index`/`delivery_id` проверяется до изменения, затем в одной
+rollback-capable операции обновляются artifact delivery records, сохраняется
+aggregate attempt receipt и переводится `OutputBatch`. Полусохранённый receipt
+не может публиковать client-facing `done`.
 
 ### AF-10.3. `cycle_done` и delivery completion
 
@@ -234,6 +261,21 @@ Recovery policy использует:
 - explicit user retry;
 - bounded/manual reconciliation.
 
+`OutputBatchState.UNKNOWN` является отдельным terminal domain fact:
+
+```text
+ready → delivering
+                 → delivered
+                 → partially_delivered
+                 → failed
+                 → unknown
+```
+
+`unknown` не входит в automatic resend queue. Он доступен через internal list
+и может перейти в подтверждённое terminal state только explicit
+reconciliation operation. Stale `delivering` claim после restart также
+консервативно становится `unknown`.
+
 ---
 
 ## AF-11. Response route, response anchor и presentation
@@ -254,10 +296,25 @@ Anchor может обновляться по deterministic policy.
 
 ### AF-11.2. Anchor selection policy
 
+Incoming reply provenance и response anchor разделены:
+
+```text
+ClientReplyContext
+→ replied_to_message_id/sender/excerpt как untrusted context
+
+response_anchor
+→ текущая часть InputBatch, на которую должен отвечать transport
+```
+
+Обычный `reply_to_message_id` не получает автоматически максимальный
+приоритет. Отдельный typed `response_anchor_override` допускается только как
+явный trusted client contract field.
+
 Приоритет:
 
 ```text
-explicit user reply target / explicit instruction
+explicit trusted response anchor override
+→ current explicit instruction
 → latest meaningful text instruction
 → caption containing instruction
 → latest attachment event
@@ -305,6 +362,19 @@ class InputBatchPresentationRef(BaseModel):
 - вызывает structured presentation callback;
 - renderer редактирует существующее сообщение, если capability разрешает;
 - иначе использует silent acknowledgement или throttled update.
+
+Transport lifecycle presentation независим от semantic state InputBatch:
+
+```text
+reserved → bound → closed | failed | expired
+```
+
+Если atomic InputBatch committed до создания Telegram status, presentation
+остаётся `reserved` с `pending_terminal_state`. Успешный late bind сохраняет
+`client_message_id` и атомарно закрывает handle. Bind уже terminal handle
+является explicit conflict, а expired reservation может быть заменена новым
+handle. Grouped application commit проходит через ingress coordinator,
+возвращает structured event/ref и закрывает bound presentation.
 
 ### AF-11.5. Structured acknowledgement
 

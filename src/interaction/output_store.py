@@ -63,6 +63,12 @@ class FileSystemOutputBatchStore:
             OutputBatchState.DELIVERED,
             OutputBatchState.PARTIALLY_DELIVERED,
             OutputBatchState.FAILED,
+            OutputBatchState.UNKNOWN,
+        },
+        OutputBatchState.UNKNOWN: {
+            OutputBatchState.DELIVERED,
+            OutputBatchState.PARTIALLY_DELIVERED,
+            OutputBatchState.FAILED,
         },
     }
 
@@ -187,6 +193,15 @@ class FileSystemOutputBatchStore:
     ) -> OutputBatch:
         return await asyncio.to_thread(self._complete_sync, receipt)
 
+    async def reconcile_unknown(
+        self,
+        receipt: OutputDeliveryReceipt,
+    ) -> OutputBatch:
+        return await asyncio.to_thread(
+            self._reconcile_unknown_sync,
+            receipt,
+        )
+
     def _complete_sync(self, receipt: OutputDeliveryReceipt) -> OutputBatch:
         from .output_models import OutputDeliveryReceiptState
 
@@ -195,8 +210,7 @@ class FileSystemOutputBatchStore:
             OutputDeliveryReceiptState.PARTIALLY_DELIVERED:
                 OutputBatchState.PARTIALLY_DELIVERED,
             OutputDeliveryReceiptState.FAILED: OutputBatchState.FAILED,
-            # Unknown must remain visible and must not trigger an automatic retry.
-            OutputDeliveryReceiptState.UNKNOWN: OutputBatchState.FAILED,
+            OutputDeliveryReceiptState.UNKNOWN: OutputBatchState.UNKNOWN,
         }[receipt.state]
         with self._lock:
             current = self._load_sync(receipt.output_batch_id)
@@ -216,6 +230,7 @@ class FileSystemOutputBatchStore:
                 OutputBatchState.DELIVERED,
                 OutputBatchState.PARTIALLY_DELIVERED,
                 OutputBatchState.FAILED,
+                OutputBatchState.UNKNOWN,
             }:
                 existing_path = self.attempts / f"{receipt.attempt_id}.json"
                 if existing_path.exists():
@@ -246,6 +261,7 @@ class FileSystemOutputBatchStore:
                     OutputBatchState.PARTIALLY_DELIVERED:
                         "output_batch_partially_delivered",
                     OutputBatchState.FAILED: "output_batch_failed",
+                    OutputBatchState.UNKNOWN: "output_batch_unknown",
                 }[mapped],
                 receipt.output_batch_id,
                 receipt.attempt_id,
@@ -253,8 +269,63 @@ class FileSystemOutputBatchStore:
             )
             return self._load_sync(receipt.output_batch_id)
 
+    def _reconcile_unknown_sync(
+        self,
+        receipt: OutputDeliveryReceipt,
+    ) -> OutputBatch:
+        if receipt.state == OutputDeliveryReceiptState.UNKNOWN:
+            raise OutputBatchConflictError(
+                "reconciliation requires a resolved receipt"
+            )
+        mapped = {
+            OutputDeliveryReceiptState.DELIVERED: OutputBatchState.DELIVERED,
+            OutputDeliveryReceiptState.PARTIALLY_DELIVERED:
+                OutputBatchState.PARTIALLY_DELIVERED,
+            OutputDeliveryReceiptState.FAILED: OutputBatchState.FAILED,
+        }[receipt.state]
+        with self._lock:
+            current = self._load_sync(receipt.output_batch_id)
+            if current.state != OutputBatchState.UNKNOWN:
+                raise OutputBatchConflictError(
+                    "only an unknown OutputBatch can be reconciled"
+                )
+            expected_parts = [
+                (item.part_id, item.index) for item in current.parts
+            ]
+            received_parts = [
+                (item.part_id, item.index)
+                for item in receipt.part_receipts
+            ]
+            if received_parts != expected_parts:
+                raise OutputBatchConflictError(
+                    "reconciliation receipt does not match output parts"
+                )
+            state_path = (
+                self.records / receipt.output_batch_id / "state.json"
+            )
+            state = self._read(state_path)
+            if state.get("attempt_id") != receipt.attempt_id:
+                raise OutputBatchConflictError(
+                    "reconciliation attempt does not match terminal claim"
+                )
+            self._write(
+                self.attempts
+                / f"{receipt.attempt_id}.reconciled.json",
+                receipt.model_dump(mode="json"),
+            )
+            state.update(
+                state=mapped.value,
+                completed_at=receipt.completed_at.isoformat(),
+                updated_at=receipt.completed_at.isoformat(),
+            )
+            self._write(state_path, state)
+            return self._load_sync(receipt.output_batch_id)
+
     async def list_recoverable(self) -> list[OutputBatch]:
         return await asyncio.to_thread(self._list_recoverable_sync)
+
+    async def list_unknown(self) -> list[OutputBatch]:
+        return await asyncio.to_thread(self._list_unknown_sync)
 
     async def reconcile_stale_claims(
         self,
@@ -318,6 +389,16 @@ class FileSystemOutputBatchStore:
             item = self._load_sync(path.name)
             # DELIVERING is reconciled, never blindly re-sent.
             if item.state in {OutputBatchState.READY, OutputBatchState.DELIVERING}:
+                result.append(item)
+        return result
+
+    def _list_unknown_sync(self) -> list[OutputBatch]:
+        result: list[OutputBatch] = []
+        for path in sorted(self.records.glob("obat_*")):
+            if not path.is_dir() or path.is_symlink():
+                continue
+            item = self._load_sync(path.name)
+            if item.state == OutputBatchState.UNKNOWN:
                 result.append(item)
         return result
 

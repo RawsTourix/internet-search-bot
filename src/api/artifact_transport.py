@@ -232,12 +232,12 @@ class ArtifactTransportFacade:
             event.event_id,
         )
 
-    async def commit_grouped_batch(
+    async def _commit_grouped_batch_application(
         self,
         input_batch_id: str,
         *,
         session_id: str,
-    ) -> tuple[CommittedInputBatch, bool]:
+    ) -> tuple[CommittedInputBatch, bool, tuple | None]:
         """Commit one complete grouped draft; repeated calls are idempotent."""
         store = self.api.ingress_services.batch_store
         draft = await store.get_draft(input_batch_id)
@@ -281,10 +281,10 @@ class ArtifactTransportFacade:
                 input_batch_id,
                 len(committed.artifact_refs),
             )
-            return committed, True
+            return committed, True, None
 
-        commit_batch = getattr(store, "commit_batch", None)
-        if commit_batch is None:
+        ingress_service = self.api.ingress_services.ingress_service
+        if not hasattr(ingress_service, "commit_batch"):
             logger.warning(
                 "gateway_batch_commit_rejected input_batch_id=%s "
                 "reason=grouped_store_unavailable",
@@ -294,11 +294,28 @@ class ArtifactTransportFacade:
                 "Grouped input batch store is not configured"
             )
         try:
-            committed, duplicate = await commit_batch(
-                input_batch_id,
-                session_id=session_id,
-                reason="explicit_client_commit",
+            application_commit = getattr(
+                ingress_service,
+                "commit_batch_application_result",
+                None,
             )
+            if application_commit is None:
+                committed, duplicate = await ingress_service.commit_batch_result(
+                    input_batch_id,
+                    session_id=session_id,
+                    reason="explicit_client_commit",
+                )
+                presentation_result = None
+            else:
+                (
+                    committed,
+                    duplicate,
+                    presentation_result,
+                ) = await application_commit(
+                    input_batch_id,
+                    session_id=session_id,
+                    reason="explicit_client_commit",
+                )
         except Exception as error:
             latest = await store.get_draft(input_batch_id)
             counts = _attachment_state_counts(latest)
@@ -324,7 +341,32 @@ class ArtifactTransportFacade:
             len(committed.artifact_refs),
             len(committed.text_parts),
         )
+        return committed, duplicate, presentation_result
+
+    async def commit_grouped_batch(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+    ) -> tuple[CommittedInputBatch, bool]:
+        """Compatibility projection without structured presentation details."""
+        committed, duplicate, _ = await self._commit_grouped_batch_application(
+            input_batch_id,
+            session_id=session_id,
+        )
         return committed, duplicate
+
+    async def commit_grouped_batch_with_presentation(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+    ) -> tuple[CommittedInputBatch, bool, tuple | None]:
+        """Commit a grouped batch and return the coordinator's ack event/ref."""
+        return await self._commit_grouped_batch_application(
+            input_batch_id,
+            session_id=session_id,
+        )
 
     async def run_committed_batch(
         self,

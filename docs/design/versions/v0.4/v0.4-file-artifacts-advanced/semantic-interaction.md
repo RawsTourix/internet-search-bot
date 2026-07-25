@@ -623,6 +623,29 @@ rules.
 
 События от разных actual senders не объединяются автоматически.
 
+### AF-6.5. Bounded semantic payload и canonical caption
+
+Ingress проверяет semantic payload при admission, grouped append и чтении
+upgraded persisted records:
+
+```text
+max_semantic_parts_per_batch
+max_semantic_metadata_bytes_per_part
+max_semantic_total_bytes
+max_poll_options
+max_poll_option_chars
+max_vcard_chars
+```
+
+`part_id` уникален в пределах batch, включая cumulative grouped append.
+Нарушение persisted v2 invariants после structural upgrade является integrity
+error до построения agent payload.
+
+Текст и caption имеют одну canonical representation в `IngressTextPart`.
+Semantic media part хранит media metadata и slot binding, но не дублирует тот
+же пользовательский caption как `TextInputPart`; поэтому LLM context получает
+caption ровно один раз.
+
 ---
 
 ## AF-7. Resolver registry и границы media processing

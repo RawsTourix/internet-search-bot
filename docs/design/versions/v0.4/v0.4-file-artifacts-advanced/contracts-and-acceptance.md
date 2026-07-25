@@ -126,6 +126,7 @@ output_batch_part_unknown
 output_batch_delivered
 output_batch_partially_delivered
 output_batch_failed
+output_batch_unknown
 
 client_output_fallback_selected
 client_output_group_created
@@ -203,6 +204,12 @@ route remains same conversation/thread
 → anchor update does not mutate route authority
 ```
 
+```text
+user replies to an old message with a new instruction
+→ old message is preserved as ClientReplyContext
+→ current instruction is response anchor
+```
+
 ### AF-20.4. Input presentation
 
 ```text
@@ -215,6 +222,13 @@ route remains same conversation/thread
 client lacks message editing
 → silent or throttled fallback
 → domain state unchanged
+```
+
+```text
+atomic batch commits before status bind
+→ presentation keeps pending terminal intent
+→ late bind stores client_message_id
+→ presentation closes
 ```
 
 ### AF-20.5. OutputBatch
@@ -253,6 +267,13 @@ all required receipts successful
 one part fails
 → partially_delivered/failed according to policy
 → exact failed part visible in receipt
+```
+
+```text
+transport result becomes ambiguous after send started
+→ exact part and OutputBatch become unknown
+→ no automatic resend
+→ explicit reconciliation remains possible
 ```
 
 ### AF-20.6. Semantic media
@@ -310,6 +331,18 @@ intermediate helper file
 process restart after OutputBatch commit
 → batch/attempt state recovered
 → no repeat agent cycle
+```
+
+```text
+stale delivering claim after restart
+→ OutputBatch becomes unknown
+→ no automatic resend
+```
+
+```text
+filesystem failure between attempt receipt and OutputBatch state
+→ delivery records, receipt and state roll back together
+→ no half-committed completion
 ```
 
 Filesystem v0.4 может гарантировать process-restart recovery в пределах текущей

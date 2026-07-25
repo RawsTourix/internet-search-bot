@@ -311,10 +311,24 @@ def create_artifact_router(
         body: CommitGroupedBatchRequest,
     ):
         try:
-            batch, duplicate = await facade.commit_grouped_batch(
-                input_batch_id,
-                session_id=body.session_id,
+            commit_with_presentation = getattr(
+                facade,
+                "commit_grouped_batch_with_presentation",
+                None,
             )
+            presentation_result = None
+            if commit_with_presentation is None:
+                batch, duplicate = await facade.commit_grouped_batch(
+                    input_batch_id,
+                    session_id=body.session_id,
+                )
+            else:
+                batch, duplicate, presentation_result = (
+                    await commit_with_presentation(
+                        input_batch_id,
+                        session_id=body.session_id,
+                    )
+                )
             response = None
             if body.run and not duplicate:
                 response = await run_batch(
@@ -328,6 +342,21 @@ def create_artifact_router(
                 "run_skipped_duplicate": bool(body.run and duplicate),
                 "committed_batch": _committed_batch_payload(batch),
             }
+            if presentation_result is not None:
+                ack_policy, presentation_event, presentation_ref = (
+                    presentation_result
+                )
+                payload.update(
+                    {
+                        "ack_policy": ack_policy.value,
+                        "presentation_event": presentation_event.model_dump(
+                            mode="json"
+                        ),
+                        "presentation_ref": presentation_ref.model_dump(
+                            mode="json"
+                        ),
+                    }
+                )
             if response is not None:
                 payload["response"] = response.content
                 payload["metadata"] = response.metadata
@@ -399,6 +428,47 @@ def create_artifact_router(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ArtifactAccessError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
+
+    @router.get(
+        "/internal/output-batches/unknown",
+        dependencies=[Depends(auth_dependency)],
+    )
+    async def list_unknown_output_batches(session_id: str):
+        batches = await facade.api.output_store.list_unknown()
+        return {
+            "output_batches": [
+                item.model_dump(mode="json")
+                for item in batches
+                if item.session_id == session_id
+            ]
+        }
+
+    @router.post(
+        "/internal/output-batches/{output_batch_id}/reconcile",
+        dependencies=[Depends(auth_dependency)],
+    )
+    async def reconcile_unknown_output_batch(
+        output_batch_id: str,
+        body: OutputBatchReceiptRequest,
+    ):
+        batch = await facade.api.output_store.get(output_batch_id)
+        if batch.session_id != body.session_id:
+            raise HTTPException(
+                status_code=403,
+                detail="Output batch authority mismatch",
+            )
+        if body.receipt.output_batch_id != output_batch_id:
+            raise HTTPException(
+                status_code=409,
+                detail="Output receipt identity mismatch",
+            )
+        try:
+            reconciled = await facade.api.output_store.reconcile_unknown(
+                body.receipt
+            )
+            return reconciled.model_dump(mode="json")
+        except OutputBatchConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @router.get(
         "/internal/output-batches/{output_batch_id}",
@@ -512,7 +582,9 @@ def create_artifact_router(
                     status_code=409,
                     detail="Output receipt identity mismatch",
                 )
-            completed = await facade.api.output_store.complete(body.receipt)
+            completed = await facade.api.output_completion.complete(
+                body.receipt
+            )
             return completed.model_dump(mode="json")
         except OutputBatchNotFoundError as error:
             raise HTTPException(status_code=404, detail=str(error)) from error

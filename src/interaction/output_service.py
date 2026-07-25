@@ -23,6 +23,7 @@ from .output_models import (
     OutputPart,
     TextOutputPart,
 )
+from ..localization.models import LocalizationMessage
 from .output_store import FileSystemOutputBatchStore, build_ready_output_batch
 from .rendering import CapabilityOutputRenderer, ClientOutputRenderer
 
@@ -81,19 +82,6 @@ class OutputBatchAssembler:
                 )
             )
         semantic_parts = self._parse_semantic_parts(result.semantic_outputs)
-        for item in semantic_parts:
-            if isinstance(item, ArtifactOutputPart):
-                # Artifact selections below own exact delivery identity/order.
-                continue
-            parts.append(
-                item.model_copy(
-                    update={
-                        "part_id": item.part_id or new_output_part_id(),
-                        "index": len(parts),
-                    }
-                )
-            )
-
         records = await self.delivery_store.list_cycle(
             session_id=input_batch.session_id,
             cycle_id=cycle_id,
@@ -114,7 +102,49 @@ class OutputBatchAssembler:
             raise InteractionValidationError(
                 "selected artifacts exceed OutputBatch policy"
             )
+        records_by_delivery = {
+            item.delivery_id: item for item in records
+        }
+        consumed_deliveries: set[str] = set()
+        for item in semantic_parts:
+            if isinstance(item, ArtifactOutputPart):
+                record = records_by_delivery.get(item.delivery_id)
+                if record is None or record.artifact_id != item.artifact_id:
+                    raise InteractionValidationError(
+                        "semantic artifact output is not an exact selected delivery"
+                    )
+                consumed_deliveries.add(record.delivery_id)
+                parts.append(
+                    item.model_copy(
+                        update={
+                            "part_id": item.part_id or new_output_part_id(),
+                            "index": len(parts),
+                            "artifact_id": record.artifact_id,
+                            "delivery_id": record.delivery_id,
+                            "filename": record.filename,
+                            "mime_type": record.mime_type,
+                            "size_bytes": record.size_bytes,
+                            "metadata": {
+                                **item.metadata,
+                                "selection_index": record.selection_index,
+                                "format_id": record.format_id,
+                            },
+                        }
+                    )
+                )
+                continue
+            parts.append(
+                item.model_copy(
+                    update={
+                        "part_id": item.part_id or new_output_part_id(),
+                        "index": len(parts),
+                    }
+                )
+            )
+
         for record in records:
+            if record.delivery_id in consumed_deliveries:
+                continue
             parts.append(
                 ArtifactOutputPart(
                     part_id=new_output_part_id(),
@@ -131,14 +161,16 @@ class OutputBatchAssembler:
                 )
             )
         if not parts:
+            localization = getattr(self.renderer, "localization", None)
+            message = LocalizationMessage(message_key="output.file_ready")
             parts.append(
                 TextOutputPart(
                     part_id=new_output_part_id(),
                     index=0,
                     text=(
-                        "Done."
-                        if resolved_locale.lower().startswith("en")
-                        else "Готово."
+                        localization.render(message, locale=resolved_locale)
+                        if localization is not None
+                        else message.message_key
                     ),
                 )
             )

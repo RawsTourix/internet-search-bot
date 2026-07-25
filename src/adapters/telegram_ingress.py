@@ -6,11 +6,12 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..core.models import ClientType
-from ..interaction.parts import InputPart
+from ..interaction.parts import InputPart, TextInputPart
 from ..ingress import (
     ClientAttachmentLocator,
     ClientConversationRef,
     ClientInputEnvelope,
+    ClientReplyContext,
     ClientResponseRoute,
     ClientSenderRef,
     IngressAttachmentSlot,
@@ -29,10 +30,13 @@ def build_telegram_input_envelope(
     attachments: list[dict[str, Any]],
     semantic_parts: list[InputPart] | None = None,
     user_name: str | None = None,
+    text: str | None = None,
     caption: str | None = None,
     media_group_id: str | None = None,
     message_thread_id: str | int | None = None,
     reply_to_message_id: str | None = None,
+    reply_to_sender_id: str | None = None,
+    reply_to_excerpt: str | None = None,
     occurred_at: datetime | None = None,
     locale: str | None = None,
     response_metadata: dict[str, Any] | None = None,
@@ -77,6 +81,13 @@ def build_telegram_input_envelope(
         ))
 
     text_parts: list[IngressTextPart] = []
+    normalized_text = (text or "").strip()
+    if normalized_text:
+        text_parts.append(IngressTextPart(
+            part_id=f"message-{normalized_message}",
+            kind="message_text",
+            text=normalized_text,
+        ))
     normalized_caption = (caption or "").strip()
     if normalized_caption:
         text_parts.append(IngressTextPart(
@@ -89,6 +100,18 @@ def build_telegram_input_envelope(
     timestamp = occurred_at or datetime.now(timezone.utc)
     if timestamp.tzinfo is None or timestamp.utcoffset() is None:
         timestamp = timestamp.replace(tzinfo=timezone.utc)
+
+    semantic = [
+        item
+        for item in list(semantic_parts or [])
+        if not (
+            isinstance(item, TextInputPart)
+            and (
+                (item.role == "message_text" and item.text == normalized_text)
+                or (item.role == "caption" and item.text == normalized_caption)
+            )
+        )
+    ]
 
     return ClientInputEnvelope(
         idempotency_key=(
@@ -115,10 +138,19 @@ def build_telegram_input_envelope(
             str(media_group_id) if media_group_id is not None else None
         ),
         reply_to_message_id=reply_to_message_id,
+        reply_context=(
+            ClientReplyContext(
+                replied_to_message_id=reply_to_message_id,
+                replied_to_sender_id=reply_to_sender_id,
+                replied_to_excerpt=reply_to_excerpt,
+            )
+            if reply_to_message_id is not None
+            else None
+        ),
         occurred_at=timestamp,
         text_parts=text_parts,
         attachment_slots=slots,
-        semantic_parts=list(semantic_parts or []),
+        semantic_parts=semantic,
         locale=locale,
         admission_mode=admission_mode,
         response_route=ClientResponseRoute(

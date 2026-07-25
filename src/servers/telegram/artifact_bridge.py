@@ -355,14 +355,28 @@ def build_telegram_input_envelope(
     if message is None:
         raise TelegramArtifactBridgeError("Telegram update has no effective message")
     attachments = extract_telegram_attachments(message)
-    if not attachments and not semantic_parts:
-        raise TelegramArtifactBridgeError("Telegram message has no supported attachment")
+    if (
+        not attachments
+        and not semantic_parts
+        and not (getattr(message, "text", None) or "").strip()
+    ):
+        raise TelegramArtifactBridgeError("Telegram message has no supported input")
     user = update.effective_user
     chat = update.effective_chat
     if user is None or chat is None:
         raise TelegramArtifactBridgeError("Telegram update authority is unavailable")
 
     reply = getattr(message, "reply_to_message", None)
+    reply_sender = getattr(reply, "from_user", None) if reply is not None else None
+    reply_excerpt = (
+        (
+            getattr(reply, "text", None)
+            or getattr(reply, "caption", None)
+            or ""
+        ).strip()[:512]
+        if reply is not None
+        else None
+    )
     return TelegramAdapter.build_input_envelope(
         bot_instance_id=bot_instance_id,
         update_id=str(update.update_id),
@@ -372,12 +386,20 @@ def build_telegram_input_envelope(
         message_id=str(message.message_id),
         attachments=attachments,
         semantic_parts=semantic_parts,
+        text=getattr(message, "text", None),
         caption=getattr(message, "caption", None),
         media_group_id=getattr(message, "media_group_id", None),
         message_thread_id=getattr(message, "message_thread_id", None),
         reply_to_message_id=(
             str(reply.message_id) if reply is not None else None
         ),
+        reply_to_sender_id=(
+            str(getattr(reply_sender, "id"))
+            if reply_sender is not None
+            and getattr(reply_sender, "id", None) is not None
+            else None
+        ),
+        reply_to_excerpt=reply_excerpt or None,
         occurred_at=getattr(message, "date", None),
         locale=getattr(user, "language_code", None),
         response_metadata=response_metadata,
@@ -598,6 +620,29 @@ class TelegramArtifactGatewayClient:
             )
             raise
 
+    async def run_committed(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+        progress_locale: str,
+    ) -> dict[str, Any]:
+        async with self._client() as client:
+            response = await client.post(
+                f"{self.gateway_url}/input-batches/{input_batch_id}/run",
+                json={
+                    "session_id": session_id,
+                    "progress_locale": progress_locale,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TelegramArtifactBridgeError(
+                    "Gateway run response is invalid"
+                )
+            return payload
+
     async def bind_input_presentation(
         self,
         presentation_ref: dict[str, Any] | None,
@@ -710,6 +755,70 @@ class TelegramArtifactGatewayClient:
                 ) from error
 
         return TelegramFileStream(size_bytes=size, iterator=iterator())
+
+    @staticmethod
+    def telegram_input_file(
+        spool: SpooledTemporaryFile,
+        filename: str,
+    ) -> InputFile:
+        return _telegram_input_file(spool, filename)
+
+    async def open_delivery_file(
+        self,
+        delivery_id: str,
+        *,
+        session_id: str,
+    ) -> tuple[SpooledTemporaryFile, str]:
+        """Claim and spool exact delivery bytes before a Telegram send starts."""
+        spool = SpooledTemporaryFile(
+            max_size=self.delivery_spool_memory_bytes,
+            mode="w+b",
+        )
+        filename = "artifact.bin"
+        try:
+            async with self._client(read_timeout=300.0) as client:
+                async with client.stream(
+                    "GET",
+                    f"{self.gateway_url}/internal/deliveries/"
+                    f"{delivery_id}/content",
+                    params={
+                        "session_id": session_id,
+                        "client_type": "telegram",
+                    },
+                ) as response:
+                    response.raise_for_status()
+                    filename = (
+                        _filename_from_disposition(
+                            response.headers.get("content-disposition", "")
+                        )
+                        or filename
+                    )
+                    expected_hash = response.headers.get("x-content-hash")
+                    expected_size = _optional_int(
+                        response.headers.get("content-length")
+                    )
+                    digest = hashlib.sha256()
+                    total = 0
+                    async for chunk in response.aiter_bytes(64 * 1024):
+                        if not chunk:
+                            continue
+                        spool.write(chunk)
+                        digest.update(chunk)
+                        total += len(chunk)
+                    if expected_size is not None and total != expected_size:
+                        raise TelegramArtifactBridgeError(
+                            "Delivery length changed during transport"
+                        )
+                    actual_hash = "sha256:" + digest.hexdigest()
+                    if expected_hash and actual_hash != expected_hash:
+                        raise TelegramArtifactBridgeError(
+                            "Delivery hash changed during transport"
+                        )
+            spool.seek(0)
+            return spool, filename
+        except BaseException:
+            spool.close()
+            raise
 
     async def deliver_selected(
         self,

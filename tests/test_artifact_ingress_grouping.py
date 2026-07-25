@@ -121,13 +121,22 @@ class ArtifactIngressGroupingTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(IngressNotFoundError):
             await self.ingress.batch_store.get_committed(first.input_batch_id)
 
-        batch, duplicate = await self.facade.commit_grouped_batch(
+        (
+            batch,
+            duplicate,
+            presentation_result,
+        ) = await self.facade.commit_grouped_batch_with_presentation(
             first.input_batch_id,
             session_id="telegram:conversation:chat-1",
         )
         self.assertFalse(duplicate)
         self.assertEqual(len(batch.artifact_refs), 2)
         self.assertEqual(len(batch.source_event_ids), 2)
+        self.assertIsNotNone(presentation_result)
+        ack_policy, presentation_event, presentation_ref = presentation_result
+        self.assertEqual(presentation_event.message_key, "input_batch.committed")
+        self.assertEqual(presentation_ref.state.value, "reserved")
+        self.assertEqual(ack_policy.value, "silent")
 
         repeated, duplicate = await self.facade.commit_grouped_batch(
             first.input_batch_id,

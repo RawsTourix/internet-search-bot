@@ -31,6 +31,7 @@ class OutputBatchState(str, Enum):
     PARTIALLY_DELIVERED = "partially_delivered"
     DELIVERED = "delivered"
     FAILED = "failed"
+    UNKNOWN = "unknown"
     CANCELLED = "cancelled"
 
 
@@ -242,6 +243,7 @@ class OutputBatch(_OutputModel):
             OutputBatchState.DELIVERED,
             OutputBatchState.PARTIALLY_DELIVERED,
             OutputBatchState.FAILED,
+            OutputBatchState.UNKNOWN,
             OutputBatchState.CANCELLED,
         } and self.completed_at is None:
             raise ValueError("terminal output state requires completed_at")
@@ -347,6 +349,33 @@ class OutputPartReceipt(_OutputModel):
             raise ValueError("receipt timestamp must be timezone-aware")
         return value.astimezone(timezone.utc)
 
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "OutputPartReceipt":
+        if self.state == OutputPartReceiptState.DELIVERED:
+            if self.delivered_at is None:
+                raise ValueError("delivered part requires delivered_at")
+            if not self.client_message_ids:
+                raise ValueError(
+                    "delivered part requires exact client message IDs"
+                )
+        elif self.delivered_at is not None:
+            raise ValueError(
+                "non-delivered part cannot have delivered_at"
+            )
+        if (
+            self.state
+            in {
+                OutputPartReceiptState.FAILED,
+                OutputPartReceiptState.UNKNOWN,
+                OutputPartReceiptState.SKIPPED,
+            }
+            and not self.error_category
+        ):
+            raise ValueError(
+                "non-delivered part requires an error category"
+            )
+        return self
+
 
 class OutputDeliveryReceipt(_OutputModel):
     output_batch_id: str
@@ -384,4 +413,43 @@ class OutputDeliveryReceipt(_OutputModel):
         part_ids = [item.part_id for item in self.part_receipts]
         if len(part_ids) != len(set(part_ids)):
             raise ValueError("duplicate output part receipt")
+        states = [item.state for item in self.part_receipts]
+        if self.state == OutputDeliveryReceiptState.DELIVERED and (
+            not states
+            or any(
+                state != OutputPartReceiptState.DELIVERED
+                for state in states
+            )
+        ):
+            raise ValueError(
+                "delivered aggregate requires every part delivered"
+            )
+        if (
+            self.state == OutputDeliveryReceiptState.UNKNOWN
+            and OutputPartReceiptState.UNKNOWN not in states
+        ):
+            raise ValueError("unknown aggregate requires an unknown part")
+        if self.state == OutputDeliveryReceiptState.PARTIALLY_DELIVERED:
+            if (
+                OutputPartReceiptState.DELIVERED not in states
+                or all(
+                    state == OutputPartReceiptState.DELIVERED
+                    for state in states
+                )
+                or OutputPartReceiptState.UNKNOWN in states
+            ):
+                raise ValueError(
+                    "partial aggregate requires confirmed mixed outcomes"
+                )
+        if self.state == OutputDeliveryReceiptState.FAILED and any(
+            state
+            in {
+                OutputPartReceiptState.DELIVERED,
+                OutputPartReceiptState.UNKNOWN,
+            }
+            for state in states
+        ):
+            raise ValueError(
+                "failed aggregate cannot hide delivered or unknown parts"
+            )
         return self

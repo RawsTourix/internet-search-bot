@@ -97,20 +97,28 @@ class InputPresentationCoordinator:
                 response_anchor.anchor_id,
                 response_anchor.kind.value,
             )
-        if state in {"committed", "failed"} and stored.state not in {
-            PresentationState.CLOSED,
-            PresentationState.FAILED,
-            PresentationState.EXPIRED,
-        }:
-            stored = await self.store.close(
-                stored.presentation_id,
-                state=(
-                    PresentationState.CLOSED
-                    if state == "committed"
-                    else PresentationState.FAILED
-                ),
-                error_code=None if state == "committed" else "input_batch_failed",
+        if state in {"committed", "failed"}:
+            terminal = (
+                PresentationState.CLOSED
+                if state == "committed"
+                else PresentationState.FAILED
             )
+            if stored.state == PresentationState.RESERVED:
+                stored = await self.store.defer_terminal(
+                    stored.presentation_id,
+                    state=terminal,
+                    error_code=(
+                        None if state == "committed" else "input_batch_failed"
+                    ),
+                )
+            elif stored.state == PresentationState.BOUND:
+                stored = await self.store.close(
+                    stored.presentation_id,
+                    state=terminal,
+                    error_code=(
+                        None if state == "committed" else "input_batch_failed"
+                    ),
+                )
         policy = (
             PresentationAckPolicy.CREATE
             if created
@@ -144,4 +152,44 @@ class InputPresentationCoordinator:
                 client_message_id=stored.client_message_id,
                 state=stored.state,
             ),
+        )
+
+    async def finalize_batch(
+        self,
+        *,
+        input_batch_id: str,
+        state: str,
+        file_count: int,
+        text_part_count: int,
+        response_anchor,
+    ) -> tuple[
+        PresentationAckPolicy,
+        InputPresentationEvent,
+        PublicPresentationRef,
+    ] | None:
+        """Apply a grouped commit to the already reserved presentation."""
+        records = await self.store.list_for_input_batch(input_batch_id)
+        active = [
+            item
+            for item in records
+            if item.state in {
+                PresentationState.RESERVED,
+                PresentationState.BOUND,
+            }
+        ]
+        if not active:
+            return None
+        if len(active) != 1:
+            raise RuntimeError(
+                "input batch has multiple active presentation handles"
+            )
+        record = active[0]
+        return await self.present(
+            input_batch_id=input_batch_id,
+            client_binding_id=record.client_binding_id,
+            locale=record.locale,
+            state=state,
+            file_count=file_count,
+            text_part_count=text_part_count,
+            response_anchor=response_anchor,
         )

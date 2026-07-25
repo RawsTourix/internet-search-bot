@@ -173,6 +173,104 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(batch.source_event_ids), 2)
 
+    async def test_ten_file_album_and_instruction_share_one_presentation(self):
+        submissions = []
+        for index in range(1, 11):
+            submissions.append(
+                await self._submit_file(
+                    self._file_envelope(
+                        message_id=str(index),
+                        group_id="album-ten",
+                        filename=f"part-{index}.md",
+                    )
+                )
+            )
+            if index == 1:
+                public = submissions[0].presentation_ref
+                await self.ingress.presentation_store.bind(
+                    public.presentation_id,
+                    client_message_id="900",
+                    token=public.presentation_token,
+                )
+
+        instruction = await self.ingress.ingress_service.submit_atomic(
+            self._text_envelope(
+                message_id="instruction",
+                text="Summarize all ten files",
+            ),
+            session_id="telegram:conversation:chat-1",
+        )
+        submissions.append(instruction)
+
+        self.assertEqual(
+            {item.input_batch_id for item in submissions},
+            {submissions[0].input_batch_id},
+        )
+        self.assertEqual(
+            {
+                item.presentation_ref.presentation_id
+                for item in submissions
+                if item.presentation_ref is not None
+            },
+            {submissions[0].presentation_ref.presentation_id},
+        )
+        self.assertEqual(
+            sum(item.ack_policy.value == "create" for item in submissions),
+            1,
+        )
+        self.assertEqual(
+            instruction.response_anchor.client_message_id,
+            "instruction",
+        )
+
+        batch, duplicate, presentation_result = (
+            await self.ingress.ingress_service.commit_batch_application_result(
+                submissions[0].input_batch_id,
+                session_id="telegram:conversation:chat-1",
+                reason="test_album_complete",
+            )
+        )
+        self.assertFalse(duplicate)
+        self.assertEqual(len(batch.artifact_refs), 10)
+        self.assertEqual(batch.text_parts[0].text, "Summarize all ten files")
+        self.assertIsNotNone(presentation_result)
+        stored = await self.ingress.presentation_store.get(
+            submissions[0].presentation_ref.presentation_id
+        )
+        self.assertEqual(stored.state.value, "closed")
+        self.assertEqual(stored.client_message_id, "900")
+
+    async def test_client_without_message_edit_uses_silent_existing_ack(self):
+        self.ingress.ingress_service.telegram_message_editing = False
+        first = await self._submit_file(
+            self._file_envelope(message_id="no-edit-1", group_id="no-edit")
+        )
+        await self.ingress.presentation_store.bind(
+            first.presentation_ref.presentation_id,
+            client_message_id="901",
+            token=first.presentation_ref.presentation_token,
+        )
+
+        instruction = await self.ingress.ingress_service.submit_atomic(
+            self._text_envelope(
+                message_id="no-edit-instruction",
+                text="Use the attached file",
+            ),
+            session_id="telegram:conversation:chat-1",
+        )
+
+        self.assertEqual(instruction.input_batch_id, first.input_batch_id)
+        self.assertEqual(instruction.ack_policy.value, "silent")
+        self.assertEqual(
+            instruction.presentation_ref.presentation_id,
+            first.presentation_ref.presentation_id,
+        )
+        stored = await self.ingress.presentation_store.get(
+            first.presentation_ref.presentation_id
+        )
+        self.assertEqual(stored.state.value, "bound")
+        self.assertEqual(stored.client_message_id, "901")
+
     async def test_display_name_change_does_not_change_sender_authority(self):
         first = await self._submit_file(self._file_envelope(
             message_id="1",
