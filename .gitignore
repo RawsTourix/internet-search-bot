@@ -30,3 +30,6 @@ agent_traces/
 # Файлы Codex
 .agents
 .codex
+
+# Старая документация
+docs_old

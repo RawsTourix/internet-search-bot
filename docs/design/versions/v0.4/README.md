@@ -1,0 +1,61 @@
+---
+id: design.v0.4.index
+version: v0.4
+spec_status: accepted
+implementation_status: partial
+last_reviewed: 2026-07-25
+---
+
+# v0.4 — реестр обновлений Agent Workspace
+
+`v0.4` создаёт agent workspace с внешним хранением полного content,
+управляемым LLM-контекстом, optional DAG, атомарным input и доставкой
+артефактов.
+
+Основная рабочая единица документации — именованное обновление. Крупное
+обновление может быть папкой с собственным README и внутренними разделами.
+
+## Именованные обновления
+
+| Порядок | Обновление | Результат |
+|---:|---|---|
+| 1 | [`v0.4-storage-foundation`](v0.4-storage-foundation.md) | `ContentStore`, `ArtifactStore`, refs и filesystem backend |
+| 2 | [`v0.4-result-compaction`](v0.4-result-compaction.md) | Сохранение и компактное представление tool results |
+| 3 | [`v0.4-cycle-compaction`](v0.4-cycle-compaction.md) | `CycleWorkingMemory` и compaction закрытых segments |
+| 4 | [`v0.4-dag-planning`](v0.4-dag-planning.md) | Optional runtime-owned DAG без scheduler |
+| 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | Artifact identity, versions, manager tools и delivery foundation |
+| 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | Semantic input/output, capabilities, localization и `OutputBatch` |
+| 7 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | `CycleInbox`, safe checkpoints и active-cycle input |
+
+## Связующие документы версии
+
+| Документ | Назначение |
+|---|---|
+| [`overview.md`](overview.md) | Цель и граница v0.4 |
+| [`v0.4-unified-input-artifact-architecture.md`](v0.4-unified-input-artifact-architecture.md) | Сквозная связь ingress, input batches, artifacts и runtime |
+| [`v0.4-release-plan.md`](v0.4-release-plan.md) | Порядок реализации и общие acceptance criteria |
+
+Связующие документы не являются дополнительными релизными обновлениями и не
+меняют порядок таблицы выше.
+
+## Зависимости обновлений
+
+```text
+v0.4-storage-foundation
+├── v0.4-result-compaction
+├── v0.4-cycle-compaction
+├── v0.4-dag-planning
+└── v0.4-file-artifacts
+    └── v0.4-file-artifacts-advanced
+        └── v0.4-input-runtime
+```
+
+## Как читать
+
+- Для последовательного проектирования идите по реестру сверху вниз.
+- Для конкретного патча открывайте документ с тем же именем, что и обновление.
+- Для `v0.4-file-artifacts-advanced` сначала открывайте README его папки: он
+  содержит порядок внутренних тематических документов.
+
+PostgreSQL/RAG начинаются в [`../v0.5/README.md`](../v0.5/README.md), workers и
+distributed orchestration — в [`../v0.6/README.md`](../v0.6/README.md).
