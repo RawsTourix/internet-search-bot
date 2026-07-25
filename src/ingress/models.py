@@ -12,12 +12,31 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from ..artifacts.models import is_artifact_id
 from ..core.models import ClientType
+from ..interaction.anchors import (
+    ClientResponseAnchor,
+    ClientResponseAnchorCandidate,
+)
+from ..interaction.capabilities import (
+    ClientCapabilityDeclaration,
+    ClientCapabilitySnapshot,
+    ClientCapabilitySnapshotRef,
+)
+from ..interaction.parts import (
+    ArtifactInputManifest,
+    ArtifactManifestItem,
+    InputPart,
+)
+from ..interaction.presentation import (
+    InputPresentationEvent,
+    PresentationAckPolicy,
+    PublicPresentationRef,
+)
 from ..storage.models import is_content_id
 
 
 _EVENT_ID_RE = re.compile(r"^evt_[0-9a-f]{32}$")
 _INPUT_BATCH_ID_RE = re.compile(r"^ibat_[0-9a-f]{32}$")
-_SLOT_ID_RE = re.compile(r"^slot_[a-zA-Z0-9_.-]{1,96}$")
+_SLOT_ID_RE = re.compile(r"^slot(?:_|-)[a-zA-Z0-9_.-]{1,96}$")
 _FINGERPRINT_RE = re.compile(r"^sha256:[0-9a-f]{64}$")
 
 
@@ -228,6 +247,8 @@ class ClientInputEnvelope(_IngressModel):
     idempotency_key: str
     client_type: ClientType
     client_instance_id: str
+    client_binding_id: str | None = None
+    client_version: str | None = None
     conversation: ClientConversationRef
     sender: ClientSenderRef
 
@@ -239,8 +260,15 @@ class ClientInputEnvelope(_IngressModel):
     occurred_at: datetime
     text_parts: list[IngressTextPart] = Field(default_factory=list)
     attachment_slots: list[IngressAttachmentSlot] = Field(default_factory=list)
+    semantic_parts: list[InputPart] = Field(default_factory=list)
 
     locale: str | None = None
+    transport_locale: str | None = None
+    capability_declaration: ClientCapabilityDeclaration | None = None
+    capability_snapshot_ref: ClientCapabilitySnapshotRef | None = None
+    response_anchor_candidates: list[ClientResponseAnchorCandidate] = Field(
+        default_factory=list
+    )
     admission_mode: InputAdmissionMode = InputAdmissionMode.AUTO
     response_route: ClientResponseRoute
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -254,7 +282,10 @@ class ClientInputEnvelope(_IngressModel):
         "source_update_id",
         "source_group_id",
         "reply_to_message_id",
+        "client_binding_id",
+        "client_version",
         "locale",
+        "transport_locale",
     )
     @classmethod
     def normalize_optional(cls, value: str | None) -> str | None:
@@ -267,8 +298,15 @@ class ClientInputEnvelope(_IngressModel):
 
     @model_validator(mode="after")
     def validate_parts(self) -> "ClientInputEnvelope":
-        if not self.text_parts and not self.attachment_slots:
+        if not self.text_parts and not self.attachment_slots and not self.semantic_parts:
             raise ValueError("input envelope must contain text or attachments")
+        if (
+            self.capability_declaration is not None
+            and self.capability_snapshot_ref is not None
+        ):
+            raise ValueError(
+                "capability declaration and snapshot ref are mutually exclusive"
+            )
         slot_ids = [item.slot_id for item in self.attachment_slots]
         if len(slot_ids) != len(set(slot_ids)):
             raise ValueError("attachment slot IDs must be unique")
@@ -280,11 +318,13 @@ class ClientInputEnvelope(_IngressModel):
 
 
 class ClientIngressEvent(_IngressModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     event_id: str
     idempotency_key: str
     client_type: ClientType
     client_instance_id: str
+    client_binding_id: str | None = None
+    client_version: str | None = None
     conversation: ClientConversationRef
     sender: ClientSenderRef
     source_update_id: str | None = None
@@ -295,7 +335,15 @@ class ClientIngressEvent(_IngressModel):
     received_at: datetime
     text_parts: list[IngressTextPart] = Field(default_factory=list)
     attachment_slots: list[IngressAttachmentSlot] = Field(default_factory=list)
+    semantic_parts: list[InputPart] = Field(default_factory=list)
     locale: str | None = None
+    transport_locale: str | None = None
+    capability_declaration: ClientCapabilityDeclaration | None = None
+    capability_snapshot_ref: ClientCapabilitySnapshotRef | None = None
+    capability_snapshot: ClientCapabilitySnapshot | None = None
+    response_anchor_candidates: list[ClientResponseAnchorCandidate] = Field(
+        default_factory=list
+    )
     admission_mode: InputAdmissionMode = InputAdmissionMode.AUTO
     response_route: ClientResponseRoute
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -321,6 +369,8 @@ class InputAttachmentPart(_IngressModel):
     declared_size_bytes: int | None = Field(default=None, ge=0)
     content_id: str | None = None
     artifact_id: str | None = None
+    artifact_lineage_id: str | None = None
+    version: int | None = Field(default=None, ge=1)
     detected_format_id: str | None = None
     detected_mime_type: str | None = None
     size_bytes: int | None = Field(default=None, ge=0)
@@ -348,6 +398,16 @@ class InputAttachmentPart(_IngressModel):
             raise ValueError("invalid artifact_id")
         return value
 
+    @field_validator("artifact_lineage_id")
+    @classmethod
+    def validate_lineage_id(cls, value: str | None) -> str | None:
+        if value is not None:
+            from ..artifacts.models import is_artifact_lineage_id
+
+            if not is_artifact_lineage_id(value):
+                raise ValueError("invalid artifact_lineage_id")
+        return value
+
     @model_validator(mode="after")
     def validate_state(self) -> "InputAttachmentPart":
         if self.state == InputAttachmentState.STORED:
@@ -365,7 +425,7 @@ class InputAttachmentPart(_IngressModel):
 
 
 class InputBatchDraft(_IngressModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     input_batch_id: str
     session_id: str
     client_type: ClientType
@@ -377,6 +437,10 @@ class InputBatchDraft(_IngressModel):
     source_event_ids: list[str]
     text_parts: list[IngressTextPart] = Field(default_factory=list)
     attachment_parts: list[InputAttachmentPart] = Field(default_factory=list)
+    semantic_parts: list[InputPart] = Field(default_factory=list)
+    locale: str | None = None
+    capability_snapshot: ClientCapabilitySnapshot | None = None
+    response_anchor: ClientResponseAnchor | None = None
     admission_mode: InputAdmissionMode = InputAdmissionMode.AUTO
     response_route: ClientResponseRoute
     opened_at: datetime
@@ -426,17 +490,26 @@ class InputBatchDraft(_IngressModel):
 
 
 class CommittedInputBatch(_IngressModel):
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     input_batch_id: str
     session_id: str
     client_type: ClientType
     sequence_number: int = Field(ge=1)
     source_event_ids: list[str]
     text_parts: list[IngressTextPart] = Field(default_factory=list)
+    semantic_parts: list[InputPart] = Field(default_factory=list)
     artifact_refs: list[str] = Field(default_factory=list)
     referenced_artifact_refs: list[str] = Field(default_factory=list)
     admission_mode: InputAdmissionMode
     response_route: ClientResponseRoute
+    response_anchor: ClientResponseAnchor | None = None
+    locale: str | None = None
+    capability_snapshot: ClientCapabilitySnapshot | None = None
+    artifact_manifest: ArtifactInputManifest = Field(
+        default_factory=lambda: ArtifactInputManifest(
+            available_count=0
+        )
+    )
     continuation_of_batch_id: str | None = None
     correction_of_batch_id: str | None = None
     committed_at: datetime
@@ -492,7 +565,20 @@ class CommittedInputBatch(_IngressModel):
                 for item in self.text_parts
             ],
             "artifact_refs": list(self.artifact_refs),
+            "input_artifacts": [
+                item.model_dump(mode="json")
+                for item in self.artifact_manifest.items
+            ],
+            "input_artifacts_available_count": (
+                self.artifact_manifest.available_count
+            ),
+            "input_artifacts_truncated": self.artifact_manifest.truncated,
             "referenced_artifact_refs": list(self.referenced_artifact_refs),
+            "semantic_parts": [
+                item.model_dump(mode="json", exclude={"metadata"})
+                for item in self.semantic_parts
+            ],
+            "locale": self.locale,
             "admission_mode": self.admission_mode.value,
             "runtime_generated": True,
             "trusted": False,
@@ -510,3 +596,9 @@ class InputSubmissionResult(_IngressModel):
     duplicate: bool = False
     committed_batch: CommittedInputBatch | None = None
     error_code: str | None = None
+    ack_policy: PresentationAckPolicy = PresentationAckPolicy.SILENT
+    presentation_event: InputPresentationEvent | None = None
+    presentation_ref: PublicPresentationRef | None = None
+    response_anchor: ClientResponseAnchor | None = None
+    file_count: int = Field(default=0, ge=0)
+    text_part_count: int = Field(default=0, ge=0)

@@ -80,6 +80,7 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
             "🧩 Сверяю детали перед финальным ответом…"
         ),
         "waiting_user": "❓ Нужны дополнительные данные от пользователя.",
+        "result_ready": "📦 Результат подготовлен. Выполняется доставка…",
         "cycle_done": "✅ Задача завершена.",
         "cycle_error": "⚠️ Задача завершилась с ошибкой.",
         "context_warning": "⚠️ Контекст задачи стал большим.",
@@ -195,6 +196,7 @@ PROGRESS_MESSAGES: dict[str, dict[str, str]] = {
             "🧩 Checking the details before the final answer…"
         ),
         "waiting_user": "❓ More information is needed from the user.",
+        "result_ready": "📦 The result is ready. Delivering it now…",
         "cycle_done": "✅ Task completed.",
         "cycle_error": "⚠️ Task failed.",
         "context_warning": "⚠️ Task context is getting large.",

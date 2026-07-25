@@ -38,6 +38,9 @@ class ArtifactDeliveryMixin:
     """Add input artifacts and delivery without bypassing inherited runtime."""
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.defer_cycle_done_for_output = bool(
+            kwargs.pop("defer_cycle_done_for_output", False)
+        )
         artifact_services = kwargs.get("artifact_services")
         artifacts_enabled = (
             artifact_services is not None
@@ -118,6 +121,7 @@ class ArtifactDeliveryMixin:
                 and self.artifact_config.enabled
             ):
                 session_id, cycle_id = identity
+                result.cycle_id = cycle_id
                 refs = await self.artifact_services.delivery_service.list_cycle_refs(
                     session_id=session_id,
                     cycle_id=cycle_id,
@@ -287,8 +291,18 @@ class ArtifactDeliveryMixin:
                 disposition=disposition,
                 result_policy=result_policy,
             )
-
         return await super()._call_registered_tool(public_tool_name, arguments)
+
+    async def _emit_progress_event(self, *args: Any, **kwargs: Any) -> None:
+        """Do not announce final success before the OutputBatch is delivered."""
+        if (
+            kwargs.get("event_type") == "cycle_done"
+            and self.defer_cycle_done_for_output
+            and get_artifact_request_input_batch() is not None
+        ):
+            kwargs["event_type"] = "result_ready"
+            kwargs["message_key"] = "result_ready"
+        await super()._emit_progress_event(*args, **kwargs)
 
     def _build_final_evidence_pack(self, **kwargs: Any) -> dict[str, Any]:
         evidence = super()._build_final_evidence_pack(**kwargs)

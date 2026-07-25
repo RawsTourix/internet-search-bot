@@ -129,6 +129,7 @@ class ProgressEvent(BaseModel):
         "artifact_delivery_unknown",
         "final_processing_started",
         "waiting_user",
+        "result_ready",
         "cycle_done",
         "cycle_error",
     ]

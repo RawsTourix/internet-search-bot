@@ -48,6 +48,15 @@ class ArtifactCandidateListInput(_CandidateToolInput):
 
 
 class ArtifactCreateFromContentInput(_CandidateToolInput):
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=lambda schema: schema.setdefault(
+            "required", []
+        ).append("purpose")
+        if "purpose" not in schema.setdefault("required", [])
+        else None,
+    )
+
     candidate_id: str
     filename: str | None = None
     purpose: ArtifactPurpose = ArtifactPurpose.WORKING

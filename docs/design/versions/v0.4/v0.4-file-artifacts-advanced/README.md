@@ -2,7 +2,7 @@
 id: design.v0.4.file-artifacts-advanced
 version: v0.4
 spec_status: accepted
-implementation_status: partial
+implementation_status: implemented
 ---
 
 # v0.4-file-artifacts-advanced
@@ -34,3 +34,26 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 
 Общий реестр обновлений версии находится в
 [`../README.md`](../README.md).
+
+## Статус реализации
+
+Контур реализован в filesystem runtime:
+
+- server-owned capability registry и immutable snapshots;
+- общая ru/en локализация;
+- deterministic response anchor и один presentation handle на InputBatch;
+- discriminated semantic `InputPart`/`OutputPart`;
+- bounded input artifact manifest и явный `ArtifactPurpose`;
+- стабильный `selection_index` для deliverables;
+- commit-once `OutputBatch`, capability renderer и агрегированные receipts;
+- Telegram document groups с сохранением порядка и conservative `unknown`;
+- process-restart recovery без автоматического повтора non-idempotent delivery.
+
+Runtime-конфигурация находится в корне
+[`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
+секциях `client_capabilities`, `localization`, `input_presentation`,
+`output_runtime` и `telegram_output`. Отсутствующие секции получают безопасные
+defaults, поэтому прежний конфигурационный файл остаётся совместимым.
+
+Точные пути модулей, stores, migrations и тестов перечислены в
+[`implementation.md`](implementation.md).

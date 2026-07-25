@@ -676,6 +676,8 @@ class ExactTextPatchOperation(_ArtifactModel):
 class ArtifactDeliveryRef(_ArtifactModel):
     delivery_id: str
     artifact_id: str
+    artifact_lineage_id: str | None = None
+    selection_index: int = Field(default=0, ge=0)
 
     filename: str
     format_id: str
@@ -698,6 +700,13 @@ class ArtifactDeliveryRef(_ArtifactModel):
     def validate_artifact_id(cls, value: str) -> str:
         if not is_artifact_id(value):
             raise ValueError("invalid artifact_id")
+        return value
+
+    @field_validator("artifact_lineage_id")
+    @classmethod
+    def validate_delivery_lineage_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_artifact_lineage_id(value):
+            raise ValueError("invalid artifact_lineage_id")
         return value
 
     @field_validator("filename", mode="before")

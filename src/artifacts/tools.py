@@ -142,6 +142,17 @@ class ArtifactSearchTextInput(_ToolInput):
 
 
 class ArtifactCreateTextInput(_ToolInput):
+    # Legacy/internal calls may still omit purpose, but the portable schema
+    # shown to the LLM requires the agent to classify the artifact explicitly.
+    model_config = ConfigDict(
+        extra="forbid",
+        json_schema_extra=lambda schema: schema.setdefault(
+            "required", []
+        ).append("purpose")
+        if "purpose" not in schema.setdefault("required", [])
+        else None,
+    )
+
     filename: str
     text: str
     format_id: str = "markdown"

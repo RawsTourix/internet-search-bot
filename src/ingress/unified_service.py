@@ -66,6 +66,28 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
             envelope,
             open_drafts=open_drafts,
         )
+        # Preserve the established direct-ingress meaning of an explicit
+        # atomic upload. Client adapters that group media pass a non-atomic
+        # mode/key and still use the shared resolver/state machine.
+        if (
+            grouping_mode == InputGroupingMode.ATOMIC
+            and grouping_key is None
+            and envelope.attachment_slots
+            and any(
+                slot.upload_field_name is not None
+                for slot in envelope.attachment_slots
+            )
+        ):
+            from .routing import InputGroupingDecision
+
+            decision = InputGroupingDecision(
+                mode=InputGroupingMode.ATOMIC,
+                key=(
+                    f"{envelope.client_type.value}:"
+                    f"{envelope.client_instance_id}:"
+                    f"event:{envelope.idempotency_key}"
+                ),
+            )
         if (
             grouping_mode != decision.mode
             or (grouping_key is not None and grouping_key != decision.key)
@@ -92,25 +114,37 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
 
         if decision.joined_input_batch_id is not None:
             self._validate_envelope_limits(envelope)
-            event, duplicate_event = await self.event_store.save_if_absent(envelope)
+            defer_commit = getattr(self.batch_store, "defer_commit", None)
+            if defer_commit is not None:
+                await defer_commit(decision.joined_input_batch_id)
+            capability_snapshot, resolved_locale = await self._resolve_interaction(
+                envelope
+            )
+            event, duplicate_event = await self.event_store.save_if_absent(
+                envelope,
+                capability_snapshot=capability_snapshot,
+                resolved_locale=resolved_locale,
+            )
             existing_draft, existing_committed = await self.batch_store.find_by_event(
                 event.event_id
             )
             if existing_committed is not None:
-                return InputSubmissionResult(
+                result = InputSubmissionResult(
                     event_id=event.event_id,
                     input_batch_id=existing_committed.input_batch_id,
                     state="committed",
                     duplicate=True,
                     committed_batch=existing_committed,
                 )
+                return await self._decorate_result(result, envelope=envelope)
             if existing_draft is not None:
-                return InputSubmissionResult(
+                result = InputSubmissionResult(
                     event_id=event.event_id,
                     input_batch_id=existing_draft.input_batch_id,
                     state="collecting",
                     duplicate=True,
                 )
+                return await self._decorate_result(result, envelope=envelope)
 
             append_exact = getattr(self.batch_store, "append_event_to_batch", None)
             if append_exact is None:
@@ -158,12 +192,13 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
                 len(event.text_parts),
                 len(event.attachment_slots),
             )
-            return InputSubmissionResult(
+            result = InputSubmissionResult(
                 event_id=event.event_id,
                 input_batch_id=draft.input_batch_id,
                 state="collecting",
                 duplicate=duplicate_event,
             )
+            return await self._decorate_result(result, envelope=envelope)
 
         return await super().submit_atomic(
             envelope,

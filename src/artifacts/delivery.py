@@ -45,7 +45,7 @@ class ArtifactDeliveryRecord(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[2] = 2
     delivery_id: str
     session_id: str
     cycle_id: str
@@ -61,6 +61,7 @@ class ArtifactDeliveryRecord(BaseModel):
     content_hash: str
 
     client_type: str
+    selection_index: int = Field(ge=0)
     state: ArtifactDeliveryState = ArtifactDeliveryState.SELECTED
     attempt_count: int = Field(default=0, ge=0)
 
@@ -157,6 +158,8 @@ class ArtifactDeliveryRecord(BaseModel):
         return ArtifactDeliveryRef(
             delivery_id=self.delivery_id,
             artifact_id=self.artifact_id,
+            artifact_lineage_id=self.artifact_lineage_id,
+            selection_index=self.selection_index,
             filename=self.filename,
             format_id=self.format_id,
             mime_type=self.mime_type,
@@ -226,6 +229,25 @@ class FileSystemArtifactDeliveryStore:
             dict(receipt or {}),
         )
 
+    async def transition_many(
+        self,
+        delivery_ids: list[str],
+        *,
+        target: ArtifactDeliveryState,
+        allowed_from: set[ArtifactDeliveryState],
+        receipt_by_delivery_id: dict[str, dict[str, Any]] | None = None,
+        error: str | None = None,
+    ) -> list[ArtifactDeliveryRecord]:
+        """Atomically apply one group outcome while retaining part receipts."""
+        return await asyncio.to_thread(
+            self._transition_many_sync,
+            delivery_ids,
+            target,
+            allowed_from,
+            dict(receipt_by_delivery_id or {}),
+            error,
+        )
+
     async def cancel_many(
         self,
         delivery_ids: list[str],
@@ -277,6 +299,17 @@ class FileSystemArtifactDeliveryStore:
             )
             updates: dict[str, tuple[ArtifactDeliveryRecord, bool]] = {}
             selected_by_artifact: dict[str, ArtifactDeliveryRecord] = {}
+            next_index = (
+                max(
+                    (
+                        item.selection_index
+                        for item in existing_records
+                        if item.state != ArtifactDeliveryState.CANCELLED
+                    ),
+                    default=-1,
+                )
+                + 1
+            )
             for item in records:
                 existing_exact = next(
                     (
@@ -290,9 +323,13 @@ class FileSystemArtifactDeliveryStore:
                     None,
                 )
                 if existing_exact is not None:
+                    if existing_exact.state == ArtifactDeliveryState.SELECTED:
+                        selected_by_artifact[item.artifact_id] = existing_exact
+                        continue
                     selected_by_artifact[item.artifact_id] = existing_exact
                     continue
 
+                inherited_index: int | None = None
                 for existing in existing_records:
                     if (
                         existing.artifact_lineage_id
@@ -302,6 +339,7 @@ class FileSystemArtifactDeliveryStore:
                         and existing.state
                         == ArtifactDeliveryState.SELECTED
                     ):
+                        inherited_index = existing.selection_index
                         updates[existing.delivery_id] = (
                             existing.model_copy(update={
                                 "state": ArtifactDeliveryState.CANCELLED,
@@ -309,8 +347,18 @@ class FileSystemArtifactDeliveryStore:
                             }),
                             True,
                         )
-                updates[item.delivery_id] = (item, False)
-                selected_by_artifact[item.artifact_id] = item
+                selection_index = (
+                    inherited_index
+                    if inherited_index is not None
+                    else next_index
+                )
+                if inherited_index is None:
+                    next_index += 1
+                ordered_item = item.model_copy(
+                    update={"selection_index": selection_index}
+                )
+                updates[item.delivery_id] = (ordered_item, False)
+                selected_by_artifact[item.artifact_id] = ordered_item
 
             self._commit_batch_sync(updates)
             return [
@@ -446,6 +494,65 @@ class FileSystemArtifactDeliveryStore:
             self._write_sync(updated, replace=True)
             return updated
 
+    def _transition_many_sync(
+        self,
+        delivery_ids: list[str],
+        target: ArtifactDeliveryState,
+        allowed_from: set[ArtifactDeliveryState],
+        receipt_by_delivery_id: dict[str, dict[str, Any]],
+        error: str | None,
+    ) -> list[ArtifactDeliveryRecord]:
+        with self._lock:
+            unique_ids = list(dict.fromkeys(delivery_ids))
+            current = {
+                delivery_id: self._load_sync(delivery_id)
+                for delivery_id in unique_ids
+            }
+            for item in current.values():
+                if item.state != target and item.state not in allowed_from:
+                    raise ArtifactDeliveryError(
+                        f"Cannot transition delivery group from "
+                        f"{item.state.value} to {target.value}"
+                    )
+            updates: dict[str, tuple[ArtifactDeliveryRecord, bool]] = {}
+            now = utc_now()
+            for delivery_id, item in current.items():
+                if item.state == target:
+                    updates[delivery_id] = (item, True)
+                    continue
+                values: dict[str, Any] = {
+                    "state": target,
+                    "updated_at": now,
+                    "last_error": error,
+                    "receipt": {
+                        **item.receipt,
+                        **receipt_by_delivery_id.get(delivery_id, {}),
+                    },
+                }
+                if target == ArtifactDeliveryState.DELIVERING:
+                    values.update(
+                        attempt_count=item.attempt_count + 1,
+                        delivering_at=now,
+                        failed_at=None,
+                    )
+                elif target == ArtifactDeliveryState.DELIVERED:
+                    values.update(
+                        delivered_at=now,
+                        failed_at=None,
+                        last_error=None,
+                    )
+                elif target in {
+                    ArtifactDeliveryState.FAILED,
+                    ArtifactDeliveryState.UNKNOWN,
+                }:
+                    values["failed_at"] = now
+                updated = ArtifactDeliveryRecord.model_validate(
+                    item.model_copy(update=values).model_dump(mode="python")
+                )
+                updates[delivery_id] = (updated, True)
+            self._commit_batch_sync(updates)
+            return [updates[delivery_id][0] for delivery_id in delivery_ids]
+
     def _list_cycle_sync(
         self,
         session_id: str,
@@ -464,7 +571,13 @@ class FileSystemArtifactDeliveryStore:
             if states and record.state not in states:
                 continue
             result.append(record)
-        result.sort(key=lambda item: (item.created_at, item.delivery_id))
+        result.sort(
+            key=lambda item: (
+                item.selection_index,
+                item.created_at,
+                item.delivery_id,
+            )
+        )
         return result
 
     def _load_sync(self, delivery_id: str) -> ArtifactDeliveryRecord:
@@ -481,6 +594,9 @@ class FileSystemArtifactDeliveryStore:
             if path.is_symlink() or not stat.S_ISREG(mode):
                 raise ArtifactIntegrityError("Invalid delivery metadata file")
             payload = json.loads(path.read_text(encoding="utf-8"))
+            if int(payload.get("schema_version", 1)) == 1:
+                payload["schema_version"] = 2
+                payload.setdefault("selection_index", 0)
             return ArtifactDeliveryRecord.model_validate(payload)
         except (ArtifactIntegrityError, ArtifactDeliveryNotFoundError):
             raise
@@ -627,6 +743,7 @@ class ArtifactDeliveryService:
                 size_bytes=artifact.size_bytes,
                 content_hash=artifact.content_hash,
                 client_type=client_type,
+                selection_index=len(records),
                 state=ArtifactDeliveryState.SELECTED,
                 created_at=now,
                 updated_at=now,

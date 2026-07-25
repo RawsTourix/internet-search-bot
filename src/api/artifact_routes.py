@@ -9,6 +9,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict
 from starlette.datastructures import UploadFile
 
 from ..artifacts import (
@@ -32,6 +33,33 @@ from .artifact_transport import (
     DeliveryReceiptRequest,
     RunCommittedBatchRequest,
 )
+from ..interaction.output_models import OutputDeliveryReceipt
+from ..interaction.errors import (
+    InteractionIntegrityError,
+    InteractionStorageError,
+    OutputBatchConflictError,
+    OutputBatchNotFoundError,
+    PresentationConflictError,
+    PresentationNotFoundError,
+)
+
+
+class OutputBatchClaimRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str
+
+
+class OutputBatchReceiptRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str
+    receipt: OutputDeliveryReceipt
+
+
+class InputPresentationBindRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    session_id: str
+    presentation_token: str
+    client_message_id: str
 
 
 ProgressCallbackFactory = Callable[[Any], Any]
@@ -75,6 +103,26 @@ def _submission_payload(
         "duplicate": result.duplicate,
         "error_code": result.error_code,
         "run_skipped_duplicate": run_skipped_duplicate,
+        "ack_policy": result.ack_policy.value,
+        "presentation_event": (
+            result.presentation_event.model_dump(mode="json")
+            if result.presentation_event is not None
+            else None
+        ),
+        "presentation_ref": (
+            result.presentation_ref.model_dump(mode="json")
+            if result.presentation_ref is not None
+            else None
+        ),
+        "response_anchor": (
+            result.response_anchor.model_dump(mode="json")
+            if result.response_anchor is not None
+            else None
+        ),
+        "counts": {
+            "file_count": result.file_count,
+            "text_part_count": result.text_part_count,
+        },
     }
     if result.committed_batch is not None:
         payload["committed_batch"] = _committed_batch_payload(
@@ -351,6 +399,127 @@ def create_artifact_router(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ArtifactAccessError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
+
+    @router.get(
+        "/internal/output-batches/{output_batch_id}",
+        dependencies=[Depends(auth_dependency)],
+    )
+    async def get_output_batch(output_batch_id: str, session_id: str):
+        try:
+            batch = await facade.api.output_store.get(output_batch_id)
+            if batch.session_id != session_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Output batch authority mismatch",
+                )
+            return {
+                "output_batch": batch.model_dump(mode="json"),
+                "delivery_plan": facade.api.output_renderer.plan(batch).model_dump(
+                    mode="json"
+                ),
+            }
+        except OutputBatchNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except (InteractionIntegrityError, InteractionStorageError) as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @router.post(
+        "/internal/input-presentations/{presentation_id}/bind",
+        dependencies=[Depends(auth_dependency)],
+    )
+    async def bind_input_presentation(
+        presentation_id: str,
+        body: InputPresentationBindRequest,
+    ):
+        try:
+            presentation = (
+                await facade.api.ingress_services.presentation_store.get(
+                    presentation_id
+                )
+            )
+            draft = await facade.api.ingress_services.batch_store.get_draft(
+                presentation.input_batch_id
+            )
+            if draft.session_id != body.session_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Input presentation authority mismatch",
+                )
+            bound = await facade.api.ingress_services.presentation_store.bind(
+                presentation_id,
+                client_message_id=body.client_message_id,
+                token=body.presentation_token,
+            )
+            return bound.model_dump(mode="json")
+        except PresentationNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except IngressNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PresentationConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (InteractionIntegrityError, InteractionStorageError) as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @router.post(
+        "/internal/output-batches/{output_batch_id}/claim",
+        dependencies=[Depends(auth_dependency)],
+    )
+    async def claim_output_batch(
+        output_batch_id: str,
+        body: OutputBatchClaimRequest,
+    ):
+        try:
+            batch = await facade.api.output_store.get(output_batch_id)
+            if batch.session_id != body.session_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Output batch authority mismatch",
+                )
+            claimed, attempt_id = await facade.api.output_store.claim_delivery(
+                output_batch_id
+            )
+            return {
+                "output_batch": claimed.model_dump(mode="json"),
+                "attempt_id": attempt_id,
+                "delivery_plan": facade.api.output_renderer.plan(claimed).model_dump(
+                    mode="json"
+                ),
+            }
+        except OutputBatchNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except OutputBatchConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (InteractionIntegrityError, InteractionStorageError) as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
+    @router.post(
+        "/internal/output-batches/{output_batch_id}/receipt",
+        dependencies=[Depends(auth_dependency)],
+    )
+    async def complete_output_batch(
+        output_batch_id: str,
+        body: OutputBatchReceiptRequest,
+    ):
+        try:
+            batch = await facade.api.output_store.get(output_batch_id)
+            if batch.session_id != body.session_id:
+                raise HTTPException(
+                    status_code=403,
+                    detail="Output batch authority mismatch",
+                )
+            if body.receipt.output_batch_id != output_batch_id:
+                raise HTTPException(
+                    status_code=409,
+                    detail="Output receipt identity mismatch",
+                )
+            completed = await facade.api.output_store.complete(body.receipt)
+            return completed.model_dump(mode="json")
+        except OutputBatchNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except OutputBatchConflictError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
+        except (InteractionIntegrityError, InteractionStorageError) as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
 
     @router.get(
         "/internal/deliveries/{delivery_id}/content",

@@ -9,6 +9,7 @@ from .response_metadata import agent_result_metadata
 from .session_ids import resolve_message_session_id
 from ..api.api import API
 from ..ingress import CommittedInputBatch, legacy_message_to_input_envelope
+from ..localization.models import LocalizationMessage
 
 
 log_dir = "logging"
@@ -148,8 +149,21 @@ class MessageProcessor:
                     "input_batch_id": submission.input_batch_id,
                     "input_state": submission.state,
                     "duplicate": submission.duplicate,
+                    "ack_policy": submission.ack_policy.value,
+                    "presentation_event": (
+                        submission.presentation_event.model_dump(mode="json")
+                        if submission.presentation_event is not None
+                        else None
+                    ),
                 }
-                if submission.state == "collecting":
+                presentation_text = self._render_submission(submission)
+                if presentation_text is not None and (
+                    submission.state == "collecting"
+                    or submission.committed_batch is None
+                    or submission.duplicate
+                ):
+                    response_content = presentation_text
+                elif submission.state == "collecting":
                     response_content = (
                         "Сообщение добавлено к открытому пакету. Обработка "
                         "начнётся после завершения приёма всех его частей."
@@ -183,6 +197,32 @@ class MessageProcessor:
             response_type=MessageType.TEXT,
             metadata=response_metadata,
         )
+
+    @staticmethod
+    def _render_message(message: LocalizationMessage, *, locale: str) -> str:
+        service = getattr(
+            getattr(API, "ingress_services", None),
+            "localization_service",
+            None,
+        )
+        if service is None:
+            return message.message_key
+        return service.render(message, locale=locale)
+
+    def _render_submission(self, submission) -> str | None:
+        event = submission.presentation_event
+        if event is None:
+            return None
+        message = LocalizationMessage(
+            message_key=(
+                "input_batch.duplicate"
+                if submission.duplicate
+                else event.message_key
+            ),
+            params=event.params if not submission.duplicate else {},
+            severity=event.severity,
+        )
+        return self._render_message(message, locale=event.locale)
 
     @staticmethod
     def _agent_result_metadata(agent_result) -> dict[str, Any]:

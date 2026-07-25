@@ -29,6 +29,18 @@ from .models import (
     new_input_batch_id,
     utc_now,
 )
+from .upgrades import (
+    upgrade_committed_input_batch,
+    upgrade_ingress_event,
+    upgrade_input_batch_draft,
+)
+from ..interaction.anchors import (
+    ClientResponseAnchorCandidate,
+    ClientResponseAnchorKind,
+    ResponseAnchorSelector,
+)
+from ..interaction.capabilities import ClientCapabilitySnapshot
+from ..interaction.parts import ArtifactInputManifest, ArtifactManifestItem
 
 
 class IngressConflictError(RuntimeError):
@@ -130,8 +142,16 @@ class FileSystemIngressEventStore(_AtomicJsonStore):
     async def save_if_absent(
         self,
         envelope: ClientInputEnvelope,
+        *,
+        capability_snapshot: ClientCapabilitySnapshot | None = None,
+        resolved_locale: str | None = None,
     ) -> tuple[ClientIngressEvent, bool]:
-        return await asyncio.to_thread(self._save_if_absent_sync, envelope)
+        return await asyncio.to_thread(
+            self._save_if_absent_sync,
+            envelope,
+            capability_snapshot,
+            resolved_locale,
+        )
 
     async def get(self, event_id: str) -> ClientIngressEvent:
         return await asyncio.to_thread(self._load_event_sync, event_id)
@@ -139,8 +159,12 @@ class FileSystemIngressEventStore(_AtomicJsonStore):
     def _save_if_absent_sync(
         self,
         envelope: ClientInputEnvelope,
+        capability_snapshot: ClientCapabilitySnapshot | None,
+        resolved_locale: str | None,
     ) -> tuple[ClientIngressEvent, bool]:
-        envelope_payload = envelope.model_dump(mode="json")
+        envelope_payload = self._semantic_projection(
+            envelope.model_dump(mode="json")
+        )
         semantic_fingerprint = _fingerprint(envelope_payload)
         key_digest = hashlib.sha256(
             envelope.idempotency_key.encode("utf-8")
@@ -172,10 +196,33 @@ class FileSystemIngressEventStore(_AtomicJsonStore):
                 })
                 return event, True
 
+            event_payload = envelope.model_dump(mode="python")
+            for generated_field in (
+                "response_route",
+                "response_anchor_candidates",
+                "capability_snapshot_ref",
+                "locale",
+            ):
+                event_payload.pop(generated_field, None)
+            route = envelope.response_route.model_copy(
+                update={"reply_to_message_id": None}
+            )
+            candidates = list(envelope.response_anchor_candidates)
+            if not candidates:
+                candidates = [self._default_anchor_candidate(envelope)]
             event = ClientIngressEvent(
                 event_id=new_ingress_event_id(),
                 received_at=utc_now(),
-                **envelope.model_dump(mode="python"),
+                **event_payload,
+                response_route=route,
+                response_anchor_candidates=candidates,
+                capability_snapshot=capability_snapshot,
+                capability_snapshot_ref=(
+                    capability_snapshot.to_ref()
+                    if capability_snapshot is not None
+                    else envelope.capability_snapshot_ref
+                ),
+                locale=resolved_locale or envelope.locale,
             )
             self._write_json(
                 self.events_dir / f"{event.event_id}.json",
@@ -195,8 +242,10 @@ class FileSystemIngressEventStore(_AtomicJsonStore):
 
     def _load_event_path_sync(self, path: Path) -> ClientIngressEvent:
         try:
-            return ClientIngressEvent.model_validate(self._read_json(path))
-        except ValidationError as error:
+            return ClientIngressEvent.model_validate(
+                upgrade_ingress_event(self._read_json(path))
+            )
+        except (ValidationError, ValueError) as error:
             raise ArtifactIntegrityError("Invalid ingress event metadata") from error
 
     @staticmethod
@@ -205,7 +254,63 @@ class FileSystemIngressEventStore(_AtomicJsonStore):
         payload.pop("schema_version", None)
         payload.pop("event_id", None)
         payload.pop("received_at", None)
-        return payload
+        payload.pop("capability_snapshot", None)
+        return FileSystemIngressEventStore._semantic_projection(payload)
+
+    @staticmethod
+    def _semantic_projection(payload: dict[str, Any]) -> dict[str, Any]:
+        """Exclude delivery/presentation ephemera from event idempotency."""
+        result = dict(payload)
+        result.pop("locale", None)
+        result.pop("transport_locale", None)
+        result.pop("response_anchor_candidates", None)
+        result.pop("capability_snapshot", None)
+        route = result.get("response_route")
+        if isinstance(route, dict):
+            result["response_route"] = {
+                "route_type": route.get("route_type"),
+                "conversation_id": route.get("conversation_id"),
+                "thread_id": route.get("thread_id"),
+            }
+        metadata = result.get("metadata")
+        if isinstance(metadata, dict):
+            result["metadata"] = {
+                key: value
+                for key, value in metadata.items()
+                if not (
+                    key.startswith("presentation_")
+                    or key.startswith("localized_")
+                    or key in {"auth_token", "download_url"}
+                )
+            }
+        return result
+
+    @staticmethod
+    def _default_anchor_candidate(
+        envelope: ClientInputEnvelope,
+    ) -> ClientResponseAnchorCandidate:
+        if envelope.reply_to_message_id:
+            kind = ClientResponseAnchorKind.EXPLICIT
+            message_id = envelope.reply_to_message_id
+        elif any(item.kind == "message_text" for item in envelope.text_parts):
+            kind = ClientResponseAnchorKind.INSTRUCTION
+            message_id = envelope.source_message_id
+        elif any(item.kind == "caption" for item in envelope.text_parts):
+            kind = ClientResponseAnchorKind.CAPTION
+            message_id = envelope.source_message_id
+        elif envelope.attachment_slots or envelope.semantic_parts:
+            kind = ClientResponseAnchorKind.ATTACHMENT
+            message_id = envelope.source_message_id
+        else:
+            kind = ClientResponseAnchorKind.FALLBACK
+            message_id = envelope.source_message_id
+        return ClientResponseAnchorCandidate(
+            client_message_id=message_id,
+            source_message_id=envelope.source_message_id,
+            kind=kind,
+            priority=ResponseAnchorSelector.priority_for(kind),
+            occurred_at=envelope.occurred_at,
+        )
 
 
 class FileSystemInputBatchStore(_AtomicJsonStore):
@@ -277,6 +382,8 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
         *,
         content_id: str,
         artifact_id: str,
+        artifact_lineage_id: str,
+        version: int,
         detected_format_id: str,
         detected_mime_type: str,
         size_bytes: int,
@@ -290,6 +397,8 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 "state": InputAttachmentState.STORED,
                 "content_id": content_id,
                 "artifact_id": artifact_id,
+                "artifact_lineage_id": artifact_lineage_id,
+                "version": version,
                 "detected_format_id": detected_format_id,
                 "detected_mime_type": detected_mime_type,
                 "size_bytes": size_bytes,
@@ -353,6 +462,7 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 grouping_key=grouping_key,
                 source_event_ids=[event.event_id],
                 text_parts=list(event.text_parts),
+                semantic_parts=list(event.semantic_parts),
                 attachment_parts=[
                     InputAttachmentPart(
                         slot_id=slot.slot_id,
@@ -364,6 +474,11 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 ],
                 admission_mode=event.admission_mode,
                 response_route=event.response_route,
+                locale=event.locale,
+                capability_snapshot=event.capability_snapshot,
+                response_anchor=ResponseAnchorSelector().select(
+                    event.response_anchor_candidates
+                ),
                 opened_at=now,
                 last_event_at=event.occurred_at,
                 updated_at=now,
@@ -402,17 +517,21 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
     def _load_draft_sync(self, input_batch_id: str) -> InputBatchDraft:
         try:
             return InputBatchDraft.model_validate(
-                self._read_json(self.root / input_batch_id / "draft.json")
+                upgrade_input_batch_draft(
+                    self._read_json(self.root / input_batch_id / "draft.json")
+                )
             )
-        except ValidationError as error:
+        except (ValidationError, ValueError) as error:
             raise ArtifactIntegrityError("Invalid input batch draft") from error
 
     def _load_committed_sync(self, input_batch_id: str) -> CommittedInputBatch:
         try:
             return CommittedInputBatch.model_validate(
-                self._read_json(self.root / input_batch_id / "committed.json")
+                upgrade_committed_input_batch(
+                    self._read_json(self.root / input_batch_id / "committed.json")
+                )
             )
-        except ValidationError as error:
+        except (ValidationError, ValueError) as error:
             raise ArtifactIntegrityError("Invalid committed input batch") from error
 
     def _set_state_sync(
@@ -541,6 +660,28 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 for item in draft.attachment_parts
                 if item.artifact_id is not None
             ]
+            manifest_items = tuple(
+                ArtifactManifestItem(
+                    artifact_id=item.artifact_id,
+                    artifact_lineage_id=item.artifact_lineage_id,
+                    version=item.version,
+                    filename=item.original_filename
+                    or f"upload-{item.slot_id}",
+                    format_id=item.detected_format_id,
+                    mime_type=item.detected_mime_type,
+                    size_bytes=item.size_bytes,
+                    purpose="input",
+                )
+                for item in draft.attachment_parts
+                if (
+                    item.artifact_id is not None
+                    and item.artifact_lineage_id is not None
+                    and item.version is not None
+                    and item.detected_format_id is not None
+                    and item.detected_mime_type is not None
+                    and item.size_bytes is not None
+                )
+            )
             sequence_number = self._next_sequence_sync(draft.session_id)
             committed_at = utc_now()
             fingerprint_payload = {
@@ -550,9 +691,11 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 "text_parts": [
                     item.model_dump(mode="json") for item in draft.text_parts
                 ],
+                "semantic_parts": [
+                    item.model_dump(mode="json") for item in draft.semantic_parts
+                ],
                 "artifact_refs": artifact_refs,
                 "admission_mode": draft.admission_mode.value,
-                "response_route": draft.response_route.model_dump(mode="json"),
             }
             committed = CommittedInputBatch(
                 input_batch_id=draft.input_batch_id,
@@ -561,10 +704,19 @@ class FileSystemInputBatchStore(_AtomicJsonStore):
                 sequence_number=sequence_number,
                 source_event_ids=list(draft.source_event_ids),
                 text_parts=list(draft.text_parts),
+                semantic_parts=list(draft.semantic_parts),
                 artifact_refs=artifact_refs,
                 referenced_artifact_refs=[],
                 admission_mode=draft.admission_mode,
                 response_route=draft.response_route,
+                response_anchor=draft.response_anchor,
+                locale=draft.locale,
+                capability_snapshot=draft.capability_snapshot,
+                artifact_manifest=ArtifactInputManifest(
+                    items=manifest_items,
+                    available_count=len(manifest_items),
+                    truncated=False,
+                ),
                 committed_at=committed_at,
                 commit_reason=reason,
                 content_fingerprint=_fingerprint(fingerprint_payload),

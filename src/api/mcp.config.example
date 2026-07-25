@@ -125,6 +125,42 @@
         "media_group_maximum_wait_seconds": 300,
         "standalone_attachment_maximum_wait_seconds": 2
     },
+    "client_capabilities": {
+        "contract_version": 1,
+        "reject_unknown_features": true,
+        "max_feature_count": 64,
+        "max_limit_count": 64
+    },
+    "localization": {
+        "default_locale": "ru",
+        "supported_locales": [
+            "ru",
+            "en"
+        ],
+        "fallback_locale": "ru",
+        "fail_on_missing_required_key": false,
+        "max_params": 32,
+        "max_param_chars": 2000
+    },
+    "input_presentation": {
+        "enabled": true,
+        "reservation_timeout_seconds": 30,
+        "update_throttle_seconds": 1.0,
+        "max_updates_per_batch": 64
+    },
+    "output_runtime": {
+        "enabled": true,
+        "max_parts_per_batch": 64,
+        "max_total_artifacts": 32,
+        "max_delivery_groups": 16,
+        "max_text_chars": 200000,
+        "max_metadata_bytes": 65536,
+        "delivery_claim_timeout_seconds": 900
+    },
+    "telegram_output": {
+        "prefer_document_groups": true,
+        "status_message_editing": true
+    },
     "planning": {
         "enabled": true,
         "max_nodes": 32,

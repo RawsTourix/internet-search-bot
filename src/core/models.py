@@ -107,6 +107,7 @@ class AgentResult(BaseModel):
     content: str
     status: AgentStatus
     session_id: Optional[str] = None
+    cycle_id: Optional[str] = None
     iterations: int = 0
     tools_used: List[str] = Field(default_factory=list)
     error: Optional[str] = None
@@ -114,3 +115,5 @@ class AgentResult(BaseModel):
     can_resume: bool = False
     progress_events: List[Dict[str, Any]] = Field(default_factory=list)
     artifacts: List[Dict[str, Any]] = Field(default_factory=list)
+    semantic_outputs: List[Dict[str, Any]] = Field(default_factory=list)
+    output_batch: Optional[Dict[str, Any]] = None

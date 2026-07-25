@@ -6,7 +6,7 @@ import re
 import uuid
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Callable
 
@@ -23,6 +23,7 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+from ...adapters.telegram_resolvers import TelegramInputResolverRegistry
 
 from .artifact_bridge import (
     TelegramArtifactBridgeError,
@@ -53,6 +54,9 @@ from .media_group_runner import (
     LifetimeBoundDebouncedBatchRunner,
     LifetimeMediaGroupActivityCoordinator,
 )
+
+
+telegram_input_resolvers = TelegramInputResolverRegistry()
 from .runtime_state import KeyedAsyncLockPool
 from ...utils.telegram_formatting import (
     markdown_to_plain_text,
@@ -293,6 +297,28 @@ async def send_initial_status_message(update: Update, text: str):
     except (TimedOut, NetworkError) as error:
         logger.warning("Failed to send initial Telegram status: %r", error)
         return None
+
+
+async def bind_input_presentation_status(
+    *,
+    submission: dict[str, Any],
+    status_message: Any,
+    session_id: str,
+) -> None:
+    """Best-effort binding; durable input admission must not depend on presentation."""
+    if status_message is None:
+        return
+    try:
+        await artifact_gateway.bind_input_presentation(
+            submission.get("presentation_ref"),
+            session_id=session_id,
+            client_message_id=str(status_message.message_id),
+        )
+    except Exception as error:
+        logger.warning(
+            "Failed to bind InputBatch presentation status: %s",
+            type(error).__name__,
+        )
 
 
 def _progress_metadata(
@@ -591,13 +617,12 @@ async def finish_status_or_send_reply(
     text: str,
     force_reply_if_long: bool = False,
     delivery_mode: str | None = None,
-) -> None:
+) -> Any:
     mode = (delivery_mode or TELEGRAM_FINAL_DELIVERY_MODE).lower().strip()
     if mode not in {"send_new", "edit_status", "auto"}:
         mode = "send_new"
     if status_message is None:
-        await send_telegram_markdown_reply(update, text)
-        return
+        return await send_telegram_markdown_reply(update, text)
     await stop_progress_edits(
         chat_id=update.effective_chat.id,
         message_id=status_message.message_id,
@@ -610,8 +635,7 @@ async def finish_status_or_send_reply(
         or len(raw) > TELEGRAM_FINAL_EDIT_MAX_LENGTH
         or len(chunks) != 1
     ):
-        await send_telegram_markdown_reply(update, raw)
-        return
+        return await send_telegram_markdown_reply(update, raw)
     chunk = chunks[0]
     try:
         await edit_telegram_message_with_retries(
@@ -620,6 +644,7 @@ async def finish_status_or_send_reply(
             text=markdown_to_telegram_html(chunk),
             parse_mode=ParseMode.HTML,
         )
+        return status_message
     except BadRequest:
         try:
             await edit_telegram_message_with_retries(
@@ -628,10 +653,11 @@ async def finish_status_or_send_reply(
                 text=markdown_to_plain_text(chunk),
                 parse_mode=None,
             )
+            return status_message
         except (TimedOut, NetworkError):
-            await send_telegram_markdown_reply(update, raw)
+            return await send_telegram_markdown_reply(update, raw)
     except (TimedOut, NetworkError):
-        await send_telegram_markdown_reply(update, raw)
+        return await send_telegram_markdown_reply(update, raw)
 
 
 async def _deliver_agent_result(
@@ -647,16 +673,50 @@ async def _deliver_agent_result(
         metadata.get("progress_locale") or detect_progress_locale(update)
     )
     artifacts = metadata.get("artifacts") or []
+    output_batch = metadata.get("output_batch") or {}
+    snapshot = output_batch.get("capability_snapshot") or {}
+    limits = snapshot.get("limits") or {}
+    anchor = output_batch.get("response_anchor") or {}
+    try:
+        reply_message_id = int(anchor.get("client_message_id"))
+    except (TypeError, ValueError):
+        reply_message_id = update.effective_message.message_id
+    max_document_group_items = int(
+        limits.get(
+            "transport.telegram.output.document_group.max_items",
+            10,
+        )
+    )
+    output_batch_id = str(output_batch.get("output_batch_id") or "")
+    output_attempt_id: str | None = None
+    claim: dict[str, Any] = {}
+    if output_batch_id and success and not is_agent_error(metadata):
+        claim = await artifact_gateway.claim_output_batch(
+            output_batch_id,
+            session_id=session_id,
+        )
+        output_attempt_id = str(claim.get("attempt_id") or "") or None
     if success and not is_agent_error(metadata):
         final_text = (message or "").strip() or (
             "Файл готов." if artifacts else "Готово."
         )
-        await finish_status_or_send_reply(
-            update=update,
-            status_message=status_message,
-            text=final_text,
-            delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
-        )
+        rendered_texts = [
+            str(group.get("rendered_text") or "").strip()
+            for group in (
+                claim.get("delivery_plan", {}).get("groups", [])
+                if isinstance(claim, dict)
+                else []
+            )
+            if (
+                isinstance(group, dict)
+                and group.get("rendered_text")
+                and str(group.get("rendered_text")).strip() != final_text
+            )
+        ]
+        if rendered_texts:
+            final_text = "\n\n".join(
+                [final_text, *dict.fromkeys(rendered_texts)]
+            )
         outcomes = await artifact_gateway.deliver_selected(
             bot=application.bot,
             artifacts=list(artifacts),
@@ -667,9 +727,92 @@ async def _deliver_agent_result(
                 "message_thread_id",
                 None,
             ),
-            reply_to_message_id=update.effective_message.message_id,
+            reply_to_message_id=reply_message_id,
+            max_document_group_items=max_document_group_items,
         )
-        if any(item.state in {"failed", "unknown"} for item in outcomes):
+        delivery_incomplete = any(
+            item.state in {"failed", "unknown"} for item in outcomes
+        )
+        final_message = await finish_status_or_send_reply(
+            update=update,
+            status_message=status_message,
+            text=(
+                final_text
+                if not delivery_incomplete
+                else (
+                    "Result delivery is incomplete."
+                    if locale_name == "en"
+                    else "Результат доставлен не полностью."
+                )
+            ),
+            delivery_mode=TELEGRAM_FINAL_DELIVERY_MODE,
+        )
+        final_message_id = getattr(final_message, "message_id", None)
+        if output_attempt_id is not None:
+            outcome_by_delivery = {
+                item.delivery_id: item for item in outcomes
+            }
+            now = datetime.now(timezone.utc).isoformat()
+            part_receipts = []
+            for part in output_batch.get("parts") or []:
+                if not isinstance(part, dict):
+                    continue
+                delivery_id = part.get("delivery_id")
+                outcome = outcome_by_delivery.get(str(delivery_id))
+                part_state = (
+                    outcome.state
+                    if outcome is not None
+                    else "delivered"
+                )
+                receipt = {
+                    "part_id": part.get("part_id"),
+                    "index": int(part.get("index", 0)),
+                    "state": part_state,
+                    "delivery_id": delivery_id,
+                    "client_message_ids": (
+                        [str(outcome.telegram_message_id)]
+                        if outcome is not None
+                        and outcome.telegram_message_id is not None
+                        else (
+                            [str(final_message_id)]
+                            if final_message_id is not None
+                            else []
+                        )
+                    ),
+                    "error_category": (
+                        outcome.error if outcome is not None else None
+                    ),
+                    "delivered_at": (
+                        now if part_state == "delivered" else None
+                    ),
+                }
+                part_receipts.append(receipt)
+            states = [item["state"] for item in part_receipts]
+            aggregate_state = (
+                "unknown"
+                if "unknown" in states
+                else "delivered"
+                if states and all(item == "delivered" for item in states)
+                else "partially_delivered"
+                if "delivered" in states
+                else "failed"
+            )
+            await artifact_gateway.complete_output_batch(
+                output_batch_id,
+                session_id=session_id,
+                receipt={
+                    "output_batch_id": output_batch_id,
+                    "attempt_id": output_attempt_id,
+                    "state": aggregate_state,
+                    "part_receipts": part_receipts,
+                    "started_at": (
+                        claim.get("output_batch", {}).get("ready_at")
+                        or now
+                    ),
+                    "completed_at": now,
+                },
+            )
+        if delivery_incomplete:
             await send_telegram_markdown_reply(
                 update,
                 "⚠️ Не все подготовленные файлы удалось подтвердить как "
@@ -865,14 +1008,30 @@ async def _process_standalone_attachment(update: Update) -> None:
     progress_locale = detect_progress_locale(update)
     session_id = _session_for_update(update)
     try:
+        semantic_parts = await telegram_input_resolvers.resolve(
+            update.effective_message,
+        )
         envelope = build_telegram_input_envelope(
             update,
             bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
             response_metadata=_progress_metadata(update, status_message),
+            semantic_parts=semantic_parts,
         )
+        if envelope.attachment_slots:
+            envelope = envelope.model_copy(update={
+                "semantic_parts": await telegram_input_resolvers.resolve(
+                    update.effective_message,
+                    attachment_slots=tuple(envelope.attachment_slots),
+                )
+            })
         submission = await artifact_gateway.submit_envelope(
             envelope,
             progress_locale=progress_locale,
+        )
+        await bind_input_presentation_status(
+            submission=submission,
+            status_message=status_message,
+            session_id=session_id,
         )
         if submission.get("status") == "failed":
             raise TelegramArtifactBridgeError("Ingress rejected the attachment")
@@ -925,8 +1084,10 @@ async def _process_standalone_attachment(update: Update) -> None:
 async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
     if not extract_telegram_attachments(message):
-        await message.reply_text("Этот тип вложения пока не поддерживается.")
-        return
+        semantic_parts = await telegram_input_resolvers.resolve(message)
+        if not semantic_parts:
+            await message.reply_text("Этот тип вложения пока не поддерживается.")
+            return
     media_group_id = getattr(message, "media_group_id", None)
     if media_group_id is None:
         key = (
@@ -970,9 +1131,20 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
             response_metadata=group.response_metadata,
         )
+        envelope = envelope.model_copy(update={
+            "semantic_parts": await telegram_input_resolvers.resolve(
+                update.effective_message,
+                attachment_slots=tuple(envelope.attachment_slots),
+            )
+        })
         submission = await artifact_gateway.submit_envelope(
             envelope,
             progress_locale=progress_locale,
+        )
+        await bind_input_presentation_status(
+            submission=submission,
+            status_message=group.status_message,
+            session_id=session_id,
         )
         if group.failed:
             logger.info(
@@ -1034,6 +1206,11 @@ attachment_filter = (
     | filters.VOICE
     | filters.VIDEO_NOTE
     | filters.ANIMATION
+    | filters.Sticker.ALL
+    | filters.LOCATION
+    | filters.CONTACT
+    | filters.POLL
+    | filters.FORWARDED
 )
 application.add_handler(
     CommandHandler(["start", "status", "reset", "help"], command_handler)

@@ -13,7 +13,7 @@ from tempfile import SpooledTemporaryFile
 from typing import Any
 
 import httpx
-from telegram import InputFile
+from telegram import InputFile, InputMediaDocument
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 from ...adapters.telegram_adapter import TelegramAdapter
@@ -320,6 +320,27 @@ def extract_telegram_attachments(message: Any) -> list[dict[str, Any]]:
             "media_kind": "photo",
         }]
 
+    sticker = getattr(message, "sticker", None)
+    if sticker is not None:
+        is_video = bool(getattr(sticker, "is_video", False))
+        is_animated = bool(getattr(sticker, "is_animated", False))
+        extension = "webm" if is_video else "tgs" if is_animated else "webp"
+        mime_type = (
+            "video/webm"
+            if is_video
+            else "application/x-tgsticker"
+            if is_animated
+            else "image/webp"
+        )
+        return [{
+            "file_id": sticker.file_id,
+            "file_unique_id": getattr(sticker, "file_unique_id", None),
+            "filename": f"sticker-{message_id}.{extension}",
+            "mime_type": mime_type,
+            "size_bytes": getattr(sticker, "file_size", None),
+            "media_kind": "sticker",
+        }]
+
     return []
 
 
@@ -328,12 +349,13 @@ def build_telegram_input_envelope(
     *,
     bot_instance_id: str,
     response_metadata: dict[str, Any] | None = None,
+    semantic_parts: list[Any] | None = None,
 ):
     message = update.effective_message
     if message is None:
         raise TelegramArtifactBridgeError("Telegram update has no effective message")
     attachments = extract_telegram_attachments(message)
-    if not attachments:
+    if not attachments and not semantic_parts:
         raise TelegramArtifactBridgeError("Telegram message has no supported attachment")
     user = update.effective_user
     chat = update.effective_chat
@@ -349,6 +371,7 @@ def build_telegram_input_envelope(
         user_name=getattr(user, "full_name", None),
         message_id=str(message.message_id),
         attachments=attachments,
+        semantic_parts=semantic_parts,
         caption=getattr(message, "caption", None),
         media_group_id=getattr(message, "media_group_id", None),
         message_thread_id=getattr(message, "message_thread_id", None),
@@ -575,6 +598,78 @@ class TelegramArtifactGatewayClient:
             )
             raise
 
+    async def bind_input_presentation(
+        self,
+        presentation_ref: dict[str, Any] | None,
+        *,
+        session_id: str,
+        client_message_id: str,
+    ) -> dict[str, Any] | None:
+        """Bind the one durable InputBatch handle to an existing Telegram status."""
+        ref = presentation_ref or {}
+        presentation_id = str(ref.get("presentation_id") or "")
+        token = str(ref.get("presentation_token") or "")
+        if not presentation_id or not token:
+            return None
+        async with self._client(read_timeout=30.0) as client:
+            response = await client.post(
+                f"{self.gateway_url}/internal/input-presentations/"
+                f"{presentation_id}/bind",
+                json={
+                    "session_id": session_id,
+                    "presentation_token": token,
+                    "client_message_id": client_message_id,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TelegramArtifactBridgeError(
+                    "Gateway presentation bind response is invalid"
+                )
+            return payload
+
+    async def claim_output_batch(
+        self,
+        output_batch_id: str,
+        *,
+        session_id: str,
+    ) -> dict[str, Any]:
+        async with self._client(read_timeout=30.0) as client:
+            response = await client.post(
+                f"{self.gateway_url}/internal/output-batches/"
+                f"{output_batch_id}/claim",
+                json={"session_id": session_id},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TelegramArtifactBridgeError(
+                    "Gateway OutputBatch claim response is invalid"
+                )
+            return payload
+
+    async def complete_output_batch(
+        self,
+        output_batch_id: str,
+        *,
+        session_id: str,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        async with self._client(read_timeout=30.0) as client:
+            response = await client.post(
+                f"{self.gateway_url}/internal/output-batches/"
+                f"{output_batch_id}/receipt",
+                json={"session_id": session_id, "receipt": receipt},
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if not isinstance(payload, dict):
+                raise TelegramArtifactBridgeError(
+                    "Gateway OutputBatch receipt response is invalid"
+                )
+            return payload
+
     async def open_telegram_file(
         self,
         bot: Any,
@@ -625,9 +720,69 @@ class TelegramArtifactGatewayClient:
         chat_id: int,
         message_thread_id: int | None = None,
         reply_to_message_id: int | None = None,
+        max_document_group_items: int = 10,
     ) -> list[TelegramDeliveryOutcome]:
+        ordered = sorted(
+            (
+                item
+                for item in artifacts
+                if isinstance(item, dict)
+            ),
+            key=lambda item: (
+                int(item.get("selection_index", 0)),
+                str(item.get("delivery_id") or ""),
+            ),
+        )
+        selected = [
+            item
+            for item in ordered
+            if str(
+                getattr(item.get("state"), "value", item.get("state"))
+                or "selected"
+            )
+            == "selected"
+            and item.get("delivery_id")
+        ]
+        group_limit = max(2, min(10, int(max_document_group_items)))
+        if len(selected) > 1 and hasattr(bot, "send_media_group"):
+            outcomes: list[TelegramDeliveryOutcome] = []
+            selected_ids = {
+                str(item["delivery_id"]) for item in selected
+            }
+            for offset in range(0, len(selected), group_limit):
+                outcomes.extend(await self._deliver_document_group(
+                    bot=bot,
+                    artifacts=selected[offset : offset + group_limit],
+                    session_id=session_id,
+                    chat_id=chat_id,
+                    message_thread_id=message_thread_id,
+                    reply_to_message_id=(
+                        reply_to_message_id if offset == 0 else None
+                    ),
+                ))
+            by_id = {item.delivery_id: item for item in outcomes}
+            return [
+                (
+                    by_id[str(item["delivery_id"])]
+                    if str(item.get("delivery_id") or "") in selected_ids
+                    else TelegramDeliveryOutcome(
+                        delivery_id=str(item.get("delivery_id") or ""),
+                        state=str(
+                            getattr(
+                                item.get("state"),
+                                "value",
+                                item.get("state"),
+                            )
+                            or "selected"
+                        ),
+                    )
+                )
+                for item in ordered
+                if item.get("delivery_id")
+            ]
+
         outcomes: list[TelegramDeliveryOutcome] = []
-        for item in artifacts:
+        for item in ordered:
             if not isinstance(item, dict):
                 continue
             delivery_id = str(item.get("delivery_id") or "")
@@ -650,6 +805,179 @@ class TelegramArtifactGatewayClient:
                 reply_to_message_id=reply_to_message_id,
             ))
         return outcomes
+
+    async def _deliver_document_group(
+        self,
+        *,
+        bot: Any,
+        artifacts: list[dict[str, Any]],
+        session_id: str,
+        chat_id: int,
+        message_thread_id: int | None,
+        reply_to_message_id: int | None,
+    ) -> list[TelegramDeliveryOutcome]:
+        """Send one stable ordered Telegram document album with part receipts."""
+        spools: list[SpooledTemporaryFile] = []
+        delivery_ids = [str(item["delivery_id"]) for item in artifacts]
+        send_started = False
+        try:
+            media: list[InputMediaDocument] = []
+            for delivery_id in delivery_ids:
+                spool = SpooledTemporaryFile(
+                    max_size=self.delivery_spool_memory_bytes,
+                    mode="w+b",
+                )
+                spools.append(spool)
+                filename = "artifact.bin"
+                async with self._client(read_timeout=300.0) as client:
+                    async with client.stream(
+                        "GET",
+                        f"{self.gateway_url}/internal/deliveries/"
+                        f"{delivery_id}/content",
+                        params={
+                            "session_id": session_id,
+                            "client_type": "telegram",
+                        },
+                    ) as response:
+                        response.raise_for_status()
+                        filename = (
+                            _filename_from_disposition(
+                                response.headers.get(
+                                    "content-disposition", ""
+                                )
+                            )
+                            or filename
+                        )
+                        expected_hash = response.headers.get("x-content-hash")
+                        expected_size = _optional_int(
+                            response.headers.get("content-length")
+                        )
+                        digest = hashlib.sha256()
+                        total = 0
+                        async for chunk in response.aiter_bytes(64 * 1024):
+                            if chunk:
+                                spool.write(chunk)
+                                digest.update(chunk)
+                                total += len(chunk)
+                        if expected_size is not None and total != expected_size:
+                            raise TelegramArtifactBridgeError(
+                                "Delivery length changed during transport"
+                            )
+                        actual_hash = "sha256:" + digest.hexdigest()
+                        if expected_hash and actual_hash != expected_hash:
+                            raise TelegramArtifactBridgeError(
+                                "Delivery hash changed during transport"
+                            )
+                spool.seek(0)
+                media.append(InputMediaDocument(
+                    media=_telegram_input_file(spool, filename)
+                ))
+
+            kwargs: dict[str, Any] = {
+                "chat_id": chat_id,
+                "media": media,
+                "write_timeout": 120.0,
+            }
+            if message_thread_id is not None:
+                kwargs["message_thread_id"] = message_thread_id
+            if reply_to_message_id is not None:
+                kwargs["reply_to_message_id"] = reply_to_message_id
+                kwargs["allow_sending_without_reply"] = True
+            send_started = True
+            sent_messages = list(await bot.send_media_group(**kwargs))
+            if len(sent_messages) != len(delivery_ids):
+                raise TelegramArtifactBridgeError(
+                    "Telegram document group receipt count mismatch"
+                )
+            result: list[TelegramDeliveryOutcome] = []
+            for delivery_id, sent in zip(
+                delivery_ids, sent_messages, strict=True
+            ):
+                receipt = {
+                    "provider": "telegram",
+                    "chat_id": chat_id,
+                    "message_id": getattr(sent, "message_id", None),
+                    "group_size": len(delivery_ids),
+                }
+                try:
+                    await self._complete(delivery_id, session_id, receipt)
+                    state = "delivered"
+                    error = None
+                except Exception:
+                    await self._fail(
+                        delivery_id,
+                        session_id,
+                        error="completion_receipt_failed",
+                        ambiguous=True,
+                        receipt=receipt,
+                    )
+                    state = "unknown"
+                    error = "completion_receipt_failed"
+                result.append(TelegramDeliveryOutcome(
+                    delivery_id=delivery_id,
+                    state=state,
+                    telegram_message_id=getattr(sent, "message_id", None),
+                    error=error,
+                ))
+            return result
+        except (TimedOut, NetworkError) as error:
+            ambiguous = send_started
+            safe_error = _safe_delivery_error(error)
+            for delivery_id in delivery_ids:
+                try:
+                    await self._fail(
+                        delivery_id,
+                        session_id,
+                        error=safe_error,
+                        ambiguous=ambiguous,
+                        receipt={
+                            "provider": "telegram",
+                            "chat_id": chat_id,
+                            "group_size": len(delivery_ids),
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist Telegram group failure"
+                    )
+            return [
+                TelegramDeliveryOutcome(
+                    delivery_id=delivery_id,
+                    state="unknown" if ambiguous else "failed",
+                    error=safe_error,
+                )
+                for delivery_id in delivery_ids
+            ]
+        except Exception as error:
+            safe_error = _safe_delivery_error(error)
+            for delivery_id in delivery_ids:
+                try:
+                    await self._fail(
+                        delivery_id,
+                        session_id,
+                        error=safe_error,
+                        ambiguous=False,
+                        receipt={
+                            "provider": "telegram",
+                            "chat_id": chat_id,
+                            "group_size": len(delivery_ids),
+                        },
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to persist Telegram group failure"
+                    )
+            return [
+                TelegramDeliveryOutcome(
+                    delivery_id=delivery_id,
+                    state="failed",
+                    error=safe_error,
+                )
+                for delivery_id in delivery_ids
+            ]
+        finally:
+            for spool in spools:
+                spool.close()
 
     async def _deliver_one(
         self,

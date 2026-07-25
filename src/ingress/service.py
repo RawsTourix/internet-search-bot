@@ -20,6 +20,14 @@ from ..artifacts.errors import (
     ArtifactStorageError,
 )
 from ..storage.interfaces import ContentStore
+from ..interaction.capabilities import (
+    build_cli_capability_declaration,
+    build_telegram_capability_declaration,
+    build_web_capability_declaration,
+)
+from ..interaction.capability_store import FileSystemCapabilitySnapshotStore
+from ..interaction.presentation_service import InputPresentationCoordinator
+from ..localization.service import LocalizationService
 from .config import IngressConfigType
 from .models import (
     ClientInputEnvelope,
@@ -60,6 +68,11 @@ class ArtifactIngressService:
         artifact_services: ArtifactServices,
         event_store: FileSystemIngressEventStore,
         batch_store: FileSystemInputBatchStore,
+        capability_store: FileSystemCapabilitySnapshotStore | None = None,
+        localization_service: LocalizationService | None = None,
+        presentation_coordinator: InputPresentationCoordinator | None = None,
+        telegram_document_grouping: bool = True,
+        telegram_message_editing: bool = True,
     ) -> None:
         self.config = config
         self.artifact_config = artifact_config
@@ -67,6 +80,11 @@ class ArtifactIngressService:
         self.artifact_services = artifact_services
         self.event_store = event_store
         self.batch_store = batch_store
+        self.capability_store = capability_store
+        self.localization_service = localization_service
+        self.presentation_coordinator = presentation_coordinator
+        self.telegram_document_grouping = telegram_document_grouping
+        self.telegram_message_editing = telegram_message_editing
 
     async def submit_atomic(
         self,
@@ -97,7 +115,14 @@ class ArtifactIngressService:
                 "Client file ingress is disabled.",
             )
         self._validate_envelope_limits(envelope)
-        event, duplicate_event = await self.event_store.save_if_absent(envelope)
+        capability_snapshot, resolved_locale = await self._resolve_interaction(
+            envelope
+        )
+        event, duplicate_event = await self.event_store.save_if_absent(
+            envelope,
+            capability_snapshot=capability_snapshot,
+            resolved_locale=resolved_locale,
+        )
         draft, duplicate_batch = await self.batch_store.create_for_event(
             event,
             session_id=session_id,
@@ -131,6 +156,7 @@ class ArtifactIngressService:
                 duplicate=True,
                 committed_batch=committed,
             )
+            result = await self._decorate_result(result, envelope=envelope)
             self._log_submission_result(result, started=started)
             return result
 
@@ -142,6 +168,7 @@ class ArtifactIngressService:
                 duplicate=duplicate_event or duplicate_batch,
                 error_code=draft.failure_code,
             )
+            result = await self._decorate_result(result, envelope=envelope)
             self._log_submission_result(result, started=started)
             return result
 
@@ -161,6 +188,7 @@ class ArtifactIngressService:
                 duplicate=duplicate_event or duplicate_batch,
                 error_code="unexpected_upload_slot",
             )
+            result = await self._decorate_result(result, envelope=envelope)
             self._log_submission_result(result, started=started)
             return result
 
@@ -267,6 +295,7 @@ class ArtifactIngressService:
                     state="collecting",
                     duplicate=duplicate_event or duplicate_batch,
                 )
+                result = await self._decorate_result(result, envelope=envelope)
                 self._log_submission_result(result, started=started)
                 return result
 
@@ -285,6 +314,7 @@ class ArtifactIngressService:
                 duplicate=duplicate_event or duplicate_batch,
                 committed_batch=committed,
             )
+            result = await self._decorate_result(result, envelope=envelope)
             self._log_submission_result(result, started=started)
             return result
         except IngressValidationError as error:
@@ -299,6 +329,7 @@ class ArtifactIngressService:
                 duplicate=duplicate_event or duplicate_batch,
                 error_code=error.code,
             )
+            result = await self._decorate_result(result, envelope=envelope)
             self._log_submission_result(result, started=started)
             return result
         except (ArtifactValidationError, ArtifactLimitError) as error:
@@ -314,6 +345,7 @@ class ArtifactIngressService:
                 duplicate=duplicate_event or duplicate_batch,
                 error_code=str(code),
             )
+            result = await self._decorate_result(result, envelope=envelope)
             self._log_submission_result(result, started=started)
             return result
         except (ArtifactStorageError, ArtifactIntegrityError) as error:
@@ -508,6 +540,8 @@ class ArtifactIngressService:
             slot.slot_id,
             content_id=content_ref.content_id,
             artifact_id=version.artifact_id,
+            artifact_lineage_id=version.artifact_lineage_id,
+            version=version.version,
             detected_format_id=version.format_id,
             detected_mime_type=version.detected_mime_type,
             size_bytes=version.size_bytes,
@@ -541,6 +575,101 @@ class ArtifactIngressService:
                 "declared_input_batch_too_large",
                 "Declared attachment sizes exceed the batch limit.",
             )
+
+    async def _resolve_interaction(self, envelope: ClientInputEnvelope):
+        locale = (
+            self.localization_service.resolve_locale(
+                explicit_locale=envelope.locale,
+                transport_locale=envelope.transport_locale,
+            )
+            if self.localization_service is not None
+            else envelope.locale
+        )
+        if self.capability_store is None:
+            return None, locale
+        if envelope.capability_snapshot_ref is not None:
+            snapshot = await self.capability_store.get(
+                envelope.capability_snapshot_ref.capability_snapshot_id
+            )
+            if (
+                snapshot.fingerprint
+                != envelope.capability_snapshot_ref.fingerprint
+                or snapshot.client_instance_id != envelope.client_instance_id
+                or snapshot.client_type != envelope.client_type.value
+            ):
+                raise IngressValidationError(
+                    "capability_snapshot_mismatch",
+                    "Capability snapshot does not match this client binding.",
+                )
+            return snapshot, locale
+        declaration = envelope.capability_declaration
+        if declaration is None:
+            if envelope.client_type.value == "telegram":
+                declaration = build_telegram_capability_declaration(
+                    client_version=envelope.client_version,
+                    document_grouping=self.telegram_document_grouping,
+                    message_editing=self.telegram_message_editing,
+                )
+            elif envelope.client_type.value == "web":
+                declaration = build_web_capability_declaration(
+                    client_version=envelope.client_version
+                )
+            else:
+                declaration = build_cli_capability_declaration(
+                    client_version=envelope.client_version
+                )
+        snapshot, _ = await self.capability_store.resolve(
+            declaration,
+            client_type=envelope.client_type.value,
+            client_instance_id=envelope.client_instance_id,
+        )
+        return snapshot, locale
+
+    async def _decorate_result(
+        self,
+        result: InputSubmissionResult,
+        *,
+        envelope: ClientInputEnvelope,
+    ) -> InputSubmissionResult:
+        try:
+            draft = await self.batch_store.get_draft(result.input_batch_id)
+        except IngressNotFoundError:
+            return result
+        updates = {
+            "response_anchor": draft.response_anchor,
+            "file_count": len(draft.attachment_parts),
+            "text_part_count": len(draft.text_parts),
+        }
+        if self.presentation_coordinator is not None:
+            locale = draft.locale or (
+                self.localization_service.config.default_locale
+                if self.localization_service is not None
+                else "ru"
+            )
+            binding_id = (
+                envelope.client_binding_id
+                or (
+                    f"{envelope.client_type.value}:"
+                    f"{envelope.client_instance_id}:"
+                    f"{envelope.conversation.conversation_id}:"
+                    f"{envelope.conversation.thread_id or '-'}"
+                )
+            )
+            ack, event, ref = await self.presentation_coordinator.present(
+                input_batch_id=result.input_batch_id,
+                client_binding_id=binding_id,
+                locale=locale,
+                state=result.state,
+                file_count=len(draft.attachment_parts),
+                text_part_count=len(draft.text_parts),
+                response_anchor=draft.response_anchor,
+            )
+            updates.update(
+                ack_policy=ack,
+                presentation_event=event,
+                presentation_ref=ref,
+            )
+        return result.model_copy(update=updates)
 
     @staticmethod
     def _log_submission_result(

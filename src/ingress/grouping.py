@@ -25,6 +25,8 @@ from .store import (
     IngressConflictError,
     IngressNotFoundError,
 )
+from .upgrades import upgrade_input_batch_draft
+from ..interaction.anchors import ResponseAnchorSelector
 
 
 _OPEN_STATES = {
@@ -71,11 +73,44 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
 
     async def mark_collecting(self, input_batch_id: str) -> InputBatchDraft:
         return await asyncio.to_thread(
-            self._set_state_sync,
+            self._mark_collecting_sync,
             input_batch_id,
-            InputBatchDraftState.COLLECTING,
-            None,
         )
+
+    async def defer_commit(self, input_batch_id: str) -> InputBatchDraft:
+        """Reserve time for an event already routed to this exact draft."""
+        return await asyncio.to_thread(
+            self._defer_commit_sync,
+            input_batch_id,
+        )
+
+    def _defer_commit_sync(self, input_batch_id: str) -> InputBatchDraft:
+        with self._lock:
+            draft = self._load_draft_sync(input_batch_id)
+            if draft.state not in _OPEN_STATES:
+                raise IngressConflictError(
+                    "Input batch is no longer open for additional events"
+                )
+            updated = self._apply_deadlines_sync(draft, reset_quiet=True)
+            self._write_json(
+                self.root / input_batch_id / "draft.json",
+                updated.model_dump(mode="json"),
+            )
+            return updated
+
+    def _mark_collecting_sync(self, input_batch_id: str) -> InputBatchDraft:
+        with self._lock:
+            draft = self._set_state_sync(
+                input_batch_id,
+                InputBatchDraftState.COLLECTING,
+                None,
+            )
+            draft = self._apply_deadlines_sync(draft, reset_quiet=True)
+            self._write_json(
+                self.root / input_batch_id / "draft.json",
+                draft.model_dump(mode="json"),
+            )
+            return draft
 
     async def commit_batch(
         self,
@@ -138,6 +173,10 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
             if draft.session_id != session_id:
                 raise IngressConflictError(
                     "Input batch belongs to another session"
+                )
+            if draft.grouping_mode == InputGroupingMode.ATOMIC:
+                raise IngressConflictError(
+                    "Atomic input batches cannot use the grouped commit route"
                 )
             committed_path = self.root / input_batch_id / "committed.json"
             duplicate = committed_path.exists() or committed_path.is_symlink()
@@ -225,8 +264,18 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
             raise IngressConflictError("Input batch event limit exceeded")
         if draft.client_type != event.client_type:
             raise IngressConflictError("Grouped input client type mismatch")
-        if draft.conversation != event.conversation or draft.sender != event.sender:
+        if (
+            draft.conversation != event.conversation
+            or draft.sender.principal_id != event.sender.principal_id
+        ):
             raise IngressConflictError("Grouped input authority mismatch")
+        if (
+            draft.capability_snapshot is not None
+            and event.capability_snapshot is not None
+            and draft.capability_snapshot.capability_snapshot_id
+            != event.capability_snapshot.capability_snapshot_id
+        ):
+            raise IngressConflictError("Grouped input capability binding mismatch")
 
         existing_part_ids = {item.part_id for item in draft.text_parts}
         existing_slot_ids = {item.slot_id for item in draft.attachment_parts}
@@ -248,9 +297,18 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
             raise IngressConflictError("Input batch attachment limit exceeded")
 
         now = utc_now()
+        response_anchor = draft.response_anchor
+        selector = ResponseAnchorSelector()
+        for candidate in event.response_anchor_candidates:
+            response_anchor = selector.select_with_current(
+                response_anchor,
+                candidate,
+                selected_at=now,
+            )
         updated = draft.model_copy(update={
             "source_event_ids": [*draft.source_event_ids, event.event_id],
             "text_parts": [*draft.text_parts, *event.text_parts],
+            "semantic_parts": [*draft.semantic_parts, *event.semantic_parts],
             "attachment_parts": [
                 *draft.attachment_parts,
                 *[
@@ -266,6 +324,7 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
             "last_event_at": event.occurred_at,
             "updated_at": now,
             "state": InputBatchDraftState.COLLECTING,
+            "response_anchor": response_anchor,
         })
         updated = InputBatchDraft.model_validate(
             updated.model_dump(mode="python")
@@ -325,7 +384,7 @@ class FileSystemGroupedInputBatchStore(FileSystemInputBatchStore):
         for draft_path in self.root.glob("ibat_*/draft.json"):
             try:
                 draft = InputBatchDraft.model_validate(
-                    self._read_json(draft_path)
+                    upgrade_input_batch_draft(self._read_json(draft_path))
                 )
             except Exception as error:
                 raise ArtifactIntegrityError(

@@ -2,7 +2,7 @@
 id: design.v0.4.output-delivery
 version: v0.4
 spec_status: accepted
-implementation_status: partial
+implementation_status: implemented
 ---
 # v0.4 — OutputBatch и client delivery
 

@@ -2,7 +2,7 @@
 id: design.v0.4.artifact-interaction-policy
 version: v0.4
 spec_status: accepted
-implementation_status: partial
+implementation_status: implemented
 ---
 # v0.4 — Artifact interaction policy и version boundaries
 

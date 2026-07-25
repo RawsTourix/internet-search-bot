@@ -12,6 +12,7 @@ from ..core.models import (
     UnifiedResponse,
 )
 from ..ingress import ClientInputEnvelope, InputAdmissionMode
+from ..interaction.parts import InputPart
 
 if TYPE_CHECKING:
     from ..core.message_processor import MessageProcessor
@@ -100,6 +101,7 @@ class TelegramAdapter:
         user_name: str | None,
         message_id: str,
         attachments: list[dict[str, Any]],
+        semantic_parts: list[InputPart] | None = None,
         caption: str | None = None,
         media_group_id: str | None = None,
         message_thread_id: str | int | None = None,
@@ -117,6 +119,7 @@ class TelegramAdapter:
             user_name=user_name,
             message_id=message_id,
             attachments=attachments,
+            semantic_parts=semantic_parts,
             caption=caption,
             media_group_id=media_group_id,
             message_thread_id=message_thread_id,

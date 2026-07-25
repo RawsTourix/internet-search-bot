@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from ..core.models import ClientType
+from ..interaction.parts import InputPart
 from ..ingress import (
     ClientAttachmentLocator,
     ClientConversationRef,
@@ -26,6 +27,7 @@ def build_telegram_input_envelope(
     user_id: str,
     message_id: str,
     attachments: list[dict[str, Any]],
+    semantic_parts: list[InputPart] | None = None,
     user_name: str | None = None,
     caption: str | None = None,
     media_group_id: str | None = None,
@@ -116,6 +118,7 @@ def build_telegram_input_envelope(
         occurred_at=timestamp,
         text_parts=text_parts,
         attachment_slots=slots,
+        semantic_parts=list(semantic_parts or []),
         locale=locale,
         admission_mode=admission_mode,
         response_route=ClientResponseRoute(

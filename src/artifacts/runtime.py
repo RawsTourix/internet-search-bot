@@ -12,6 +12,11 @@ from .models import (
     ArtifactDeliveryRef,
 )
 from .service import ArtifactService
+from ..interaction.parts import (
+    ArtifactDeliverableProjection,
+    ArtifactInputManifest,
+    ArtifactManifestItem,
+)
 
 
 class ArtifactRuntimeState(BaseModel):
@@ -23,6 +28,12 @@ class ArtifactRuntimeState(BaseModel):
     items: list[ArtifactCatalogItem] = Field(default_factory=list)
     items_truncated: bool = False
     deliveries: list[ArtifactDeliveryRef] = Field(default_factory=list)
+    input_manifest: ArtifactInputManifest = Field(
+        default_factory=lambda: ArtifactInputManifest(available_count=0)
+    )
+    deliverable_projection: ArtifactDeliverableProjection = Field(
+        default_factory=ArtifactDeliverableProjection
+    )
 
     @property
     def count(self) -> int:
@@ -76,6 +87,30 @@ class ArtifactRuntimeCoordinator:
             deliveries=deliveries,
         )
         maximum = self.service.config.max_runtime_artifact_summaries
+        manifest_items = tuple(
+            ArtifactManifestItem(
+                artifact_id=item.artifact_id,
+                artifact_lineage_id=item.artifact_lineage_id,
+                version=item.version,
+                filename=item.filename,
+                format_id=item.format_id,
+                mime_type=item.mime_type,
+                size_bytes=item.size_bytes,
+                purpose=item.purpose.value,
+                capabilities=tuple(
+                    key
+                    for key, enabled in item.capabilities.model_dump().items()
+                    if enabled
+                ),
+            )
+            for item in catalog.items[:maximum]
+        )
+        selected_ids = tuple(item.artifact_id for item in deliveries)
+        deliverable_items = tuple(
+            item
+            for item in manifest_items
+            if item.purpose == "deliverable"
+        )
         state = ArtifactRuntimeState(
             available_count=catalog.available_count,
             lineage_count=catalog.lineage_count,
@@ -85,6 +120,27 @@ class ArtifactRuntimeCoordinator:
                 or catalog.available_count > maximum
             ),
             deliveries=deliveries[:maximum],
+            input_manifest=ArtifactInputManifest(
+                items=manifest_items,
+                available_count=catalog.available_count,
+                truncated=(
+                    catalog.items_truncated
+                    or catalog.available_count > maximum
+                ),
+            ),
+            deliverable_projection=ArtifactDeliverableProjection(
+                created_deliverables=deliverable_items,
+                selected_artifact_ids=selected_ids,
+                unselected_artifact_ids=tuple(
+                    item.artifact_id
+                    for item in deliverable_items
+                    if item.artifact_id not in selected_ids
+                ),
+                delivery_states={
+                    item.artifact_id: item.state.value
+                    for item in deliveries
+                },
+            ),
         )
         context.active_cycle.artifact_state = state
         return state

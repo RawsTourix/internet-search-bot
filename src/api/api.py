@@ -38,6 +38,18 @@ from ..mcp.mcp_client import load_config
 from ..planning import create_planning_services, load_planning_config
 from ..planning.runtime_context import PlanningAwareContentStore
 from ..storage import StorageServices, create_storage_services
+from ..interaction.config import (
+    load_interaction_config,
+    safe_interaction_config_summary,
+)
+from ..interaction.capabilities import (
+    build_cli_capability_declaration,
+    build_telegram_capability_declaration,
+    build_web_capability_declaration,
+)
+from ..interaction.output_service import OutputBatchAssembler
+from ..interaction.output_store import FileSystemOutputBatchStore
+from ..interaction.rendering import CapabilityOutputRenderer
 
 
 os.environ["http_proxy"] = HTTP_PROXY
@@ -83,6 +95,7 @@ class Api:
             self.planning_config = load_planning_config(config_path)
             self.artifact_config = load_artifact_config(config_path)
             self.ingress_config = load_ingress_config(config_path)
+            self.interaction_config = load_interaction_config(config_path)
             apply_local_workspace_server_policy(
                 self.server_configs,
                 self.artifact_config,
@@ -138,6 +151,10 @@ class Api:
                 self.ingress_config.max_attachments_per_batch,
                 self.ingress_config.max_batch_total_bytes,
             )
+            logger.info(
+                "Interaction: %s",
+                safe_interaction_config_summary(self.interaction_config),
+            )
 
             base_storage = create_storage_services(self.storage_config)
             self.storage_services = StorageServices(
@@ -157,6 +174,29 @@ class Api:
                 ingress_config=self.ingress_config,
                 content_store=self.storage_services.content_store,
                 artifact_services=self.artifact_services,
+                interaction_config=self.interaction_config,
+            )
+            output_root = Path(self.storage_config.root_dir).expanduser()
+            if not output_root.is_absolute():
+                output_root = Path.cwd() / output_root
+            self.output_store = FileSystemOutputBatchStore(
+                output_root.resolve(strict=False),
+                atomic_writes=self.storage_config.atomic_writes,
+            )
+            self.output_renderer = CapabilityOutputRenderer(
+                self.ingress_services.localization_service,
+                max_delivery_groups=(
+                    self.interaction_config.output_runtime.max_delivery_groups
+                ),
+                prefer_document_groups=(
+                    self.interaction_config.telegram_output.prefer_document_groups
+                ),
+            )
+            self.output_assembler = OutputBatchAssembler(
+                config=self.interaction_config.output_runtime,
+                delivery_store=self.artifact_services.delivery_store,
+                output_store=self.output_store,
+                renderer=self.output_renderer,
             )
             self.planning_services = create_planning_services(
                 storage_config=self.storage_config,
@@ -170,6 +210,9 @@ class Api:
                 memory_config=self.memory_config,
                 runtime_config=self.runtime_config,
                 planning_services=self.planning_services,
+                defer_cycle_done_for_output=(
+                    self.interaction_config.output_runtime.enabled
+                ),
             )
         except Exception as error:
             raise APIError(f"Ошибка инициализации Api: {error!r}") from error
@@ -206,6 +249,61 @@ class Api:
                 logger.warning(
                     "Committed %s recovered input drafts without automatic agent run",
                     len(committed_drafts),
+                )
+
+            expired_presentations = await (
+                self.ingress_services.presentation_store
+                .expire_stale_reservations(
+                    timeout_seconds=(
+                        self.interaction_config.input_presentation
+                        .reservation_timeout_seconds
+                    )
+                )
+            )
+            if expired_presentations:
+                logger.warning(
+                    "Expired %s stale unbound input presentations",
+                    len(expired_presentations),
+                )
+
+            recoverable_presentations = (
+                await self.ingress_services.presentation_store.list_recoverable()
+            )
+            if recoverable_presentations:
+                logger.warning(
+                    "Found %s recoverable input presentations; "
+                    "transport reconciliation is required",
+                    len(recoverable_presentations),
+                )
+
+            reconciled_outputs = await self.output_store.reconcile_stale_claims(
+                timeout_seconds=(
+                    self.interaction_config.output_runtime
+                    .delivery_claim_timeout_seconds
+                )
+            )
+            if reconciled_outputs:
+                logger.warning(
+                    "Reconciled %s stale output delivery claims as unknown; "
+                    "no automatic resend performed",
+                    len(reconciled_outputs),
+                )
+
+            recoverable_outputs = await self.output_store.list_recoverable()
+            ready_outputs = sum(
+                item.state.value == "ready" for item in recoverable_outputs
+            )
+            delivering_outputs = sum(
+                item.state.value == "delivering"
+                for item in recoverable_outputs
+            )
+            if recoverable_outputs:
+                logger.warning(
+                    "Found %s recoverable output batches "
+                    "(ready=%s, delivering=%s); no automatic resend performed",
+                    len(recoverable_outputs),
+                    ready_outputs,
+                    delivering_outputs,
                 )
 
             logger.info("Подключение к MCP-серверам")
@@ -273,7 +371,33 @@ class Api:
             )
             if batch.session_id != session_id:
                 raise APIError("Input batch belongs to another session")
-            return await self.mcp_client.process_query(
+            capability_snapshot = batch.capability_snapshot
+            if capability_snapshot is None:
+                if batch.client_type == ClientType.TELEGRAM:
+                    declaration = build_telegram_capability_declaration(
+                        document_grouping=(
+                            self.interaction_config.telegram_output
+                            .prefer_document_groups
+                        ),
+                        message_editing=(
+                            self.interaction_config.telegram_output
+                            .status_message_editing
+                        ),
+                    )
+                elif batch.client_type == ClientType.WEB:
+                    declaration = build_web_capability_declaration()
+                else:
+                    declaration = build_cli_capability_declaration()
+                capability_snapshot, _ = (
+                    await self.ingress_services.capability_store.resolve(
+                        declaration,
+                        client_type=batch.client_type.value,
+                        client_instance_id=(
+                            f"legacy-committed-batch:{batch.client_type.value}"
+                        ),
+                    )
+                )
+            result = await self.mcp_client.process_query(
                 "",
                 session_id=session_id,
                 client_type=batch.client_type,
@@ -281,6 +405,17 @@ class Api:
                 progress_locale=progress_locale,
                 input_batch=batch,
             )
+            if (
+                result.status == AgentStatus.DONE
+                and self.interaction_config.output_runtime.enabled
+            ):
+                await self.output_assembler.assemble_final(
+                    result=result,
+                    input_batch=batch,
+                    capability_snapshot=capability_snapshot,
+                    locale=batch.locale or progress_locale,
+                )
+            return result
         except APIError:
             raise
         except Exception as error:

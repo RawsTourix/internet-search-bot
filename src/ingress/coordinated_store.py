@@ -15,6 +15,7 @@ from .models import (
     utc_now,
 )
 from .store import IngressConflictError
+from ..interaction.anchors import ResponseAnchorSelector
 
 
 class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
@@ -62,6 +63,13 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
             or draft.sender.principal_id != event.sender.principal_id
         ):
             raise IngressConflictError("Grouped input authority mismatch")
+        if (
+            draft.capability_snapshot is not None
+            and event.capability_snapshot is not None
+            and draft.capability_snapshot.capability_snapshot_id
+            != event.capability_snapshot.capability_snapshot_id
+        ):
+            raise IngressConflictError("Grouped input capability binding mismatch")
 
         existing_part_ids = {item.part_id for item in draft.text_parts}
         existing_slot_ids = {item.slot_id for item in draft.attachment_parts}
@@ -83,9 +91,18 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
             raise IngressConflictError("Input batch attachment limit exceeded")
 
         now = utc_now()
+        response_anchor = draft.response_anchor
+        selector = ResponseAnchorSelector()
+        for candidate in event.response_anchor_candidates:
+            response_anchor = selector.select_with_current(
+                response_anchor,
+                candidate,
+                selected_at=now,
+            )
         updated = draft.model_copy(update={
             "source_event_ids": [*draft.source_event_ids, event.event_id],
             "text_parts": [*draft.text_parts, *event.text_parts],
+            "semantic_parts": [*draft.semantic_parts, *event.semantic_parts],
             "attachment_parts": [
                 *draft.attachment_parts,
                 *[
@@ -101,6 +118,7 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
             "last_event_at": event.occurred_at,
             "updated_at": now,
             "state": InputBatchDraftState.COLLECTING,
+            "response_anchor": response_anchor,
         })
         updated = InputBatchDraft.model_validate(
             updated.model_dump(mode="python")
@@ -135,34 +153,50 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
         """
 
         while True:
-            draft = await self.get_draft(input_batch_id)
+            committed, delay = await asyncio.to_thread(
+                self._commit_when_quiet_sync,
+                input_batch_id,
+                session_id,
+                reason,
+            )
+            if committed is not None:
+                return committed
+            await asyncio.sleep(max(0.001, min(0.25, delay)))
+
+    def _commit_when_quiet_sync(
+        self,
+        input_batch_id: str,
+        session_id: str,
+        reason: str,
+    ):
+        """Check the deadline and commit under the same lock as exact joins."""
+        with self._lock:
+            draft = self._load_draft_sync(input_batch_id)
             if draft.session_id != session_id:
                 raise IngressConflictError(
                     "Input batch belongs to another session"
                 )
             now = datetime.now(timezone.utc)
-            quiet_deadline = draft.quiet_deadline
-            maximum_deadline = draft.maximum_deadline
-            should_wait = (
+            if (
                 draft.grouping_mode == InputGroupingMode.MEDIA_GROUP
-                and quiet_deadline is not None
-                and now < quiet_deadline
-                and (maximum_deadline is None or now < maximum_deadline)
-            )
-            if not should_wait:
-                break
-            quiet_remaining = (quiet_deadline - now).total_seconds()
-            maximum_remaining = (
-                (maximum_deadline - now).total_seconds()
-                if maximum_deadline is not None
-                else quiet_remaining
-            )
-            await asyncio.sleep(
-                max(0.001, min(0.25, quiet_remaining, maximum_remaining))
-            )
-
-        return await super().commit_batch(
-            input_batch_id,
-            session_id=session_id,
-            reason=reason,
-        )
+                and draft.quiet_deadline is not None
+                and now < draft.quiet_deadline
+                and (
+                    draft.maximum_deadline is None
+                    or now < draft.maximum_deadline
+                )
+            ):
+                quiet_remaining = (
+                    draft.quiet_deadline - now
+                ).total_seconds()
+                maximum_remaining = (
+                    (draft.maximum_deadline - now).total_seconds()
+                    if draft.maximum_deadline is not None
+                    else quiet_remaining
+                )
+                return None, min(quiet_remaining, maximum_remaining)
+            return self._commit_grouped_sync(
+                input_batch_id,
+                session_id,
+                reason,
+            ), 0.0
