@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 from tempfile import SpooledTemporaryFile
 from typing import Any
 
+import httpx
+
+from ...interaction.ids import new_output_claim_request_id
 from .artifact_bridge import (
     TelegramArtifactBridgeError,
     TelegramArtifactGatewayClient,
@@ -87,18 +91,14 @@ class InstanceScopedTelegramArtifactGatewayClient(
         *,
         session_id: str,
     ) -> dict[str, Any]:
-        async with self._client(read_timeout=30.0) as client:
-            response = await client.post(
-                f"{self.gateway_url}/internal/output-outbox/"
-                f"{output_batch_id}/claim",
-                json=self._output_authority(session_id),
-            )
-            response.raise_for_status()
-            payload = response.json()
-            if not isinstance(payload, dict):
-                raise TelegramArtifactBridgeError(
-                    "Gateway OutputBatch claim response is invalid"
-                )
+        claim_request_id = new_output_claim_request_id()
+        payload = await self._post_json_with_retry(
+            f"/internal/output-outbox/{output_batch_id}/claim",
+            {
+                **self._output_authority(session_id),
+                "claim_request_id": claim_request_id,
+            },
+        )
         self.bind_output_claim(payload.get("output_batch"))
         return payload
 
@@ -110,27 +110,51 @@ class InstanceScopedTelegramArtifactGatewayClient(
         receipt: dict[str, Any],
     ) -> dict[str, Any]:
         try:
-            async with self._client(read_timeout=30.0) as client:
-                response = await client.post(
-                    f"{self.gateway_url}/internal/output-outbox/"
-                    f"{output_batch_id}/receipt",
-                    json={
-                        **self._output_authority(session_id),
-                        "receipt": receipt,
-                    },
-                )
-                response.raise_for_status()
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise TelegramArtifactBridgeError(
-                        "Gateway OutputBatch receipt response is invalid"
-                    )
-                return payload
+            return await self._post_json_with_retry(
+                f"/internal/output-outbox/{output_batch_id}/receipt",
+                {
+                    **self._output_authority(session_id),
+                    "receipt": receipt,
+                },
+            )
         finally:
             # No further byte read is valid after an aggregate receipt attempt.
             # A lost HTTP response is reconciled by exact receipt replay, not by
             # reopening or resending artifact content.
             self.release_output_claim(output_batch_id)
+
+    async def _post_json_with_retry(
+        self,
+        path: str,
+        payload: dict[str, Any],
+        *,
+        attempts: int = 3,
+    ) -> dict[str, Any]:
+        last_error: BaseException | None = None
+        for attempt in range(attempts):
+            try:
+                async with self._client(read_timeout=30.0) as client:
+                    response = await client.post(
+                        f"{self.gateway_url}{path}",
+                        json=payload,
+                    )
+                    response.raise_for_status()
+                    result = response.json()
+                    if not isinstance(result, dict):
+                        raise TelegramArtifactBridgeError(
+                            "Gateway output response is invalid"
+                        )
+                    return result
+            except httpx.HTTPStatusError as error:
+                last_error = error
+                if error.response.status_code < 500:
+                    raise
+            except httpx.RequestError as error:
+                last_error = error
+            if attempt + 1 < attempts:
+                await asyncio.sleep(2 ** attempt)
+        assert last_error is not None
+        raise last_error
 
     async def open_delivery_file(
         self,
