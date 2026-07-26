@@ -234,6 +234,13 @@ class OutputBatch(_OutputModel):
     def validate_order(self) -> "OutputBatch":
         if not self.parts:
             raise ValueError("output batch requires at least one part")
+        if (
+            self.response_route.route_type.strip().lower()
+            != self.capability_snapshot.client_type.strip().lower()
+        ):
+            raise ValueError(
+                "response route and capability snapshot client types must match"
+            )
         indices = [part.index for part in self.parts]
         if indices != list(range(len(indices))):
             raise ValueError("output part indices must be contiguous and monotonic")
