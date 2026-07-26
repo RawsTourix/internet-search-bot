@@ -79,6 +79,7 @@ class OutputBatchAssembler:
                     part_id=new_output_part_id(),
                     index=0,
                     text=result.content,
+                    parse_mode="markdown",
                 )
             )
         semantic_parts = self._parse_semantic_parts(result.semantic_outputs)
@@ -172,6 +173,7 @@ class OutputBatchAssembler:
                         if localization is not None
                         else message.message_key
                     ),
+                    parse_mode="markdown",
                 )
             )
         if len(parts) > self.config.max_parts_per_batch:
