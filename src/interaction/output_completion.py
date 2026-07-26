@@ -12,6 +12,7 @@ from ..artifacts.errors import ArtifactStorageError
 from ..artifacts.models import ArtifactDeliveryState
 from .errors import OutputBatchConflictError
 from .output_models import (
+    ArtifactContentReceiptState,
     ArtifactOutputPart,
     OutputBatch,
     OutputBatchState,
@@ -35,6 +36,7 @@ class OutputDeliveryCompletionService:
         self.output_store = output_store
         self.artifact_delivery_store = artifact_delivery_store
         self._lock = threading.RLock()
+
         bind_reconciliation = getattr(
             self.output_store,
             "bind_reconciliation_handler",
@@ -42,6 +44,7 @@ class OutputDeliveryCompletionService:
         )
         if bind_reconciliation is not None:
             bind_reconciliation(self.reconcile_unknown)
+
         bind_stale_recovery = getattr(
             self.output_store,
             "bind_stale_recovery_handler",
@@ -54,22 +57,14 @@ class OutputDeliveryCompletionService:
         self,
         receipt: OutputDeliveryReceipt,
     ) -> OutputBatch:
-        return await asyncio.to_thread(
-            self._apply_sync,
-            receipt,
-            False,
-        )
+        return await asyncio.to_thread(self._apply_sync, receipt, False)
 
     async def reconcile_unknown(
         self,
         receipt: OutputDeliveryReceipt,
     ) -> OutputBatch:
         """Resolve one unknown attempt across OutputBatch and artifact stores."""
-        return await asyncio.to_thread(
-            self._apply_sync,
-            receipt,
-            True,
-        )
+        return await asyncio.to_thread(self._apply_sync, receipt, True)
 
     async def recover_stale_claims(
         self,
@@ -97,6 +92,7 @@ class OutputDeliveryCompletionService:
             raise ValueError("timeout_seconds must be a positive integer")
         if now.tzinfo is None or now.utcoffset() is None:
             raise ValueError("now must be timezone-aware")
+
         current_time = now.astimezone(timezone.utc)
         deadline = current_time - timedelta(seconds=timeout_seconds)
         recovered: list[OutputBatch] = []
@@ -109,6 +105,7 @@ class OutputDeliveryCompletionService:
             for batch in self.output_store._list_recoverable_sync():
                 if batch.state != OutputBatchState.DELIVERING:
                     continue
+
                 state_path = (
                     self.output_store.records
                     / batch.output_batch_id
@@ -120,6 +117,7 @@ class OutputDeliveryCompletionService:
                     raise OutputBatchConflictError(
                         "output state timestamp must be timezone-aware"
                     )
+
                 output_is_stale = (
                     updated_at.astimezone(timezone.utc) <= deadline
                 )
@@ -128,6 +126,7 @@ class OutputDeliveryCompletionService:
                 )
                 if not output_is_stale and not artifact_was_recovered:
                     continue
+
                 attempt_id = str(state.get("attempt_id") or "")
                 receipt = self._build_stale_receipt(
                     batch=batch,
@@ -136,6 +135,7 @@ class OutputDeliveryCompletionService:
                     completed_at=current_time,
                 )
                 recovered.append(self._apply_sync(receipt, False))
+
         return recovered
 
     def _has_startup_recovered_artifact(self, batch: OutputBatch) -> bool:
@@ -175,8 +175,10 @@ class OutputDeliveryCompletionService:
 
             record = self.artifact_delivery_store._load_sync(part.delivery_id)
             self._validate_artifact_authority(batch, part, record)
+
             if record.state == ArtifactDeliveryState.SELECTED:
                 part_state = OutputPartReceiptState.FAILED
+                content_state = ArtifactContentReceiptState.NOT_DELIVERED
                 error_category = "transport_not_started_before_recovery"
                 message_ids: tuple[str, ...] = ()
                 delivered_at = None
@@ -185,6 +187,7 @@ class OutputDeliveryCompletionService:
                 ArtifactDeliveryState.UNKNOWN,
             }:
                 part_state = OutputPartReceiptState.UNKNOWN
+                content_state = ArtifactContentReceiptState.UNKNOWN
                 error_category = "delivery_claim_timeout_after_start"
                 message_ids = tuple(
                     str(item)
@@ -193,6 +196,7 @@ class OutputDeliveryCompletionService:
                 delivered_at = None
             elif record.state == ArtifactDeliveryState.FAILED:
                 part_state = OutputPartReceiptState.FAILED
+                content_state = ArtifactContentReceiptState.NOT_DELIVERED
                 error_category = record.last_error or "artifact_delivery_failed"
                 message_ids = ()
                 delivered_at = None
@@ -206,12 +210,14 @@ class OutputDeliveryCompletionService:
                         "delivered artifact recovery lacks exact client message IDs"
                     )
                 part_state = OutputPartReceiptState.DELIVERED
+                content_state = ArtifactContentReceiptState.DELIVERED
                 error_category = None
                 delivered_at = record.delivered_at or completed_at
             else:
                 raise OutputBatchConflictError(
                     "cancelled artifact cannot belong to an active OutputBatch"
                 )
+
             part_receipts.append(
                 OutputPartReceipt(
                     part_id=part.part_id,
@@ -219,6 +225,7 @@ class OutputDeliveryCompletionService:
                     required=part.required,
                     state=part_state,
                     delivery_id=part.delivery_id,
+                    artifact_content_state=content_state,
                     client_message_ids=message_ids,
                     error_category=error_category,
                     delivered_at=delivered_at,
@@ -260,8 +267,8 @@ class OutputDeliveryCompletionService:
                 )
 
             # Validate exact replay before touching artifact evidence. This keeps
-            # retries byte-idempotent and ensures a conflicting replay cannot
-            # temporarily mutate another store before rollback.
+            # retries byte-idempotent and prevents a conflicting replay from
+            # temporarily mutating another store before rollback.
             if reconciling and batch.state != OutputBatchState.UNKNOWN:
                 return self.output_store._reconcile_unknown_sync(receipt)
             if not reconciling and batch.state in {
@@ -281,6 +288,7 @@ class OutputDeliveryCompletionService:
                     dict,
                 ]
             ] = []
+
             for part_receipt in receipt.part_receipts:
                 part = part_by_id[part_receipt.part_id]
                 exact_delivery_id = getattr(part, "delivery_id", None)
@@ -290,20 +298,28 @@ class OutputDeliveryCompletionService:
                     )
                 if not isinstance(part, ArtifactOutputPart):
                     continue
+
                 record = self.artifact_delivery_store._load_sync(
                     part.delivery_id
                 )
                 self._validate_artifact_authority(batch, part, record)
+                content_state = self._resolve_artifact_content_state(
+                    part_receipt
+                )
                 target, allowed = self._artifact_transition(
-                    part_receipt.state,
+                    content_state,
                     reconciling=reconciling,
+                )
+                artifact_error = self._artifact_error(
+                    part_receipt,
+                    content_state,
                 )
                 delivery_updates.append(
                     (
                         part.delivery_id,
                         target,
                         allowed,
-                        part_receipt.error_category,
+                        artifact_error,
                         {
                             "provider": batch.capability_snapshot.client_type,
                             "client_instance_id": (
@@ -312,6 +328,7 @@ class OutputDeliveryCompletionService:
                             "message_ids": list(
                                 part_receipt.client_message_ids
                             ),
+                            "artifact_content_state": content_state.value,
                             "output_batch_id": batch.output_batch_id,
                             "output_part_id": part.part_id,
                             "output_part_index": part.index,
@@ -369,13 +386,16 @@ class OutputDeliveryCompletionService:
                 **current.receipt,
                 **transport_receipt,
             }
-            updated = current.model_copy(update={
-                "updated_at": datetime.now(timezone.utc),
-                "last_error": error or current.last_error,
-                "receipt": merged_receipt,
-            })
+            updated = current.model_copy(
+                update={
+                    "updated_at": datetime.now(timezone.utc),
+                    "last_error": error or current.last_error,
+                    "receipt": merged_receipt,
+                }
+            )
             self.artifact_delivery_store._write_sync(updated, replace=True)
             return
+
         self.artifact_delivery_store._transition_sync(
             delivery_id,
             target,
@@ -392,6 +412,9 @@ class OutputDeliveryCompletionService:
             or record.cycle_id != batch.cycle_id
             or record.artifact_id != part.artifact_id
             or record.client_type != batch.capability_snapshot.client_type
+            or record.filename != part.filename
+            or record.mime_type != part.mime_type
+            or record.size_bytes != part.size_bytes
             or bound_output not in {None, batch.output_batch_id}
         ):
             raise OutputBatchConflictError(
@@ -399,38 +422,65 @@ class OutputDeliveryCompletionService:
             )
 
     @staticmethod
+    def _resolve_artifact_content_state(
+        receipt: OutputPartReceipt,
+    ) -> ArtifactContentReceiptState:
+        if receipt.artifact_content_state is not None:
+            return receipt.artifact_content_state
+
+        # Backward-compatible inference for receipts created before the content
+        # evidence field existed. PARTIALLY_DELIVERED remains ambiguous because
+        # it may describe either delivered bytes plus a failed caption or only a
+        # partially delivered text fallback.
+        if receipt.state == OutputPartReceiptState.DELIVERED:
+            return ArtifactContentReceiptState.DELIVERED
+        if receipt.state in {
+            OutputPartReceiptState.FAILED,
+            OutputPartReceiptState.SKIPPED,
+        }:
+            return ArtifactContentReceiptState.NOT_DELIVERED
+        return ArtifactContentReceiptState.UNKNOWN
+
+    @staticmethod
+    def _artifact_error(
+        receipt: OutputPartReceipt,
+        content_state: ArtifactContentReceiptState,
+    ) -> str | None:
+        if receipt.error_category:
+            return receipt.error_category
+        if content_state == ArtifactContentReceiptState.NOT_DELIVERED:
+            return "artifact_content_not_delivered"
+        if content_state == ArtifactContentReceiptState.UNKNOWN:
+            return "artifact_content_delivery_unknown"
+        return None
+
+    @staticmethod
     def _artifact_transition(
-        state: OutputPartReceiptState,
+        content_state: ArtifactContentReceiptState,
         *,
         reconciling: bool,
     ) -> tuple[ArtifactDeliveryState, set[ArtifactDeliveryState]]:
         if reconciling:
-            if state == OutputPartReceiptState.DELIVERED:
+            if content_state == ArtifactContentReceiptState.DELIVERED:
                 return (
                     ArtifactDeliveryState.DELIVERED,
                     {ArtifactDeliveryState.UNKNOWN},
                 )
-            if state in {
-                OutputPartReceiptState.FAILED,
-                OutputPartReceiptState.SKIPPED,
-            }:
+            if content_state == ArtifactContentReceiptState.NOT_DELIVERED:
                 return (
                     ArtifactDeliveryState.FAILED,
                     {ArtifactDeliveryState.UNKNOWN},
                 )
             raise OutputBatchConflictError(
-                "artifact reconciliation requires a confirmed delivered or failed outcome"
+                "artifact reconciliation requires confirmed content evidence"
             )
 
-        if state == OutputPartReceiptState.DELIVERED:
+        if content_state == ArtifactContentReceiptState.DELIVERED:
             return (
                 ArtifactDeliveryState.DELIVERED,
                 {ArtifactDeliveryState.DELIVERING},
             )
-        if state in {
-            OutputPartReceiptState.UNKNOWN,
-            OutputPartReceiptState.PARTIALLY_DELIVERED,
-        }:
+        if content_state == ArtifactContentReceiptState.UNKNOWN:
             return (
                 ArtifactDeliveryState.UNKNOWN,
                 {ArtifactDeliveryState.DELIVERING},
@@ -452,6 +502,7 @@ class OutputDeliveryCompletionService:
             for item in receipts
         ):
             return OutputDeliveryReceiptState.UNKNOWN
+
         required = [item for item in receipts if item.required] or list(receipts)
         if required and all(
             item.state == OutputPartReceiptState.DELIVERED
