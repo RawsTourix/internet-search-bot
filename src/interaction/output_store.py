@@ -9,6 +9,7 @@ import logging
 import os
 import tempfile
 import threading
+from collections.abc import Awaitable, Callable
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
@@ -79,8 +80,22 @@ class FileSystemOutputBatchStore:
         self.attempts = self.root / "attempts"
         self.atomic_writes = atomic_writes
         self._lock = threading.RLock()
+        self._reconciliation_handler: (
+            Callable[[OutputDeliveryReceipt], Awaitable[OutputBatch]] | None
+        ) = None
         for path in (self.records, self.cycle_index, self.attempts):
             path.mkdir(parents=True, exist_ok=True)
+
+    def bind_reconciliation_handler(
+        self,
+        handler: Callable[[OutputDeliveryReceipt], Awaitable[OutputBatch]],
+    ) -> None:
+        """Bind the application-level aggregate reconciler once at composition."""
+        if self._reconciliation_handler not in {None, handler}:
+            raise OutputBatchConflictError(
+                "output reconciliation handler is already bound"
+            )
+        self._reconciliation_handler = handler
 
     async def commit(self, batch: OutputBatch) -> tuple[OutputBatch, bool]:
         return await asyncio.to_thread(self._commit_sync, batch)
@@ -197,14 +212,15 @@ class FileSystemOutputBatchStore:
         self,
         receipt: OutputDeliveryReceipt,
     ) -> OutputBatch:
+        handler = self._reconciliation_handler
+        if handler is not None:
+            return await handler(receipt)
         return await asyncio.to_thread(
             self._reconcile_unknown_sync,
             receipt,
         )
 
     def _complete_sync(self, receipt: OutputDeliveryReceipt) -> OutputBatch:
-        from .output_models import OutputDeliveryReceiptState
-
         mapped = {
             OutputDeliveryReceiptState.DELIVERED: OutputBatchState.DELIVERED,
             OutputDeliveryReceiptState.PARTIALLY_DELIVERED:
@@ -370,6 +386,7 @@ class FileSystemOutputBatchStore:
                             part_id=part.part_id,
                             index=part.index,
                             state=OutputPartReceiptState.UNKNOWN,
+                            required=part.required,
                             delivery_id=getattr(part, "delivery_id", None),
                             error_category="delivery_claim_timeout_after_start",
                         )
