@@ -112,13 +112,14 @@ class OutputBatchAssembler:
             )
 
         semantic_parts = self._parse_semantic_parts(result.semantic_outputs)
+        # A new OutputBatch may start only from deliveries whose previous outcome
+        # is known not to be in flight. DELIVERING and UNKNOWN belong to an
+        # existing attempt and must be resolved there, never assembled again.
         records = await self.delivery_store.list_cycle(
             session_id=input_batch.session_id,
             cycle_id=cycle_id,
             states={
                 ArtifactDeliveryState.SELECTED,
-                ArtifactDeliveryState.DELIVERING,
-                ArtifactDeliveryState.UNKNOWN,
                 ArtifactDeliveryState.FAILED,
             },
         )
@@ -146,7 +147,7 @@ class OutputBatchAssembler:
             record = records_by_delivery.get(item.delivery_id)
             if record is None or record.artifact_id != item.artifact_id:
                 raise InteractionValidationError(
-                    "semantic artifact output is not an exact selected delivery"
+                    "semantic artifact output is not an exact safe delivery selection"
                 )
             if item.delivery_id in semantic_artifacts:
                 raise InteractionValidationError(
