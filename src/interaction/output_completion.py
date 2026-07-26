@@ -101,9 +101,6 @@ class OutputDeliveryCompletionService:
         deadline = current_time - timedelta(seconds=timeout_seconds)
         recovered: list[OutputBatch] = []
 
-        # Reading and applying are both protected by the same ordered store locks.
-        # A concurrent live completion either wins before this block or observes
-        # the terminal state afterwards; stale recovery never blind-resends.
         with (
             self._lock,
             self.output_store._lock,
@@ -242,10 +239,6 @@ class OutputDeliveryCompletionService:
         receipt: OutputDeliveryReceipt,
         reconciling: bool,
     ) -> OutputBatch:
-        # The transaction lock is intentionally shared with the stores' own
-        # mutation locks. All process-local writers serialize against backup,
-        # commit and rollback, preventing a rollback from erasing a concurrent
-        # valid mutation.
         with (
             self._lock,
             self.output_store._lock,
@@ -265,6 +258,19 @@ class OutputDeliveryCompletionService:
                 raise OutputBatchConflictError(
                     "aggregate receipt does not match committed output parts"
                 )
+
+            # Validate exact replay before touching artifact evidence. This keeps
+            # retries byte-idempotent and ensures a conflicting replay cannot
+            # temporarily mutate another store before rollback.
+            if reconciling and batch.state != OutputBatchState.UNKNOWN:
+                return self.output_store._reconcile_unknown_sync(receipt)
+            if not reconciling and batch.state in {
+                OutputBatchState.DELIVERED,
+                OutputBatchState.PARTIALLY_DELIVERED,
+                OutputBatchState.FAILED,
+                OutputBatchState.UNKNOWN,
+            }:
+                return self.output_store._complete_sync(receipt)
 
             delivery_updates: list[
                 tuple[
@@ -335,20 +341,8 @@ class OutputDeliveryCompletionService:
             ]
             backups = self._backups(paths)
             try:
-                for (
-                    delivery_id,
-                    target,
-                    allowed,
-                    error,
-                    transport_receipt,
-                ) in delivery_updates:
-                    self.artifact_delivery_store._transition_sync(
-                        delivery_id,
-                        target,
-                        allowed,
-                        error,
-                        transport_receipt,
-                    )
+                for update in delivery_updates:
+                    self._apply_artifact_update(*update)
                 if reconciling:
                     return self.output_store._reconcile_unknown_sync(receipt)
                 return self.output_store._complete_sync(receipt)
@@ -356,13 +350,49 @@ class OutputDeliveryCompletionService:
                 self._restore(backups)
                 raise
 
+    def _apply_artifact_update(
+        self,
+        delivery_id: str,
+        target: ArtifactDeliveryState,
+        allowed: set[ArtifactDeliveryState],
+        error: str | None,
+        transport_receipt: dict,
+    ) -> None:
+        current = self.artifact_delivery_store._load_sync(delivery_id)
+        if current.state == target:
+            bound_output = current.receipt.get("output_batch_id")
+            if bound_output not in {None, transport_receipt["output_batch_id"]}:
+                raise OutputBatchConflictError(
+                    "artifact delivery is already bound to another OutputBatch"
+                )
+            merged_receipt = {
+                **current.receipt,
+                **transport_receipt,
+            }
+            updated = current.model_copy(update={
+                "updated_at": datetime.now(timezone.utc),
+                "last_error": error or current.last_error,
+                "receipt": merged_receipt,
+            })
+            self.artifact_delivery_store._write_sync(updated, replace=True)
+            return
+        self.artifact_delivery_store._transition_sync(
+            delivery_id,
+            target,
+            allowed,
+            error,
+            transport_receipt,
+        )
+
     @staticmethod
     def _validate_artifact_authority(batch, part, record) -> None:
+        bound_output = record.receipt.get("output_batch_id")
         if (
             record.session_id != batch.session_id
             or record.cycle_id != batch.cycle_id
             or record.artifact_id != part.artifact_id
             or record.client_type != batch.capability_snapshot.client_type
+            or bound_output not in {None, batch.output_batch_id}
         ):
             raise OutputBatchConflictError(
                 "artifact delivery is outside OutputBatch authority"
