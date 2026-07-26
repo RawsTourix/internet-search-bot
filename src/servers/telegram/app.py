@@ -14,9 +14,9 @@ from .config import (
     TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
 )
-from .ready_outbox import TelegramReadyOutboxWorker
 from .scoped_artifact_bridge import InstanceScopedTelegramArtifactGatewayClient
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
+from .scoped_ready_outbox import InstanceScopedTelegramReadyOutboxWorker
 
 
 # One exact client-instance authority is shared by the ordinary synchronous
@@ -34,7 +34,7 @@ telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
 server.telegram_output_executor = telegram_output_executor
 
-ready_outbox_worker = TelegramReadyOutboxWorker(
+ready_outbox_worker = InstanceScopedTelegramReadyOutboxWorker(
     gateway_url=GATEWAY_URL,
     api_key=TELEGRAM_API_KEY,
     client_instance_id=TELEGRAM_BOT_INSTANCE_ID,
