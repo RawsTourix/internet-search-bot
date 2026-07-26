@@ -26,11 +26,14 @@ result delivery исполняет `OutputDeliveryPlan`, не legacy artifact pr
 | Grouped ingress application commit | `src/ingress/service.py`, `grouping.py`, `coordinated_store.py` |
 | Structural schema upgrades | `src/ingress/upgrades.py` |
 | Artifact manifest/order | `src/artifacts/runtime.py`, `delivery.py` |
-| Output domain/store/recovery | `src/interaction/output_models.py`, `output_store.py` |
+| Output domain/store/recovery | `src/interaction/output_models.py`, `output_store.py`, `output_outbox.py`, `output_claim.py` |
 | Assembly/rendering | `src/interaction/output_service.py`, `rendering.py` |
-| Atomic aggregate completion | `src/interaction/output_completion.py` |
-| Telegram plan execution | `src/servers/telegram/output_plan_executor.py` |
-| API/transport bridge | `src/api/artifact_routes.py`, `artifact_transport.py`, `src/servers/telegram/artifact_bridge.py`, `telegram_server.py` |
+| Atomic aggregate completion и evidence | `src/interaction/output_completion.py`, `output_evidence.py` |
+| Telegram plan execution | `src/servers/telegram/output_plan_executor.py`, `scoped_output_executor.py` |
+| Telegram READY outbox | `src/servers/telegram/ready_outbox.py`, `scoped_ready_outbox.py` |
+| Exact client-instance transport bridge | `src/servers/telegram/scoped_artifact_bridge.py` |
+| Canonical Telegram composition | `src/servers/telegram/app.py`, `src/servers/telegram/__main__.py` |
+| API/transport bridge | `src/api/artifact_routes.py`, `artifact_transport.py`, `output_outbox_routes.py`, `legacy_delivery_guard.py` |
 
 Input/presentation lifecycle:
 
@@ -65,12 +68,17 @@ OutputBatch.ready
 ```
 
 Каждый `OutputPartReceipt` сохраняет exact `part_id`, `index`, `required`,
-transport message IDs и outcome. Подтверждённая доставка части многочастного
-текста представляется как `partially_delivered`, а не как полный failure.
+transport message IDs и outcome. Для artifact отдельно сохраняется
+`artifact_content_state`, поэтому доставка текстового fallback не выдаётся за
+доставку байтов, а неудачная дополнительная подпись не отменяет уже
+подтверждённый media upload. Подтверждённая доставка части многочастного текста
+представляется как `partially_delivered`, а не как полный failure.
+
 Aggregate state определяется по обязательным parts; optional failure не
 отменяет подтверждённую доставку всех required parts. Любой `unknown`, включая
 optional part, остаётся видимым на уровне всего OutputBatch и требует
-reconciliation.
+reconciliation. External transport receipt проходит strict evidence policy до
+любых durable mutations.
 
 `TelegramOutputPlanExecutor` выполняет groups по `group.index`, вызывает native
 Telegram methods и создаёт exact outcome для каждого part. `UNSUPPORTED` и
@@ -92,17 +100,64 @@ application composition делегирует тому же composite service, п
 reconciliation согласованно меняет и OutputBatch, и связанные artifact delivery
 records.
 
-Recovery:
+### AF-21.2. READY outbox и crash boundary
 
-- `ready` после restart остаётся claimable;
-- stale `delivering` становится `unknown`;
-- `unknown` не отправляется повторно автоматически;
-- internal list/reconcile API поддерживает explicit reconciliation;
-- explicit reconciliation атомарно сохраняет resolved receipt и обновляет
-  связанные artifact delivery records;
-- `delivered` не запускает повторный agent cycle или transport delivery.
+Безопасный process-local recovery разделяет состояния:
 
-### AF-21.2. Совместимость и v1 → v2
+```text
+READY
+→ transport ещё не начинался
+→ bounded automatic claim допустим
+
+DELIVERING
+→ transport outcome может быть ambiguous
+→ stale recovery в UNKNOWN
+
+UNKNOWN / PARTIALLY_DELIVERED / FAILED / DELIVERED
+→ automatic resend запрещён
+```
+
+`ReadyOutputOutboxService` публикует только достаточно старые `FINAL + READY`
+точного `client_type + client_instance_id`. Worker не повторяет agent cycle:
+он claim-ит immutable OutputBatch, исполняет уже committed plan и сохраняет exact
+receipt.
+
+Claim имеет отдельный `oclm_*` idempotency key. Потерянный HTTP-ответ после
+успешной записи claim повторяется с тем же key и возвращает исходный
+`attempt_id`; другой key не может присоединиться к активному attempt. State и
+claim-request index записываются под одним process-local lock с rollback.
+
+Artifact bytes для Telegram доступны только через:
+
+```text
+claimed FINAL OutputBatch
++ exact session_id
++ exact client_type
++ exact client_instance_id
++ exact delivery_id member
+→ scoped content stream
+```
+
+Legacy `/internal/deliveries/{id}/content` сохранён для других compatibility
+transports, но Telegram на Gateway получает conflict и обязан использовать
+instance-scoped outbox route.
+
+Каноническая точка запуска полного Telegram runtime:
+
+```bash
+python -m src.servers.telegram
+```
+
+или:
+
+```bash
+uvicorn src.servers.telegram.app:app --host 0.0.0.0 --port 8001
+```
+
+Низкоуровневый `telegram_server:app` остаётся compatibility webhook entrypoint,
+но не является полным production composition root.
+
+### AF-21.3. Совместимость и v1 → v2
 
 Выбран вариант A — structural compatibility upgrade:
 
@@ -118,19 +173,28 @@ Recovery:
   Telegram text проходит shared ingress;
 - `AgentResult.artifacts` остаётся compatibility projection и не является
   authority Telegram-доставки;
-- persisted receipts без нового `required` поля читаются с безопасным
-  backward-compatible default `true`;
+- persisted receipts без нового `required`/`artifact_content_state` читаются с
+  безопасной backward-compatible inference;
 - route authority не зависит от response anchor и не меняется при join.
 
-### AF-21.3. Проверка
+### AF-21.4. Проверка
 
-Целевые test modules:
+Целевые test modules включают:
 
 ```text
 tests/test_input_presentation_lifecycle.py
 tests/test_telegram_output_plan_executor.py
 tests/test_output_delivery_recovery.py
 tests/test_output_receipt_semantics.py
+tests/test_artifact_content_delivery_evidence.py
+tests/test_output_evidence_policy.py
+tests/test_output_claim_idempotency.py
+tests/test_ready_output_outbox.py
+tests/test_output_outbox_api_authority.py
+tests/test_output_outbox_delivery_content.py
+tests/test_telegram_ready_outbox_claim_retry.py
+tests/test_telegram_scoped_output_execution.py
+tests/test_legacy_telegram_delivery_guard.py
 tests/test_semantic_ingress_limits.py
 tests/test_reply_provenance.py
 tests/test_capability_snapshot_integrity.py
@@ -145,20 +209,19 @@ tests/test_telegram_semantic_resolvers.py
 - atomic late bind, strict terminal bind, grouped close и expired reclaim;
 - 10-file group + instruction: один batch/presentation/create-ack, instruction
   anchor и terminal close;
-- silent fallback клиента без `presentation.message_edit`;
-- native location/contact/image, mixed ordering и independence от legacy
-  artifact order;
-- 11-document split, missing outcome, pre/post-send failures и отсутствие
-  automatic resend;
-- required/optional receipt semantics и confirmed partial multi-chunk text;
+- native location/contact/image, mixed ordering и independence от legacy order;
+- 11-document split, pre/post-send failures и отсутствие ambiguous resend;
+- required/optional semantics, partial text и artifact content evidence;
 - Markdown → Telegram HTML и deterministic plain-text fallback;
-- atomic receipt completion/rollback, restart recovery, separate `unknown` и
-  artifact-aware explicit reconciliation;
+- atomic receipt completion/rollback и artifact-aware reconciliation;
+- final-only READY projection и exact client-instance authority;
+- idempotent claim replay и rollback при claim-index failure;
+- scoped byte streaming только для exact manifest member;
+- запрет legacy Telegram content bypass;
 - caption exactly once, cumulative semantic limits и semantic ID collision;
 - capability snapshot tampering/index/symlink rejection;
 - incoming reply provenance отдельно от typed response anchor override;
-- RU/EN rendering, deterministic missing-key fallback и plural forms;
-- structural `v1 → v2` с `legacy_derived=True`.
+- RU/EN rendering и structural `v1 → v2`.
 
 ---
 
@@ -198,7 +261,8 @@ v0.4-file-artifacts
 
 v0.4-file-artifacts-advanced
 → client capability, localization, semantic media foundation,
-  response anchor, presentation и ordered OutputBatch delivery
+  response anchor, presentation, ordered OutputBatch delivery,
+  process-local final READY outbox и exact transport receipts
 
 v0.4-input-runtime
 → active-cycle interaction, CycleInbox, safe checkpoints,
@@ -208,7 +272,7 @@ v0.5
 → PostgreSQL, extraction, chunks, embeddings и RAG
 
 v0.6
-→ workers, queues, distributed outbox и orchestration
+→ workers, queues, distributed outbox, leases и orchestration
 ```
 
 Главный invariant:
