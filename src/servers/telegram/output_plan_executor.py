@@ -63,8 +63,25 @@ class TelegramOutputPlanExecutor:
     ) -> OutputDeliveryReceipt:
         if plan.output_batch_id != batch.output_batch_id:
             raise ValueError("delivery plan belongs to another OutputBatch")
-        started_at = _utc_now()
         parts = {item.part_id: item for item in batch.parts}
+        planned_ids = tuple(
+            part_id
+            for group in sorted(plan.groups, key=lambda item: item.index)
+            for part_id in group.part_ids
+        )
+        expected_ids = tuple(item.part_id for item in batch.parts)
+        if planned_ids != expected_ids:
+            raise ValueError(
+                "delivery plan must cover committed output parts exactly in order"
+            )
+        for group in plan.groups:
+            group_parts = [parts[part_id] for part_id in group.part_ids]
+            if group.required != any(part.required for part in group_parts):
+                raise ValueError(
+                    "delivery group required flag does not match committed parts"
+                )
+
+        started_at = _utc_now()
         outcomes: dict[str, OutputPartReceipt] = {}
         reply_available = context.reply_to_message_id
 
@@ -76,7 +93,8 @@ class TelegramOutputPlanExecutor:
                 context=context,
                 reply_to_message_id=reply_available,
             )
-            reply_available = None
+            if reply_available is not None and self._transport_attempted(receipts):
+                reply_available = None
             for receipt in receipts:
                 if receipt.part_id in outcomes:
                     raise ValueError("duplicate transport outcome for output part")
@@ -195,20 +213,10 @@ class TelegramOutputPlanExecutor:
             and (part.parse_mode or "").strip().lower() in {"markdown", "md"}
         )
         if markdown:
-            safe_limit = min(limit, 3000)
-            logical_chunks = split_markdown_for_telegram(
-                text,
-                limit=safe_limit,
-            )
             chunks = tuple(
-                subchunk
-                for chunk in logical_chunks
-                for subchunk in (
-                    tuple(
-                        chunk[offset : offset + safe_limit]
-                        for offset in range(0, len(chunk), safe_limit)
-                    )
-                    or ("",)
+                split_markdown_for_telegram(
+                    text,
+                    limit=min(limit, 3000),
                 )
             )
         else:
@@ -230,17 +238,30 @@ class TelegramOutputPlanExecutor:
                         chunk_index=index,
                         reply_to_message_id=reply_to_message_id,
                     )
-                except BadRequest:
-                    if not markdown:
+                except BadRequest as error:
+                    if self._is_message_not_modified(error, status=status, context=context):
+                        sent = None
+                    elif not markdown:
                         raise
-                    sent = await self._send_text_chunk(
-                        context=context,
-                        status=status,
-                        chunk=markdown_to_plain_text(chunk),
-                        parse_mode=None,
-                        chunk_index=index,
-                        reply_to_message_id=reply_to_message_id,
-                    )
+                    else:
+                        try:
+                            sent = await self._send_text_chunk(
+                                context=context,
+                                status=status,
+                                chunk=markdown_to_plain_text(chunk),
+                                parse_mode=None,
+                                chunk_index=index,
+                                reply_to_message_id=reply_to_message_id,
+                            )
+                        except BadRequest as fallback_error:
+                            if self._is_message_not_modified(
+                                fallback_error,
+                                status=status,
+                                context=context,
+                            ):
+                                sent = None
+                            else:
+                                raise
                 message_id = (
                     getattr(sent, "message_id", None)
                     or (
@@ -366,9 +387,15 @@ class TelegramOutputPlanExecutor:
                     self._receipt(
                         part,
                         state=OutputPartReceiptState.UNKNOWN,
+                        client_message_ids=(
+                            (str(sent[index].message_id),)
+                            if index < len(sent)
+                            and getattr(sent[index], "message_id", None) is not None
+                            else ()
+                        ),
                         error_category="telegram_media_group_receipt_mismatch",
                     )
-                    for part in parts
+                    for index, part in enumerate(parts)
                 ]
             return [
                 self._receipt(
@@ -622,6 +649,32 @@ class TelegramOutputPlanExecutor:
             state=OutputPartReceiptState.FAILED,
             error_category="delivery_plan_part_type_mismatch",
         )
+
+    @staticmethod
+    def _is_message_not_modified(
+        error: BadRequest,
+        *,
+        status: bool,
+        context: TelegramExecutionContext,
+    ) -> bool:
+        return (
+            status
+            and context.status_message_id is not None
+            and "message is not modified" in str(error).lower()
+        )
+
+    @staticmethod
+    def _transport_attempted(receipts: list[OutputPartReceipt]) -> bool:
+        for receipt in receipts:
+            if receipt.state in {
+                OutputPartReceiptState.DELIVERED,
+                OutputPartReceiptState.PARTIALLY_DELIVERED,
+                OutputPartReceiptState.UNKNOWN,
+            }:
+                return True
+            if (receipt.error_category or "").startswith("telegram_bad_request"):
+                return True
+        return False
 
     @staticmethod
     def _receipt(
