@@ -219,6 +219,34 @@ class FileSystemOutputBatchStore:
     async def get(self, output_batch_id: str) -> OutputBatch:
         return await asyncio.to_thread(self._load_sync, output_batch_id)
 
+    async def get_for_cycle(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+        kind: OutputBatchKind,
+    ) -> OutputBatch | None:
+        return await asyncio.to_thread(
+            self._get_for_cycle_sync,
+            session_id,
+            cycle_id,
+            kind,
+        )
+
+    def _get_for_cycle_sync(
+        self,
+        session_id: str,
+        cycle_id: str,
+        kind: OutputBatchKind,
+    ) -> OutputBatch | None:
+        with self._lock:
+            identity = self._identity(session_id, cycle_id, kind)
+            index_path = self.cycle_index / f"{identity}.json"
+            if not index_path.exists() and not index_path.is_symlink():
+                return None
+            pointer = self._read(index_path)
+            return self._load_sync(str(pointer.get("output_batch_id") or ""))
+
     async def claim_delivery(
         self, output_batch_id: str, *, now: datetime | None = None
     ) -> tuple[OutputBatch, str]:
