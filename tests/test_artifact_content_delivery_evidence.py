@@ -1,6 +1,5 @@
 import tempfile
 import unittest
-from datetime import datetime, timezone
 from pathlib import Path
 
 from telegram.error import BadRequest
@@ -19,7 +18,7 @@ from src.interaction.capabilities import (
     build_default_capability_registry,
     build_telegram_capability_declaration,
 )
-from src.interaction.ids import new_output_attempt_id, new_output_part_id
+from src.interaction.ids import new_output_part_id
 from src.interaction.output_completion import OutputDeliveryCompletionService
 from src.interaction.output_models import (
     ArtifactContentReceiptState,
@@ -42,9 +41,6 @@ from src.servers.telegram.output_plan_executor import (
 from src.storage import create_storage_services
 from src.storage.config import StorageConfigType
 from tests.telegram_fakes import FakeTelegramBot, FakeTelegramGateway
-
-
-UTC = timezone.utc
 
 
 class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
@@ -100,10 +96,12 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
             receipt.part_receipts[0].artifact_content_state,
             ArtifactContentReceiptState.NOT_DELIVERED,
         )
+
         completed = await self.completion.complete(receipt)
         self.assertEqual(completed.state, OutputBatchState.DELIVERED)
         delivery = await self.artifacts.delivery_store.get(selected.delivery_id)
         self.assertEqual(delivery.state, ArtifactDeliveryState.FAILED)
+        self.assertEqual(delivery.last_error, "artifact_content_not_delivered")
         self.assertEqual(
             delivery.receipt["artifact_content_state"],
             "not_delivered",
@@ -112,9 +110,10 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
     async def test_media_bytes_remain_delivered_when_caption_is_partial(self):
         artifact, selected = await self._create_image_artifact()
         await self.artifacts.delivery_service.claim(selected.delivery_id)
-        declaration = build_telegram_capability_declaration().model_copy(update={
+        base_declaration = build_telegram_capability_declaration()
+        declaration = base_declaration.model_copy(update={
             "limits": {
-                **build_telegram_capability_declaration().limits,
+                **base_declaration.limits,
                 "transport.telegram.output.text.max_chars": 4,
                 "transport.telegram.output.caption.max_chars": 5,
             }
@@ -146,6 +145,7 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
             receipt.part_receipts[0].artifact_content_state,
             ArtifactContentReceiptState.DELIVERED,
         )
+
         completed = await self.completion.complete(receipt)
         self.assertEqual(completed.state, OutputBatchState.PARTIALLY_DELIVERED)
         delivery = await self.artifacts.delivery_store.get(selected.delivery_id)
@@ -167,12 +167,14 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
             parts=(part,),
         )
         batch, _ = await self.output_store.commit(batch)
-        _, attempt_id = await self.output_store.claim_delivery(batch.output_batch_id)
+        _, attempt_id = await self.output_store.claim_delivery(
+            batch.output_batch_id
+        )
         self.attempt_id = attempt_id
         return batch
 
     async def _execute(self, batch, *, bot=None):
-        receipt = await TelegramOutputPlanExecutor().execute(
+        return await TelegramOutputPlanExecutor().execute(
             batch=batch,
             plan=CapabilityOutputRenderer().plan(batch),
             attempt_id=self.attempt_id,
@@ -183,7 +185,6 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 chat_id=1,
             ),
         )
-        return receipt
 
     async def _create_text_artifact(self):
         artifact = await self.artifacts.artifact_service.create_text(
@@ -211,22 +212,22 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
         return artifact, selected
 
     async def _create_image_artifact(self):
-        async def chunks():
-            yield b"\x89PNG\r\n\x1a\nimage"
-
-        content = await self.content_store.put_stream(
-            chunks(),
-            max_bytes=1024,
+        content = await self.content_store.save_content(
+            b"\x89PNG\r\n\x1a\nimage",
+            source_type="artifact_test",
+            source_name="image.png",
+            mime_type="image/png",
+            cycle_id="cycle-1",
+            metadata={"artifact_format_id": "png"},
         )
-        artifact = await self.artifacts.artifact_service.create_from_content(
+        _, version = await self.artifacts.artifact_store.create_lineage(
             session_id="session-1",
             cycle_id="cycle-1",
-            filename="image.png",
             content_id=content.content_id,
-            content_hash=content.content_hash,
-            size_bytes=content.size_bytes,
-            detected_format_id="png",
+            filename="image.png",
+            format_id="png",
             detected_mime_type="image/png",
+            declared_mime_type="image/png",
             purpose=ArtifactPurpose.DELIVERABLE,
             provenance=ArtifactProvenance(
                 origin="agent_created",
@@ -234,13 +235,18 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
                 operation="caption_test",
             ),
         )
+        access = ArtifactAccessContext(
+            session_id="session-1",
+            cycle_id="cycle-1",
+            allowed_artifact_ids=[version.artifact_id],
+        )
+        artifact = await self.artifacts.artifact_service.get_artifact(
+            version.artifact_id,
+            access=access,
+        )
         selected = await self.artifacts.delivery_service.select(
             artifact_id=artifact.artifact_id,
-            access=ArtifactAccessContext(
-                session_id="session-1",
-                cycle_id="cycle-1",
-                allowed_artifact_ids=[artifact.artifact_id],
-            ),
+            access=access,
             client_type="telegram",
         )
         return artifact, selected
