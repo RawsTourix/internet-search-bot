@@ -8,6 +8,7 @@ from tempfile import SpooledTemporaryFile
 from typing import Any
 
 from telegram import InputMediaDocument
+from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 from ...interaction.output_models import (
@@ -24,7 +25,13 @@ from ...interaction.output_models import (
     OutputPart,
     OutputPartReceipt,
     OutputPartReceiptState,
+    TextOutputPart,
     TransportOperationKind,
+)
+from ...utils.telegram_formatting import (
+    markdown_to_plain_text,
+    markdown_to_telegram_html,
+    split_markdown_for_telegram,
 )
 
 
@@ -174,40 +181,74 @@ class TelegramOutputPlanExecutor:
                 state=OutputPartReceiptState.FAILED,
                 error_category="empty_rendered_text",
             )
-        limit = int(
-            getattr(part, "metadata", {}).get(
-                "transport_text_max_chars",
-                4096,
+        limit = max(
+            1,
+            int(
+                getattr(part, "metadata", {}).get(
+                    "transport_text_max_chars",
+                    4096,
+                )
+            ),
+        )
+        markdown = (
+            isinstance(part, TextOutputPart)
+            and (part.parse_mode or "").strip().lower() in {"markdown", "md"}
+        )
+        if markdown:
+            safe_limit = min(limit, 3000)
+            logical_chunks = split_markdown_for_telegram(
+                text,
+                limit=safe_limit,
             )
-        )
-        chunks = tuple(
-            text[offset : offset + max(1, limit)]
-            for offset in range(0, len(text), max(1, limit))
-        )
+            chunks = tuple(
+                subchunk
+                for chunk in logical_chunks
+                for subchunk in (
+                    tuple(
+                        chunk[offset : offset + safe_limit]
+                        for offset in range(0, len(chunk), safe_limit)
+                    )
+                    or ("",)
+                )
+            )
+        else:
+            chunks = tuple(
+                text[offset : offset + limit]
+                for offset in range(0, len(text), limit)
+            )
+
         message_ids: list[str] = []
         try:
             for index, chunk in enumerate(chunks):
-                if status and context.status_message_id is not None and index == 0:
-                    sent = await context.bot.edit_message_text(
-                        chat_id=context.chat_id,
-                        message_id=context.status_message_id,
-                        text=chunk,
+                rendered = markdown_to_telegram_html(chunk) if markdown else chunk
+                try:
+                    sent = await self._send_text_chunk(
+                        context=context,
+                        status=status,
+                        chunk=rendered,
+                        parse_mode=ParseMode.HTML if markdown else None,
+                        chunk_index=index,
+                        reply_to_message_id=reply_to_message_id,
                     )
-                    message_id = (
-                        getattr(sent, "message_id", None)
-                        or context.status_message_id
+                except BadRequest:
+                    if not markdown:
+                        raise
+                    sent = await self._send_text_chunk(
+                        context=context,
+                        status=status,
+                        chunk=markdown_to_plain_text(chunk),
+                        parse_mode=None,
+                        chunk_index=index,
+                        reply_to_message_id=reply_to_message_id,
                     )
-                else:
-                    sent = await context.bot.send_message(
-                        **self._message_kwargs(
-                            context,
-                            reply_to_message_id=(
-                                reply_to_message_id if index == 0 else None
-                            ),
-                            text=chunk,
-                        )
+                message_id = (
+                    getattr(sent, "message_id", None)
+                    or (
+                        context.status_message_id
+                        if status and index == 0
+                        else None
                     )
-                    message_id = getattr(sent, "message_id", None)
+                )
                 if message_id is None:
                     return self._receipt(
                         part,
@@ -219,7 +260,11 @@ class TelegramOutputPlanExecutor:
         except BadRequest as error:
             return self._receipt(
                 part,
-                state=OutputPartReceiptState.FAILED,
+                state=(
+                    OutputPartReceiptState.PARTIALLY_DELIVERED
+                    if message_ids
+                    else OutputPartReceiptState.FAILED
+                ),
                 client_message_ids=tuple(message_ids),
                 error_category=f"telegram_bad_request:{type(error).__name__}",
             )
@@ -245,6 +290,34 @@ class TelegramOutputPlanExecutor:
             part,
             state=OutputPartReceiptState.DELIVERED,
             client_message_ids=tuple(message_ids),
+        )
+
+    async def _send_text_chunk(
+        self,
+        *,
+        context: TelegramExecutionContext,
+        status: bool,
+        chunk: str,
+        parse_mode: str | None,
+        chunk_index: int,
+        reply_to_message_id: int | None,
+    ) -> Any:
+        if status and context.status_message_id is not None and chunk_index == 0:
+            return await context.bot.edit_message_text(
+                chat_id=context.chat_id,
+                message_id=context.status_message_id,
+                text=chunk,
+                parse_mode=parse_mode,
+            )
+        return await context.bot.send_message(
+            **self._message_kwargs(
+                context,
+                reply_to_message_id=(
+                    reply_to_message_id if chunk_index == 0 else None
+                ),
+                text=chunk,
+                parse_mode=parse_mode,
+            )
         )
 
     async def _send_document_group(
@@ -390,7 +463,7 @@ class TelegramOutputPlanExecutor:
                 reply_to_message_id=reply_to_message_id,
                 **{argument: payload},
             )
-            if isinstance(part, (ImageOutputPart,)):
+            if isinstance(part, ImageOutputPart):
                 kwargs["caption"] = part.caption
             elif isinstance(part, AudioOutputPart):
                 kwargs["title"] = part.title
@@ -562,11 +635,18 @@ class TelegramOutputPlanExecutor:
             part_id=part.part_id,
             index=part.index,
             state=state,
+            required=part.required,
             delivery_id=getattr(part, "delivery_id", None),
             client_message_ids=client_message_ids,
             error_category=error_category,
             delivered_at=(
-                _utc_now() if state == OutputPartReceiptState.DELIVERED else None
+                _utc_now()
+                if state
+                in {
+                    OutputPartReceiptState.DELIVERED,
+                    OutputPartReceiptState.PARTIALLY_DELIVERED,
+                }
+                else None
             ),
         )
 
@@ -575,20 +655,26 @@ class TelegramOutputPlanExecutor:
         receipts: tuple[OutputPartReceipt, ...],
         batch: OutputBatch,
     ) -> OutputDeliveryReceiptState:
-        required_ids = {
-            item.part_id for item in batch.parts if item.required
-        }
-        required = [
-            item for item in receipts if item.part_id in required_ids
-        ]
-        if any(item.state == OutputPartReceiptState.UNKNOWN for item in required):
+        del batch
+        all_receipts = list(receipts)
+        if any(
+            item.state == OutputPartReceiptState.UNKNOWN
+            for item in all_receipts
+        ):
             return OutputDeliveryReceiptState.UNKNOWN
+        required = [item for item in all_receipts if item.required] or all_receipts
         if required and all(
-            item.state == OutputPartReceiptState.DELIVERED for item in required
+            item.state == OutputPartReceiptState.DELIVERED
+            for item in required
         ):
             return OutputDeliveryReceiptState.DELIVERED
         if any(
-            item.state == OutputPartReceiptState.DELIVERED for item in required
+            item.state
+            in {
+                OutputPartReceiptState.DELIVERED,
+                OutputPartReceiptState.PARTIALLY_DELIVERED,
+            }
+            for item in required
         ):
             return OutputDeliveryReceiptState.PARTIALLY_DELIVERED
         return OutputDeliveryReceiptState.FAILED
