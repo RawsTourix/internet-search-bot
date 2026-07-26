@@ -12,6 +12,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 from ...interaction.output_models import (
+    ArtifactContentReceiptState,
     ArtifactOutputPart,
     AudioOutputPart,
     ContactOutputPart,
@@ -195,10 +196,16 @@ class TelegramOutputPlanExecutor:
         reply_to_message_id: int | None,
         limits: Mapping[str, Any],
     ) -> OutputPartReceipt:
+        artifact_fallback = (
+            ArtifactContentReceiptState.NOT_DELIVERED
+            if isinstance(part, ArtifactOutputPart)
+            else None
+        )
         if not text:
             return self._receipt(
                 part,
                 state=OutputPartReceiptState.FAILED,
+                artifact_content_state=artifact_fallback,
                 error_category="empty_rendered_text",
             )
         limit_key = (
@@ -261,6 +268,7 @@ class TelegramOutputPlanExecutor:
                     return self._receipt(
                         part,
                         state=OutputPartReceiptState.UNKNOWN,
+                        artifact_content_state=artifact_fallback,
                         client_message_ids=tuple(message_ids),
                         error_category="telegram_text_receipt_missing",
                     )
@@ -273,6 +281,7 @@ class TelegramOutputPlanExecutor:
                     if message_ids
                     else OutputPartReceiptState.FAILED
                 ),
+                artifact_content_state=artifact_fallback,
                 client_message_ids=tuple(message_ids),
                 error_category=f"telegram_bad_request:{type(error).__name__}",
             )
@@ -280,6 +289,7 @@ class TelegramOutputPlanExecutor:
             return self._receipt(
                 part,
                 state=OutputPartReceiptState.UNKNOWN,
+                artifact_content_state=artifact_fallback,
                 client_message_ids=tuple(message_ids),
                 error_category=f"telegram_transport_unknown:{type(error).__name__}",
             )
@@ -291,12 +301,14 @@ class TelegramOutputPlanExecutor:
                     if message_ids
                     else OutputPartReceiptState.FAILED
                 ),
+                artifact_content_state=artifact_fallback,
                 client_message_ids=tuple(message_ids),
                 error_category=f"telegram_text_error:{type(error).__name__}",
             )
         return self._receipt(
             part,
             state=OutputPartReceiptState.DELIVERED,
+            artifact_content_state=artifact_fallback,
             client_message_ids=tuple(message_ids),
         )
 
@@ -373,6 +385,7 @@ class TelegramOutputPlanExecutor:
                     self._receipt(
                         part,
                         state=OutputPartReceiptState.UNKNOWN,
+                        artifact_content_state=ArtifactContentReceiptState.UNKNOWN,
                         client_message_ids=(
                             (str(sent[index].message_id),)
                             if index < len(sent)
@@ -387,6 +400,7 @@ class TelegramOutputPlanExecutor:
                 self._receipt(
                     part,
                     state=OutputPartReceiptState.DELIVERED,
+                    artifact_content_state=ArtifactContentReceiptState.DELIVERED,
                     client_message_ids=(str(message.message_id),),
                 )
                 for part, message in zip(parts, sent, strict=True)
@@ -396,20 +410,27 @@ class TelegramOutputPlanExecutor:
                 self._receipt(
                     part,
                     state=OutputPartReceiptState.FAILED,
+                    artifact_content_state=ArtifactContentReceiptState.NOT_DELIVERED,
                     error_category=f"telegram_bad_request:{type(error).__name__}",
                 )
                 for part in parts
             ]
-        except (TimedOut, NetworkError, Exception) as error:
+        except Exception as error:
             state = (
                 OutputPartReceiptState.UNKNOWN
                 if send_started
                 else OutputPartReceiptState.FAILED
             )
+            content_state = (
+                ArtifactContentReceiptState.UNKNOWN
+                if send_started
+                else ArtifactContentReceiptState.NOT_DELIVERED
+            )
             return [
                 self._receipt(
                     part,
                     state=state,
+                    artifact_content_state=content_state,
                     error_category=f"telegram_group_error:{type(error).__name__}",
                 )
                 for part in parts
@@ -481,6 +502,7 @@ class TelegramOutputPlanExecutor:
                 return self._receipt(
                     part,
                     state=OutputPartReceiptState.UNKNOWN,
+                    artifact_content_state=ArtifactContentReceiptState.UNKNOWN,
                     error_category="telegram_artifact_receipt_missing",
                 )
             message_ids.append(str(message_id))
@@ -496,12 +518,14 @@ class TelegramOutputPlanExecutor:
                     return self._receipt(
                         part,
                         state=caption_outcome[0],
+                        artifact_content_state=ArtifactContentReceiptState.DELIVERED,
                         client_message_ids=tuple(message_ids),
                         error_category=caption_outcome[2],
                     )
             return self._receipt(
                 part,
                 state=OutputPartReceiptState.DELIVERED,
+                artifact_content_state=ArtifactContentReceiptState.DELIVERED,
                 client_message_ids=tuple(message_ids),
             )
         except BadRequest as error:
@@ -511,6 +535,11 @@ class TelegramOutputPlanExecutor:
                     OutputPartReceiptState.PARTIALLY_DELIVERED
                     if message_ids
                     else OutputPartReceiptState.FAILED
+                ),
+                artifact_content_state=(
+                    ArtifactContentReceiptState.DELIVERED
+                    if message_ids
+                    else ArtifactContentReceiptState.NOT_DELIVERED
                 ),
                 client_message_ids=tuple(message_ids),
                 error_category=f"telegram_bad_request:{type(error).__name__}",
@@ -523,6 +552,11 @@ class TelegramOutputPlanExecutor:
                     if send_started
                     else OutputPartReceiptState.FAILED
                 ),
+                artifact_content_state=(
+                    ArtifactContentReceiptState.UNKNOWN
+                    if send_started
+                    else ArtifactContentReceiptState.NOT_DELIVERED
+                ),
                 client_message_ids=tuple(message_ids),
                 error_category=f"telegram_artifact_error:{type(error).__name__}",
             )
@@ -533,6 +567,11 @@ class TelegramOutputPlanExecutor:
                     OutputPartReceiptState.UNKNOWN
                     if send_started
                     else OutputPartReceiptState.FAILED
+                ),
+                artifact_content_state=(
+                    ArtifactContentReceiptState.UNKNOWN
+                    if send_started
+                    else ArtifactContentReceiptState.NOT_DELIVERED
                 ),
                 client_message_ids=tuple(message_ids),
                 error_category=f"telegram_artifact_error:{type(error).__name__}",
@@ -578,7 +617,7 @@ class TelegramOutputPlanExecutor:
                 message_ids,
                 f"telegram_caption_bad_request:{type(error).__name__}",
             )
-        except (TimedOut, NetworkError, Exception) as error:
+        except Exception as error:
             return (
                 OutputPartReceiptState.UNKNOWN,
                 message_ids,
@@ -655,7 +694,7 @@ class TelegramOutputPlanExecutor:
                 state=OutputPartReceiptState.FAILED,
                 error_category=f"telegram_bad_request:{type(error).__name__}",
             )
-        except (TimedOut, NetworkError, Exception) as error:
+        except Exception as error:
             return self._receipt(
                 part,
                 state=OutputPartReceiptState.UNKNOWN,
@@ -736,15 +775,27 @@ class TelegramOutputPlanExecutor:
         part: OutputPart,
         *,
         state: OutputPartReceiptState,
+        artifact_content_state: ArtifactContentReceiptState | None = None,
         client_message_ids: tuple[str, ...] = (),
         error_category: str | None = None,
     ) -> OutputPartReceipt:
+        if isinstance(part, ArtifactOutputPart) and artifact_content_state is None:
+            if state == OutputPartReceiptState.DELIVERED:
+                artifact_content_state = ArtifactContentReceiptState.DELIVERED
+            elif state in {
+                OutputPartReceiptState.FAILED,
+                OutputPartReceiptState.SKIPPED,
+            }:
+                artifact_content_state = ArtifactContentReceiptState.NOT_DELIVERED
+            else:
+                artifact_content_state = ArtifactContentReceiptState.UNKNOWN
         return OutputPartReceipt(
             part_id=part.part_id,
             index=part.index,
             state=state,
             required=part.required,
             delivery_id=getattr(part, "delivery_id", None),
+            artifact_content_state=artifact_content_state,
             client_message_ids=client_message_ids,
             error_category=error_category,
             delivered_at=(
