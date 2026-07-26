@@ -65,7 +65,6 @@ def register_domain_exception_handlers(app: FastAPI) -> None:
         IngressValidationError,
         InteractionValidationError,
         ValidationError,
-        ValueError,
     )
     unavailable = (
         ArtifactIntegrityError,
