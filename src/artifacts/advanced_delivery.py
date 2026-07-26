@@ -8,8 +8,12 @@ from .delivery import (
     FileSystemArtifactDeliveryStore,
     utc_now,
 )
-from .errors import ArtifactDeliveryError
-from .models import ArtifactDeliveryRef, ArtifactDeliveryState
+from .errors import ArtifactDeliveryError, ArtifactDeliveryNotFoundError
+from .models import (
+    ArtifactAccessContext,
+    ArtifactDeliveryRef,
+    ArtifactDeliveryState,
+)
 
 
 class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
@@ -155,7 +159,12 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
 
 
 class AdvancedArtifactDeliveryService(ArtifactDeliveryService):
-    """Disallow normal retry of an ambiguous UNKNOWN delivery."""
+    """Preserve ambiguous UNKNOWN outcomes until explicit reconciliation."""
+
+    _CANCELLABLE = {
+        ArtifactDeliveryState.SELECTED,
+        ArtifactDeliveryState.FAILED,
+    }
 
     async def claim(self, delivery_id: str) -> ArtifactDeliveryRef:
         record = await self.store.transition(
@@ -167,3 +176,66 @@ class AdvancedArtifactDeliveryService(ArtifactDeliveryService):
             },
         )
         return record.public_ref()
+
+    async def cancel(self, delivery_id: str) -> ArtifactDeliveryRef:
+        record = await self.store.transition(
+            delivery_id,
+            target=ArtifactDeliveryState.CANCELLED,
+            allowed_from=set(self._CANCELLABLE),
+        )
+        return record.public_ref()
+
+    async def cancel_many_by_artifact_ids(
+        self,
+        *,
+        artifact_ids: list[str],
+        access: ArtifactAccessContext,
+        client_type: str,
+    ) -> list[ArtifactDeliveryRef]:
+        """Cancel exact retryable selections without erasing unknown evidence."""
+        unique_ids = list(dict.fromkeys(artifact_ids))
+        for artifact_id in unique_ids:
+            await self.artifact_service.get_artifact(
+                artifact_id,
+                access=access,
+            )
+
+        records = await self.store.list_cycle(
+            session_id=access.session_id,
+            cycle_id=access.cycle_id,
+        )
+        delivery_ids_by_artifact: dict[str, str] = {}
+        for artifact_id in unique_ids:
+            matches = [
+                item
+                for item in records
+                if item.artifact_id == artifact_id
+                and item.client_type == client_type
+                and item.state != ArtifactDeliveryState.CANCELLED
+            ]
+            if not matches:
+                raise ArtifactDeliveryNotFoundError(
+                    "No delivery selection exists for this artifact"
+                )
+            latest = max(
+                matches,
+                key=lambda item: (item.updated_at, item.delivery_id),
+            )
+            if latest.state not in self._CANCELLABLE:
+                raise ArtifactDeliveryError(
+                    "Cannot cancel an active, delivered, or unknown delivery "
+                    f"in state {latest.state.value}"
+                )
+            delivery_ids_by_artifact[artifact_id] = latest.delivery_id
+
+        cancelled = await self.store.cancel_many([
+            delivery_ids_by_artifact[artifact_id]
+            for artifact_id in unique_ids
+        ])
+        by_delivery_id = {
+            item.delivery_id: item.public_ref() for item in cancelled
+        }
+        return [
+            by_delivery_id[delivery_ids_by_artifact[artifact_id]]
+            for artifact_id in artifact_ids
+        ]
