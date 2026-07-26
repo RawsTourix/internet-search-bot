@@ -64,9 +64,19 @@ OutputBatch.ready
  | unknown
 ```
 
+Каждый `OutputPartReceipt` сохраняет exact `part_id`, `index`, `required`,
+transport message IDs и outcome. Подтверждённая доставка части многочастного
+текста представляется как `partially_delivered`, а не как полный failure.
+Aggregate state определяется по обязательным parts; optional failure не
+отменяет подтверждённую доставку всех required parts. Любой `unknown`, включая
+optional part, остаётся видимым на уровне всего OutputBatch и требует
+reconciliation.
+
 `TelegramOutputPlanExecutor` выполняет groups по `group.index`, вызывает native
 Telegram methods и создаёт exact outcome для каждого part. `UNSUPPORTED` и
-отсутствующий outcome не считаются delivered. Для документов:
+отсутствующий outcome не считаются delivered. Финальный Markdown проходит
+через общий Telegram formatting path с HTML-rendering и plain-text fallback.
+Для документов:
 
 ```text
 1 → send_document
@@ -77,7 +87,10 @@ Telegram methods и создаёт exact outcome для каждого part. `UN
 После начала non-idempotent send timeout/network/mismatched receipt становится
 `unknown`. `OutputDeliveryCompletionService` валидирует authority и атомарно
 обновляет delivery records, attempt receipt и OutputBatch; filesystem failure
-откатывает все три слоя.
+откатывает все три слоя. Публичный `output_store.reconcile_unknown()` в
+application composition делегирует тому же composite service, поэтому explicit
+reconciliation согласованно меняет и OutputBatch, и связанные artifact delivery
+records.
 
 Recovery:
 
@@ -85,6 +98,8 @@ Recovery:
 - stale `delivering` становится `unknown`;
 - `unknown` не отправляется повторно автоматически;
 - internal list/reconcile API поддерживает explicit reconciliation;
+- explicit reconciliation атомарно сохраняет resolved receipt и обновляет
+  связанные artifact delivery records;
 - `delivered` не запускает повторный agent cycle или transport delivery.
 
 ### AF-21.2. Совместимость и v1 → v2
@@ -103,6 +118,8 @@ Recovery:
   Telegram text проходит shared ingress;
 - `AgentResult.artifacts` остаётся compatibility projection и не является
   authority Telegram-доставки;
+- persisted receipts без нового `required` поля читаются с безопасным
+  backward-compatible default `true`;
 - route authority не зависит от response anchor и не меняется при join.
 
 ### AF-21.3. Проверка
@@ -113,6 +130,7 @@ Recovery:
 tests/test_input_presentation_lifecycle.py
 tests/test_telegram_output_plan_executor.py
 tests/test_output_delivery_recovery.py
+tests/test_output_receipt_semantics.py
 tests/test_semantic_ingress_limits.py
 tests/test_reply_provenance.py
 tests/test_capability_snapshot_integrity.py
@@ -132,8 +150,10 @@ tests/test_telegram_semantic_resolvers.py
   artifact order;
 - 11-document split, missing outcome, pre/post-send failures и отсутствие
   automatic resend;
+- required/optional receipt semantics и confirmed partial multi-chunk text;
+- Markdown → Telegram HTML и deterministic plain-text fallback;
 - atomic receipt completion/rollback, restart recovery, separate `unknown` и
-  explicit reconciliation;
+  artifact-aware explicit reconciliation;
 - caption exactly once, cumulative semantic limits и semantic ID collision;
 - capability snapshot tampering/index/symlink rejection;
 - incoming reply provenance отдельно от typed response anchor override;
