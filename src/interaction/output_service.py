@@ -56,6 +56,13 @@ class OutputBatchAssembler:
         self.renderer = renderer or CapabilityOutputRenderer(
             max_delivery_groups=config.max_delivery_groups
         )
+        bind_claim_validator = getattr(
+            self.output_store,
+            "bind_claim_validator",
+            None,
+        )
+        if bind_claim_validator is not None:
+            bind_claim_validator(self.renderer.plan)
 
     async def assemble_final(
         self,
@@ -175,6 +182,10 @@ class OutputBatchAssembler:
                     update={
                         "part_id": semantic.part_id or new_output_part_id(),
                         "index": len(parts),
+                        # Selected deliverables are server-authoritative required
+                        # output. Semantic intents may enrich presentation but may
+                        # not silently downgrade delivery obligations.
+                        "required": True,
                         "artifact_id": record.artifact_id,
                         "delivery_id": record.delivery_id,
                         "filename": record.filename,
