@@ -62,6 +62,29 @@ if (
 TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES = int(
     os.getenv("TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES", str(8 * 1024 * 1024))
 )
+if TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES <= 0:
+    raise ValueError("TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES must be positive")
+
+# Process-local v0.4 outbox pump. The minimum age prevents a recovered worker
+# from racing the ordinary synchronous response path for freshly committed
+# batches. Durable claim ownership still arbitrates multiple replicas.
+TELEGRAM_READY_OUTBOX_POLL_SECONDS = float(
+    os.getenv("TELEGRAM_READY_OUTBOX_POLL_SECONDS", "15")
+)
+TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS = float(
+    os.getenv("TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS", "30")
+)
+TELEGRAM_READY_OUTBOX_BATCH_LIMIT = int(
+    os.getenv("TELEGRAM_READY_OUTBOX_BATCH_LIMIT", "50")
+)
+if TELEGRAM_READY_OUTBOX_POLL_SECONDS <= 0:
+    raise ValueError("TELEGRAM_READY_OUTBOX_POLL_SECONDS must be positive")
+if not 0 <= TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS <= 3600:
+    raise ValueError(
+        "TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS must be between 0 and 3600"
+    )
+if not 1 <= TELEGRAM_READY_OUTBOX_BATCH_LIMIT <= 500:
+    raise ValueError("TELEGRAM_READY_OUTBOX_BATCH_LIMIT must be between 1 and 500")
 
 PROGRESS_EDIT_MIN_INTERVAL = float(
     os.getenv("PROGRESS_EDIT_MIN_INTERVAL", "1.2")
