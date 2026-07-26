@@ -21,6 +21,7 @@ from .api.artifact_routes import create_artifact_router
 from .api.artifact_transport import ArtifactTransportFacade
 from .api.attachment_provider import StrictHttpAttachmentStreamProvider
 from .api.domain_errors import register_domain_exception_handlers
+from .api.legacy_delivery_guard import LegacyTelegramDeliveryGuardMiddleware
 from .api.output_outbox_routes import create_output_outbox_router
 from .core.message_processor import MessageProcessor
 from .core.models import ClientType, MessageType, UnifiedMessage, WebMessage
@@ -249,6 +250,7 @@ app = FastAPI(
     lifespan=lifespan,
 )
 register_domain_exception_handlers(app)
+app.add_middleware(LegacyTelegramDeliveryGuardMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=origins,
