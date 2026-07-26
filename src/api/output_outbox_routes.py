@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 from fastapi import APIRouter, Depends, HTTPException, Query
 from pydantic import BaseModel, ConfigDict
 
@@ -28,21 +30,33 @@ class OutputTransportReceiptRequest(OutputTransportAuthorityRequest):
     receipt: OutputDeliveryReceipt
 
 
-def create_output_outbox_router(*, facade, auth_dependency) -> APIRouter:
+def create_output_outbox_router(
+    *,
+    facade,
+    auth_dependency,
+    api_key_scopes: Mapping[str, frozenset[str]],
+) -> APIRouter:
     """Create the internal process-local outbox worker API.
 
     Only sufficiently old READY final batches are listed. DELIVERING and
     UNKNOWN batches are deliberately excluded because their transport outcome
-    may be ambiguous.
+    may be ambiguous. The authenticated key must also own the requested client
+    transport; body fields alone never grant authority.
     """
 
     router = APIRouter()
     service = ReadyOutputOutboxService(facade.api.output_store)
 
-    @router.get(
-        "/internal/output-outbox/ready",
-        dependencies=[Depends(auth_dependency)],
-    )
+    def require_transport_scope(api_key: str, client_type: str) -> None:
+        normalized = client_type.strip().lower()
+        scopes = api_key_scopes.get(api_key, frozenset())
+        if "*" not in scopes and normalized not in scopes:
+            raise HTTPException(
+                status_code=403,
+                detail="API key is not authorized for this output transport",
+            )
+
+    @router.get("/internal/output-outbox/ready")
     async def list_ready_output_batches(
         client_type: str,
         client_instance_id: str,
@@ -52,7 +66,9 @@ def create_output_outbox_router(*, facade, auth_dependency) -> APIRouter:
             ge=0,
             le=service.MAX_MINIMUM_AGE_SECONDS,
         ),
+        api_key: str = Depends(auth_dependency),
     ):
+        require_transport_scope(api_key, client_type)
         try:
             batches = await service.list_ready(
                 client_type=client_type,
@@ -71,14 +87,13 @@ def create_output_outbox_router(*, facade, auth_dependency) -> APIRouter:
         except (InteractionIntegrityError, InteractionStorageError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
-    @router.post(
-        "/internal/output-outbox/{output_batch_id}/claim",
-        dependencies=[Depends(auth_dependency)],
-    )
+    @router.post("/internal/output-outbox/{output_batch_id}/claim")
     async def claim_ready_output_batch(
         output_batch_id: str,
         body: OutputTransportAuthorityRequest,
+        api_key: str = Depends(auth_dependency),
     ):
+        require_transport_scope(api_key, body.client_type)
         try:
             batch = await facade.api.output_store.get(output_batch_id)
             service.validate_authority(
@@ -107,14 +122,13 @@ def create_output_outbox_router(*, facade, auth_dependency) -> APIRouter:
         except (InteractionIntegrityError, InteractionStorageError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
-    @router.post(
-        "/internal/output-outbox/{output_batch_id}/receipt",
-        dependencies=[Depends(auth_dependency)],
-    )
+    @router.post("/internal/output-outbox/{output_batch_id}/receipt")
     async def complete_ready_output_batch(
         output_batch_id: str,
         body: OutputTransportReceiptRequest,
+        api_key: str = Depends(auth_dependency),
     ):
+        require_transport_scope(api_key, body.client_type)
         try:
             batch = await facade.api.output_store.get(output_batch_id)
             service.validate_authority(
