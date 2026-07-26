@@ -54,18 +54,10 @@ def _fingerprint(value: Any) -> str:
 
 def _semantic_fingerprint_payload(stable: dict[str, Any]) -> dict[str, Any]:
     payload = dict(stable)
-    for generated in (
-        "output_batch_id",
-        "created_at",
-        "ready_at",
-    ):
+    for generated in ("output_batch_id", "created_at", "ready_at"):
         payload.pop(generated, None)
     payload["parts"] = [
-        {
-            key: value
-            for key, value in part.items()
-            if key != "part_id"
-        }
+        {key: value for key, value in part.items() if key != "part_id"}
         for part in payload.get("parts", [])
     ]
     return payload
@@ -105,14 +97,18 @@ class FileSystemOutputBatchStore:
         self._stale_recovery_handler: (
             Callable[..., Awaitable[list[OutputBatch]]] | None
         ) = None
-        for path in (self.records, self.cycle_index, self.attempts):
-            path.mkdir(parents=True, exist_ok=True)
+        try:
+            for path in (self.records, self.cycle_index, self.attempts):
+                path.mkdir(parents=True, exist_ok=True)
+        except OSError as error:
+            raise InteractionStorageError(
+                "failed to initialize output storage"
+            ) from error
 
     def bind_reconciliation_handler(
         self,
         handler: Callable[[OutputDeliveryReceipt], Awaitable[OutputBatch]],
     ) -> None:
-        """Bind the application-level aggregate reconciler once at composition."""
         if (
             self._reconciliation_handler is not None
             and self._reconciliation_handler != handler
@@ -126,7 +122,6 @@ class FileSystemOutputBatchStore:
         self,
         handler: Callable[..., Awaitable[list[OutputBatch]]],
     ) -> None:
-        """Bind cross-store stale recovery once at composition."""
         if (
             self._stale_recovery_handler is not None
             and self._stale_recovery_handler != handler
@@ -148,39 +143,54 @@ class FileSystemOutputBatchStore:
             index_path = self.cycle_index / f"{identity}.json"
             fingerprint = _fingerprint(_semantic_fingerprint_payload(stable))
             manifest_hash = _fingerprint(stable)
-            if index_path.exists():
+            if index_path.exists() or index_path.is_symlink():
                 pointer = self._read(index_path)
-                existing = self._load_sync(pointer["output_batch_id"])
-                if pointer["fingerprint"] != fingerprint:
+                existing = self._load_sync(str(pointer.get("output_batch_id") or ""))
+                if pointer.get("fingerprint") != fingerprint:
                     raise OutputBatchConflictError(
                         "output identity reused with different semantic output"
                     )
                 return existing, False
 
             batch_dir = self.records / batch.output_batch_id
-            if batch_dir.exists():
+            if batch_dir.exists() or batch_dir.is_symlink():
                 raise OutputBatchConflictError("output batch ID already exists")
-            batch_dir.mkdir(parents=True)
-            self._write(batch_dir / "manifest.json", stable)
-            self._write(
-                batch_dir / "state.json",
-                {
-                    "state": batch.state.value,
-                    "completed_at": None,
-                    "updated_at": batch.ready_at.isoformat()
-                    if batch.ready_at
-                    else batch.created_at.isoformat(),
-                    "attempt_id": None,
-                },
-            )
-            self._write(
-                index_path,
-                {
-                    "output_batch_id": batch.output_batch_id,
-                    "fingerprint": fingerprint,
-                    "manifest_hash": manifest_hash,
-                },
-            )
+            manifest_path = batch_dir / "manifest.json"
+            state_path = batch_dir / "state.json"
+            try:
+                batch_dir.mkdir(parents=True)
+                self._write(manifest_path, stable)
+                self._write(
+                    state_path,
+                    {
+                        "state": batch.state.value,
+                        "completed_at": None,
+                        "updated_at": batch.ready_at.isoformat()
+                        if batch.ready_at
+                        else batch.created_at.isoformat(),
+                        "attempt_id": None,
+                    },
+                )
+                self._write(
+                    index_path,
+                    {
+                        "output_batch_id": batch.output_batch_id,
+                        "fingerprint": fingerprint,
+                        "manifest_hash": manifest_hash,
+                    },
+                )
+            except BaseException:
+                for path in (index_path, state_path, manifest_path):
+                    try:
+                        path.unlink(missing_ok=True)
+                    except OSError:
+                        logger.exception("failed to remove partial OutputBatch file")
+                try:
+                    batch_dir.rmdir()
+                except OSError:
+                    if batch_dir.exists():
+                        logger.exception("failed to remove partial OutputBatch directory")
+                raise
             logger.info(
                 "output_batch_created output_batch_id=%s session_id=%s "
                 "cycle_id=%s part_count=%s",
@@ -228,23 +238,15 @@ class FileSystemOutputBatchStore:
             )
             return self._load_sync(output_batch_id), attempt_id
 
-    async def complete(
-        self,
-        receipt: OutputDeliveryReceipt,
-    ) -> OutputBatch:
+    async def complete(self, receipt: OutputDeliveryReceipt) -> OutputBatch:
         return await asyncio.to_thread(self._complete_sync, receipt)
 
     async def reconcile_unknown(
-        self,
-        receipt: OutputDeliveryReceipt,
+        self, receipt: OutputDeliveryReceipt
     ) -> OutputBatch:
-        handler = self._reconciliation_handler
-        if handler is not None:
-            return await handler(receipt)
-        return await asyncio.to_thread(
-            self._reconcile_unknown_sync,
-            receipt,
-        )
+        if self._reconciliation_handler is not None:
+            return await self._reconciliation_handler(receipt)
+        return await asyncio.to_thread(self._reconcile_unknown_sync, receipt)
 
     @staticmethod
     def _receipt_projection(receipt: OutputDeliveryReceipt) -> list[tuple[str, int, bool]]:
@@ -255,10 +257,7 @@ class FileSystemOutputBatchStore:
 
     @staticmethod
     def _batch_projection(batch: OutputBatch) -> list[tuple[str, int, bool]]:
-        return [
-            (item.part_id, item.index, item.required)
-            for item in batch.parts
-        ]
+        return [(item.part_id, item.index, item.required) for item in batch.parts]
 
     def _complete_sync(self, receipt: OutputDeliveryReceipt) -> OutputBatch:
         mapped = {
@@ -320,8 +319,7 @@ class FileSystemOutputBatchStore:
             return self._load_sync(receipt.output_batch_id)
 
     def _reconcile_unknown_sync(
-        self,
-        receipt: OutputDeliveryReceipt,
+        self, receipt: OutputDeliveryReceipt
     ) -> OutputBatch:
         if receipt.state == OutputDeliveryReceiptState.UNKNOWN:
             raise OutputBatchConflictError(
@@ -339,14 +337,9 @@ class FileSystemOutputBatchStore:
                 raise OutputBatchConflictError(
                     "reconciliation receipt does not match output parts"
                 )
-            reconciled_path = (
-                self.attempts / f"{receipt.attempt_id}.reconciled.json"
-            )
+            reconciled_path = self.attempts / f"{receipt.attempt_id}.reconciled.json"
             if current.state != OutputBatchState.UNKNOWN:
-                if (
-                    current.state == mapped
-                    and reconciled_path.exists()
-                ):
+                if current.state == mapped and reconciled_path.exists():
                     existing = OutputDeliveryReceipt.model_validate(
                         self._read(reconciled_path)
                     )
@@ -358,18 +351,13 @@ class FileSystemOutputBatchStore:
                 raise OutputBatchConflictError(
                     "only an unknown OutputBatch can be reconciled"
                 )
-            state_path = (
-                self.records / receipt.output_batch_id / "state.json"
-            )
+            state_path = self.records / receipt.output_batch_id / "state.json"
             state = self._read(state_path)
             if state.get("attempt_id") != receipt.attempt_id:
                 raise OutputBatchConflictError(
                     "reconciliation attempt does not match terminal claim"
                 )
-            self._write(
-                reconciled_path,
-                receipt.model_dump(mode="json"),
-            )
+            self._write(reconciled_path, receipt.model_dump(mode="json"))
             state.update(
                 state=mapped.value,
                 completed_at=receipt.completed_at.isoformat(),
@@ -390,9 +378,8 @@ class FileSystemOutputBatchStore:
         timeout_seconds: int,
         now: datetime | None = None,
     ) -> list[OutputBatch]:
-        handler = self._stale_recovery_handler
-        if handler is not None:
-            return await handler(
+        if self._stale_recovery_handler is not None:
+            return await self._stale_recovery_handler(
                 timeout_seconds=timeout_seconds,
                 now=now,
             )
@@ -492,14 +479,12 @@ class FileSystemOutputBatchStore:
 
         identity = self._identity(batch.session_id, batch.cycle_id, batch.kind)
         index_path = self.cycle_index / f"{identity}.json"
-        if not index_path.exists():
+        if not index_path.exists() and not index_path.is_symlink():
             raise InteractionIntegrityError("OutputBatch identity index is missing")
         pointer = self._read(index_path)
         if pointer.get("output_batch_id") != output_batch_id:
             raise InteractionIntegrityError("OutputBatch identity index mismatch")
-        expected_semantic = _fingerprint(
-            _semantic_fingerprint_payload(manifest)
-        )
+        expected_semantic = _fingerprint(_semantic_fingerprint_payload(manifest))
         if pointer.get("fingerprint") != expected_semantic:
             raise InteractionIntegrityError("OutputBatch semantic fingerprint mismatch")
         manifest_hash = pointer.get("manifest_hash")
@@ -523,8 +508,8 @@ class FileSystemOutputBatchStore:
 
     def _write(self, path: Path, payload: dict[str, Any]) -> None:
         data = _canonical(payload)
-        path.parent.mkdir(parents=True, exist_ok=True)
         try:
+            path.parent.mkdir(parents=True, exist_ok=True)
             if not self.atomic_writes:
                 path.write_bytes(data)
                 return
@@ -543,7 +528,6 @@ class FileSystemOutputBatchStore:
 
 
 def build_ready_output_batch(**values: Any) -> OutputBatch:
-    """Convenience constructor that centralizes ready timestamps and IDs."""
     now = values.pop("now", None) or utc_now()
     return OutputBatch(
         output_batch_id=values.pop("output_batch_id", new_output_batch_id()),
