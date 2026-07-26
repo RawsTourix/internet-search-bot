@@ -31,16 +31,33 @@ class OutputDeliveryCompletionService:
         self.output_store = output_store
         self.artifact_delivery_store = artifact_delivery_store
         self._lock = threading.RLock()
+        self.output_store.bind_reconciliation_handler(self.reconcile_unknown)
 
     async def complete(
         self,
         receipt: OutputDeliveryReceipt,
     ) -> OutputBatch:
-        return await asyncio.to_thread(self._complete_sync, receipt)
+        return await asyncio.to_thread(
+            self._apply_sync,
+            receipt,
+            False,
+        )
 
-    def _complete_sync(
+    async def reconcile_unknown(
         self,
         receipt: OutputDeliveryReceipt,
+    ) -> OutputBatch:
+        """Resolve one unknown attempt across OutputBatch and artifact stores."""
+        return await asyncio.to_thread(
+            self._apply_sync,
+            receipt,
+            True,
+        )
+
+    def _apply_sync(
+        self,
+        receipt: OutputDeliveryReceipt,
+        reconciling: bool,
     ) -> OutputBatch:
         with self._lock:
             batch = self.output_store._load_sync(receipt.output_batch_id)
@@ -56,10 +73,20 @@ class OutputDeliveryCompletionService:
                 )
 
             delivery_updates: list[
-                tuple[str, ArtifactDeliveryState, set[ArtifactDeliveryState], str | None, dict]
+                tuple[
+                    str,
+                    ArtifactDeliveryState,
+                    set[ArtifactDeliveryState],
+                    str | None,
+                    dict,
+                ]
             ] = []
             for part_receipt in receipt.part_receipts:
                 part = part_by_id[part_receipt.part_id]
+                if part_receipt.required != part.required:
+                    raise OutputBatchConflictError(
+                        "part receipt required flag does not match committed output"
+                    )
                 exact_delivery_id = getattr(part, "delivery_id", None)
                 if part_receipt.delivery_id != exact_delivery_id:
                     raise OutputBatchConflictError(
@@ -79,7 +106,8 @@ class OutputDeliveryCompletionService:
                         "artifact delivery is outside OutputBatch authority"
                     )
                 target, allowed = self._artifact_transition(
-                    part_receipt.state
+                    part_receipt.state,
+                    reconciling=reconciling,
                 )
                 delivery_updates.append(
                     (
@@ -95,16 +123,24 @@ class OutputDeliveryCompletionService:
                             "output_batch_id": batch.output_batch_id,
                             "output_part_id": part.part_id,
                             "output_part_index": part.index,
+                            "reconciled": reconciling,
                         },
                     )
                 )
 
+            attempt_path = (
+                self.output_store.attempts
+                / (
+                    f"{receipt.attempt_id}.reconciled.json"
+                    if reconciling
+                    else f"{receipt.attempt_id}.json"
+                )
+            )
             paths = [
                 self.output_store.records
                 / batch.output_batch_id
                 / "state.json",
-                self.output_store.attempts
-                / f"{receipt.attempt_id}.json",
+                attempt_path,
                 *[
                     self.artifact_delivery_store.root
                     / f"{delivery_id}.json"
@@ -127,6 +163,8 @@ class OutputDeliveryCompletionService:
                         error,
                         transport_receipt,
                     )
+                if reconciling:
+                    return self.output_store._reconcile_unknown_sync(receipt)
                 return self.output_store._complete_sync(receipt)
             except BaseException:
                 self._restore(backups)
@@ -135,13 +173,36 @@ class OutputDeliveryCompletionService:
     @staticmethod
     def _artifact_transition(
         state: OutputPartReceiptState,
+        *,
+        reconciling: bool,
     ) -> tuple[ArtifactDeliveryState, set[ArtifactDeliveryState]]:
+        if reconciling:
+            if state == OutputPartReceiptState.DELIVERED:
+                return (
+                    ArtifactDeliveryState.DELIVERED,
+                    {ArtifactDeliveryState.UNKNOWN},
+                )
+            if state in {
+                OutputPartReceiptState.FAILED,
+                OutputPartReceiptState.SKIPPED,
+            }:
+                return (
+                    ArtifactDeliveryState.FAILED,
+                    {ArtifactDeliveryState.UNKNOWN},
+                )
+            raise OutputBatchConflictError(
+                "artifact reconciliation requires a confirmed delivered or failed outcome"
+            )
+
         if state == OutputPartReceiptState.DELIVERED:
             return (
                 ArtifactDeliveryState.DELIVERED,
                 {ArtifactDeliveryState.DELIVERING},
             )
-        if state == OutputPartReceiptState.UNKNOWN:
+        if state in {
+            OutputPartReceiptState.UNKNOWN,
+            OutputPartReceiptState.PARTIALLY_DELIVERED,
+        }:
             return (
                 ArtifactDeliveryState.UNKNOWN,
                 {ArtifactDeliveryState.DELIVERING},
