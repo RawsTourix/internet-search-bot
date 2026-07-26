@@ -11,7 +11,10 @@ from src.interaction.capabilities import (
     build_telegram_capability_declaration,
     build_web_capability_declaration,
 )
-from src.interaction.errors import InteractionIntegrityError
+from src.interaction.errors import (
+    InteractionIntegrityError,
+    InteractionStorageError,
+)
 from src.interaction.ids import new_output_part_id
 from src.interaction.output_models import OutputBatchKind, TextOutputPart
 from src.interaction.output_store import (
@@ -76,6 +79,25 @@ class OutputManifestIntegrityTests(unittest.IsolatedAsyncioTestCase):
         )
         with self.assertRaises(InteractionIntegrityError):
             await store.get(batch.output_batch_id)
+
+    async def test_partial_commit_is_rolled_back(self):
+        store = FileSystemOutputBatchStore(self.root)
+        batch = self._batch()
+        original_write = store._write
+
+        def fail_cycle_index(path, payload):
+            if path.parent == store.cycle_index:
+                raise InteractionStorageError("simulated index failure")
+            return original_write(path, payload)
+
+        store._write = fail_cycle_index
+        with self.assertRaises(InteractionStorageError):
+            await store.commit(batch)
+        store._write = original_write
+
+        identity = store._identity(batch.session_id, batch.cycle_id, batch.kind)
+        self.assertFalse((store.records / batch.output_batch_id).exists())
+        self.assertFalse((store.cycle_index / f"{identity}.json").exists())
 
     def test_route_and_capability_client_types_must_match(self):
         with self.assertRaises(ValidationError):
