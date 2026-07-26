@@ -82,6 +82,7 @@ class OutputBatchAssembler:
                     parse_mode="markdown",
                 )
             )
+
         semantic_parts = self._parse_semantic_parts(result.semantic_outputs)
         records = await self.delivery_store.list_cycle(
             session_id=input_batch.session_id,
@@ -106,34 +107,28 @@ class OutputBatchAssembler:
         records_by_delivery = {
             item.delivery_id: item for item in records
         }
-        consumed_deliveries: set[str] = set()
+
+        semantic_artifacts: dict[str, ArtifactOutputPart] = {}
+        non_artifact_semantic_parts: list[OutputPart] = []
         for item in semantic_parts:
-            if isinstance(item, ArtifactOutputPart):
-                record = records_by_delivery.get(item.delivery_id)
-                if record is None or record.artifact_id != item.artifact_id:
-                    raise InteractionValidationError(
-                        "semantic artifact output is not an exact selected delivery"
-                    )
-                consumed_deliveries.add(record.delivery_id)
-                parts.append(
-                    item.model_copy(
-                        update={
-                            "part_id": item.part_id or new_output_part_id(),
-                            "index": len(parts),
-                            "artifact_id": record.artifact_id,
-                            "delivery_id": record.delivery_id,
-                            "filename": record.filename,
-                            "mime_type": record.mime_type,
-                            "size_bytes": record.size_bytes,
-                            "metadata": {
-                                **item.metadata,
-                                "selection_index": record.selection_index,
-                                "format_id": record.format_id,
-                            },
-                        }
-                    )
-                )
+            if not isinstance(item, ArtifactOutputPart):
+                non_artifact_semantic_parts.append(item)
                 continue
+            record = records_by_delivery.get(item.delivery_id)
+            if record is None or record.artifact_id != item.artifact_id:
+                raise InteractionValidationError(
+                    "semantic artifact output is not an exact selected delivery"
+                )
+            if item.delivery_id in semantic_artifacts:
+                raise InteractionValidationError(
+                    "semantic output contains duplicate artifact delivery intent"
+                )
+            semantic_artifacts[item.delivery_id] = item
+
+        # Non-artifact semantic output follows the final text in declared order.
+        # Artifact output is appended separately from the authoritative delivery
+        # selection order, so an LLM intent can enrich but never reorder delivery.
+        for item in non_artifact_semantic_parts:
             parts.append(
                 item.model_copy(
                     update={
@@ -144,23 +139,43 @@ class OutputBatchAssembler:
             )
 
         for record in records:
-            if record.delivery_id in consumed_deliveries:
+            semantic = semantic_artifacts.get(record.delivery_id)
+            if semantic is None:
+                parts.append(
+                    ArtifactOutputPart(
+                        part_id=new_output_part_id(),
+                        index=len(parts),
+                        artifact_id=record.artifact_id,
+                        delivery_id=record.delivery_id,
+                        filename=record.filename,
+                        mime_type=record.mime_type,
+                        size_bytes=record.size_bytes,
+                        metadata={
+                            "selection_index": record.selection_index,
+                            "format_id": record.format_id,
+                        },
+                    )
+                )
                 continue
             parts.append(
-                ArtifactOutputPart(
-                    part_id=new_output_part_id(),
-                    index=len(parts),
-                    artifact_id=record.artifact_id,
-                    delivery_id=record.delivery_id,
-                    filename=record.filename,
-                    mime_type=record.mime_type,
-                    size_bytes=record.size_bytes,
-                    metadata={
-                        "selection_index": record.selection_index,
-                        "format_id": record.format_id,
-                    },
+                semantic.model_copy(
+                    update={
+                        "part_id": semantic.part_id or new_output_part_id(),
+                        "index": len(parts),
+                        "artifact_id": record.artifact_id,
+                        "delivery_id": record.delivery_id,
+                        "filename": record.filename,
+                        "mime_type": record.mime_type,
+                        "size_bytes": record.size_bytes,
+                        "metadata": {
+                            **semantic.metadata,
+                            "selection_index": record.selection_index,
+                            "format_id": record.format_id,
+                        },
+                    }
                 )
             )
+
         if not parts:
             localization = getattr(self.renderer, "localization", None)
             message = LocalizationMessage(message_key="output.file_ready")
@@ -175,6 +190,10 @@ class OutputBatchAssembler:
                     ),
                     parse_mode="markdown",
                 )
+            )
+        if not any(part.required for part in parts):
+            raise InteractionValidationError(
+                "final OutputBatch requires at least one required output part"
             )
         if len(parts) > self.config.max_parts_per_batch:
             raise InteractionValidationError(
