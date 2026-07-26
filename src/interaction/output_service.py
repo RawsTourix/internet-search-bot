@@ -30,7 +30,6 @@ from .output_models import (
     VideoOutputPart,
     VoiceOutputPart,
 )
-from ..localization.models import LocalizationMessage
 from .output_store import FileSystemOutputBatchStore, build_ready_output_batch
 from .rendering import CapabilityOutputRenderer, ClientOutputRenderer
 
@@ -88,8 +87,19 @@ class OutputBatchAssembler:
             raise InteractionValidationError(
                 "final OutputBatch requires an authoritative cycle_id"
             )
-        resolved_locale = locale or input_batch.locale or "ru"
 
+        # A committed output is the immutable authority for this cycle. Repeated
+        # finalization after delivery must not rebuild from mutable delivery states.
+        existing = await self.output_store.get_for_cycle(
+            session_id=input_batch.session_id,
+            cycle_id=cycle_id,
+            kind=OutputBatchKind.FINAL,
+        )
+        if existing is not None:
+            result.output_batch = existing.model_dump(mode="json")
+            return existing
+
+        resolved_locale = locale or input_batch.locale or "ru"
         parts: list[OutputPart] = []
         if result.content:
             parts.append(
@@ -182,9 +192,6 @@ class OutputBatchAssembler:
                     update={
                         "part_id": semantic.part_id or new_output_part_id(),
                         "index": len(parts),
-                        # Selected deliverables are server-authoritative required
-                        # output. Semantic intents may enrich presentation but may
-                        # not silently downgrade delivery obligations.
                         "required": True,
                         "artifact_id": record.artifact_id,
                         "delivery_id": record.delivery_id,
@@ -201,19 +208,8 @@ class OutputBatchAssembler:
             )
 
         if not parts:
-            localization = getattr(self.renderer, "localization", None)
-            message = LocalizationMessage(message_key="output.file_ready")
-            parts.append(
-                TextOutputPart(
-                    part_id=new_output_part_id(),
-                    index=0,
-                    text=(
-                        localization.render(message, locale=resolved_locale)
-                        if localization is not None
-                        else message.message_key
-                    ),
-                    parse_mode="markdown",
-                )
+            raise InteractionValidationError(
+                "final AgentResult contains no deliverable output"
             )
         if not any(part.required for part in parts):
             raise InteractionValidationError(
