@@ -16,12 +16,13 @@ from .config import (
 )
 from .ready_outbox import TelegramReadyOutboxWorker
 from .scoped_artifact_bridge import InstanceScopedTelegramArtifactGatewayClient
+from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 
 
 # One exact client-instance authority is shared by the ordinary synchronous
 # response path, the recovery outbox worker and delivery-content streaming.
-# Handler functions in telegram_server resolve this module global at call time,
-# so replacing it here does not duplicate ingress or Telegram application state.
+# Handler functions in telegram_server resolve these module globals at call
+# time, so replacing them here does not duplicate ingress or Telegram state.
 artifact_gateway = InstanceScopedTelegramArtifactGatewayClient(
     gateway_url=GATEWAY_URL,
     api_key=TELEGRAM_API_KEY,
@@ -29,7 +30,9 @@ artifact_gateway = InstanceScopedTelegramArtifactGatewayClient(
     delivery_spool_memory_bytes=TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES,
     media_group_activity=server.media_group_activity,
 )
+telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
+server.telegram_output_executor = telegram_output_executor
 
 ready_outbox_worker = TelegramReadyOutboxWorker(
     gateway_url=GATEWAY_URL,
@@ -37,7 +40,7 @@ ready_outbox_worker = TelegramReadyOutboxWorker(
     client_instance_id=TELEGRAM_BOT_INSTANCE_ID,
     bot=server.application.bot,
     gateway=artifact_gateway,
-    executor=server.telegram_output_executor,
+    executor=telegram_output_executor,
     poll_seconds=TELEGRAM_READY_OUTBOX_POLL_SECONDS,
     minimum_age_seconds=TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
     batch_limit=TELEGRAM_READY_OUTBOX_BATCH_LIMIT,
