@@ -72,6 +72,10 @@ class OutputBatchAssembler:
             raise InteractionValidationError(
                 "final OutputBatch requires a capability snapshot"
             )
+        if snapshot.client_type != input_batch.client_type.value:
+            raise InteractionValidationError(
+                "capability snapshot client type does not match input authority"
+            )
         cycle_id = result.cycle_id
         if not cycle_id:
             raise InteractionValidationError(
@@ -105,6 +109,7 @@ class OutputBatchAssembler:
             item
             for item in records
             if item.state != ArtifactDeliveryState.CANCELLED
+            and item.client_type == snapshot.client_type
         ]
         records.sort(key=lambda item: (item.selection_index, item.delivery_id))
         if len(records) > self.config.max_total_artifacts:
