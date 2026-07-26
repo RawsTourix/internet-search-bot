@@ -24,6 +24,7 @@ from ..interaction.errors import (
     OutputBatchConflictError,
     OutputBatchNotFoundError,
 )
+from ..interaction.output_claim import IdempotentOutputClaimService
 from ..interaction.output_models import (
     ArtifactOutputPart,
     OutputBatchKind,
@@ -39,6 +40,10 @@ class OutputTransportAuthorityRequest(BaseModel):
     session_id: str
     client_type: str
     client_instance_id: str
+
+
+class OutputTransportClaimRequest(OutputTransportAuthorityRequest):
+    claim_request_id: str
 
 
 class OutputTransportReceiptRequest(OutputTransportAuthorityRequest):
@@ -61,6 +66,7 @@ def create_output_outbox_router(
 
     router = APIRouter()
     service = ReadyOutputOutboxService(facade.api.output_store)
+    claim_service = IdempotentOutputClaimService(facade.api.output_store)
 
     def require_transport_scope(api_key: str, client_type: str) -> None:
         normalized = client_type.strip().lower()
@@ -105,7 +111,7 @@ def create_output_outbox_router(
     @router.post("/internal/output-outbox/{output_batch_id}/claim")
     async def claim_ready_output_batch(
         output_batch_id: str,
-        body: OutputTransportAuthorityRequest,
+        body: OutputTransportClaimRequest,
         api_key: str = Depends(auth_dependency),
     ):
         require_transport_scope(api_key, body.client_type)
@@ -117,8 +123,9 @@ def create_output_outbox_router(
                 client_type=body.client_type,
                 client_instance_id=body.client_instance_id,
             )
-            claimed, attempt_id = await facade.api.output_store.claim_delivery(
-                output_batch_id
+            claimed, attempt_id = await claim_service.claim(
+                output_batch_id,
+                claim_request_id=body.claim_request_id,
             )
             plan = facade.api.output_renderer.plan(claimed)
             return {
