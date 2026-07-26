@@ -17,7 +17,10 @@ from src.interaction.output_models import (
     OutputDeliveryReceiptState,
     TextOutputPart,
 )
-from src.interaction.output_outbox import ReadyOutputOutboxService
+from src.interaction.output_outbox import (
+    ReadyOutputOutboxRef,
+    ReadyOutputOutboxService,
+)
 from src.interaction.output_store import (
     FileSystemOutputBatchStore,
     build_ready_output_batch,
@@ -105,7 +108,13 @@ class ReadyOutputOutboxServiceTests(unittest.IsolatedAsyncioTestCase):
             [item.output_batch_id for item in all_ready],
             [oldest.output_batch_id, second.output_batch_id],
         )
-        self.assertTrue(all(item.state == OutputBatchState.READY for item in all_ready))
+        self.assertTrue(
+            all(isinstance(item, ReadyOutputOutboxRef) for item in all_ready)
+        )
+        projection = all_ready[0].model_dump(mode="json")
+        self.assertNotIn("parts", projection)
+        self.assertNotIn("response_route", projection)
+        self.assertEqual(projection["client_instance_id"], "bot-1")
 
     async def _commit(self, *, cycle_id, snapshot, ready_at):
         batch = build_ready_output_batch(
@@ -186,7 +195,7 @@ class TelegramReadyOutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
         plan = CapabilityOutputRenderer().plan(claimed)
         bot = FakeTelegramBot()
         worker = _StubReadyOutboxWorker(
-            listed=batch,
+            listed=ReadyOutputOutboxRef.from_batch(batch),
             claimed=claimed,
             plan=plan,
             bot=bot,
@@ -209,7 +218,7 @@ class TelegramReadyOutboxWorkerTests(unittest.IsolatedAsyncioTestCase):
         plan = CapabilityOutputRenderer().plan(claimed)
         bot = FakeTelegramBot()
         worker = _StubReadyOutboxWorker(
-            listed=batch,
+            listed=ReadyOutputOutboxRef.from_batch(batch),
             claimed=claimed,
             plan=plan,
             bot=bot,
