@@ -25,6 +25,7 @@ from ..interaction.errors import (
     OutputBatchNotFoundError,
 )
 from ..interaction.output_claim import IdempotentOutputClaimService
+from ..interaction.output_evidence import validate_external_output_evidence
 from ..interaction.output_models import (
     ArtifactOutputPart,
     OutputBatchKind,
@@ -253,6 +254,7 @@ def create_output_outbox_router(
                 raise OutputBatchConflictError(
                     "Output receipt identity mismatch"
                 )
+            validate_external_output_evidence(batch, body.receipt)
             completed = await facade.api.output_completion.complete(
                 body.receipt
             )
