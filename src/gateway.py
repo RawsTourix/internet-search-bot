@@ -21,6 +21,7 @@ from .api.artifact_routes import create_artifact_router
 from .api.artifact_transport import ArtifactTransportFacade
 from .api.attachment_provider import StrictHttpAttachmentStreamProvider
 from .api.domain_errors import register_domain_exception_handlers
+from .api.output_outbox_routes import create_output_outbox_router
 from .core.message_processor import MessageProcessor
 from .core.models import ClientType, MessageType, UnifiedMessage, WebMessage
 
@@ -255,6 +256,12 @@ app.include_router(
         facade=artifact_transport,
         auth_dependency=api_key_auth,
         progress_callback_factory=make_input_batch_progress_callback,
+    )
+)
+app.include_router(
+    create_output_outbox_router(
+        facade=artifact_transport,
+        auth_dependency=api_key_auth,
     )
 )
 
