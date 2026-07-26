@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from .errors import OutputBatchConflictError
 from .ids import is_interaction_id
 from .output_models import OutputBatch, OutputBatchKind, OutputBatchState
 from .output_store import FileSystemOutputBatchStore
@@ -148,6 +149,10 @@ class ReadyOutputOutboxService:
         client_type: str,
         client_instance_id: str,
     ) -> None:
+        if batch.kind != OutputBatchKind.FINAL:
+            raise OutputBatchConflictError(
+                "Recovery outbox can claim only final OutputBatch records"
+            )
         if batch.session_id != session_id.strip():
             raise PermissionError("Output batch session authority mismatch")
         if batch.capability_snapshot.client_type != client_type.strip():
