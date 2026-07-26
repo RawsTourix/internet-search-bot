@@ -49,6 +49,7 @@ from src.interaction.config import (
 )
 from src.interaction.errors import (
     CapabilityValidationError,
+    InteractionValidationError,
     OutputBatchConflictError,
 )
 from src.interaction.ids import new_output_part_id
@@ -551,7 +552,7 @@ class AdvancedInteractionRuntimeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(batch.artifact_manifest.truncated)
         self.assertTrue(batch.legacy_derived)
 
-    async def test_semantic_artifact_subtype_binds_exact_selected_delivery(self):
+    async def test_semantic_artifact_subtype_rejects_mime_mismatch(self):
         storage_config = StorageConfigType(
             root_dir=str(self.root / "semantic-subtype")
         )
@@ -607,14 +608,11 @@ class AdvancedInteractionRuntimeTests(unittest.IsolatedAsyncioTestCase):
                 "caption": "preserved caption",
             }],
         )
-        batch = await assembler.assemble_final(
-            result=result,
-            input_batch=self._committed_batch(),
-        )
-        self.assertEqual(len(batch.parts), 1)
-        self.assertIsInstance(batch.parts[0], ImageOutputPart)
-        self.assertEqual(batch.parts[0].caption, "preserved caption")
-        self.assertEqual(batch.parts[0].filename, selected.filename)
+        with self.assertRaises(InteractionValidationError):
+            await assembler.assemble_final(
+                result=result,
+                input_batch=self._committed_batch(),
+            )
 
     def _text_batch(self, text: str):
         return build_ready_output_batch(
