@@ -47,7 +47,8 @@ from tests.telegram_fakes import FakeTelegramBot, FakeTelegramGateway
 
 class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
-        self.snapshot = build_default_capability_registry().resolve(
+        self.registry = build_default_capability_registry()
+        self.snapshot = self.registry.resolve(
             build_telegram_capability_declaration(),
             client_type="telegram",
             client_instance_id="bot-1",
@@ -55,7 +56,7 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.renderer = CapabilityOutputRenderer()
         self.executor = TelegramOutputPlanExecutor()
 
-    def _batch(self, parts, *, cycle_id="cycle-1"):
+    def _batch(self, parts, *, cycle_id="cycle-1", snapshot=None):
         return build_ready_output_batch(
             session_id="session-1",
             cycle_id=cycle_id,
@@ -66,12 +67,12 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
                 conversation_id="chat-1",
             ),
             locale="en",
-            capability_snapshot=self.snapshot,
+            capability_snapshot=snapshot or self.snapshot,
             parts=tuple(parts),
         )
 
-    async def _execute(self, parts, *, bot=None):
-        batch = self._batch(parts)
+    async def _execute(self, parts, *, bot=None, snapshot=None):
+        batch = self._batch(parts, snapshot=snapshot)
         return await self.executor.execute(
             batch=batch,
             plan=self.renderer.plan(batch),
@@ -118,6 +119,17 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(receipt.part_receipts[1].required)
 
     async def test_confirmed_second_chunk_failure_is_partial(self):
+        base = build_telegram_capability_declaration()
+        limited_snapshot = self.registry.resolve(
+            base.model_copy(update={
+                "limits": {
+                    **base.limits,
+                    "transport.telegram.output.text.max_chars": 5,
+                }
+            }),
+            client_type="telegram",
+            client_instance_id="bot-1",
+        )
         bot = FakeTelegramBot()
         bot.queue("send_message", None, BadRequest("second chunk rejected"))
         receipt = await self._execute(
@@ -126,10 +138,10 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
                     part_id=new_output_part_id(),
                     index=0,
                     text="abcdefghij",
-                    metadata={"transport_text_max_chars": 5},
                 )
             ],
             bot=bot,
+            snapshot=limited_snapshot,
         )
         part = receipt.part_receipts[0]
         self.assertEqual(
@@ -214,7 +226,9 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
                 cycle_id="cycle-reconcile",
             )
             batch, _ = await output_store.commit(batch)
-            _, attempt_id = await output_store.claim_delivery(batch.output_batch_id)
+            _, attempt_id = await output_store.claim_delivery(
+                batch.output_batch_id
+            )
             now = datetime.now(timezone.utc)
 
             unknown_receipt = OutputDeliveryReceipt(
@@ -259,7 +273,9 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
                 started_at=now,
                 completed_at=now,
             )
-            reconciled = await output_store.reconcile_unknown(delivered_receipt)
+            reconciled = await output_store.reconcile_unknown(
+                delivered_receipt
+            )
             self.assertEqual(reconciled.state, OutputBatchState.DELIVERED)
             self.assertEqual(
                 (await artifacts.delivery_store.get(selected.delivery_id)).state,
