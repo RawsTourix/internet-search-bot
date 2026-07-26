@@ -8,6 +8,7 @@ from typing import Any
 import httpx
 
 from ...interaction.ids import new_output_claim_request_id
+from ...interaction.output_outbox import ReadyOutputOutboxRef
 from .ready_outbox import TelegramReadyOutboxWorker
 
 
@@ -17,6 +18,12 @@ class InstanceScopedTelegramReadyOutboxWorker(TelegramReadyOutboxWorker):
     def __init__(self, **values: Any) -> None:
         super().__init__(**values)
         self._claim_request_ids: dict[str, str] = {}
+
+    async def _deliver_one(self, reference: ReadyOutputOutboxRef) -> None:
+        try:
+            await super()._deliver_one(reference)
+        finally:
+            self._claim_request_ids.pop(reference.output_batch_id, None)
 
     async def _request_json(
         self,
@@ -54,6 +61,7 @@ class InstanceScopedTelegramReadyOutboxWorker(TelegramReadyOutboxWorker):
                     last_error = error
                 if attempt < 2:
                     await asyncio.sleep(2 ** attempt)
+            self._claim_request_ids.pop(output_batch_id, None)
             assert last_error is not None
             raise last_error
 
