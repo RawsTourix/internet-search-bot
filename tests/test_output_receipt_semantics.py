@@ -136,7 +136,10 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
             part.state,
             OutputPartReceiptState.PARTIALLY_DELIVERED,
         )
-        self.assertEqual(receipt.state, OutputDeliveryReceiptState.PARTIALLY_DELIVERED)
+        self.assertEqual(
+            receipt.state,
+            OutputDeliveryReceiptState.PARTIALLY_DELIVERED,
+        )
         self.assertEqual(len(part.client_message_ids), 1)
         self.assertIsNotNone(part.delivered_at)
 
@@ -267,6 +270,13 @@ class OutputReceiptSemanticsTests(unittest.IsolatedAsyncioTestCase):
                     output_store.attempts
                     / f"{attempt_id}.reconciled.json"
                 ).exists()
+            )
+
+            replayed = await output_store.reconcile_unknown(delivered_receipt)
+            self.assertEqual(replayed.state, OutputBatchState.DELIVERED)
+            self.assertEqual(
+                (await artifacts.delivery_store.get(selected.delivery_id)).state,
+                ArtifactDeliveryState.DELIVERED,
             )
 
 
