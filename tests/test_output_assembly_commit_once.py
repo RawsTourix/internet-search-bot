@@ -1,0 +1,205 @@
+import tempfile
+import unittest
+from datetime import datetime, timezone
+from pathlib import Path
+
+from src.artifacts import (
+    ArtifactAccessContext,
+    ArtifactConfigType,
+    ArtifactProvenance,
+    ArtifactPurpose,
+    create_artifact_services,
+)
+from src.core.models import AgentResult, AgentStatus, ClientType
+from src.ingress.models import (
+    ClientResponseRoute,
+    CommittedInputBatch,
+    new_ingress_event_id,
+    new_input_batch_id,
+)
+from src.interaction.capabilities import (
+    build_default_capability_registry,
+    build_telegram_capability_declaration,
+)
+from src.interaction.config import OutputRuntimeConfig
+from src.interaction.errors import InteractionValidationError
+from src.interaction.output_completion import OutputDeliveryCompletionService
+from src.interaction.output_models import (
+    ArtifactOutputPart,
+    OutputBatchState,
+    OutputDeliveryReceipt,
+    OutputDeliveryReceiptState,
+    OutputPartReceipt,
+    OutputPartReceiptState,
+)
+from src.interaction.output_service import OutputBatchAssembler
+from src.interaction.output_store import FileSystemOutputBatchStore
+from src.storage import create_storage_services
+from src.storage.config import StorageConfigType
+
+
+UTC = timezone.utc
+
+
+class OutputAssemblyCommitOnceTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_output_is_reused_after_delivery_state_changes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = StorageConfigType(root_dir=temporary)
+            storage = create_storage_services(config)
+            artifacts = create_artifact_services(
+                storage_config=config,
+                artifact_config=ArtifactConfigType(),
+                content_store=storage.content_store,
+            )
+            artifact = await artifacts.artifact_service.create_text(
+                session_id="session-1",
+                cycle_id="cycle-1",
+                filename="result.md",
+                text="result",
+                format_id="markdown",
+                purpose=ArtifactPurpose.DELIVERABLE,
+                provenance=ArtifactProvenance(
+                    origin="agent_created",
+                    creator="agent",
+                    operation="commit_once_test",
+                ),
+            )
+            selected = await artifacts.delivery_service.select(
+                artifact_id=artifact.artifact_id,
+                access=ArtifactAccessContext(
+                    session_id="session-1",
+                    cycle_id="cycle-1",
+                    allowed_artifact_ids=[artifact.artifact_id],
+                ),
+                client_type="telegram",
+            )
+            output_store = FileSystemOutputBatchStore(Path(temporary))
+            completion = OutputDeliveryCompletionService(
+                output_store=output_store,
+                artifact_delivery_store=artifacts.delivery_store,
+            )
+            assembler = OutputBatchAssembler(
+                config=OutputRuntimeConfig(),
+                delivery_store=artifacts.delivery_store,
+                output_store=output_store,
+            )
+            input_batch = self._input_batch()
+            result = AgentResult(
+                content="Final text",
+                status=AgentStatus.DONE,
+                session_id="session-1",
+                cycle_id="cycle-1",
+            )
+            batch = await assembler.assemble_final(
+                result=result,
+                input_batch=input_batch,
+            )
+            artifact_part = next(
+                part for part in batch.parts if isinstance(part, ArtifactOutputPart)
+            )
+            await artifacts.delivery_service.claim(selected.delivery_id)
+            _, attempt_id = await output_store.claim_delivery(batch.output_batch_id)
+            now = datetime.now(UTC)
+            receipts = []
+            for part in batch.parts:
+                receipts.append(OutputPartReceipt(
+                    part_id=part.part_id,
+                    index=part.index,
+                    required=part.required,
+                    state=OutputPartReceiptState.DELIVERED,
+                    delivery_id=getattr(part, "delivery_id", None),
+                    client_message_ids=(f"message-{part.index}",),
+                    delivered_at=now,
+                ))
+            completed = await completion.complete(OutputDeliveryReceipt(
+                output_batch_id=batch.output_batch_id,
+                attempt_id=attempt_id,
+                state=OutputDeliveryReceiptState.DELIVERED,
+                part_receipts=tuple(receipts),
+                started_at=now,
+                completed_at=now,
+            ))
+            self.assertEqual(completed.state, OutputBatchState.DELIVERED)
+
+            replay = await assembler.assemble_final(
+                result=AgentResult(
+                    content="Final text",
+                    status=AgentStatus.DONE,
+                    session_id="session-1",
+                    cycle_id="cycle-1",
+                ),
+                input_batch=input_batch,
+            )
+            self.assertEqual(replay.output_batch_id, batch.output_batch_id)
+            self.assertEqual(replay.state, OutputBatchState.DELIVERED)
+            self.assertEqual(
+                next(
+                    part.delivery_id
+                    for part in replay.parts
+                    if isinstance(part, ArtifactOutputPart)
+                ),
+                artifact_part.delivery_id,
+            )
+
+    async def test_empty_uncommitted_final_result_is_rejected(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            config = StorageConfigType(root_dir=temporary)
+            storage = create_storage_services(config)
+            artifacts = create_artifact_services(
+                storage_config=config,
+                artifact_config=ArtifactConfigType(),
+                content_store=storage.content_store,
+            )
+            assembler = OutputBatchAssembler(
+                config=OutputRuntimeConfig(),
+                delivery_store=artifacts.delivery_store,
+                output_store=FileSystemOutputBatchStore(Path(temporary)),
+            )
+            with self.assertRaises(InteractionValidationError):
+                await assembler.assemble_final(
+                    result=AgentResult(
+                        content="",
+                        status=AgentStatus.DONE,
+                        session_id="session-empty",
+                        cycle_id="cycle-empty",
+                    ),
+                    input_batch=self._input_batch(
+                        session_id="session-empty",
+                        event_suffix="e",
+                    ),
+                )
+
+    @staticmethod
+    def _input_batch(
+        *,
+        session_id="session-1",
+        event_suffix="a",
+    ):
+        registry = build_default_capability_registry()
+        snapshot = registry.resolve(
+            build_telegram_capability_declaration(),
+            client_type="telegram",
+            client_instance_id="bot-1",
+        )
+        now = datetime.now(UTC)
+        return CommittedInputBatch(
+            input_batch_id=new_input_batch_id(),
+            session_id=session_id,
+            client_type=ClientType.TELEGRAM,
+            sequence_number=1,
+            source_event_ids=[new_ingress_event_id()],
+            admission_mode="auto",
+            response_route=ClientResponseRoute(
+                route_type="telegram",
+                conversation_id="chat-1",
+            ),
+            locale="ru",
+            capability_snapshot=snapshot,
+            committed_at=now,
+            commit_reason=f"test-{event_suffix}",
+            content_fingerprint="sha256:" + (event_suffix * 64),
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
