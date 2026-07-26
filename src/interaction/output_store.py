@@ -52,6 +52,25 @@ def _fingerprint(value: Any) -> str:
     return "sha256:" + hashlib.sha256(_canonical(value)).hexdigest()
 
 
+def _semantic_fingerprint_payload(stable: dict[str, Any]) -> dict[str, Any]:
+    payload = dict(stable)
+    for generated in (
+        "output_batch_id",
+        "created_at",
+        "ready_at",
+    ):
+        payload.pop(generated, None)
+    payload["parts"] = [
+        {
+            key: value
+            for key, value in part.items()
+            if key != "part_id"
+        }
+        for part in payload.get("parts", [])
+    ]
+    return payload
+
+
 class FileSystemOutputBatchStore:
     """Commit-once manifests and explicit delivery state transitions."""
 
@@ -127,22 +146,8 @@ class FileSystemOutputBatchStore:
             stable = batch.model_dump(mode="json", exclude={"state", "completed_at"})
             identity = self._identity(batch.session_id, batch.cycle_id, batch.kind)
             index_path = self.cycle_index / f"{identity}.json"
-            fingerprint_payload = dict(stable)
-            for generated in (
-                "output_batch_id",
-                "created_at",
-                "ready_at",
-            ):
-                fingerprint_payload.pop(generated, None)
-            fingerprint_payload["parts"] = [
-                {
-                    key: value
-                    for key, value in part.items()
-                    if key != "part_id"
-                }
-                for part in fingerprint_payload.get("parts", [])
-            ]
-            fingerprint = _fingerprint(fingerprint_payload)
+            fingerprint = _fingerprint(_semantic_fingerprint_payload(stable))
+            manifest_hash = _fingerprint(stable)
             if index_path.exists():
                 pointer = self._read(index_path)
                 existing = self._load_sync(pointer["output_batch_id"])
@@ -173,6 +178,7 @@ class FileSystemOutputBatchStore:
                 {
                     "output_batch_id": batch.output_batch_id,
                     "fingerprint": fingerprint,
+                    "manifest_hash": manifest_hash,
                 },
             )
             logger.info(
@@ -445,7 +451,6 @@ class FileSystemOutputBatchStore:
             if not path.is_dir() or path.is_symlink():
                 continue
             item = self._load_sync(path.name)
-            # DELIVERING is reconciled, never blindly re-sent.
             if item.state in {OutputBatchState.READY, OutputBatchState.DELIVERING}:
                 result.append(item)
         return result
@@ -481,9 +486,26 @@ class FileSystemOutputBatchStore:
         payload["state"] = state["state"]
         payload["completed_at"] = state.get("completed_at")
         try:
-            return OutputBatch.model_validate(payload)
+            batch = OutputBatch.model_validate(payload)
         except Exception as error:
             raise InteractionIntegrityError("invalid stored OutputBatch") from error
+
+        identity = self._identity(batch.session_id, batch.cycle_id, batch.kind)
+        index_path = self.cycle_index / f"{identity}.json"
+        if not index_path.exists():
+            raise InteractionIntegrityError("OutputBatch identity index is missing")
+        pointer = self._read(index_path)
+        if pointer.get("output_batch_id") != output_batch_id:
+            raise InteractionIntegrityError("OutputBatch identity index mismatch")
+        expected_semantic = _fingerprint(
+            _semantic_fingerprint_payload(manifest)
+        )
+        if pointer.get("fingerprint") != expected_semantic:
+            raise InteractionIntegrityError("OutputBatch semantic fingerprint mismatch")
+        manifest_hash = pointer.get("manifest_hash")
+        if manifest_hash is not None and manifest_hash != _fingerprint(manifest):
+            raise InteractionIntegrityError("OutputBatch exact manifest hash mismatch")
+        return batch
 
     @staticmethod
     def _read(path: Path) -> dict[str, Any]:
