@@ -43,6 +43,12 @@ class OutputPartReceiptState(str, Enum):
     SKIPPED = "skipped"
 
 
+class ArtifactContentReceiptState(str, Enum):
+    DELIVERED = "delivered"
+    NOT_DELIVERED = "not_delivered"
+    UNKNOWN = "unknown"
+
+
 class OutputDeliveryReceiptState(str, Enum):
     DELIVERED = "delivered"
     PARTIALLY_DELIVERED = "partially_delivered"
@@ -349,6 +355,7 @@ class OutputPartReceipt(_OutputModel):
     state: OutputPartReceiptState
     required: bool = True
     delivery_id: str | None = None
+    artifact_content_state: ArtifactContentReceiptState | None = None
     client_message_ids: tuple[str, ...] = ()
     error_category: str | None = None
     delivered_at: datetime | None = None
@@ -373,6 +380,10 @@ class OutputPartReceipt(_OutputModel):
 
     @model_validator(mode="after")
     def validate_outcome(self) -> "OutputPartReceipt":
+        if self.delivery_id is None and self.artifact_content_state is not None:
+            raise ValueError(
+                "non-artifact receipt cannot declare artifact content state"
+            )
         confirmed_delivery = self.state in {
             OutputPartReceiptState.DELIVERED,
             OutputPartReceiptState.PARTIALLY_DELIVERED,
@@ -385,9 +396,7 @@ class OutputPartReceipt(_OutputModel):
                     "delivered part requires exact client message IDs"
                 )
         elif self.delivered_at is not None:
-            raise ValueError(
-                "non-delivered part cannot have delivered_at"
-            )
+            raise ValueError("non-delivered part cannot have delivered_at")
         if (
             self.state
             in {
