@@ -91,7 +91,10 @@ class FileSystemOutputBatchStore:
         handler: Callable[[OutputDeliveryReceipt], Awaitable[OutputBatch]],
     ) -> None:
         """Bind the application-level aggregate reconciler once at composition."""
-        if self._reconciliation_handler not in {None, handler}:
+        if (
+            self._reconciliation_handler is not None
+            and self._reconciliation_handler != handler
+        ):
             raise OutputBatchConflictError(
                 "output reconciliation handler is already bound"
             )
@@ -220,6 +223,20 @@ class FileSystemOutputBatchStore:
             receipt,
         )
 
+    @staticmethod
+    def _receipt_projection(receipt: OutputDeliveryReceipt) -> list[tuple[str, int, bool]]:
+        return [
+            (item.part_id, item.index, item.required)
+            for item in receipt.part_receipts
+        ]
+
+    @staticmethod
+    def _batch_projection(batch: OutputBatch) -> list[tuple[str, int, bool]]:
+        return [
+            (item.part_id, item.index, item.required)
+            for item in batch.parts
+        ]
+
     def _complete_sync(self, receipt: OutputDeliveryReceipt) -> OutputBatch:
         mapped = {
             OutputDeliveryReceiptState.DELIVERED: OutputBatchState.DELIVERED,
@@ -230,13 +247,7 @@ class FileSystemOutputBatchStore:
         }[receipt.state]
         with self._lock:
             current = self._load_sync(receipt.output_batch_id)
-            expected_parts = [
-                (item.part_id, item.index) for item in current.parts
-            ]
-            received_parts = [
-                (item.part_id, item.index) for item in receipt.part_receipts
-            ]
-            if received_parts != expected_parts:
+            if self._receipt_projection(receipt) != self._batch_projection(current):
                 raise OutputBatchConflictError(
                     "delivery receipt does not match committed output parts"
                 )
@@ -301,20 +312,28 @@ class FileSystemOutputBatchStore:
         }[receipt.state]
         with self._lock:
             current = self._load_sync(receipt.output_batch_id)
-            if current.state != OutputBatchState.UNKNOWN:
-                raise OutputBatchConflictError(
-                    "only an unknown OutputBatch can be reconciled"
-                )
-            expected_parts = [
-                (item.part_id, item.index) for item in current.parts
-            ]
-            received_parts = [
-                (item.part_id, item.index)
-                for item in receipt.part_receipts
-            ]
-            if received_parts != expected_parts:
+            if self._receipt_projection(receipt) != self._batch_projection(current):
                 raise OutputBatchConflictError(
                     "reconciliation receipt does not match output parts"
+                )
+            reconciled_path = (
+                self.attempts / f"{receipt.attempt_id}.reconciled.json"
+            )
+            if current.state != OutputBatchState.UNKNOWN:
+                if (
+                    current.state == mapped
+                    and reconciled_path.exists()
+                ):
+                    existing = OutputDeliveryReceipt.model_validate(
+                        self._read(reconciled_path)
+                    )
+                    if existing != receipt:
+                        raise OutputBatchConflictError(
+                            "reconciliation receipt replay conflicts"
+                        )
+                    return current
+                raise OutputBatchConflictError(
+                    "only an unknown OutputBatch can be reconciled"
                 )
             state_path = (
                 self.records / receipt.output_batch_id / "state.json"
@@ -325,8 +344,7 @@ class FileSystemOutputBatchStore:
                     "reconciliation attempt does not match terminal claim"
                 )
             self._write(
-                self.attempts
-                / f"{receipt.attempt_id}.reconciled.json",
+                reconciled_path,
                 receipt.model_dump(mode="json"),
             )
             state.update(
