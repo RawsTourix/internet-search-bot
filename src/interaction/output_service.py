@@ -8,7 +8,7 @@ from typing import Any
 
 from pydantic import TypeAdapter, ValidationError
 
-from ..artifacts.delivery import FileSystemArtifactDeliveryStore
+from ..artifacts.delivery import ArtifactDeliveryRecord, FileSystemArtifactDeliveryStore
 from ..artifacts.models import ArtifactDeliveryState
 from ..core.models import AgentResult
 from ..ingress.models import CommittedInputBatch
@@ -17,11 +17,18 @@ from .config import OutputRuntimeConfig
 from .errors import InteractionValidationError
 from .ids import new_output_part_id
 from .output_models import (
+    AnimationOutputPart,
     ArtifactOutputPart,
+    AudioOutputPart,
+    ImageOutputPart,
     OutputBatch,
     OutputBatchKind,
     OutputPart,
+    StickerOutputPart,
     TextOutputPart,
+    VideoNoteOutputPart,
+    VideoOutputPart,
+    VoiceOutputPart,
 )
 from ..localization.models import LocalizationMessage
 from .output_store import FileSystemOutputBatchStore, build_ready_output_batch
@@ -123,6 +130,7 @@ class OutputBatchAssembler:
                 raise InteractionValidationError(
                     "semantic output contains duplicate artifact delivery intent"
                 )
+            self._validate_semantic_artifact_compatibility(item, record)
             semantic_artifacts[item.delivery_id] = item
 
         # Non-artifact semantic output follows the final text in declared order.
@@ -236,6 +244,35 @@ class OutputBatchAssembler:
         )
         result.output_batch = committed.model_dump(mode="json")
         return committed
+
+    @staticmethod
+    def _validate_semantic_artifact_compatibility(
+        intent: ArtifactOutputPart,
+        record: ArtifactDeliveryRecord,
+    ) -> None:
+        mime_type = record.mime_type.split(";", maxsplit=1)[0].strip().lower()
+        compatible = True
+        if isinstance(intent, ImageOutputPart):
+            compatible = mime_type.startswith("image/")
+        elif isinstance(intent, (AudioOutputPart, VoiceOutputPart)):
+            compatible = mime_type.startswith("audio/")
+        elif isinstance(intent, (VideoOutputPart, VideoNoteOutputPart)):
+            compatible = mime_type.startswith("video/")
+        elif isinstance(intent, AnimationOutputPart):
+            compatible = (
+                mime_type == "image/gif"
+                or mime_type.startswith("video/")
+            )
+        elif isinstance(intent, StickerOutputPart):
+            compatible = mime_type in {
+                "image/webp",
+                "application/x-tgsticker",
+                "video/webm",
+            }
+        if not compatible:
+            raise InteractionValidationError(
+                "semantic artifact subtype is incompatible with authoritative MIME"
+            )
 
     @staticmethod
     def _parse_semantic_parts(values: list[dict[str, Any]]) -> list[OutputPart]:
