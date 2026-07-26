@@ -123,7 +123,13 @@ class OutputDeliveryCompletionService:
                     raise OutputBatchConflictError(
                         "output state timestamp must be timezone-aware"
                     )
-                if updated_at.astimezone(timezone.utc) > deadline:
+                output_is_stale = (
+                    updated_at.astimezone(timezone.utc) <= deadline
+                )
+                artifact_was_recovered = self._has_startup_recovered_artifact(
+                    batch
+                )
+                if not output_is_stale and not artifact_was_recovered:
                     continue
                 attempt_id = str(state.get("attempt_id") or "")
                 receipt = self._build_stale_receipt(
@@ -134,6 +140,19 @@ class OutputDeliveryCompletionService:
                 )
                 recovered.append(self._apply_sync(receipt, False))
         return recovered
+
+    def _has_startup_recovered_artifact(self, batch: OutputBatch) -> bool:
+        """Bridge independently configured artifact/output recovery timeouts."""
+        for part in batch.parts:
+            if not isinstance(part, ArtifactOutputPart):
+                continue
+            record = self.artifact_delivery_store._load_sync(part.delivery_id)
+            if (
+                record.state == ArtifactDeliveryState.UNKNOWN
+                and record.receipt.get("recovery") == "startup_stale_claim"
+            ):
+                return True
+        return False
 
     def _build_stale_receipt(
         self,
@@ -158,14 +177,7 @@ class OutputDeliveryCompletionService:
                 continue
 
             record = self.artifact_delivery_store._load_sync(part.delivery_id)
-            if (
-                record.session_id != batch.session_id
-                or record.cycle_id != batch.cycle_id
-                or record.artifact_id != part.artifact_id
-            ):
-                raise OutputBatchConflictError(
-                    "artifact delivery is outside OutputBatch authority"
-                )
+            self._validate_artifact_authority(batch, part, record)
             if record.state == ArtifactDeliveryState.SELECTED:
                 part_state = OutputPartReceiptState.FAILED
                 error_category = "transport_not_started_before_recovery"
@@ -275,14 +287,7 @@ class OutputDeliveryCompletionService:
                 record = self.artifact_delivery_store._load_sync(
                     part.delivery_id
                 )
-                if (
-                    record.session_id != batch.session_id
-                    or record.cycle_id != batch.cycle_id
-                    or record.artifact_id != part.artifact_id
-                ):
-                    raise OutputBatchConflictError(
-                        "artifact delivery is outside OutputBatch authority"
-                    )
+                self._validate_artifact_authority(batch, part, record)
                 target, allowed = self._artifact_transition(
                     part_receipt.state,
                     reconciling=reconciling,
@@ -350,6 +355,18 @@ class OutputDeliveryCompletionService:
             except BaseException:
                 self._restore(backups)
                 raise
+
+    @staticmethod
+    def _validate_artifact_authority(batch, part, record) -> None:
+        if (
+            record.session_id != batch.session_id
+            or record.cycle_id != batch.cycle_id
+            or record.artifact_id != part.artifact_id
+            or record.client_type != batch.capability_snapshot.client_type
+        ):
+            raise OutputBatchConflictError(
+                "artifact delivery is outside OutputBatch authority"
+            )
 
     @staticmethod
     def _artifact_transition(
