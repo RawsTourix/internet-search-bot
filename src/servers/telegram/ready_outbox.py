@@ -19,6 +19,7 @@ from ...interaction.output_models import (
     OutputPartReceipt,
     OutputPartReceiptState,
 )
+from ...interaction.output_outbox import ReadyOutputOutboxRef
 from .output_plan_executor import (
     TelegramExecutionContext,
     TelegramOutputPlanExecutor,
@@ -49,16 +50,24 @@ class TelegramReadyOutboxWorker:
         poll_seconds: float = 15.0,
         minimum_age_seconds: float = 30.0,
         batch_limit: int = 50,
+        http_transport: httpx.AsyncBaseTransport | None = None,
     ) -> None:
-        self.gateway_url = gateway_url.rstrip("/")
-        self.api_key = api_key
+        self.gateway_url = str(gateway_url or "").rstrip("/")
+        self.api_key = str(api_key or "")
         self.client_instance_id = client_instance_id.strip()
         self.bot = bot
         self.gateway = gateway
         self.executor = executor
+        if isinstance(poll_seconds, bool):
+            raise TypeError("ready outbox poll interval must be numeric")
+        if isinstance(minimum_age_seconds, bool):
+            raise TypeError("ready outbox minimum age must be numeric")
+        if isinstance(batch_limit, bool):
+            raise TypeError("ready outbox batch limit must be an integer")
         self.poll_seconds = float(poll_seconds)
         self.minimum_age_seconds = float(minimum_age_seconds)
         self.batch_limit = int(batch_limit)
+        self.http_transport = http_transport
         if not self.gateway_url:
             raise ValueError("ready outbox gateway URL must not be empty")
         if not self.api_key:
@@ -129,14 +138,14 @@ class TelegramReadyOutboxWorker:
                 "minimum_age_seconds": self.minimum_age_seconds,
             },
         )
-        raw_batches = payload.get("output_batches", [])
-        if not isinstance(raw_batches, list):
+        raw_refs = payload.get("output_batches", [])
+        if not isinstance(raw_refs, list):
             raise RuntimeError("Gateway ready outbox response is invalid")
 
         completed = 0
-        for raw_batch in raw_batches:
+        for raw_ref in raw_refs:
             try:
-                listed = OutputBatch.model_validate(raw_batch)
+                listed = ReadyOutputOutboxRef.model_validate(raw_ref)
                 if await self._deliver_one(listed):
                     completed += 1
             except asyncio.CancelledError:
@@ -145,26 +154,26 @@ class TelegramReadyOutboxWorker:
                 if error.response.status_code == 409:
                     logger.info(
                         "telegram_ready_outbox_claim_lost output_batch_id=%s",
-                        self._batch_id(raw_batch),
+                        self._batch_id(raw_ref),
                     )
                     continue
                 logger.warning(
                     "telegram_ready_outbox_batch_http_failed output_batch_id=%s "
                     "status_code=%s",
-                    self._batch_id(raw_batch),
+                    self._batch_id(raw_ref),
                     error.response.status_code,
                 )
             except Exception as error:
                 logger.exception(
                     "telegram_ready_outbox_batch_failed output_batch_id=%s "
                     "error_type=%s",
-                    self._batch_id(raw_batch),
+                    self._batch_id(raw_ref),
                     type(error).__name__,
                 )
         self.completed_count += completed
         return completed
 
-    async def _deliver_one(self, listed: OutputBatch) -> bool:
+    async def _deliver_one(self, listed: ReadyOutputOutboxRef) -> bool:
         self._validate_listed_authority(listed)
         authority = {
             "session_id": listed.session_id,
@@ -280,6 +289,7 @@ class TelegramReadyOutboxWorker:
         async with httpx.AsyncClient(
             timeout=timeout,
             headers={"X-API-Key": self.api_key},
+            transport=self.http_transport,
         ) as client:
             response = await client.request(
                 method,
@@ -293,16 +303,15 @@ class TelegramReadyOutboxWorker:
             raise RuntimeError("Gateway outbox response must be an object")
         return payload
 
-    def _validate_listed_authority(self, batch: OutputBatch) -> None:
-        snapshot = batch.capability_snapshot
-        if snapshot.client_type != "telegram":
+    def _validate_listed_authority(self, listed: ReadyOutputOutboxRef) -> None:
+        if listed.client_type != "telegram":
             raise ValueError("ready outbox returned another client type")
-        if snapshot.client_instance_id != self.client_instance_id:
+        if listed.client_instance_id != self.client_instance_id:
             raise ValueError("ready outbox returned another client instance")
 
     @staticmethod
     def _validate_claim(
-        listed: OutputBatch,
+        listed: ReadyOutputOutboxRef,
         claimed: OutputBatch,
         plan: OutputDeliveryPlan,
         attempt_id: str,
@@ -311,6 +320,16 @@ class TelegramReadyOutboxWorker:
             raise ValueError("ready outbox claim changed output identity")
         if listed.session_id != claimed.session_id:
             raise ValueError("ready outbox claim changed session authority")
+        if listed.cycle_id != claimed.cycle_id:
+            raise ValueError("ready outbox claim changed cycle authority")
+        if listed.kind != claimed.kind:
+            raise ValueError("ready outbox claim changed output kind")
+        if (
+            listed.client_type != claimed.capability_snapshot.client_type
+            or listed.client_instance_id
+            != claimed.capability_snapshot.client_instance_id
+        ):
+            raise ValueError("ready outbox claim changed transport authority")
         if plan.output_batch_id != claimed.output_batch_id:
             raise ValueError("ready outbox plan belongs to another batch")
         if not attempt_id:
@@ -368,7 +387,7 @@ class TelegramReadyOutboxWorker:
             raise ValueError(f"{field_name} must be an integer ID") from error
 
     @staticmethod
-    def _batch_id(raw_batch: Any) -> str:
-        if isinstance(raw_batch, dict):
-            return str(raw_batch.get("output_batch_id") or "unknown")
+    def _batch_id(raw_ref: Any) -> str:
+        if isinstance(raw_ref, dict):
+            return str(raw_ref.get("output_batch_id") or "unknown")
         return "unknown"
