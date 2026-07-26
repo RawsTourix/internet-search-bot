@@ -96,6 +96,11 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
                     None,
                 )
                 if existing_exact is not None:
+                    if existing_exact.state in blocking:
+                        raise ArtifactDeliveryError(
+                            "Cannot select an exact artifact with an active or "
+                            "unknown delivery outcome"
+                        )
                     selected_by_artifact[item.artifact_id] = existing_exact
                     continue
 
