@@ -51,22 +51,27 @@ if not logger.handlers:
 API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
 
 
-def get_api_keys() -> list[str]:
-    keys: list[str] = []
-    for environment_name in (
-        "TELEGRAM_API_KEY",
-        "WEB_API_KEY",
-        "INTERNAL_API_KEY",
+def get_api_key_scopes() -> dict[str, frozenset[str]]:
+    """Bind every configured internal credential to its transport authority."""
+    mutable: dict[str, set[str]] = {}
+    for environment_name, scope in (
+        ("TELEGRAM_API_KEY", "telegram"),
+        ("WEB_API_KEY", "web"),
+        ("INTERNAL_API_KEY", "*"),
     ):
         value = os.getenv(environment_name, "").strip()
-        if value and value not in keys:
-            keys.append(value)
-    if not keys:
+        if value:
+            mutable.setdefault(value, set()).add(scope)
+    if not mutable:
         raise RuntimeError("Отсутствуют API-ключи в переменных среды")
-    return keys
+    return {
+        key: frozenset(sorted(scopes))
+        for key, scopes in mutable.items()
+    }
 
 
-VALID_API_KEYS = get_api_keys()
+API_KEY_SCOPES = get_api_key_scopes()
+VALID_API_KEYS = frozenset(API_KEY_SCOPES)
 PROGRESS_CALLBACK_ALLOWED_PREFIXES = [
     value.strip()
     for value in os.getenv(
@@ -262,6 +267,7 @@ app.include_router(
     create_output_outbox_router(
         facade=artifact_transport,
         auth_dependency=api_key_auth,
+        api_key_scopes=API_KEY_SCOPES,
     )
 )
 
