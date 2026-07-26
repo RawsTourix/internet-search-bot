@@ -31,8 +31,9 @@ class OutputTransportReceiptRequest(OutputTransportAuthorityRequest):
 def create_output_outbox_router(*, facade, auth_dependency) -> APIRouter:
     """Create the internal process-local outbox worker API.
 
-    Only READY final batches are listed. DELIVERING and UNKNOWN batches are
-    deliberately excluded because their transport outcome may be ambiguous.
+    Only sufficiently old READY final batches are listed. DELIVERING and
+    UNKNOWN batches are deliberately excluded because their transport outcome
+    may be ambiguous.
     """
 
     router = APIRouter()
@@ -46,6 +47,11 @@ def create_output_outbox_router(*, facade, auth_dependency) -> APIRouter:
         client_type: str,
         client_instance_id: str,
         limit: int = Query(default=50, ge=1, le=service.MAX_LIMIT),
+        minimum_age_seconds: float = Query(
+            default=30.0,
+            ge=0,
+            le=service.MAX_MINIMUM_AGE_SECONDS,
+        ),
     ):
         try:
             batches = await service.list_ready(
@@ -53,6 +59,7 @@ def create_output_outbox_router(*, facade, auth_dependency) -> APIRouter:
                 client_instance_id=client_instance_id,
                 kind=OutputBatchKind.FINAL,
                 limit=limit,
+                minimum_age_seconds=minimum_age_seconds,
             )
             return {
                 "output_batches": [
