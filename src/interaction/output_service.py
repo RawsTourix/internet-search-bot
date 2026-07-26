@@ -225,13 +225,29 @@ class OutputBatchAssembler:
             if isinstance(item, TextOutputPart)
         ) > self.config.max_text_chars:
             raise InteractionValidationError("output text exceeds policy")
-        metadata_size = len(json.dumps(
-            [item.metadata for item in parts],
-            ensure_ascii=False,
-            separators=(",", ":"),
-        ).encode("utf-8"))
-        if metadata_size > self.config.max_metadata_bytes:
-            raise InteractionValidationError("output metadata exceeds policy")
+
+        # max_metadata_bytes is the budget for the complete non-primary-text
+        # semantic manifest, not only for each part's open-ended metadata dict.
+        # Captions, titles, vCards, localization params and future typed fields
+        # therefore cannot bypass the bounded-output policy.
+        manifest_projection: list[dict[str, Any]] = []
+        for item in parts:
+            payload = item.model_dump(mode="json")
+            if isinstance(item, TextOutputPart):
+                payload.pop("text", None)
+            manifest_projection.append(payload)
+        semantic_manifest_size = len(
+            json.dumps(
+                manifest_projection,
+                ensure_ascii=False,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+        )
+        if semantic_manifest_size > self.config.max_metadata_bytes:
+            raise InteractionValidationError(
+                "output semantic manifest exceeds metadata policy"
+            )
 
         batch = build_ready_output_batch(
             session_id=input_batch.session_id,
