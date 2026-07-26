@@ -13,10 +13,11 @@ _PREFIXES = {
     "output_batch": "obat",
     "output_part": "opart",
     "output_attempt": "odat",
+    "output_claim_request": "oclm",
     "delivery_group": "odgrp",
 }
 _ID_RE = re.compile(
-    r"^(?:cbs|anch|iprs|obat|opart|odat|odgrp)_[0-9a-f]{32}$"
+    r"^(?:cbs|anch|iprs|obat|opart|odat|oclm|odgrp)_[0-9a-f]{32}$"
 )
 
 
@@ -61,6 +62,10 @@ def new_output_part_id() -> str:
 
 def new_output_attempt_id() -> str:
     return new_interaction_id("output_attempt")
+
+
+def new_output_claim_request_id() -> str:
+    return new_interaction_id("output_claim_request")
 
 
 def new_delivery_group_id() -> str:
