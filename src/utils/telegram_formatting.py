@@ -1,6 +1,7 @@
-import re
 import html
+import re
 from typing import List
+
 
 def markdown_to_plain_text(text: str) -> str:
     text = re.sub(r"```[a-zA-Z0-9_+-]*\n(.*?)```", r"\1", text, flags=re.DOTALL)
@@ -12,54 +13,91 @@ def markdown_to_plain_text(text: str) -> str:
     text = re.sub(r"^#{1,6}\s+", "", text, flags=re.MULTILINE)
     return html.unescape(text).strip()
 
+
+def _split_plain_block(block: str, limit: int) -> list[str]:
+    """Split one block at stable boundaries while enforcing a hard limit."""
+    result: list[str] = []
+    remaining = block
+    while len(remaining) > limit:
+        newline = remaining.rfind("\n", 0, limit + 1)
+        space = remaining.rfind(" ", 0, limit + 1)
+        boundary = max(newline, space)
+        if boundary <= 0:
+            boundary = limit
+        piece = remaining[:boundary].rstrip()
+        if not piece:
+            piece = remaining[:limit]
+            boundary = limit
+        result.append(piece)
+        remaining = remaining[boundary:].lstrip(" \n")
+    if remaining:
+        result.append(remaining)
+    return result
+
+
+def _split_markdown_block(block: str, limit: int) -> list[str]:
+    """Split a paragraph/code block without emitting oversized chunks."""
+    lines = block.split("\n")
+    if (
+        len(lines) >= 2
+        and lines[0].startswith("```")
+        and lines[-1].strip() == "```"
+    ):
+        opening = lines[0]
+        body = "\n".join(lines[1:-1])
+        overhead = len(opening) + len("```") + 2
+        body_limit = limit - overhead
+        if body_limit > 0:
+            pieces = _split_plain_block(body, body_limit) or [""]
+            return [f"{opening}\n{piece}\n```" for piece in pieces]
+    return _split_plain_block(block, limit)
+
+
 def split_markdown_for_telegram(text: str, limit: int = 3000) -> list[str]:
+    """Split Markdown into non-empty chunks whose raw length never exceeds limit."""
+    if isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0:
+        raise ValueError("Telegram Markdown split limit must be a positive integer")
     if not text:
         return [""]
 
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-
-    chunks = []
-    current = ""
+    normalized = text.replace("\r\n", "\n").replace("\r", "\n")
+    blocks: list[str] = []
+    current_lines: list[str] = []
     in_code_block = False
-    block = []
-
-    for line in text.split("\n"):
+    for line in normalized.split("\n"):
         if line.startswith("```"):
             in_code_block = not in_code_block
-
-        block.append(line)
-
+        current_lines.append(line)
         if not in_code_block and line.strip() == "":
-            paragraph = "\n".join(block).strip()
-            block = []
+            block = "\n".join(current_lines).strip()
+            current_lines = []
+            if block:
+                blocks.append(block)
+    if current_lines:
+        block = "\n".join(current_lines).strip()
+        if block:
+            blocks.append(block)
 
-            if not paragraph:
-                continue
-
-            candidate = current + ("\n\n" if current else "") + paragraph
-
-            if len(candidate) <= limit:
-                current = candidate
-            else:
-                if current:
-                    chunks.append(current)
-                current = paragraph
-
-    if block:
-        paragraph = "\n".join(block).strip()
-        candidate = current + ("\n\n" if current else "") + paragraph
-
+    pieces = [
+        piece
+        for block in blocks
+        for piece in _split_markdown_block(block, limit)
+        if piece
+    ]
+    chunks: list[str] = []
+    current = ""
+    for piece in pieces:
+        candidate = current + ("\n\n" if current else "") + piece
         if len(candidate) <= limit:
             current = candidate
-        else:
-            if current:
-                chunks.append(current)
-            current = paragraph
-
+            continue
+        if current:
+            chunks.append(current)
+        current = piece
     if current:
         chunks.append(current)
+    return chunks or [""]
 
-    return chunks
 
 def preprocess_markdown_lines(text: str) -> str:
     lines = []
@@ -81,6 +119,7 @@ def preprocess_markdown_lines(text: str) -> str:
         lines.append(line)
 
     return "\n".join(lines)
+
 
 def markdown_to_telegram_html(text: str) -> str:
     """
@@ -108,7 +147,6 @@ def markdown_to_telegram_html(text: str) -> str:
         placeholders.append(value)
         return token
 
-    # 1. Code blocks
     def replace_code_block(match: re.Match) -> str:
         language = match.group(1) or ""
         code = match.group(2) or ""
@@ -117,7 +155,10 @@ def markdown_to_telegram_html(text: str) -> str:
 
         if language:
             escaped_language = html.escape(language.strip())
-            return stash(f'<pre><code class="language-{escaped_language}">{escaped_code}</code></pre>')
+            return stash(
+                f'<pre><code class="language-{escaped_language}">'
+                f"{escaped_code}</code></pre>"
+            )
 
         return stash(f"<pre><code>{escaped_code}</code></pre>")
 
@@ -125,17 +166,15 @@ def markdown_to_telegram_html(text: str) -> str:
         r"```([a-zA-Z0-9_+-]*)?\n(.*?)```",
         replace_code_block,
         text,
-        flags=re.DOTALL
+        flags=re.DOTALL,
     )
 
-    # 2. Inline code
     def replace_inline_code(match: re.Match) -> str:
         code = match.group(1)
         return stash(f"<code>{html.escape(code)}</code>")
 
     text = re.sub(r"`([^`\n]+)`", replace_inline_code, text)
 
-    # 3. Links
     def replace_link(match: re.Match) -> str:
         label = html.escape(match.group(1))
         url = html.escape(match.group(2), quote=True)
@@ -143,23 +182,19 @@ def markdown_to_telegram_html(text: str) -> str:
 
     text = re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", replace_link, text)
 
-    # 4. Preprocess markdown lines + Escape everything else
     text = preprocess_markdown_lines(text)
     text = html.escape(text)
 
-    # 5. Bold
     text = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text, flags=re.DOTALL)
     text = re.sub(r"__(.+?)__", r"<b>\1</b>", text, flags=re.DOTALL)
 
-    # 6. Italic
     text = re.sub(
         r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)",
         r"<i>\1</i>",
         text,
-        flags=re.DOTALL
+        flags=re.DOTALL,
     )
 
-    # 7. Headings and lists line-by-line
     lines = []
 
     for line in text.split("\n"):
@@ -174,14 +209,12 @@ def markdown_to_telegram_html(text: str) -> str:
         elif re.match(r"^\s*[-*]\s+", line):
             line = re.sub(r"^\s*[-*]\s+", "• ", line)
         elif re.match(r"^\s*\d+\.\s+", line):
-            # Нумерованные списки оставляем как есть
             line = stripped
 
         lines.append(line)
 
     text = "\n".join(lines)
 
-    # 8. Restore placeholders
     for index, value in enumerate(placeholders):
         text = text.replace(f"§§TG_PLACEHOLDER_{index}§§", value)
 
@@ -215,7 +248,6 @@ def split_telegram_message(text: str, limit: int = 3900) -> List[str]:
             if len(paragraph) <= limit:
                 current = paragraph
             else:
-                # Грубый fallback для очень длинных кусков
                 for i in range(0, len(paragraph), limit):
                     chunks.append(paragraph[i:i + limit])
 
