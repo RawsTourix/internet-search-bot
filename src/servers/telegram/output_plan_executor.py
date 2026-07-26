@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from tempfile import SpooledTemporaryFile
-from typing import Any
+from typing import Any, Mapping
 
 from telegram import InputMediaDocument
 from telegram.constants import ParseMode
@@ -84,6 +84,7 @@ class TelegramOutputPlanExecutor:
         started_at = _utc_now()
         outcomes: dict[str, OutputPartReceipt] = {}
         reply_available = context.reply_to_message_id
+        limits = batch.capability_snapshot.limits
 
         for group in sorted(plan.groups, key=lambda item: item.index):
             group_parts = [parts[part_id] for part_id in group.part_ids]
@@ -92,6 +93,7 @@ class TelegramOutputPlanExecutor:
                 parts=group_parts,
                 context=context,
                 reply_to_message_id=reply_available,
+                limits=limits,
             )
             if reply_available is not None and self._transport_attempted(receipts):
                 reply_available = None
@@ -110,11 +112,10 @@ class TelegramOutputPlanExecutor:
                     error_category="missing_transport_outcome",
                 )
             ordered.append(outcome)
-        aggregate = self._aggregate(tuple(ordered), batch)
         return OutputDeliveryReceipt(
             output_batch_id=batch.output_batch_id,
             attempt_id=attempt_id,
-            state=aggregate,
+            state=self._aggregate(tuple(ordered)),
             part_receipts=tuple(ordered),
             started_at=started_at,
             completed_at=_utc_now(),
@@ -127,6 +128,7 @@ class TelegramOutputPlanExecutor:
         parts: list[OutputPart],
         context: TelegramExecutionContext,
         reply_to_message_id: int | None,
+        limits: Mapping[str, Any],
     ) -> list[OutputPartReceipt]:
         kind = group.operation_kind
         if kind == TransportOperationKind.UNSUPPORTED:
@@ -138,10 +140,7 @@ class TelegramOutputPlanExecutor:
                 )
                 for part in parts
             ]
-        if kind in {
-            TransportOperationKind.TEXT,
-            TransportOperationKind.STATUS,
-        }:
+        if kind in {TransportOperationKind.TEXT, TransportOperationKind.STATUS}:
             return [
                 await self._send_text(
                     part=parts[0],
@@ -149,6 +148,7 @@ class TelegramOutputPlanExecutor:
                     status=(kind == TransportOperationKind.STATUS),
                     context=context,
                     reply_to_message_id=reply_to_message_id,
+                    limits=limits,
                 )
             ]
         if kind == TransportOperationKind.DOCUMENT_GROUP and len(parts) == 1:
@@ -181,6 +181,7 @@ class TelegramOutputPlanExecutor:
                 operation=kind,
                 context=context,
                 reply_to_message_id=reply_to_message_id,
+                limits=limits,
             )
         ]
 
@@ -192,6 +193,7 @@ class TelegramOutputPlanExecutor:
         status: bool,
         context: TelegramExecutionContext,
         reply_to_message_id: int | None,
+        limits: Mapping[str, Any],
     ) -> OutputPartReceipt:
         if not text:
             return self._receipt(
@@ -199,31 +201,21 @@ class TelegramOutputPlanExecutor:
                 state=OutputPartReceiptState.FAILED,
                 error_category="empty_rendered_text",
             )
-        limit = max(
-            1,
-            int(
-                getattr(part, "metadata", {}).get(
-                    "transport_text_max_chars",
-                    4096,
-                )
-            ),
+        limit_key = (
+            "transport.telegram.presentation.edit.max_chars"
+            if status
+            else "transport.telegram.output.text.max_chars"
         )
+        limit = self._limit(limits, limit_key, default=4096, ceiling=4096)
         markdown = (
             isinstance(part, TextOutputPart)
             and (part.parse_mode or "").strip().lower() in {"markdown", "md"}
         )
-        if markdown:
-            chunks = tuple(
-                split_markdown_for_telegram(
-                    text,
-                    limit=min(limit, 3000),
-                )
-            )
-        else:
-            chunks = tuple(
-                text[offset : offset + limit]
-                for offset in range(0, len(text), limit)
-            )
+        chunks = (
+            tuple(split_markdown_for_telegram(text, limit=min(limit, 3000)))
+            if markdown
+            else self._plain_chunks(text, limit)
+        )
 
         message_ids: list[str] = []
         try:
@@ -262,13 +254,8 @@ class TelegramOutputPlanExecutor:
                                 sent = None
                             else:
                                 raise
-                message_id = (
-                    getattr(sent, "message_id", None)
-                    or (
-                        context.status_message_id
-                        if status and index == 0
-                        else None
-                    )
+                message_id = getattr(sent, "message_id", None) or (
+                    context.status_message_id if status and index == 0 else None
                 )
                 if message_id is None:
                     return self._receipt(
@@ -375,13 +362,12 @@ class TelegramOutputPlanExecutor:
                 )
                 for spool, filename in opened
             ]
-            kwargs = self._message_kwargs(
+            send_started = True
+            sent = list(await context.bot.send_media_group(**self._message_kwargs(
                 context,
                 reply_to_message_id=reply_to_message_id,
                 media=media,
-            )
-            send_started = True
-            sent = list(await context.bot.send_media_group(**kwargs))
+            )))
             if len(sent) != len(parts):
                 return [
                     self._receipt(
@@ -414,21 +400,7 @@ class TelegramOutputPlanExecutor:
                 )
                 for part in parts
             ]
-        except (TimedOut, NetworkError) as error:
-            state = (
-                OutputPartReceiptState.UNKNOWN
-                if send_started
-                else OutputPartReceiptState.FAILED
-            )
-            return [
-                self._receipt(
-                    part,
-                    state=state,
-                    error_category=f"telegram_group_error:{type(error).__name__}",
-                )
-                for part in parts
-            ]
-        except Exception as error:
+        except (TimedOut, NetworkError, Exception) as error:
             state = (
                 OutputPartReceiptState.UNKNOWN
                 if send_started
@@ -453,6 +425,7 @@ class TelegramOutputPlanExecutor:
         operation: TransportOperationKind,
         context: TelegramExecutionContext,
         reply_to_message_id: int | None,
+        limits: Mapping[str, Any],
     ) -> OutputPartReceipt:
         if not isinstance(part, ArtifactOutputPart):
             return self._receipt(
@@ -462,6 +435,7 @@ class TelegramOutputPlanExecutor:
             )
         opened: tuple[SpooledTemporaryFile, str] | None = None
         send_started = False
+        message_ids: list[str] = []
         try:
             opened = await context.gateway.open_delivery_file(
                 part.delivery_id,
@@ -475,14 +449,8 @@ class TelegramOutputPlanExecutor:
                 TransportOperationKind.AUDIO: ("send_audio", "audio"),
                 TransportOperationKind.VOICE: ("send_voice", "voice"),
                 TransportOperationKind.VIDEO: ("send_video", "video"),
-                TransportOperationKind.VIDEO_NOTE: (
-                    "send_video_note",
-                    "video_note",
-                ),
-                TransportOperationKind.ANIMATION: (
-                    "send_animation",
-                    "animation",
-                ),
+                TransportOperationKind.VIDEO_NOTE: ("send_video_note", "video_note"),
+                TransportOperationKind.ANIMATION: ("send_animation", "animation"),
                 TransportOperationKind.STICKER: ("send_sticker", "sticker"),
             }[operation]
             kwargs = self._message_kwargs(
@@ -490,13 +458,22 @@ class TelegramOutputPlanExecutor:
                 reply_to_message_id=reply_to_message_id,
                 **{argument: payload},
             )
-            if isinstance(part, ImageOutputPart):
-                kwargs["caption"] = part.caption
-            elif isinstance(part, AudioOutputPart):
+            caption = getattr(part, "caption", None)
+            caption_limit = self._limit(
+                limits,
+                "transport.telegram.output.caption.max_chars",
+                default=1024,
+                ceiling=1024,
+            )
+            overflow_caption = (
+                caption if caption and len(caption) > caption_limit else None
+            )
+            if caption and overflow_caption is None:
+                kwargs["caption"] = caption
+            if isinstance(part, AudioOutputPart):
                 kwargs["title"] = part.title
                 kwargs["performer"] = part.performer
-            elif hasattr(part, "caption"):
-                kwargs["caption"] = getattr(part, "caption")
+
             send_started = True
             sent = await getattr(context.bot, method_name)(**kwargs)
             message_id = getattr(sent, "message_id", None)
@@ -506,15 +483,36 @@ class TelegramOutputPlanExecutor:
                     state=OutputPartReceiptState.UNKNOWN,
                     error_category="telegram_artifact_receipt_missing",
                 )
+            message_ids.append(str(message_id))
+            if overflow_caption:
+                caption_outcome = await self._send_caption_overflow(
+                    caption=overflow_caption,
+                    media_message_id=int(message_id),
+                    context=context,
+                    limits=limits,
+                )
+                message_ids.extend(caption_outcome[1])
+                if caption_outcome[0] is not None:
+                    return self._receipt(
+                        part,
+                        state=caption_outcome[0],
+                        client_message_ids=tuple(message_ids),
+                        error_category=caption_outcome[2],
+                    )
             return self._receipt(
                 part,
                 state=OutputPartReceiptState.DELIVERED,
-                client_message_ids=(str(message_id),),
+                client_message_ids=tuple(message_ids),
             )
         except BadRequest as error:
             return self._receipt(
                 part,
-                state=OutputPartReceiptState.FAILED,
+                state=(
+                    OutputPartReceiptState.PARTIALLY_DELIVERED
+                    if message_ids
+                    else OutputPartReceiptState.FAILED
+                ),
+                client_message_ids=tuple(message_ids),
                 error_category=f"telegram_bad_request:{type(error).__name__}",
             )
         except (TimedOut, NetworkError) as error:
@@ -525,6 +523,7 @@ class TelegramOutputPlanExecutor:
                     if send_started
                     else OutputPartReceiptState.FAILED
                 ),
+                client_message_ids=tuple(message_ids),
                 error_category=f"telegram_artifact_error:{type(error).__name__}",
             )
         except Exception as error:
@@ -535,11 +534,57 @@ class TelegramOutputPlanExecutor:
                     if send_started
                     else OutputPartReceiptState.FAILED
                 ),
+                client_message_ids=tuple(message_ids),
                 error_category=f"telegram_artifact_error:{type(error).__name__}",
             )
         finally:
             if opened is not None:
                 opened[0].close()
+
+    async def _send_caption_overflow(
+        self,
+        *,
+        caption: str,
+        media_message_id: int,
+        context: TelegramExecutionContext,
+        limits: Mapping[str, Any],
+    ) -> tuple[OutputPartReceiptState | None, list[str], str | None]:
+        limit = self._limit(
+            limits,
+            "transport.telegram.output.text.max_chars",
+            default=4096,
+            ceiling=4096,
+        )
+        message_ids: list[str] = []
+        try:
+            for index, chunk in enumerate(self._plain_chunks(caption, limit)):
+                sent = await context.bot.send_message(**self._message_kwargs(
+                    context,
+                    reply_to_message_id=(media_message_id if index == 0 else None),
+                    text=chunk,
+                    parse_mode=None,
+                ))
+                message_id = getattr(sent, "message_id", None)
+                if message_id is None:
+                    return (
+                        OutputPartReceiptState.UNKNOWN,
+                        message_ids,
+                        "telegram_caption_receipt_missing",
+                    )
+                message_ids.append(str(message_id))
+        except BadRequest as error:
+            return (
+                OutputPartReceiptState.PARTIALLY_DELIVERED,
+                message_ids,
+                f"telegram_caption_bad_request:{type(error).__name__}",
+            )
+        except (TimedOut, NetworkError, Exception) as error:
+            return (
+                OutputPartReceiptState.UNKNOWN,
+                message_ids,
+                f"telegram_caption_unknown:{type(error).__name__}",
+            )
+        return None, message_ids, None
 
     async def _send_location(
         self,
@@ -610,18 +655,32 @@ class TelegramOutputPlanExecutor:
                 state=OutputPartReceiptState.FAILED,
                 error_category=f"telegram_bad_request:{type(error).__name__}",
             )
-        except (TimedOut, NetworkError) as error:
+        except (TimedOut, NetworkError, Exception) as error:
             return self._receipt(
                 part,
                 state=OutputPartReceiptState.UNKNOWN,
                 error_category=f"telegram_structured_error:{type(error).__name__}",
             )
-        except Exception as error:
-            return self._receipt(
-                part,
-                state=OutputPartReceiptState.UNKNOWN,
-                error_category=f"telegram_structured_error:{type(error).__name__}",
-            )
+
+    @staticmethod
+    def _limit(
+        limits: Mapping[str, Any],
+        key: str,
+        *,
+        default: int,
+        ceiling: int,
+    ) -> int:
+        value = limits.get(key, default)
+        if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+            raise ValueError(f"invalid client capability limit: {key}")
+        return min(value, ceiling)
+
+    @staticmethod
+    def _plain_chunks(text: str, limit: int) -> tuple[str, ...]:
+        return tuple(
+            text[offset : offset + limit]
+            for offset in range(0, len(text), limit)
+        )
 
     @staticmethod
     def _message_kwargs(
@@ -636,11 +695,7 @@ class TelegramOutputPlanExecutor:
         if reply_to_message_id is not None:
             result["reply_to_message_id"] = reply_to_message_id
             result["allow_sending_without_reply"] = True
-        return {
-            key: value
-            for key, value in result.items()
-            if value is not None
-        }
+        return {key: value for key, value in result.items() if value is not None}
 
     @staticmethod
     def _type_failure(part: OutputPart) -> OutputPartReceipt:
@@ -694,8 +749,7 @@ class TelegramOutputPlanExecutor:
             error_category=error_category,
             delivered_at=(
                 _utc_now()
-                if state
-                in {
+                if state in {
                     OutputPartReceiptState.DELIVERED,
                     OutputPartReceiptState.PARTIALLY_DELIVERED,
                 }
@@ -706,9 +760,7 @@ class TelegramOutputPlanExecutor:
     @staticmethod
     def _aggregate(
         receipts: tuple[OutputPartReceipt, ...],
-        batch: OutputBatch,
     ) -> OutputDeliveryReceiptState:
-        del batch
         all_receipts = list(receipts)
         if any(
             item.state == OutputPartReceiptState.UNKNOWN
@@ -722,8 +774,7 @@ class TelegramOutputPlanExecutor:
         ):
             return OutputDeliveryReceiptState.DELIVERED
         if any(
-            item.state
-            in {
+            item.state in {
                 OutputPartReceiptState.DELIVERED,
                 OutputPartReceiptState.PARTIALLY_DELIVERED,
             }
