@@ -97,6 +97,7 @@ class FileSystemOutputBatchStore:
         self._stale_recovery_handler: (
             Callable[..., Awaitable[list[OutputBatch]]] | None
         ) = None
+        self._claim_validator: Callable[[OutputBatch], Any] | None = None
         try:
             for path in (self.records, self.cycle_index, self.attempts):
                 path.mkdir(parents=True, exist_ok=True)
@@ -130,6 +131,20 @@ class FileSystemOutputBatchStore:
                 "output stale recovery handler is already bound"
             )
         self._stale_recovery_handler = handler
+
+    def bind_claim_validator(
+        self,
+        validator: Callable[[OutputBatch], Any],
+    ) -> None:
+        """Bind deterministic plan validation before a delivery claim is stored."""
+        if (
+            self._claim_validator is not None
+            and self._claim_validator != validator
+        ):
+            raise OutputBatchConflictError(
+                "output claim validator is already bound"
+            )
+        self._claim_validator = validator
 
     async def commit(self, batch: OutputBatch) -> tuple[OutputBatch, bool]:
         return await asyncio.to_thread(self._commit_sync, batch)
@@ -224,6 +239,8 @@ class FileSystemOutputBatchStore:
                 )
             if current.state != OutputBatchState.READY:
                 raise OutputBatchConflictError("output batch cannot be claimed")
+            if self._claim_validator is not None:
+                self._claim_validator(current)
             attempt_id = new_output_attempt_id()
             state.update(
                 state=OutputBatchState.DELIVERING.value,
