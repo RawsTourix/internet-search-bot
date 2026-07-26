@@ -51,7 +51,12 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 - authoritative `OutputDeliveryPlan` executor для native Telegram operations;
 - atomic aggregate completion delivery records, attempt receipt и OutputBatch;
 - отдельное terminal-состояние `unknown` с explicit reconciliation;
-- process-restart recovery без автоматического повтора non-idempotent delivery.
+- process-restart recovery без автоматического повтора non-idempotent delivery;
+- bounded final-only `READY` outbox без повторного agent cycle;
+- idempotent claim requests для безопасного повтора потерянного HTTP-ответа;
+- exact `client_instance_id` authority для claim, receipt и artifact bytes;
+- strict transport evidence перед durable aggregate completion;
+- canonical Telegram composition root `python -m src.servers.telegram`.
 
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
