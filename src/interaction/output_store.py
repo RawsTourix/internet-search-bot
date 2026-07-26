@@ -83,6 +83,9 @@ class FileSystemOutputBatchStore:
         self._reconciliation_handler: (
             Callable[[OutputDeliveryReceipt], Awaitable[OutputBatch]] | None
         ) = None
+        self._stale_recovery_handler: (
+            Callable[..., Awaitable[list[OutputBatch]]] | None
+        ) = None
         for path in (self.records, self.cycle_index, self.attempts):
             path.mkdir(parents=True, exist_ok=True)
 
@@ -99,6 +102,20 @@ class FileSystemOutputBatchStore:
                 "output reconciliation handler is already bound"
             )
         self._reconciliation_handler = handler
+
+    def bind_stale_recovery_handler(
+        self,
+        handler: Callable[..., Awaitable[list[OutputBatch]]],
+    ) -> None:
+        """Bind cross-store stale recovery once at composition."""
+        if (
+            self._stale_recovery_handler is not None
+            and self._stale_recovery_handler != handler
+        ):
+            raise OutputBatchConflictError(
+                "output stale recovery handler is already bound"
+            )
+        self._stale_recovery_handler = handler
 
     async def commit(self, batch: OutputBatch) -> tuple[OutputBatch, bool]:
         return await asyncio.to_thread(self._commit_sync, batch)
@@ -367,6 +384,12 @@ class FileSystemOutputBatchStore:
         timeout_seconds: int,
         now: datetime | None = None,
     ) -> list[OutputBatch]:
+        handler = self._stale_recovery_handler
+        if handler is not None:
+            return await handler(
+                timeout_seconds=timeout_seconds,
+                now=now,
+            )
         return await asyncio.to_thread(
             self._reconcile_stale_claims_sync,
             timeout_seconds,
