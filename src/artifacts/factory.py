@@ -4,6 +4,10 @@ from dataclasses import dataclass
 
 from ..storage.config import StorageConfigType
 from ..storage.interfaces import ContentStore
+from .advanced_delivery import (
+    AdvancedArtifactDeliveryService,
+    AdvancedFileSystemArtifactDeliveryStore,
+)
 from .candidate_store import (
     ArtifactCandidateStore,
     FileSystemArtifactCandidateStore,
@@ -49,7 +53,7 @@ def create_artifact_services(
         allow_legacy_layout=allow_legacy_layout,
     )
     candidate_store = FileSystemArtifactCandidateStore(storage_config)
-    delivery_store = FileSystemArtifactDeliveryStore(storage_config)
+    delivery_store = AdvancedFileSystemArtifactDeliveryStore(storage_config)
     format_registry = build_default_format_registry()
     artifact_service = ArtifactService(
         config=artifact_config,
@@ -61,7 +65,7 @@ def create_artifact_services(
         artifact_service=artifact_service,
         candidate_store=candidate_store,
     )
-    delivery_service = ArtifactDeliveryService(
+    delivery_service = AdvancedArtifactDeliveryService(
         config=artifact_config,
         artifact_service=artifact_service,
         content_store=content_store,
