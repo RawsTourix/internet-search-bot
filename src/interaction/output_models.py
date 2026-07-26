@@ -37,6 +37,7 @@ class OutputBatchState(str, Enum):
 
 class OutputPartReceiptState(str, Enum):
     DELIVERED = "delivered"
+    PARTIALLY_DELIVERED = "partially_delivered"
     FAILED = "failed"
     UNKNOWN = "unknown"
     SKIPPED = "skipped"
@@ -326,6 +327,7 @@ class OutputPartReceipt(_OutputModel):
     part_id: str
     index: int = Field(ge=0)
     state: OutputPartReceiptState
+    required: bool = True
     delivery_id: str | None = None
     client_message_ids: tuple[str, ...] = ()
     error_category: str | None = None
@@ -351,7 +353,11 @@ class OutputPartReceipt(_OutputModel):
 
     @model_validator(mode="after")
     def validate_outcome(self) -> "OutputPartReceipt":
-        if self.state == OutputPartReceiptState.DELIVERED:
+        confirmed_delivery = self.state in {
+            OutputPartReceiptState.DELIVERED,
+            OutputPartReceiptState.PARTIALLY_DELIVERED,
+        }
+        if confirmed_delivery:
             if self.delivered_at is None:
                 raise ValueError("delivered part requires delivered_at")
             if not self.client_message_ids:
@@ -365,6 +371,7 @@ class OutputPartReceipt(_OutputModel):
         if (
             self.state
             in {
+                OutputPartReceiptState.PARTIALLY_DELIVERED,
                 OutputPartReceiptState.FAILED,
                 OutputPartReceiptState.UNKNOWN,
                 OutputPartReceiptState.SKIPPED,
@@ -372,7 +379,7 @@ class OutputPartReceipt(_OutputModel):
             and not self.error_category
         ):
             raise ValueError(
-                "non-delivered part requires an error category"
+                "non-delivered or partial part requires an error category"
             )
         return self
 
@@ -413,43 +420,54 @@ class OutputDeliveryReceipt(_OutputModel):
         part_ids = [item.part_id for item in self.part_receipts]
         if len(part_ids) != len(set(part_ids)):
             raise ValueError("duplicate output part receipt")
-        states = [item.state for item in self.part_receipts]
-        if self.state == OutputDeliveryReceiptState.DELIVERED and (
-            not states
-            or any(
+        if not self.part_receipts:
+            raise ValueError("delivery receipt requires output part receipts")
+
+        all_receipts = list(self.part_receipts)
+        required = [item for item in all_receipts if item.required] or all_receipts
+        required_states = [item.state for item in required]
+        all_states = [item.state for item in all_receipts]
+
+        if self.state == OutputDeliveryReceiptState.UNKNOWN:
+            if OutputPartReceiptState.UNKNOWN not in all_states:
+                raise ValueError("unknown aggregate requires an unknown part")
+            return self
+
+        if OutputPartReceiptState.UNKNOWN in all_states:
+            raise ValueError("confirmed aggregate cannot hide an unknown part")
+
+        if self.state == OutputDeliveryReceiptState.DELIVERED:
+            if any(
                 state != OutputPartReceiptState.DELIVERED
-                for state in states
-            )
-        ):
-            raise ValueError(
-                "delivered aggregate requires every part delivered"
-            )
-        if (
-            self.state == OutputDeliveryReceiptState.UNKNOWN
-            and OutputPartReceiptState.UNKNOWN not in states
-        ):
-            raise ValueError("unknown aggregate requires an unknown part")
-        if self.state == OutputDeliveryReceiptState.PARTIALLY_DELIVERED:
-            if (
-                OutputPartReceiptState.DELIVERED not in states
-                or all(
-                    state == OutputPartReceiptState.DELIVERED
-                    for state in states
-                )
-                or OutputPartReceiptState.UNKNOWN in states
+                for state in required_states
             ):
                 raise ValueError(
-                    "partial aggregate requires confirmed mixed outcomes"
+                    "delivered aggregate requires every required part delivered"
                 )
-        if self.state == OutputDeliveryReceiptState.FAILED and any(
+            return self
+
+        required_has_delivery = any(
             state
             in {
                 OutputPartReceiptState.DELIVERED,
-                OutputPartReceiptState.UNKNOWN,
+                OutputPartReceiptState.PARTIALLY_DELIVERED,
             }
-            for state in states
-        ):
+            for state in required_states
+        )
+        required_all_delivered = all(
+            state == OutputPartReceiptState.DELIVERED
+            for state in required_states
+        )
+
+        if self.state == OutputDeliveryReceiptState.PARTIALLY_DELIVERED:
+            if not required_has_delivery or required_all_delivered:
+                raise ValueError(
+                    "partial aggregate requires confirmed incomplete required output"
+                )
+            return self
+
+        if self.state == OutputDeliveryReceiptState.FAILED and required_has_delivery:
             raise ValueError(
-                "failed aggregate cannot hide delivered or unknown parts"
+                "failed aggregate cannot hide delivered required output"
             )
         return self
