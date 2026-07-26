@@ -31,7 +31,13 @@ class OutputDeliveryCompletionService:
         self.output_store = output_store
         self.artifact_delivery_store = artifact_delivery_store
         self._lock = threading.RLock()
-        self.output_store.bind_reconciliation_handler(self.reconcile_unknown)
+        bind_reconciliation = getattr(
+            self.output_store,
+            "bind_reconciliation_handler",
+            None,
+        )
+        if bind_reconciliation is not None:
+            bind_reconciliation(self.reconcile_unknown)
 
     async def complete(
         self,
@@ -62,9 +68,12 @@ class OutputDeliveryCompletionService:
         with self._lock:
             batch = self.output_store._load_sync(receipt.output_batch_id)
             part_by_id = {part.part_id: part for part in batch.parts}
-            expected = [(part.part_id, part.index) for part in batch.parts]
+            expected = [
+                (part.part_id, part.index, part.required)
+                for part in batch.parts
+            ]
             received = [
-                (part.part_id, part.index)
+                (part.part_id, part.index, part.required)
                 for part in receipt.part_receipts
             ]
             if received != expected:
@@ -83,10 +92,6 @@ class OutputDeliveryCompletionService:
             ] = []
             for part_receipt in receipt.part_receipts:
                 part = part_by_id[part_receipt.part_id]
-                if part_receipt.required != part.required:
-                    raise OutputBatchConflictError(
-                        "part receipt required flag does not match committed output"
-                    )
                 exact_delivery_id = getattr(part, "delivery_id", None)
                 if part_receipt.delivery_id != exact_delivery_id:
                     raise OutputBatchConflictError(
