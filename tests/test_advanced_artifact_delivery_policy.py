@@ -74,7 +74,7 @@ class AdvancedArtifactDeliveryPolicyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored_old.state, ArtifactDeliveryState.CANCELLED)
         self.assertEqual(stored_new.selection_index, stored_old.selection_index)
 
-    async def test_unknown_head_blocks_replacement_and_normal_retry(self):
+    async def test_unknown_head_blocks_replacement_retry_and_cancellation(self):
         old = await self._select(self.first.artifact_id)
         await self.artifacts.delivery_service.claim(old.delivery_id)
         await self.artifacts.delivery_service.fail(
@@ -88,6 +88,14 @@ class AdvancedArtifactDeliveryPolicyTests(unittest.IsolatedAsyncioTestCase):
             await self._select(successor.artifact_id)
         with self.assertRaises(ArtifactDeliveryError):
             await self.artifacts.delivery_service.claim(old.delivery_id)
+        with self.assertRaises(ArtifactDeliveryError):
+            await self.artifacts.delivery_service.cancel(old.delivery_id)
+        with self.assertRaises(ArtifactDeliveryError):
+            await self.artifacts.delivery_service.cancel_many_by_artifact_ids(
+                artifact_ids=[self.first.artifact_id],
+                access=self.access,
+                client_type="telegram",
+            )
         self.assertEqual(
             (await self.artifacts.delivery_store.get(old.delivery_id)).state,
             ArtifactDeliveryState.UNKNOWN,
