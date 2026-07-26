@@ -232,12 +232,25 @@ class OutputBatch(_OutputModel):
 
     @model_validator(mode="after")
     def validate_order(self) -> "OutputBatch":
+        if not self.parts:
+            raise ValueError("output batch requires at least one part")
         indices = [part.index for part in self.parts]
         if indices != list(range(len(indices))):
             raise ValueError("output part indices must be contiguous and monotonic")
         ids = [part.part_id for part in self.parts]
         if len(ids) != len(set(ids)):
             raise ValueError("output part IDs must be unique")
+        artifact_delivery_ids = [
+            part.delivery_id
+            for part in self.parts
+            if isinstance(part, ArtifactOutputPart)
+        ]
+        if len(artifact_delivery_ids) != len(set(artifact_delivery_ids)):
+            raise ValueError("artifact delivery IDs must be unique in OutputBatch")
+        if self.kind == OutputBatchKind.FINAL and not any(
+            part.required for part in self.parts
+        ):
+            raise ValueError("final output batch requires a required part")
         if self.state == OutputBatchState.READY and self.ready_at is None:
             raise ValueError("ready output batch requires ready_at")
         if self.state in {
