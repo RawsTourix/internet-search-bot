@@ -4,16 +4,74 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+from .ids import is_interaction_id
 from .output_models import OutputBatch, OutputBatchKind, OutputBatchState
 from .output_store import FileSystemOutputBatchStore
+
+
+class ReadyOutputOutboxRef(BaseModel):
+    """Minimal transport polling reference; the manifest remains behind claim."""
+
+    model_config = ConfigDict(extra="forbid", frozen=True)
+
+    output_batch_id: str
+    session_id: str
+    cycle_id: str
+    sequence_number: int = Field(ge=1)
+    kind: OutputBatchKind
+    client_type: str
+    client_instance_id: str
+    ready_at: datetime
+
+    @field_validator("output_batch_id")
+    @classmethod
+    def validate_output_batch_id(cls, value: str) -> str:
+        if not is_interaction_id(value, prefix="obat"):
+            raise ValueError("invalid ready outbox output batch ID")
+        return value
+
+    @field_validator(
+        "session_id",
+        "cycle_id",
+        "client_type",
+        "client_instance_id",
+    )
+    @classmethod
+    def validate_required(cls, value: str, info) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{info.field_name} must not be empty")
+        return normalized
+
+    @field_validator("ready_at")
+    @classmethod
+    def normalize_ready_at(cls, value: datetime) -> datetime:
+        if value.tzinfo is None or value.utcoffset() is None:
+            raise ValueError("ready outbox timestamp must be timezone-aware")
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def from_batch(cls, batch: OutputBatch) -> "ReadyOutputOutboxRef":
+        return cls(
+            output_batch_id=batch.output_batch_id,
+            session_id=batch.session_id,
+            cycle_id=batch.cycle_id,
+            sequence_number=batch.sequence_number,
+            kind=batch.kind,
+            client_type=batch.capability_snapshot.client_type,
+            client_instance_id=batch.capability_snapshot.client_instance_id,
+            ready_at=batch.ready_at or batch.created_at,
+        )
 
 
 class ReadyOutputOutboxService:
     """Expose only delivery attempts that are still safe to start.
 
     The filesystem implementation scans the v0.4 store and returns a bounded
-    projection. A future database/queue repository can implement the same
-    application contract without changing transport workers.
+    minimal projection. A future database/queue repository can implement the
+    same application contract without changing transport workers.
     """
 
     MAX_LIMIT = 500
@@ -31,7 +89,7 @@ class ReadyOutputOutboxService:
         limit: int = 50,
         minimum_age_seconds: float = 30.0,
         now: datetime | None = None,
-    ) -> list[OutputBatch]:
+    ) -> list[ReadyOutputOutboxRef]:
         normalized_client = self._required(client_type, "client_type")
         normalized_instance = self._required(
             client_instance_id,
@@ -80,7 +138,7 @@ class ReadyOutputOutboxService:
                 batch.output_batch_id,
             )
         )
-        return ready[:limit]
+        return [ReadyOutputOutboxRef.from_batch(batch) for batch in ready[:limit]]
 
     @staticmethod
     def validate_authority(
