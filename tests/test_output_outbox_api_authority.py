@@ -13,7 +13,10 @@ from src.interaction.capabilities import (
     build_default_capability_registry,
     build_telegram_capability_declaration,
 )
-from src.interaction.ids import new_output_part_id
+from src.interaction.ids import (
+    new_output_claim_request_id,
+    new_output_part_id,
+)
 from src.interaction.output_models import (
     OutputBatchKind,
     OutputBatchState,
@@ -122,6 +125,7 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
                 "session_id": "session-1",
                 "client_type": "telegram",
                 "client_instance_id": "bot-1",
+                "claim_request_id": new_output_claim_request_id(),
             },
             headers={"X-API-Key": "telegram-key"},
         )
