@@ -2,7 +2,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from telegram.error import BadRequest
+from telegram.error import BadRequest, NetworkError
 
 from src.artifacts import (
     ArtifactAccessContext,
@@ -108,6 +108,57 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_media_bytes_remain_delivered_when_caption_is_partial(self):
+        artifact, selected, snapshot, part = await self._caption_case()
+        batch = await self._commit_batch(snapshot=snapshot, part=part)
+        bot = FakeTelegramBot()
+        bot.queue("send_message", BadRequest("caption rejected"))
+        receipt = await self._execute(batch, bot=bot)
+        self.assertEqual(
+            receipt.part_receipts[0].state,
+            OutputPartReceiptState.PARTIALLY_DELIVERED,
+        )
+        self.assertEqual(
+            receipt.part_receipts[0].artifact_content_state,
+            ArtifactContentReceiptState.DELIVERED,
+        )
+
+        completed = await self.completion.complete(receipt)
+        self.assertEqual(completed.state, OutputBatchState.PARTIALLY_DELIVERED)
+        delivery = await self.artifacts.delivery_store.get(selected.delivery_id)
+        self.assertEqual(delivery.state, ArtifactDeliveryState.DELIVERED)
+        self.assertEqual(
+            delivery.receipt["artifact_content_state"],
+            "delivered",
+        )
+
+    async def test_media_bytes_remain_delivered_when_caption_is_unknown(self):
+        artifact, selected, snapshot, part = await self._caption_case()
+        batch = await self._commit_batch(snapshot=snapshot, part=part)
+        bot = FakeTelegramBot()
+        bot.queue(
+            "send_message",
+            NetworkError("caption response became unknown"),
+        )
+        receipt = await self._execute(batch, bot=bot)
+        part_receipt = receipt.part_receipts[0]
+        self.assertEqual(receipt.state, OutputDeliveryReceiptState.UNKNOWN)
+        self.assertEqual(part_receipt.state, OutputPartReceiptState.UNKNOWN)
+        self.assertEqual(
+            part_receipt.artifact_content_state,
+            ArtifactContentReceiptState.DELIVERED,
+        )
+        self.assertEqual(len(part_receipt.client_message_ids), 1)
+
+        completed = await self.completion.complete(receipt)
+        self.assertEqual(completed.state, OutputBatchState.UNKNOWN)
+        delivery = await self.artifacts.delivery_store.get(selected.delivery_id)
+        self.assertEqual(delivery.state, ArtifactDeliveryState.DELIVERED)
+        self.assertEqual(
+            delivery.receipt["artifact_content_state"],
+            "delivered",
+        )
+
+    async def _caption_case(self):
         artifact, selected = await self._create_image_artifact()
         await self.artifacts.delivery_service.claim(selected.delivery_id)
         base_declaration = build_telegram_capability_declaration()
@@ -133,27 +184,7 @@ class ArtifactContentDeliveryEvidenceTests(unittest.IsolatedAsyncioTestCase):
             size_bytes=selected.size_bytes,
             caption="abcdefghij",
         )
-        batch = await self._commit_batch(snapshot=snapshot, part=part)
-        bot = FakeTelegramBot()
-        bot.queue("send_message", BadRequest("caption rejected"))
-        receipt = await self._execute(batch, bot=bot)
-        self.assertEqual(
-            receipt.part_receipts[0].state,
-            OutputPartReceiptState.PARTIALLY_DELIVERED,
-        )
-        self.assertEqual(
-            receipt.part_receipts[0].artifact_content_state,
-            ArtifactContentReceiptState.DELIVERED,
-        )
-
-        completed = await self.completion.complete(receipt)
-        self.assertEqual(completed.state, OutputBatchState.PARTIALLY_DELIVERED)
-        delivery = await self.artifacts.delivery_store.get(selected.delivery_id)
-        self.assertEqual(delivery.state, ArtifactDeliveryState.DELIVERED)
-        self.assertEqual(
-            delivery.receipt["artifact_content_state"],
-            "delivered",
-        )
+        return artifact, selected, snapshot, part
 
     async def _commit_batch(self, *, snapshot, part):
         batch = build_ready_output_batch(
