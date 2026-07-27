@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import hashlib
+from pathlib import PurePath
 from tempfile import SpooledTemporaryFile
 from typing import Any
+from urllib.parse import unquote
 
 import httpx
 from telegram import InputFile
@@ -13,13 +15,7 @@ from .artifact_bridge import TelegramArtifactBridgeError
 
 
 class TelegramClaimedOutputGateway:
-    """Open artifact bytes only through one exact instance-owned OutputBatch.
-
-    The transport executor deliberately receives this bound facade instead of the
-    general Telegram gateway client.  Consequently it cannot fall back to the
-    legacy per-delivery endpoint or open a delivery that is not a member of the
-    currently claimed immutable OutputBatch.
-    """
+    """Open bytes only through one exact instance-owned OutputBatch claim."""
 
     def __init__(
         self,
@@ -75,13 +71,19 @@ class TelegramClaimedOutputGateway:
         *,
         session_id: str,
     ) -> tuple[SpooledTemporaryFile, str]:
-        """Claim and verify one exact delivery through the scoped outbox route."""
+        """Claim and verify one exact delivery through the scoped route."""
+
+        normalized_delivery = str(delivery_id or "").strip()
+        normalized_session = str(session_id or "").strip()
+        if not normalized_delivery:
+            raise ValueError("delivery ID must not be empty")
+        if not normalized_session:
+            raise ValueError("session ID must not be empty")
 
         spool = SpooledTemporaryFile(
             max_size=self.delivery_spool_memory_bytes,
             mode="w+b",
         )
-        filename = "artifact.bin"
         try:
             timeout = httpx.Timeout(
                 connect=10.0,
@@ -97,40 +99,67 @@ class TelegramClaimedOutputGateway:
                 async with client.stream(
                     "GET",
                     f"{self.gateway_url}/internal/output-outbox/"
-                    f"{self.output_batch_id}/deliveries/{delivery_id}/content",
+                    f"{self.output_batch_id}/deliveries/"
+                    f"{normalized_delivery}/content",
                     params={
-                        "session_id": session_id,
+                        "session_id": normalized_session,
                         "client_type": "telegram",
                         "client_instance_id": self.client_instance_id,
                     },
                 ) as response:
                     response.raise_for_status()
-                    filename = self._filename_from_disposition(
-                        response.headers.get("content-disposition", "")
-                    ) or filename
-                    expected_hash = response.headers.get("x-content-hash")
-                    expected_batch = response.headers.get("x-output-batch-id")
-                    if expected_batch and expected_batch != self.output_batch_id:
+                    expected_batch = self._required_header(
+                        response,
+                        "x-output-batch-id",
+                    )
+                    returned_delivery = self._required_header(
+                        response,
+                        "x-delivery-id",
+                    )
+                    expected_hash = self._required_header(
+                        response,
+                        "x-content-hash",
+                    )
+                    expected_size = self._required_size(
+                        response.headers.get("content-length")
+                    )
+                    if expected_batch != self.output_batch_id:
                         raise TelegramArtifactBridgeError(
                             "Gateway returned bytes for another OutputBatch"
                         )
-                    expected_size = self._optional_int(
-                        response.headers.get("content-length")
+                    if returned_delivery != normalized_delivery:
+                        raise TelegramArtifactBridgeError(
+                            "Gateway returned bytes for another delivery"
+                        )
+                    if not expected_hash.startswith("sha256:"):
+                        raise TelegramArtifactBridgeError(
+                            "Gateway returned an unsupported content hash"
+                        )
+                    filename = self._safe_filename(
+                        self._filename_from_disposition(
+                            response.headers.get("content-disposition", "")
+                        )
+                        or "artifact.bin"
                     )
+
                     digest = hashlib.sha256()
                     total = 0
                     async for chunk in response.aiter_bytes(64 * 1024):
                         if not chunk:
                             continue
+                        total += len(chunk)
+                        if total > expected_size:
+                            raise TelegramArtifactBridgeError(
+                                "Delivery exceeded its declared length"
+                            )
                         spool.write(chunk)
                         digest.update(chunk)
-                        total += len(chunk)
-                    if expected_size is not None and total != expected_size:
+                    if total != expected_size:
                         raise TelegramArtifactBridgeError(
                             "Delivery length changed during scoped transport"
                         )
                     actual_hash = "sha256:" + digest.hexdigest()
-                    if expected_hash and actual_hash != expected_hash:
+                    if actual_hash != expected_hash:
                         raise TelegramArtifactBridgeError(
                             "Delivery hash changed during scoped transport"
                         )
@@ -152,9 +181,20 @@ class TelegramClaimedOutputGateway:
         )
 
     @staticmethod
-    def _optional_int(value: Any) -> int | None:
+    def _required_header(response: httpx.Response, name: str) -> str:
+        value = str(response.headers.get(name) or "").strip()
+        if not value:
+            raise TelegramArtifactBridgeError(
+                f"Gateway delivery response lacks {name}"
+            )
+        return value
+
+    @staticmethod
+    def _required_size(value: Any) -> int:
         if value is None or str(value).strip() == "":
-            return None
+            raise TelegramArtifactBridgeError(
+                "Gateway delivery response lacks Content-Length"
+            )
         try:
             parsed = int(str(value).strip())
         except (TypeError, ValueError) as error:
@@ -168,12 +208,24 @@ class TelegramClaimedOutputGateway:
         return parsed
 
     @staticmethod
-    def _filename_from_disposition(value: str) -> str | None:
-        from urllib.parse import unquote
+    def _safe_filename(value: str) -> str:
+        normalized = str(value or "").replace("\x00", "").strip()
+        basename = PurePath(normalized.replace("\\", "/")).name
+        if not basename or basename in {".", ".."}:
+            return "artifact.bin"
+        return basename[:255]
 
+    @staticmethod
+    def _filename_from_disposition(value: str) -> str | None:
         marker = "filename*=UTF-8''"
         if marker in value:
-            return unquote(value.split(marker, maxsplit=1)[1].split(";", maxsplit=1)[0])
+            return unquote(
+                value.split(marker, maxsplit=1)[1].split(";", maxsplit=1)[0]
+            )
         if "filename=" in value:
-            return value.split("filename=", maxsplit=1)[1].split(";", maxsplit=1)[0].strip('"')
+            return (
+                value.split("filename=", maxsplit=1)[1]
+                .split(";", maxsplit=1)[0]
+                .strip('"')
+            )
         return None
