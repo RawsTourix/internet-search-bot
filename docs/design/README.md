@@ -3,7 +3,7 @@ id: design.index
 version: cross-version
 spec_status: accepted
 implementation_status: not-applicable
-last_reviewed: 2026-07-25
+last_reviewed: 2026-07-27
 ---
 
 # Архитектура ИИ-агента
@@ -12,6 +12,9 @@ last_reviewed: 2026-07-25
 организованы по версиям и архитектурным темам так, чтобы для анализа не
 требовалось загружать всю историю проекта.
 
+Инструкции для ИИ-агентов, изменяющих документацию, находятся в
+[`../AGENTS.md`](../AGENTS.md).
+
 ## Быстрый старт
 
 Для общего анализа читайте:
@@ -19,44 +22,57 @@ last_reviewed: 2026-07-25
 1. [`current.md`](current.md) — что считается текущим baseline.
 2. [`overview.md`](overview.md) — назначение и направление развития системы.
 3. [`principles.md`](principles.md) — каталог архитектурных инвариантов.
-4. README интересующей версии.
+4. [`architecture-evolution.md`](architecture-evolution.md) — путь от модульного
+   runtime к distributed execution plane.
+5. README интересующей версии.
 
 Не начинайте анализ с roadmap или history: эти документы дают хронологический
 контекст, но не заменяют тематические спецификации.
 
 ## Версии
 
-| Версия | Статус спецификации | Статус реализации по исходной документации | Индекс |
+| Версия | Статус спецификации | Статус реализации | Индекс |
 |---|---|---|---|
 | `v0.3` | accepted | implemented baseline | [`versions/v0.3/`](versions/v0.3/README.md) |
 | `v0.4` | accepted | partial | [`versions/v0.4/`](versions/v0.4/README.md) |
 | `v0.5` | draft | planned | [`versions/v0.5/`](versions/v0.5/README.md) |
 | `v0.6` | draft | planned | [`versions/v0.6/`](versions/v0.6/README.md) |
-| `v0.7` | provisional | planned | [`versions/v0.7/`](versions/v0.7/README.md) |
-| `v0.8` | provisional | planned | [`versions/v0.8/`](versions/v0.8/README.md) |
+| `v0.7` | draft | planned | [`versions/v0.7/`](versions/v0.7/README.md) |
+| `v0.8` | draft | planned | [`versions/v0.8/`](versions/v0.8/README.md) |
+| `v0.9` | draft | planned | [`versions/v0.9/`](versions/v0.9/README.md) |
+| `v0.10` | draft | planned | [`versions/v0.10/`](versions/v0.10/README.md) |
 
 Статус реализации является навигационным. Для release-решений его необходимо
-проверять по реализации и тестам.
+проверять по коду, миграциям и тестам.
 
 ## Как работать со списком обновлений
 
 1. Откройте README нужной основной версии.
-2. Найдите знакомое имя обновления в таблице, например
-   `v0.3-agent-protocol-foundation` или `v0.4-storage-foundation`.
-3. Перейдите в одноимённый Markdown-файл.
-4. Если обновление достаточно крупное, оно представлено папкой с собственным
-   README. Так устроен `v0.4-file-artifacts-advanced`.
+2. Найдите идентификатор обновления.
+3. Перейдите в указанную тематическую спецификацию или implementation plan.
+4. Если обновление стало достаточно крупным, оно может быть представлено папкой
+   с собственным README без изменения стабильного идентификатора.
 
-Тематические документы внутри крупного обновления не заменяют его имя и место
-в последовательности версий.
+Исторические имена v0.3 и v0.4 сохраняются. Начиная с v0.5, именованные
+implementation updates используют формат:
+
+```text
+v<major>.<minor>.<sequence>-<descriptive-slug>
+```
+
+Например: `v0.5.1-postgresql-foundation` или `v0.6.3-task-runtime`.
+Подробные правила находятся в [`versions/README.md`](versions/README.md).
 
 ## Сквозные документы
 
 | Документ | Назначение |
 |---|---|
 | [`current.md`](current.md) | Текущий baseline и граница между существующим и будущим |
-| [`overview.md`](overview.md) | Цели развития архитектуры `v0.3 → v0.8` |
+| [`overview.md`](overview.md) | Цели развития архитектуры `v0.3 → v0.10` |
 | [`principles.md`](principles.md) | Каталог инвариантов разных этапов развития |
+| [`architecture-evolution.md`](architecture-evolution.md) | Этапы модульного, сервисного и execution-plane развития |
+| [`dependency-rules.md`](dependency-rules.md) | Допустимое направление imports и ports/adapters |
+| [`release-gates.md`](release-gates.md) | Универсальные и version-specific критерии завершения |
 | [`glossary.md`](glossary.md) | Канонические значения основных терминов |
 | [`roadmap.md`](roadmap.md) | Хронологическая сводка; не источник детальных контрактов |
 | [`decisions/`](decisions/README.md) | Правила ведения ADR |
@@ -69,17 +85,20 @@ last_reviewed: 2026-07-25
 | Context management v0.4 | `v0.4/README.md` → storage → result compaction → cycle compaction |
 | DAG planning | `v0.4/README.md` → storage → DAG planning |
 | Файлы, input и delivery | `v0.4/README.md` → unified input/artifact → file artifacts → semantic interaction → output delivery → input runtime |
-| PostgreSQL и RAG | `v0.5/README.md` и перечисленные там зависимости v0.4 |
-| Distributed runtime | `v0.6/README.md` → v0.5 persistence/RAG |
-| Skills | `v0.7/README.md` → v0.6 orchestration |
-| Identity и multi-user | `v0.8/README.md` → v0.5 scopes → v0.6 runtime → v0.7 skills |
+| Рефакторинг runtime | `v0.4/README.md` → `v0.4-runtime-modularization/` → dependency rules |
+| PostgreSQL и RAG | `v0.5/README.md` → architecture overview → implementation plan |
+| Distributed runtime | `v0.6/README.md` → v0.5 persistence → implementation plan |
+| Skills | `v0.7/README.md` → v0.6 task runtime → implementation plan |
+| Identity и multi-user | `v0.8/README.md` → ownership-ready persistence/runtime/skills |
+| Isolated execution | `v0.9/README.md` → v0.6 TaskRun → v0.7 capabilities → v0.8 authorization |
+| Distributed runners | `v0.10/README.md` → v0.9 execution contracts и hardening |
 
 ## Правила каноничности
 
 1. README основной версии является каноническим реестром именованных
    обновлений и их порядка.
-2. Для одной архитектурной темы внутри обновления существует один
-   канонический тематический файл.
+2. Для одной архитектурной темы внутри обновления существует один канонический
+   тематический файл.
 3. README версии определяет порядок чтения и область действия, но не
    переопределяет подробные контракты тематического файла.
 4. `roadmap.md` описывает последовательность развития и не является второй
@@ -107,7 +126,7 @@ last_reviewed: 2026-07-25
 
 `implementation_status`:
 
-- `implemented` — исходная документация утверждает, что решение отражено в коде;
+- `implemented` — решение отражено в коде и подтверждено тестами;
 - `partial` — реализована или стабилизирована только часть контура;
 - `planned` — реализация запланирована;
 - `mixed` — документ охватывает несколько версий;
@@ -117,13 +136,14 @@ last_reviewed: 2026-07-25
 
 - Один Markdown-файл отвечает за одну архитектурную ответственность.
 - В каждом файле один заголовок `# H1`.
-- Глобальные номера `Часть VIII`, `AF-10` являются локальной структурой
-  соответствующего обновления; межфайловая навигация использует имена
-  обновлений.
 - Детали не копируются в README: используется краткое резюме и ссылка.
-- Новый крупный патч обновляет существующий канонический файл либо создаёт
-  новую ясно названную тему. Имена `advanced`, `new`, `final`, `F1/F2` не
-  используются как постоянная архитектурная классификация.
+- Новый крупный патч обновляет существующий канонический файл либо создаёт новую
+  ясно названную тему.
+- Внутренние шаги update не получают обязательную нумерацию `v0.x.y.z`;
+  dependencies и допустимая параллельность задаются implementation plan.
 - Fenced blocks применяются для кода, схем и форматозависимых flow, а не как
   замена обычным Markdown-спискам.
-- Каждый новый документ должен быть достижим из README своей версии.
+- Каждый новый документ должен быть достижим из README своей версии или из
+  таблицы сквозных документов.
+- Каждая основная версия заканчивается stabilization/hardening update и
+  проверяется по [`release-gates.md`](release-gates.md).
