@@ -9,6 +9,7 @@ from typing import Any
 
 import httpx
 
+from ...interaction.ids import new_output_claim_request_id
 from ...interaction.output_models import (
     ArtifactContentReceiptState,
     ArtifactOutputPart,
@@ -20,6 +21,7 @@ from ...interaction.output_models import (
     OutputPartReceiptState,
 )
 from ...interaction.output_outbox import ReadyOutputOutboxRef
+from .output_batch_gateway import TelegramClaimedOutputGateway
 from .output_plan_executor import (
     TelegramExecutionContext,
     TelegramOutputPlanExecutor,
@@ -180,10 +182,9 @@ class TelegramReadyOutboxWorker:
             "client_type": "telegram",
             "client_instance_id": self.client_instance_id,
         }
-        claim = await self._request_json(
-            "POST",
-            f"/internal/output-outbox/{listed.output_batch_id}/claim",
-            json=authority,
+        claim = await self._claim_with_retry(
+            listed,
+            authority=authority,
         )
         batch = OutputBatch.model_validate(claim.get("output_batch"))
         plan = OutputDeliveryPlan.model_validate(claim.get("delivery_plan"))
@@ -221,6 +222,40 @@ class TelegramReadyOutboxWorker:
         )
         return True
 
+    async def _claim_with_retry(
+        self,
+        listed: ReadyOutputOutboxRef,
+        *,
+        authority: dict[str, str],
+    ) -> dict[str, Any]:
+        """Retry one claim with a stable idempotency key.
+
+        A lost HTTP response after the Gateway committed READY -> DELIVERING must
+        return the original attempt rather than strand the batch or create a
+        second transport attempt.
+        """
+
+        claim_request_id = new_output_claim_request_id()
+        body = {**authority, "claim_request_id": claim_request_id}
+        last_error: BaseException | None = None
+        for attempt in range(3):
+            try:
+                return await self._request_json(
+                    "POST",
+                    f"/internal/output-outbox/{listed.output_batch_id}/claim",
+                    json=body,
+                )
+            except httpx.HTTPStatusError as error:
+                last_error = error
+                if error.response.status_code < 500:
+                    raise
+            except httpx.RequestError as error:
+                last_error = error
+            if attempt < 2:
+                await asyncio.sleep(2 ** attempt)
+        assert last_error is not None
+        raise last_error
+
     def _execution_context(self, batch: OutputBatch) -> TelegramExecutionContext:
         route = batch.response_route
         if route.route_type.strip().lower() != "telegram":
@@ -238,7 +273,7 @@ class TelegramReadyOutboxWorker:
         )
         return TelegramExecutionContext(
             bot=self.bot,
-            gateway=self.gateway,
+            gateway=self._claimed_gateway(batch),
             session_id=batch.session_id,
             chat_id=chat_id,
             message_thread_id=thread_id,
@@ -248,6 +283,25 @@ class TelegramReadyOutboxWorker:
             # an uncertain presentation handle.
             status_message_id=None,
         )
+
+    def _claimed_gateway(self, batch: OutputBatch) -> Any:
+        """Bind exact byte access to this claimed immutable OutputBatch.
+
+        Deterministic test doubles may implement only the executor protocol. The
+        production TelegramArtifactGatewayClient exposes the connection fields
+        required by ``from_client`` and is always converted to the scoped facade.
+        """
+
+        if all(
+            hasattr(self.gateway, attribute)
+            for attribute in ("gateway_url", "api_key")
+        ):
+            return TelegramClaimedOutputGateway.from_client(
+                self.gateway,
+                output_batch_id=batch.output_batch_id,
+                client_instance_id=self.client_instance_id,
+            )
+        return self.gateway
 
     async def _persist_receipt_with_retry(
         self,
