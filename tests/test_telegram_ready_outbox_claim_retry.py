@@ -14,6 +14,7 @@ from src.interaction.output_models import (
     OutputBatchState,
     TextOutputPart,
 )
+from src.interaction.output_outbox import ReadyOutputOutboxRef
 from src.interaction.output_store import build_ready_output_batch
 from src.interaction.rendering import CapabilityOutputRenderer
 from src.servers.telegram.output_plan_executor import TelegramOutputPlanExecutor
@@ -80,10 +81,9 @@ class TelegramReadyOutboxClaimRetryTests(unittest.IsolatedAsyncioTestCase):
             batch_limit=10,
             http_transport=httpx.MockTransport(handler),
         )
-        payload = await worker._request_json(
-            "POST",
-            f"/internal/output-outbox/{ready.output_batch_id}/claim",
-            json={
+        payload = await worker._claim_with_retry(
+            ReadyOutputOutboxRef.from_batch(ready),
+            authority={
                 "session_id": ready.session_id,
                 "client_type": "telegram",
                 "client_instance_id": "bot-1",
