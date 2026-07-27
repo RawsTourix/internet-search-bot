@@ -217,6 +217,7 @@ class FileSystemInputPresentationStore:
         return await self._mutate(
             presentation_id,
             state=state,
+            pending_terminal_state=None,
             error_code=error_code,
             closed_at=now or utc_now(),
             now=now,
