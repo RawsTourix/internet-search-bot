@@ -33,6 +33,17 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
         context: TelegramExecutionContext,
     ) -> OutputDeliveryReceipt:
         gateway = context.gateway
+        configured_instance = str(
+            getattr(gateway, "client_instance_id", "") or ""
+        ).strip()
+        if (
+            configured_instance
+            and configured_instance
+            != batch.capability_snapshot.client_instance_id
+        ):
+            raise ValueError(
+                "Telegram executor gateway instance differs from OutputBatch"
+            )
         if (
             not isinstance(gateway, TelegramClaimedOutputGateway)
             and all(
