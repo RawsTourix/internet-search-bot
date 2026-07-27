@@ -108,7 +108,7 @@ def register_domain_exception_handlers(app: FastAPI) -> None:
             request: Request,
             error: Exception,
             *,
-            _status: int = status.HTTP_422_UNPROCESSABLE_ENTITY,
+            _status: int = status.HTTP_422_UNPROCESSABLE_CONTENT,
         ) -> JSONResponse:
             del request
             return _response(_status, error)
