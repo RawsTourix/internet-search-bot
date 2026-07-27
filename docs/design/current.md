@@ -3,7 +3,7 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-25
+last_reviewed: 2026-07-27
 ---
 
 # Текущий архитектурный baseline
@@ -12,9 +12,9 @@ last_reviewed: 2026-07-25
 проекта. Статус конкретного обновления перед release-решением дополнительно
 проверяется по коду и тестам.
 
-## Baseline
+## Реализованный baseline
 
-`v0.3` описана как реализованная основа:
+`v0.3` является реализованной основой:
 
 - JSON-протокол `AgentAction`;
 - разделение dialog memory, LLM context и cycle trace;
@@ -25,11 +25,35 @@ last_reviewed: 2026-07-25
 
 Канонический индекс: [`versions/v0.3/README.md`](versions/v0.3/README.md).
 
-## Активное развитие
+## Активное развитие v0.4
 
-`v0.4` является принятой целевой архитектурой agent workspace. Исходная
-документация содержит признаки частичной реализации отдельных частей, поэтому
-для точного ответа «что уже работает» необходимо проверять код и тесты.
+`v0.4` является принятой архитектурой agent workspace.
+
+По документации и текущему коду реализованы либо доведены до устойчивого
+filesystem runtime:
+
+- `v0.4-storage-foundation`;
+- `v0.4-result-compaction`;
+- `v0.4-cycle-compaction`;
+- `v0.4-dag-planning`;
+- `v0.4-file-artifacts`;
+- `v0.4-file-artifacts-advanced`.
+
+Следующий основной функциональный этап:
+
+```text
+v0.4-input-runtime
+```
+
+После его завершения запланирован архитектурный этап:
+
+```text
+v0.4-runtime-modularization
+```
+
+Он декомпозирует центральный orchestration core без изменения принятого
+поведения v0.4 и подготавливает ports/repositories/composition root для v0.5 и
+v0.6.
 
 Канонический индекс: [`versions/v0.4/README.md`](versions/v0.4/README.md).
 
@@ -38,17 +62,21 @@ last_reviewed: 2026-07-25
 | Версия | Роль |
 |---|---|
 | `v0.5` | PostgreSQL, lazy indexing, embeddings и RAG |
-| `v0.6` | workers, queues, distributed runtime и workflow orchestration |
-| `v0.7` | предварительная Skills Library |
-| `v0.8` | предварительная Identity & Multi-user Workspace |
+| `v0.6` | AgentRun/TaskRun, workers, queues и workflow orchestration |
+| `v0.7` | Skills и extension platform |
+| `v0.8` | Identity, authorization и multi-user workspace |
+| `v0.9` | Single-node isolated execution через sandbox backend |
+| `v0.10` | Distributed execution plane и runner fleet |
 
 Будущая версия не должна использоваться как описание текущего поведения, если
-это явно не указано в соответствующей спецификации.
+это явно не подтверждено кодом, тестами или соответствующей migration.
 
-## Правило для анализа
+## Правило анализа
 
 Для вопроса о текущем поведении:
 
-1. используйте v0.3 как подтверждённый документацией baseline;
-2. проверьте затронутый код на наличие реализации v0.4;
-3. используйте v0.5–v0.8 только как будущие архитектурные ограничения.
+1. используйте v0.3 как реализованный baseline;
+2. применяйте отмеченные реализованные updates v0.4;
+3. проверяйте затронутый код и тесты для точного implementation status;
+4. используйте незавершённый v0.4 и v0.5–v0.10 только как будущие ограничения;
+5. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun` в одну сущность.
