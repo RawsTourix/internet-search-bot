@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
-from dataclasses import replace
-
 from ...interaction.output_models import (
     OutputBatch,
     OutputDeliveryPlan,
     OutputDeliveryReceipt,
 )
 from .output_batch_gateway import TelegramClaimedOutputGateway
+from .output_context import (
+    build_preflight_failure_receipt,
+    build_telegram_execution_context,
+)
 from .output_plan_executor import (
     TelegramExecutionContext,
     TelegramOutputPlanExecutor,
@@ -17,12 +19,7 @@ from .output_plan_executor import (
 
 
 class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
-    """Execute one claimed immutable batch through a narrow byte gateway.
-
-    Each call receives its own immutable OutputBatch-bound facade. No mutable
-    process-global claim binding is used, so concurrent chats and future worker
-    replicas cannot leak delivery authority into one another.
-    """
+    """Execute one claimed immutable batch through exact durable authority."""
 
     async def execute(
         self,
@@ -58,10 +55,25 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
                     batch.capability_snapshot.client_instance_id
                 ),
             )
-            context = replace(context, gateway=gateway)
+        try:
+            authoritative_context = build_telegram_execution_context(
+                batch,
+                bot=context.bot,
+                gateway=gateway,
+                status_message_id=context.status_message_id,
+            )
+        except (TypeError, ValueError) as error:
+            return build_preflight_failure_receipt(
+                batch,
+                attempt_id=attempt_id,
+                error_category=(
+                    "telegram_invalid_response_route:"
+                    f"{type(error).__name__}"
+                ),
+            )
         return await super().execute(
             batch=batch,
             plan=plan,
             attempt_id=attempt_id,
-            context=context,
+            context=authoritative_context,
         )
