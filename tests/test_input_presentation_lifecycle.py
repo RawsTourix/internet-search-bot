@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+from datetime import timedelta
 from pathlib import Path
 
 from src.ingress.models import new_input_batch_id
@@ -126,3 +127,37 @@ class InputPresentationLifecycleTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(first.presentation_id, second.presentation_id)
         self.assertIsNotNone(second.presentation_token)
+
+    async def test_stale_deferred_terminal_reservation_expires_cleanly(self):
+        _, _, public = await self.coordinator.present(
+            input_batch_id=new_input_batch_id(),
+            client_binding_id="telegram:bot:startup-recovery",
+            locale="ru",
+            state="committed",
+            file_count=1,
+            text_part_count=0,
+            response_anchor=None,
+        )
+        reserved = await self.store.get(public.presentation_id)
+        self.assertEqual(reserved.state, PresentationState.RESERVED)
+        self.assertEqual(
+            reserved.pending_terminal_state,
+            PresentationState.CLOSED,
+        )
+
+        recovery_time = reserved.updated_at + timedelta(seconds=31)
+        expired = await self.store.expire_stale_reservations(
+            timeout_seconds=30,
+            now=recovery_time,
+        )
+
+        self.assertEqual(len(expired), 1)
+        recovered = expired[0]
+        self.assertEqual(recovered.state, PresentationState.EXPIRED)
+        self.assertIsNone(recovered.pending_terminal_state)
+        self.assertEqual(recovered.closed_at, recovery_time)
+        self.assertEqual(recovered.error_code, "reservation_timeout")
+
+
+if __name__ == "__main__":
+    unittest.main()
