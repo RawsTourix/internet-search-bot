@@ -32,20 +32,34 @@ def validate_external_output_evidence(batch, receipt: OutputDeliveryReceipt) -> 
         content_state = item.artifact_content_state
         if content_state is None:
             # Backward-compatible persisted receipts are inferred by the
-            # completion service. New transport executors always emit the
-            # explicit field.
+            # completion service. New transport executors always emit the field.
             continue
         if content_state == ArtifactContentReceiptState.DELIVERED:
+            # A native media/document send can be confirmed before a separate
+            # overflow caption becomes ambiguous. In that case the OutputPart is
+            # UNKNOWN, while exact artifact bytes are still DELIVERED.
             if item.state not in {
                 OutputPartReceiptState.DELIVERED,
                 OutputPartReceiptState.PARTIALLY_DELIVERED,
+                OutputPartReceiptState.UNKNOWN,
             }:
                 raise OutputBatchConflictError(
-                    "delivered artifact bytes require confirmed part delivery"
+                    "delivered artifact bytes contradict the part outcome"
                 )
-            if not item.client_message_ids or item.delivered_at is None:
+            if not item.client_message_ids:
                 raise OutputBatchConflictError(
-                    "delivered artifact bytes require exact client evidence"
+                    "delivered artifact bytes require exact client message IDs"
+                )
+            if (
+                item.state
+                in {
+                    OutputPartReceiptState.DELIVERED,
+                    OutputPartReceiptState.PARTIALLY_DELIVERED,
+                }
+                and item.delivered_at is None
+            ):
+                raise OutputBatchConflictError(
+                    "confirmed delivered part requires delivered_at"
                 )
         elif content_state == ArtifactContentReceiptState.UNKNOWN:
             if item.state != OutputPartReceiptState.UNKNOWN:
