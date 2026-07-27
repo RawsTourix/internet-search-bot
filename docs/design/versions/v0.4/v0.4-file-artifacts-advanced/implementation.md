@@ -1,9 +1,10 @@
-﻿---
+---
 id: design.v0.4.semantic-interaction-implementation
 version: v0.4
 spec_status: accepted
 implementation_status: implemented
 ---
+
 # v0.4 — Реализация и архитектурные границы semantic interaction
 
 > Подраздел обновления
@@ -29,10 +30,11 @@ result delivery исполняет `OutputDeliveryPlan`, не legacy artifact pr
 | Output domain/store/recovery | `src/interaction/output_models.py`, `output_store.py`, `output_outbox.py`, `output_claim.py` |
 | Assembly/rendering | `src/interaction/output_service.py`, `rendering.py` |
 | Atomic aggregate completion и evidence | `src/interaction/output_completion.py`, `output_evidence.py` |
-| Telegram plan execution | `src/servers/telegram/output_plan_executor.py`, `scoped_output_executor.py` |
-| Telegram READY outbox | `src/servers/telegram/ready_outbox.py`, `scoped_ready_outbox.py` |
-| Exact client-instance transport bridge | `src/servers/telegram/scoped_artifact_bridge.py` |
-| Canonical Telegram composition | `src/servers/telegram/app.py`, `src/servers/telegram/__main__.py` |
+| Telegram plan execution | `src/servers/telegram/output_plan_executor.py`, `scoped_output_executor.py`, `output_context.py` |
+| Exact per-batch artifact bytes | `src/servers/telegram/output_batch_gateway.py` |
+| Telegram READY outbox | `src/servers/telegram/ready_outbox.py` |
+| Telegram control-plane bridge | `src/servers/telegram/scoped_artifact_bridge.py` |
+| Canonical Telegram composition | `src/servers/telegram/app.py`, `src/servers/telegram/__main__.py`, package safety policy in `__init__.py` |
 | API/transport bridge | `src/api/artifact_routes.py`, `artifact_transport.py`, `output_outbox_routes.py`, `legacy_delivery_guard.py` |
 
 Input/presentation lifecycle:
@@ -102,6 +104,9 @@ records.
 
 ### AF-21.2. READY outbox и crash boundary
 
+Полный accepted contract находится в
+[`ready-output-outbox.md`](ready-output-outbox.md).
+
 Безопасный process-local recovery разделяет состояния:
 
 ```text
@@ -124,23 +129,34 @@ receipt.
 
 Claim имеет отдельный `oclm_*` idempotency key. Потерянный HTTP-ответ после
 успешной записи claim повторяется с тем же key и возвращает исходный
-`attempt_id`; другой key не может присоединиться к активному attempt. State и
+`attempt_id`; другой key не может присоединиться к active attempt. State и
 claim-request index записываются под одним process-local lock с rollback.
 
-Artifact bytes для Telegram доступны только через:
+Gateway проверяет credential authority по двум измерениям:
 
 ```text
-claimed FINAL OutputBatch
-+ exact session_id
-+ exact client_type
-+ exact client_instance_id
-+ exact delivery_id member
-→ scoped content stream
+API key → client_type + exact client_instance_id
 ```
+
+Telegram key связывается с `TELEGRAM_BOT_INSTANCE_ID`, а internal key может
+иметь explicit wildcard. Query/body fields не создают полномочия.
+
+Shared control client не хранит mutable delivery-to-batch mapping. На каждый
+claimed batch executor создаёт отдельный `TelegramClaimedOutputGateway`, через
+который artifact bytes доступны только для exact manifest member. Client
+проверяет batch ID, delivery ID, content hash, content length и безопасный
+filename до Telegram send.
+
+Normal и recovered execution адресуют ответ только по immutable
+`response_route` и `response_anchor`. Transient `Update`, первый файл альбома
+или устаревший reply target не могут заменить финальную instruction anchor.
+Невалидный durable route закрывает attempt preflight-failure receipt до начала
+transport.
 
 Legacy `/internal/deliveries/{id}/content` сохранён для других compatibility
 transports, но Telegram на Gateway получает conflict и обязан использовать
-instance-scoped outbox route.
+instance-scoped outbox route. Package-level byte policy сохраняет это правило
+даже для low-level webhook entrypoint.
 
 Каноническая точка запуска полного Telegram runtime:
 
@@ -154,8 +170,8 @@ python -m src.servers.telegram
 uvicorn src.servers.telegram.app:app --host 0.0.0.0 --port 8001
 ```
 
-Низкоуровневый `telegram_server:app` остаётся compatibility webhook entrypoint,
-но не является полным production composition root.
+Низкоуровневый `telegram_server:app` остаётся compatibility webhook entrypoint
+без background READY polling, но не может использовать legacy byte endpoint.
 
 ### AF-21.3. Совместимость и v1 → v2
 
@@ -194,6 +210,8 @@ tests/test_output_outbox_api_authority.py
 tests/test_output_outbox_delivery_content.py
 tests/test_telegram_ready_outbox_claim_retry.py
 tests/test_telegram_scoped_output_execution.py
+tests/test_telegram_claimed_output_gateway.py
+tests/test_telegram_package_byte_policy.py
 tests/test_legacy_telegram_delivery_guard.py
 tests/test_semantic_ingress_limits.py
 tests/test_reply_provenance.py
@@ -212,11 +230,13 @@ tests/test_telegram_semantic_resolvers.py
 - native location/contact/image, mixed ordering и independence от legacy order;
 - 11-document split, pre/post-send failures и отсутствие ambiguous resend;
 - required/optional semantics, partial text и artifact content evidence;
+- delivered media при confirmed/unknown overflow-caption outcome;
 - Markdown → Telegram HTML и deterministic plain-text fallback;
 - atomic receipt completion/rollback и artifact-aware reconciliation;
-- final-only READY projection и exact client-instance authority;
+- final-only READY projection и exact API-key/client-instance authority;
 - idempotent claim replay и rollback при claim-index failure;
-- scoped byte streaming только для exact manifest member;
+- immutable per-batch byte streaming, hash/length/identity verification;
+- durable route/anchor для normal и recovered Telegram delivery;
 - запрет legacy Telegram content bypass;
 - caption exactly once, cumulative semantic limits и semantic ID collision;
 - capability snapshot tampering/index/symlink rejection;
