@@ -54,6 +54,7 @@ API_KEY_HEADER = APIKeyHeader(name="X-API-Key")
 
 def get_api_key_scopes() -> dict[str, frozenset[str]]:
     """Bind every configured internal credential to its transport authority."""
+
     mutable: dict[str, set[str]] = {}
     for environment_name, scope in (
         ("TELEGRAM_API_KEY", "telegram"),
@@ -71,7 +72,35 @@ def get_api_key_scopes() -> dict[str, frozenset[str]]:
     }
 
 
+def get_api_key_instance_scopes() -> dict[
+    str,
+    frozenset[tuple[str, str]],
+]:
+    """Bind transport credentials to exact client-instance authority."""
+
+    telegram_instance = (
+        os.getenv("TELEGRAM_BOT_INSTANCE_ID", "default").strip()
+        or "default"
+    )
+    mutable: dict[str, set[tuple[str, str]]] = {}
+    for environment_name, scope in (
+        ("TELEGRAM_API_KEY", ("telegram", telegram_instance)),
+        ("WEB_API_KEY", ("web", "*")),
+        ("INTERNAL_API_KEY", ("*", "*")),
+    ):
+        value = os.getenv(environment_name, "").strip()
+        if value:
+            mutable.setdefault(value, set()).add(scope)
+    if not mutable:
+        raise RuntimeError("Отсутствуют API-ключи в переменных среды")
+    return {
+        key: frozenset(sorted(scopes))
+        for key, scopes in mutable.items()
+    }
+
+
 API_KEY_SCOPES = get_api_key_scopes()
+API_KEY_INSTANCE_SCOPES = get_api_key_instance_scopes()
 VALID_API_KEYS = frozenset(API_KEY_SCOPES)
 PROGRESS_CALLBACK_ALLOWED_PREFIXES = [
     value.strip()
@@ -270,6 +299,7 @@ app.include_router(
         facade=artifact_transport,
         auth_dependency=api_key_auth,
         api_key_scopes=API_KEY_SCOPES,
+        api_key_instance_scopes=API_KEY_INSTANCE_SCOPES,
     )
 )
 
