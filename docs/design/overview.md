@@ -1,53 +1,81 @@
-﻿---
+---
 id: design.overview
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
+last_reviewed: 2026-07-27
 ---
-# Дизайн-документ: архитектура ИИ-агента v0.3 → v0.8
 
-## 0. Назначение документа
+# Дизайн-документ: архитектура ИИ-агента v0.3 → v0.10
 
-Этот документ фиксирует развитие архитектуры памяти, рабочего пространства и runtime ИИ-агента после перехода на JSON-протокол, динамические MCP-инструменты и разделение контекста.
+## Назначение
+
+Документ фиксирует развитие памяти, рабочего пространства и runtime ИИ-агента
+после перехода на JSON-протокол, динамические MCP-инструменты и разделение
+контекста.
 
 Главная цель:
 
 ```text
-Агент должен уметь выполнять длинные задачи,
-не терять рабочий контекст при WAITING_USER,
+Агент должен выполнять длинные и составные задачи,
+не терять рабочее состояние при WAITING_USER или restart,
 не засорять LLM-контекст завершёнными tool results,
-и постепенно перейти к долговременной памяти, durable orchestration,
-подключаемым skills и многопользовательской среде.
+работать с durable файлами и памятью,
+а затем безопасно масштабироваться до workers, skills,
+multi-user режима и изолированного execution plane.
 ```
 
-Документ описывает:
+## Этапы развития
 
-- текущую логику v0.3;
-- промежуточные обновления ветки `feature` перед v0.4:
-  - `v0.3-agent-protocol-foundation`;
-  - `v0.3-agent-memory-runtime`;
-  - `v0.3-cycle-memory`;
-  - `v0.3-progress-events`;
-  - `v0.3-progress-events refinements`;
-  - `v0.3-mcp-server-manager`;
-  - `v0.3-prompt-optimization`;
-  - `v0.3-final-processing-pipeline`;
-  - `v0.3-final-processing-progress`;
-- итог v0.3 и границу feature freeze перед v0.4;
-- v0.4: agent workspace, storage foundation, LLM-compaction, file artifacts, DAG planning и input runtime;
-- v0.5: PostgreSQL, lazy indexing, pgvector и RAG для памяти и workspace;
-- v0.6: микросервисную архитектуру, Redis/arq, workers, workflow orchestration и distributed runtime;
-- v0.7: предварительную концепцию подключаемой библиотеки skills;
-- v0.8: предварительную концепцию Identity & Multi-user Workspace;
-- принципы result/cycle compaction;
-- работу с файлами и версиями артефактов;
-- `InputBatch` и `CycleInbox`;
-- будущие RAG-инструменты, scheduler, skills и multi-user boundaries.
+- `v0.3` — agent loop baseline, memory/runtime separation, progress, MCP lifecycle
+  и final processing;
+- `v0.4` — agent workspace, stores/refs, compaction, artifacts, optional DAG,
+  semantic input/output, `CycleInbox` и modularization runtime;
+- `v0.5` — PostgreSQL, lazy extraction, pgvector, RAG и durable persistence;
+- `v0.6` — `AgentRun`, `TaskRun`, execution modes, Redis/arq, workers, workflow
+  scheduler и service boundaries;
+- `v0.7` — подключаемые skills и extension/capability platform;
+- `v0.8` — accounts, linked identities, conversations, ownership,
+  authorization, quotas и multi-user workspace;
+- `v0.9` — single-node sandbox runtime через `ExecutionBackend`;
+- `v0.10` — distributed runner fleet, placement, leases, fencing и remote
+  workspace.
 
-Разделы `v0.7` и `v0.8` фиксируют предварительные архитектурные концепции.
-Они не являются готовым техническим заданием: точные схемы данных, интерфейсы,
-пакеты и промежуточные версии должны уточняться после стабилизации `v0.5` и
-`v0.6`.
+## Сквозная runtime-модель
 
----
+```text
+Account / Principal               начиная с v0.8
+└── Conversation / Workspace
+    └── AgentRun                  начиная с v0.6
+        └── TaskRun               начиная с v0.6
+            ├── AgentCycle        развитие baseline v0.3–v0.4
+            └── ExecutionAttempt  начиная с v0.9
+```
 
+Эти сущности не объединяются в универсальную `session`.
+
+## Основные архитектурные линии
+
+Документация описывает:
+
+- result и cycle compaction;
+- durable content/artifact identity и immutable versions;
+- atomic `InputBatch`, `CycleInbox` и safe checkpoints;
+- exact retrieval и rebuildable RAG indexes;
+- local task DAG и workflow DAG;
+- structured task handoff вместо передачи полного parent trace;
+- composition-based skills и capability enforcement;
+- control plane / execution plane separation;
+- single-node sandbox и последующий distributed execution backend.
+
+## Статус будущих версий
+
+`v0.5`–`v0.10` являются проектными спецификациями. Их README задают
+канонический порядок именованных updates, а `implementation-plan.md` — scope,
+зависимости, последовательность и release gate.
+
+Будущая спецификация ограничивает направление развития, но не считается
+описанием текущего поведения без подтверждения кодом и тестами.
+
+Общий путь физической декомпозиции находится в
+[`architecture-evolution.md`](architecture-evolution.md).
