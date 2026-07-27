@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 
+import httpx
+
 from . import telegram_server as server
 from .config import (
     GATEWAY_URL,
@@ -45,6 +47,34 @@ ready_outbox_worker = TelegramReadyOutboxWorker(
     minimum_age_seconds=TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
     batch_limit=TELEGRAM_READY_OUTBOX_BATCH_LIMIT,
 )
+
+
+_base_deliver_agent_result = server._deliver_agent_result
+
+
+async def _deliver_agent_result(**values):
+    """Let the durable worker win a rare synchronous/outbox claim race."""
+
+    try:
+        return await _base_deliver_agent_result(**values)
+    except httpx.HTTPStatusError as error:
+        request = error.request
+        if (
+            error.response.status_code == 409
+            and request.method == "POST"
+            and request.url.path.endswith("/claim")
+            and "/internal/output-outbox/" in request.url.path
+        ):
+            output_batch = (values.get("metadata") or {}).get("output_batch") or {}
+            server.logger.info(
+                "telegram_output_claim_already_owned output_batch_id=%s",
+                output_batch.get("output_batch_id"),
+            )
+            return None
+        raise
+
+
+server._deliver_agent_result = _deliver_agent_result
 
 
 @asynccontextmanager
