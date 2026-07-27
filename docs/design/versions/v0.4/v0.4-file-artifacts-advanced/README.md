@@ -13,13 +13,14 @@ implementation_status: implemented
 
 Обновление завершает transport-independent контур semantic input/output,
 client capabilities, локализации, `OutputBatch`, delivery и artifact policy.
-Внутри оно разделено на пять тематических документов, но в списке версий
-остаётся одной рабочей единицей с именем `v0.4-file-artifacts-advanced`.
+Внутри оно разделено на тематические документы, но в списке версий остаётся
+одной рабочей единицей с именем `v0.4-file-artifacts-advanced`.
 
 | Разделы обновления | Документ |
 |---|---|
 | `AF-1`–`AF-8` | [`semantic-interaction.md`](semantic-interaction.md) |
 | `AF-9`–`AF-11` | [`output-delivery.md`](output-delivery.md) |
+| `AF-10A` | [`ready-output-outbox.md`](ready-output-outbox.md) |
 | `AF-12`–`AF-16` | [`artifact-interaction-policy.md`](artifact-interaction-policy.md) |
 | `AF-17`–`AF-20` | [`contracts-and-acceptance.md`](contracts-and-acceptance.md) |
 | `AF-21`–`AF-23` | [`implementation.md`](implementation.md) |
@@ -28,9 +29,10 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 
 1. [`semantic-interaction.md`](semantic-interaction.md)
 2. [`output-delivery.md`](output-delivery.md)
-3. [`artifact-interaction-policy.md`](artifact-interaction-policy.md)
-4. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
-5. [`implementation.md`](implementation.md)
+3. [`ready-output-outbox.md`](ready-output-outbox.md)
+4. [`artifact-interaction-policy.md`](artifact-interaction-policy.md)
+5. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
+6. [`implementation.md`](implementation.md)
 
 Общий реестр обновлений версии находится в
 [`../README.md`](../README.md).
@@ -54,8 +56,10 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 - process-restart recovery без автоматического повтора non-idempotent delivery;
 - bounded final-only `READY` outbox без повторного agent cycle;
 - idempotent claim requests для безопасного повтора потерянного HTTP-ответа;
-- exact `client_instance_id` authority для claim, receipt и artifact bytes;
-- strict transport evidence перед durable aggregate completion;
+- exact API-key + `client_instance_id` authority для claim, receipt и bytes;
+- immutable per-OutputBatch byte facade без shared mutable claim mapping;
+- durable response route/anchor для normal и recovered delivery;
+- strict transport и artifact-content evidence перед aggregate completion;
 - canonical Telegram composition root `python -m src.servers.telegram`.
 
 Runtime-конфигурация находится в корне
