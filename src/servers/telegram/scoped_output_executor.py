@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 from ...interaction.output_models import (
     OutputBatch,
     OutputDeliveryPlan,
     OutputDeliveryReceipt,
 )
+from .output_batch_gateway import TelegramClaimedOutputGateway
 from .output_plan_executor import (
     TelegramExecutionContext,
     TelegramOutputPlanExecutor,
@@ -14,11 +17,11 @@ from .output_plan_executor import (
 
 
 class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
-    """Bind one claimed immutable batch for the duration of transport execution.
+    """Execute one claimed immutable batch through a narrow byte gateway.
 
-    The binding is an in-memory routing projection used only to select the
-    instance-scoped delivery-content endpoint. It neither creates nor owns the
-    durable claim, which remains in the Gateway OutputBatch store.
+    Each call receives its own immutable OutputBatch-bound facade. No mutable
+    process-global claim binding is used, so concurrent chats and future worker
+    replicas cannot leak delivery authority into one another.
     """
 
     async def execute(
@@ -29,28 +32,25 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
         attempt_id: str,
         context: TelegramExecutionContext,
     ) -> OutputDeliveryReceipt:
-        bind = getattr(context.gateway, "bind_output_claim", None)
-        release = getattr(context.gateway, "release_output_claim", None)
-        if bind is not None:
-            gateway_instance = str(
-                getattr(context.gateway, "client_instance_id", "") or ""
-            ).strip()
-            if (
-                gateway_instance
-                and gateway_instance
-                != batch.capability_snapshot.client_instance_id
-            ):
-                raise ValueError(
-                    "Telegram executor gateway instance differs from OutputBatch"
-                )
-            bind(batch)
-        try:
-            return await super().execute(
-                batch=batch,
-                plan=plan,
-                attempt_id=attempt_id,
-                context=context,
+        gateway = context.gateway
+        if (
+            not isinstance(gateway, TelegramClaimedOutputGateway)
+            and all(
+                hasattr(gateway, attribute)
+                for attribute in ("gateway_url", "api_key")
             )
-        finally:
-            if release is not None:
-                release(batch.output_batch_id)
+        ):
+            gateway = TelegramClaimedOutputGateway.from_client(
+                gateway,
+                output_batch_id=batch.output_batch_id,
+                client_instance_id=(
+                    batch.capability_snapshot.client_instance_id
+                ),
+            )
+            context = replace(context, gateway=gateway)
+        return await super().execute(
+            batch=batch,
+            plan=plan,
+            attempt_id=attempt_id,
+            context=context,
+        )
