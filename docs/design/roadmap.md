@@ -1,245 +1,83 @@
-﻿---
+---
 id: design.roadmap
 version: cross-version
 spec_status: summary
 implementation_status: mixed
+last_reviewed: 2026-07-27
 ---
-# Часть XIII. Roadmap
 
-> **Роль документа:** хронологическая сводка. Рабочий список именованных
-> обновлений и их порядок определяются README соответствующей версии в
-> [`versions/`](versions/), а текущая применимая версия — в
-> [`current.md`](current.md).
+# Roadmap v0.3 → v0.10
 
-## v0.3 — базовая agent loop архитектура
+> **Роль документа:** хронологическая сводка. Канонический список именованных
+> updates и их порядок определяются README соответствующей версии в
+> [`versions/`](versions/), текущий baseline — в [`current.md`](current.md), а
+> подробные contracts — в тематических спецификациях.
+
+## Общая траектория
 
 ```text
-pending_cycle
-context budget
-interrupted/resume logic
-agent_cycle_archive
-compaction placeholder
+v0.3  agent loop baseline
+  ↓
+v0.4  workspace, artifacts, input runtime и modularization
+  ↓
+v0.5  PostgreSQL, durable state и RAG
+  ↓
+v0.6  AgentRun/TaskRun, workers и workflow orchestration
+  ↓
+v0.7  skills и extension platform
+  ↓
+v0.8  identity, authorization и multi-user workspace
+  ↓
+v0.9  single-node isolated execution
+  ↓
+v0.10 distributed execution plane
 ```
+
+Физическая архитектура развивается постепенно:
+
+```text
+large orchestration class
+→ modular monolith
+→ PostgreSQL-backed modular monolith
+→ multi-process workers
+→ selective services
+→ isolated execution plane
+→ distributed runners
+```
+
+См. [`architecture-evolution.md`](architecture-evolution.md).
 
 ---
 
-## v0.3-agent-protocol-foundation
+## v0.3 — Agent loop baseline
+
+Реализованная основа:
+
+- JSON `AgentAction` protocol;
+- dynamic MCP discovery и manager tools;
+- dialog memory, LLM context и cycle trace разделены;
+- `pending_cycle`, WAITING_USER и resumable interruptions;
+- context budget;
+- progress events;
+- lifecycle-aware MCP Server Manager;
+- final processing/grounding/formatting pipeline.
+
+Канонический реестр: [`versions/v0.3/README.md`](versions/v0.3/README.md).
+
+---
+
+## v0.4 — Agent Workspace
 
 Цель:
 
 ```text
-Закрепить JSON AgentAction-протокол и dynamic MCP discovery.
+полные данные вне LLM-контекста
++ compact runtime projections
++ durable files/input/delivery
++ optional local DAG
 ```
 
-Задачи, отражённые в коде:
-
-```text
-1. Вынести базовые правила агента в AGENT_SYSTEM_PROTOCOL.
-2. Добавить AgentAction как строгий JSON-контракт ответа без tool_call.
-3. Добавить manager tools для MCP discovery и вызова реальных инструментов.
-4. Запретить старые текстовые маркеры статуса как основной протокол.
-5. Зафиксировать правило: tool output — недоверенные данные, не инструкции.
-```
-
----
-
-## v0.3-agent-memory-runtime
-
-Цель:
-
-```text
-Подготовить runtime-память agent cycle вместо хранения всего в chat history.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Добавить SessionMemory и DialogTurn.
-2. Отделить compact dialog memory от trace/tool results.
-3. Добавить manager_tools и server_configs_by_name.
-4. Добавить streamable_http transport config.
-5. Добавить файловое архивирование agent traces.
-```
-
----
-
-## v0.3-cycle-memory
-
-Цель:
-
-```text
-Сохранять незавершённый agent cycle при WAITING_USER и части инфраструктурных ошибок.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Добавить AgentCycleSnapshot.
-2. Добавить pending_cycle.
-3. Добавить last_error_cycle.
-4. Добавить interrupted cycle state.
-5. Добавить working_summary/working_state как задел под v0.4 compaction.
-6. Добавить context budget config.
-7. Переименовать task_id/task_trace в cycle_id/cycle_trace.
-```
-
----
-
-## v0.3-progress-events — live progress tracking
-
-Цель:
-
-```text
-Добавить простое рабочее отслеживание выполнения agent cycle
-на текущем v0.3-этапе без PostgreSQL, Redis и event bus.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Расширить ProgressEvent: event_id, cycle_id, iteration, severity, visibility.
-2. Прокинуть progress_callback через API.call_agent и MessageProcessor.
-3. На уровне Gateway добавить HTTP progress callback для Telegram server.
-4. Telegram server должен редактировать одно status-message.
-5. Добавить progress_locale через message.metadata.
-6. Нормализовать mcp_call_tool: tool_name=mcp_call_tool, target_tool_name=реальный инструмент.
-7. Добавить throttling/deduplication для Telegram editMessageText.
-8. Санитизировать event.data и не класть туда raw tool results/secrets.
-9. Сохранять progress_events в pending_cycle и agent_cycle_archive.
-10. Оставить LLM-generated progress только как будущий optional layer.
-```
-
----
-
-## v0.3-progress-events refinements
-
-Цель:
-
-```text
-Довести progress layer до единого локализованного механизма без Telegram-specific костылей в runtime.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Добавить progress/error события для LLM retry/exhausted: llm_retry, llm_error, infrastructure_error.
-2. Добавить error_kind и can_resume.
-3. Оставить логи инфраструктурных ошибок техническими.
-4. Для Telegram добавить режим TELEGRAM_FINAL_DELIVERY_MODE.
-5. Не затирать последний runtime-status финальным "✅ Готово".
-6. Классифицировать non-retryable LLM HTTP errors как llm_configuration_error.
-7. Вынести PROGRESS_MESSAGES из MCPClient.
-8. Добавить локализованные fallback kwargs.
-9. Добавить progress_key/progress_arg_map для ManagerToolSpec.
-10. Унифицировать эмиссию через _emit_progress_event().
-```
-
----
-
-## v0.3-mcp-server-manager — lifecycle-aware MCP runtime
-
-Цель:
-
-```text
-Сделать MCPServerManager настоящим lifecycle coordinator для MCP-серверов и инструментов.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Расширить MCPServerRuntime lifecycle-полями: healthy, reconnecting, last_error, connected_at, generation.
-2. Перенести orchestration вызова реальных MCP-tools в MCPServerManager.call_tool().
-3. Добавить resolve_tool_binding(), get_runtime(), call_tool_once(), call_tool_with_recovery().
-4. Добавить mark_unhealthy(), recover_runtime(), replace_runtime().
-5. Поддержать recovery для streamable_http/http и executable/stdio.
-6. Разделить transport/lifecycle errors и tool/application errors.
-7. Добавить per-transport timeout для одной попытки вызова и timeout для reconnect/restart.
-8. Ограничить retry: одна попытка после восстановления runtime.
-9. Защитить parallel recovery через per-server lock.
-10. Обновлять tool_registry/available_tools после replace_runtime().
-11. Классифицировать Session terminated / CancelledError как управляемые lifecycle errors.
-12. Не позволять сбою внешнего MCP-сервера ронять Gateway request как HTTP 500.
-13. Подготовить структуру к будущему PostgreSQL-хранению MCP servers/tools/tool calls.
-```
-
----
-
-## v0.3-prompt-optimization
-
-Цель:
-
-```text
-Убрать surface-specific formatting из system prompt и перенести его в финальную обработку ответа.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Добавить _delivery_constraints(client_type).
-2. Не добавлять Telegram/Web formatting rules в _create_system_message().
-3. Применять delivery_constraints только к форме финального ответа.
-4. Использовать delivery_constraints в final audit / forced final answer.
-5. Не давать delivery_constraints влиять на факты, выводы или выбор инструментов.
-```
-
----
-
-## v0.3-final-processing-pipeline
-
-Цель:
-
-```text
-Разделить финальную обработку ответа на выбор режима, grounding и форматирование.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Добавить FinalProcessingMode: SKIP, FORMAT_ONLY, GROUNDED, STRICT_GROUNDED.
-2. Добавить FinalProcessingDecision.
-3. Добавить _select_final_processing_mode().
-4. Добавить _build_final_evidence_pack().
-5. Добавить _format_final_answer().
-6. Добавить _ground_final_answer().
-7. Добавить _process_final_answer().
-8. Перевести forced final answer на evidence-based сценарий.
-9. Добавить trace events final_processing_decision и final_processing_done.
-```
-
----
-
-## v0.3-final-processing-progress
-
-Цель:
-
-```text
-Показывать пользователю этап финальной подготовки/проверки ответа.
-```
-
-Задачи, отражённые в коде:
-
-```text
-1. Добавить ProgressEvent.type = final_processing_started.
-2. Добавить user-friendly progress messages для final processing modes.
-3. Добавить _final_processing_progress_key().
-4. Эмитить final_processing_started после final_processing_decision и до _process_final_answer().
-5. Не показывать пользователю внутренние термины evidence_pack / strict_grounded / audit.
-```
-
----
-
-## v0.4 — agent workspace, planning & context management
-
-Цель:
-
-```text
-Создать рабочее пространство агента:
-полные данные хранятся вне LLM-контекста,
-а runtime работает с компактными представлениями,
-файлами, InputBatch и необязательным DAG-планом.
-```
-
-Пакеты:
+Именованные updates:
 
 ```text
 v0.4-storage-foundation
@@ -247,239 +85,208 @@ v0.4-result-compaction
 v0.4-cycle-compaction
 v0.4-dag-planning
 v0.4-file-artifacts
+v0.4-file-artifacts-advanced
 v0.4-input-runtime
+v0.4-runtime-modularization
+```
+
+`v0.4-file-artifacts-advanced` завершает semantic input/output, capabilities,
+localization, `OutputBatch`, delivery/recovery и READY outbox.
+
+`v0.4-input-runtime` добавляет `CommittedInputBatch`, `CycleInbox`, safe
+checkpoints, control inbox и finalization race barrier.
+
+`v0.4-runtime-modularization` после functional v0.4 декомпозирует
+`mcp_client.py`, вводит `AgentRuntime`, LLM/tool/event/repository ports,
+composition extensions и composition root.
+
+Канонический реестр: [`versions/v0.4/README.md`](versions/v0.4/README.md).
+
+---
+
+## v0.5 — PostgreSQL и RAG
+
+Цель:
+
+```text
+filesystem-friendly contracts v0.4
+→ PostgreSQL-backed durable metadata/runtime
+→ lazy structured content processing
+→ provenance-aware retrieval
+```
+
+Порядок:
+
+```text
+v0.5.1-postgresql-foundation
+v0.5.2-repository-backends
+v0.5.3-durable-runtime-state
+v0.5.4-lazy-content-processing
+v0.5.5-rag-and-memory-tools
+v0.5.6-migration-and-recovery
+v0.5.7-persistence-stabilization
 ```
 
 Ключевые результаты:
 
-```text
-ContentStore + streaming payload IO
-ArtifactStore with lineage + immutable versions
-filesystem backend and atomic manifests
-result/content/artifact refs
-relative context budgets
-result_handling with runtime override
-single-pass result summary
-oversized fallback
-one CycleWorkingMemory
-optional DAG artifact
-ClientIngressEvent + durable IngressEventStore
-InputBatchDraft + immutable CommittedInputBatch
-Telegram album/sealing + standalone attachment draft
-Web atomic multipart input
-artifact format registry and manager tools
-MCP artifact binding and candidate promotion
-CycleAdmissionService
-CycleInbox<CommittedInputBatch>
-SessionControlInbox + safe checkpoints
-per-session lock and finalization race guard
-ClientResponseOutbox + delivery lifecycle
-```
+- SQLAlchemy 2.x async, Alembic, UnitOfWork;
+- transactional admission/finalization/outbox;
+- PostgreSQL implementations existing stores;
+- full restart recovery;
+- lazy extraction/chunking;
+- pgvector keyword/semantic/hybrid retrieval;
+- provenance/evidence;
+- filesystem migration и v0.6-ready durable state.
 
-### Учёт токенов и восстановление после переполнения контекста
-
-Runtime разделяет две задачи оценки:
-
-```text
-raw-result accounting
-    консервативная верхнесмещённая оценка недоверенного результата;
-    применяется для inline/store/summary policy и fidelity checks.
-
-main-request accounting
-    оценка полного запроса к основной LLM:
-    messages + runtime state + tool schemas + protocol overhead.
-```
-
-Для main request используется следующий порядок источников:
-
-```text
-1. Локальный tokenizer, явно заданный валидным tokenizer_encoding.
-2. Локальный tokenizer, автоматически выбранный по полному имени model,
-   затем по имени модели без provider-префикса. Этот шаг также выполняется,
-   если явно заданный tokenizer_encoding не существует в tiktoken.
-3. Model-neutral UTF-8/character heuristic, если tokenizer неизвестен.
-4. Фактический prompt_tokens из успешного ответа провайдера как
-   calibration snapshot для последующих запросов того же model и набора tools.
-```
-
-Валидный явно заданный `tokenizer_encoding` остаётся приоритетным override.
-Если автоматический mapping модели указывает на другую кодировку, runtime
-сохраняет явную настройку и пишет безопасное предупреждение без содержимого
-запроса. Диагностика выбора содержит requested/resolved encoding и источник:
-`explicit`, `model_mapping`, `model_mapping_after_explicit_failure` или
-`heuristic`.
-
-`prompt_tokens` не переносится между разными моделями и схемами инструментов.
-Snapshot привязывается к fingerprint запроса и tool schemas; для изменившегося
-low-confidence request независимо от направления изменения используются
-одновременно additive- и ratio-calibration от последнего фактического usage,
-после чего выбирается более безопасная оценка. Для high-confidence estimator
-используется additive calibration. Выбор источника, confidence,
-estimate/actual ratio и факт применения snapshot сохраняются в безопасной
-диагностике без содержимого сообщений.
-
-До сохранения token usage snapshots в persistent CycleStore требуется ввести
-стабильный `estimator_identity`: implementation, encoding name, protocol
-overhead и algorithm version. Совместимость snapshot должна проверять эту
-identity вместе с model и tool-schema fingerprint.
-
-Для non-OpenAI provider необходим общий `ProviderInputAdapter`, формирующий
-одинаковое tokenizable input representation для фактического LLM-вызова и
-token accounting. В него входят только prompt-bearing поля (`messages` или
-форматированный `prompt`, а также `tools`), но не generation-параметры вроде
-`temperature` и `max_tokens`.
-
-Compaction target относится к реально компактируемой части цикла. Системный
-prompt, tool schemas, исходный пользовательский запрос, незакрытые tool
-последовательности и защищённые последние блоки учитываются как fixed/protected
-overhead и не создают недостижимую цель для selector.
-
-Если провайдер всё же возвращает распознаваемую ошибку context overflow,
-основной LLM-вызов выполняет ровно один recovery:
-
-```text
-provider context overflow
-    -> принудительная безопасная cycle compaction
-    -> повторная сборка полного main request
-    -> один повтор LLM-вызова
-```
-
-Recovery не применяется к произвольным `400/413/422`, не делает повторов без
-компактизации и не превращает остальные configuration errors в resumable.
-Повторный overflow после recovery завершается `CycleContextLimitError` с
-сохранением рабочего цикла.
+Канонический реестр: [`versions/v0.5/README.md`](versions/v0.5/README.md).
 
 ---
 
-## v0.5 — PostgreSQL, lazy indexing и RAG
+## v0.6 — Distributed runtime
 
 Цель:
 
 ```text
-Перенести memory/workspace metadata в PostgreSQL,
-добавить pgvector и retrieval по results, files, cycles и plans.
+request → AgentRun → execution mode → TaskRun → AgentCycle
+→ structured TaskResult → durable final result/delivery
 ```
 
-Задачи:
+Порядок:
 
 ```text
-PostgreSQL + migrations
-Postgres implementations of storage/workspace/input contracts
-transactional session admission and finalization
-hybrid raw content/object storage
-artifact lineage/version/delivery persistence
-persistent ingress/draft/batch/inbox/control/outbox state
-ownership/scope-ready metadata without full account authorization
-structured task-output refs for future orchestration
-lazy file extraction and structured representations
-pgvector embeddings
-keyword/semantic/hybrid retrieval
-provenance-aware memory/artifact/plan tools
-resume full workspace after restart
+v0.6.1-job-runtime-foundation
+v0.6.2-agent-run-lifecycle
+v0.6.3-task-runtime
+v0.6.4-workflow-orchestration
+v0.6.5-interventions-and-cycle-inbox
+v0.6.6-event-bus-and-delivery
+v0.6.7-background-workers
+v0.6.8-object-storage-and-payload-runtime
+v0.6.9-capability-registry-scopes
+v0.6.10-service-boundary-stabilization
 ```
+
+Execution modes:
+
+```text
+DIRECT | SINGLE_TASK | PLANNED_TASK | WORKFLOW
+```
+
+Версия вводит durable jobs/leases, `TaskContextManifest`, workflow revisions,
+safe fork/join, user interventions, progress event bus, background workers,
+object storage и первые обоснованные process boundaries.
+
+Канонический реестр: [`versions/v0.6/README.md`](versions/v0.6/README.md).
 
 ---
 
-## v0.6 — microservices, Redis и workers
+## v0.7 — Skills и extension platform
 
-Цель:
-
-```text
-Перейти к distributed runtime
-с durable queues, workers и многоуровневой workflow/task orchestration.
-```
-
-Задачи:
+Порядок:
 
 ```text
-Redis/arq
-durable jobs/retries
-distributed CycleInbox
-worker extraction/chunking/embeddings
-background hierarchical summarization
-durable workflow/job/task domain
-optional request decomposition and workflow planner boundary
-local task-DAG scheduler
-workflow-level scheduler for major dependent tasks
-structured task result/artifact handoff
-separate task status, agent activity and task type
-safe parallel nodes
-optional MCP builtin/instance/user/session registry patch
-object storage
-service boundaries
-observability/idempotency
-Gateway / Client API and Agent Runtime separation
-durable AgentRun lifecycle
-idempotent Web ingress with request_id/run_id
-bounded synchronous compatibility mode
-status/result/cancel endpoints for long runs
-separate per-attempt, retry and total run deadlines
-durable final result before succeeded status
-canonical progress event contract
-progress event bus with at-least-once delivery
-idempotent client consumption by event_id
-Notification / Delivery boundary
-common client delivery lifecycle
-Telegram/Web/CLI-specific progress sinks
-SSE/WebSocket reconnect and event replay
-separate execution, delivery and result-retrieval metrics
-local callback compatibility mode
+v0.7.1-skill-package-format
+v0.7.2-skill-registry
+v0.7.3-skill-discovery
+v0.7.4-skill-runtime-integration
+v0.7.5-capability-and-trust
+v0.7.6-builtin-skills
+v0.7.7-extension-platform-stabilization
 ```
+
+Skills выбираются task-scoped, загружаются bounded и подключаются через
+providers/policies/hooks. Required capabilities не являются разрешениями.
+Registry использует scopes `builtin`, `instance`, `user`, `session`.
+
+Канонический реестр: [`versions/v0.7/README.md`](versions/v0.7/README.md).
 
 ---
 
-## v0.7 — Skills Library (предварительно)
+## v0.8 — Identity & Multi-user Workspace
 
-Цель:
-
-```text
-Добавить подключаемые декларативные skills,
-выбираемые по необходимости для отдельных workflow tasks.
-```
-
-Предварительные направления:
+Порядок:
 
 ```text
-skill.md + metadata/frontmatter
-SkillRegistry with builtin/instance/user/session scopes
-compact index and hybrid retrieval
-bounded on-demand loading
-skill selection per workflow task
-skill-guided local DAG
-capability and trust enforcement
-builtin domain/system skills
-memory skill through typed memory service
-trace/progress and regression tests
+v0.8.1-identity-model
+v0.8.2-authentication
+v0.8.3-linked-identities
+v0.8.4-conversations-and-workspaces
+v0.8.5-authorization-and-ownership
+v0.8.6-quotas-settings-and-secrets
+v0.8.7-security-hardening
 ```
 
-Точный формат и промежуточные пакеты определяются после `v0.6`.
+Account, Identity, AuthSession, Principal, Conversation, Workspace, AgentRun,
+TaskRun и AgentCycle остаются разными сущностями. Telegram связывается с account
+через explicit linking flow. Every durable resource получает owner/scope,
+negative authorization tests и quota enforcement.
+
+Канонический реестр: [`versions/v0.8/README.md`](versions/v0.8/README.md).
 
 ---
 
-## v0.8 — Identity & Multi-user Workspace (предварительно)
+## v0.9 — Single-node isolated execution
 
-Цель:
-
-```text
-Добавить accounts, linked identities, conversations
-и точное ownership/authorization всех durable resources.
-```
-
-Предварительные направления:
+Порядок:
 
 ```text
-email/password account MVP
-auth sessions and profile
-Telegram identity linking
-conversation/chat management
-Web and Telegram shared workspace
-user-scoped memory/artifacts/MCP/skills/settings
-negative authorization tests
-local/self-hosted compatibility
-security audit and hardening as release gate
+v0.9.1-execution-contracts
+v0.9.2-sandbox-profiles
+v0.9.3-workspace-materialization
+v0.9.4-single-node-runner
+v0.9.5-security-and-resource-policy
+v0.9.6-lifecycle-and-recovery
+v0.9.7-sandbox-hardening
 ```
 
-Точные auth protocols, UI и deployment model пока не утверждены.
+Potentially untrusted code/process/file execution переносится в ephemeral
+sandbox. AgentRuntime, DB, Redis, auth и provider credentials остаются в trusted
+control plane. `ExecutionBackend` скрывает local/container implementation,
+workspace materialized по exact refs, outputs commit-ятся до teardown.
+
+Канонический реестр: [`versions/v0.9/README.md`](versions/v0.9/README.md).
 
 ---
 
+## v0.10 — Distributed execution plane
+
+Порядок:
+
+```text
+v0.10.1-runner-protocol
+v0.10.2-placement-and-capacity
+v0.10.3-leases-and-fencing
+v0.10.4-remote-workspace
+v0.10.5-execution-backends
+v0.10.6-distributed-security
+v0.10.7-observability-and-recovery
+v0.10.8-distributed-execution-hardening
+```
+
+Single-host Sandbox Manager расширяется до runner fleet. Placement учитывает
+profiles, resources, quotas и isolation classes. Leases/fencing исключают stale
+double commit. Object storage обеспечивает remote workspace. Docker,
+Kubernetes, gVisor и microVM остаются adapters одного execution contract.
+
+Канонический реестр: [`versions/v0.10/README.md`](versions/v0.10/README.md).
+
+---
+
+## Общий ритм версии
+
+Каждая основная версия следует ритму:
+
+```text
+functional updates
+→ integration/recovery tests
+→ architecture stabilization/hardening
+→ current/roadmap/docs consistency
+→ release gate
+```
+
+Общие критерии: [`release-gates.md`](release-gates.md).
+
+Начиная с v0.5, стабильный update ID имеет формат
+`v<major>.<minor>.<sequence>-<slug>`. Внутренние шаги не получают обязательную
+четырёхуровневую нумерацию; dependencies и параллельность задаются
+implementation plan.
