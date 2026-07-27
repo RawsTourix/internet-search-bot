@@ -1,4 +1,4 @@
-﻿---
+---
 id: design.v0.6.distributed-runtime
 version: v0.6
 spec_status: draft
@@ -343,6 +343,60 @@ ClientIngressEvent persisted in PostgreSQL
 Redis является acceleration/event transport, но PostgreSQL остаётся source of
 truth для batches, inbox application, terminal result и outbox.
 
+### 126.1. User intervention поверх `CycleInbox`
+
+`CycleInbox` сохраняет transport/admission semantics из `v0.4`: он надёжно
+доставляет committed `InputBatch` активному runtime и применяет его только в safe
+checkpoint. В `v0.6` поверх этой гарантии появляется отдельная семантика
+пользовательского вмешательства в уже выполняющийся `AgentRun`.
+
+```text
+CommittedInputBatch во время active AgentRun
+→ durable UserIntervention
+→ relation/classification относительно текущего workflow
+→ direct application, новая task или workflow revision
+→ controlled join / finalization barrier
+```
+
+Предварительные dispositions не являются окончательной schema, но должны
+различать как минимум:
+
+```text
+answer_pending
+add_context / attach_artifact
+create_task
+revise_workflow / change_constraints
+cancel_or_replace
+defer
+```
+
+Это разделяет два разных решения:
+
+```text
+Intervention Router
+→ как новый input связан с текущей работой
+
+Execution Mode Selector / Workflow Planner
+→ как выполнять возникшую из него задачу
+```
+
+Уже запущенный `TaskRun` работает с immutable context snapshot/revision. Новый
+input не вставляется в середину LLM request, незакрытого assistant/tool block или
+другой атомарной операции. В зависимости от impact policy:
+
+- незатронутая task продолжает выполняться;
+- дополнение может стать новой task и выполняться параллельно;
+- изменившиеся constraints создают новую workflow revision;
+- устаревший result помечается partial/superseded и при необходимости
+  перепроверяется;
+- cancellation применяется cooperative в safe checkpoint;
+- перед terminal commit runtime повторно проверяет relevant interventions.
+
+Пользовательское дополнение внутри активного run не должно автоматически создавать
+второй конфликтующий `AgentRun` или конкурентный cycle той же session. Оно
+сохраняет `input_batch_id`, origin, target run/task, ordering и idempotency, чтобы
+после restart можно было точно восстановить, было ли intervention применено.
+
 ---
 
 ## 127. Workflow orchestration и scheduler
@@ -524,6 +578,226 @@ metadata JSON.
 Этот patch логически связан с distributed registry/runtime, но не обязан входить
 в первый минимальный release `v0.6`.
 
+### 127.8. Execution modes и выбор стратегии
+
+До запуска основного executor runtime предварительно выбирает способ обработки
+запроса. Это не `AgentActivity`, а стратегия организации всего `AgentRun` или
+конкретной workflow task.
+
+```text
+DIRECT
+→ один bounded LLM-вызов без agent loop и manager-tool workflow
+
+SINGLE_TASK
+→ один TaskRun с обычным AgentCycle и tools по необходимости
+
+PLANNED_TASK
+→ один TaskRun с обязательным локальным AgentPlan/DAG
+
+WORKFLOW
+→ несколько TaskRun, workflow DAG, scheduler, fork/join и structured handoff
+```
+
+Внутри `WORKFLOW` каждая task выбирает собственную стратегию: простая проверка
+может быть `DIRECT`, предметная работа — `SINGLE_TASK`, а сложное изменение —
+`PLANNED_TASK`. `WORKFLOW` не должен автоматически порождать вложенный
+неограниченный `WORKFLOW`.
+
+`ExecutionModeSelector` располагается перед текущим универсальным agent cycle и
+получает bounded request envelope:
+
+```text
+current CommittedInputBatch
+compact conversation/session state
+attachment and reply metadata
+active run/waiting state
+runtime capabilities and budget policy
+```
+
+Очевидные control/direct cases могут определяться детерминированно. Неоднозначные
+случаи допускают короткий structured LLM-вызов. Безопасный compatibility fallback
+— `SINGLE_TASK`, который соответствует текущему универсальному поведению.
+
+Для `PLANNED_TASK` runtime policy делает local plan обязательным до первого
+существенного tool/action step; optional DAG semantics `v0.4` при этом не
+ломаются для остальных режимов.
+
+### 127.9. `AgentRun`, `TaskRun`, `AgentCycle` и context projection
+
+Будущий runtime не должен отождествлять один пользовательский запрос с одной
+неограниченно растущей message history.
+
+```text
+AgentRun
+└── TaskRun
+    └── AgentCycle
+```
+
+- `AgentRun` — durable обработка пользовательской цели;
+- `TaskRun` — одна изолированная, проверяемая задача;
+- `AgentCycle` — локальный LLM/tool loop конкретного executor.
+
+Каждый `TaskRun` получает runtime-owned `TaskContextManifest`, а не произвольный
+набор message indexes из родительской ветки. Manifest предварительно описывает:
+
+```text
+source input batch and original-request projection
+prompt/executor profile
+exact dependency result/artifact/content refs
+bounded summaries and applicable user addenda
+allowed manager tools and MCP tools
+constraints, output contract and success criteria
+context/model/tool/token budgets
+```
+
+`TaskContextBuilder` разрешает refs через authoritative stores, проверяет
+ownership/provenance/dependencies и создаёт новую protocol-valid историю.
+Родительская LLM может задавать `executor_profile`, goal, constraints, refs,
+expected output и budgets, но не пишет произвольный system prompt дочернему
+executor.
+
+System prompt собирается runtime из versioned/vetted blocks, например:
+
+```text
+core safety and AgentAction protocol
++ selected executor profile
++ allowed tool protocol
++ task output contract
++ optional domain/skill instructions
+```
+
+Перед LLM-вызовом обязательна валидация:
+
+- system/runtime boundary сформирована однозначно;
+- есть корректный task input;
+- каждый assistant tool call имеет matching `role=tool` result;
+- отсутствуют orphan tool results и незакрытые tool blocks;
+- dependency refs принадлежат допустимому predecessor в том же run/workflow;
+- sibling/foreign task trace не подмешивается неявно.
+
+Полный task-local trace остаётся доступен для диагностики/retrieval, но не
+переносится автоматически в parent/downstream context.
+
+### 127.10. MCP discovery как изолированная задача
+
+Manager functions остаются builtin control-plane tools, а MCP-серверы и их tools
+являются динамическим runtime registry. Подбор инструментов для конкретной задачи
+не требует трёх рекурсивных sub-agents.
+
+Один ограниченный `TaskRun` с профилем `mcp_discovery` может последовательно:
+
+```text
+mcp_list_servers
+→ mcp_list_tools для выбранных server candidates
+→ semantic selection
+→ mcp_get_tool_schema для выбранных tools
+→ structured tool-selection result
+```
+
+Экономия создаётся тем, что этот локальный cycle получает цель task и минимальный
+контекст, а не полную историю основного AgentRun.
+
+Результаты `mcp_list_*`/schema являются snapshot актуального runtime registry, а
+не долговременным cache или гарантией неизменности. При hot add/remove,
+enable/disable, reconnect или изменении tool list registry revision/server
+generation должны обновляться.
+
+Structured discovery result сохраняет реальные binding/runtime coordinates:
+
+```text
+public tool name
+server name and alias
+remote tool name
+description and input schema
+registry revision / server generation
+limitations
+```
+
+Перед фактическим `mcp_call_tool` runtime повторно проверяет, что binding доступен
+и snapshot не устарел. При несовпадении generation/revision discovery выполняется
+заново или task переводится в controlled replan.
+
+После semantic selection получение нескольких независимых schemas может
+выполняться параллельно как read-only batch. Произвольные MCP tool calls не
+становятся parallel-safe автоматически: side-effect class и independence
+определяет runtime policy.
+
+### 127.11. Adaptive revisions без бесконтрольного self-spawn
+
+Scheduler жёстко исполняет текущую committed workflow revision, но сложная задача
+не обязана полностью планироваться до последнего шага заранее.
+
+```text
+coarse workflow plan
+→ execute current revision
+→ checkpoint/evaluator
+→ sufficient: continue
+→ insufficient/changed input: propose bounded revision
+→ validate and commit next revision
+```
+
+LLM/executor не вызывает произвольную копию самого себя напрямую. Task может
+вернуть typed outcome `needs_replan`, `insufficient` или proposal новых задач;
+`Workflow Orchestrator` валидирует proposal, создаёт runtime-owned IDs,
+проверяет зависимости/лимиты и только затем передаёт новую revision scheduler.
+
+Минимальные policy limits:
+
+```text
+max tasks per run
+max parallel tasks
+max workflow/task depth
+max replanning rounds
+max total LLM/tool calls and tokens
+per-task and total deadlines
+```
+
+Уточнение пользователя, stale MCP snapshot, недостаточное покрытие поиска или
+ошибка predecessor могут менять только затронутую часть graph. Уже завершённые и
+не затронутые results не пересчитываются без причины.
+
+### 127.12. Fork/join и structured integration
+
+Параллельно выполняются только независимые tasks с явными dependencies,
+совместимыми input snapshots и безопасной resource/side-effect policy.
+Параллельность сокращает wall-clock time; изоляция `TaskRun` сокращает повторную
+передачу контекста.
+
+Join является частью workflow graph, а не свободным manager tool для ручного
+склеивания message histories:
+
+```text
+Task A ─┐
+Task B ─┼→ Join / WorkflowIntegrator → downstream task
+Task C ─┘
+```
+
+`WorkflowIntegrator` получает structured `TaskResult`:
+
+```text
+task/run/revision identity
+compact outcome summary
+typed output fields
+exact result/content/artifact refs
+provenance and limitations
+verification status
+```
+
+Возможные integration policies:
+
+```text
+evidence union
+artifact/ref set union
+context addendum
+constraint override
+result supersession
+requires reverification
+```
+
+Механическое объединение summaries недопустимо, если результаты противоречат друг
+другу или новое user intervention изменило критерии задачи. В таком случае join
+создаёт verification/reconciliation task либо новую workflow revision.
+
 ---
 
 ## 128. Background operations
@@ -576,6 +850,9 @@ Summary хранит provenance и не заменяет original content.
 cycle_id
 request_id
 run_id
+workflow_revision
+task_run_id
+intervention_id
 tool_call_id
 batch_id
 plan_id + revision
@@ -602,15 +879,17 @@ cancelled
 
 ## 132. Observability
 
-Нужны structured logs, trace IDs, cycle/tool/job correlations, metrics, distributed tracing, context/compaction metrics, queue depth и worker health.
+Нужны structured logs, trace IDs, run/task/cycle/tool/job correlations, metrics,
+distributed tracing, context projection/compaction metrics, queue depth и worker
+health.
 
 User-visible progress остаётся отдельным адаптированным слоем.
 
 Для progress delivery отдельно наблюдаются:
 
 - event published / accepted / rendered / coalesced / deduplicated / failed;
-- `request_id`, `run_id`, `event_id`, `cycle_id`, client type и delivery
-  target ID;
+- `request_id`, `run_id`, `task_run_id`, `event_id`, `cycle_id`, client type и
+  delivery target ID;
 - event bus lag, client queue depth и render latency;
 - reconnect/replay, retry и late-event rejection;
 - закрытие delivery session перед final response.
@@ -618,14 +897,19 @@ User-visible progress остаётся отдельным адаптирован
 Для Web request/run lifecycle отдельно наблюдаются:
 
 - request accepted / deduplicated / client disconnected;
+- execution mode selected и selector fallback/reason code;
 - run queued / started / waiting / retrying / finalizing / terminal;
+- task queued / started / waiting_dependency / completed / failed / cancelled;
+- workflow revision committed, fork group started и join completed;
+- intervention received / classified / applied / deferred / superseded;
+- per-task input/output tokens, context manifest size и repeated-context ratio;
 - per-attempt timeout, retry/backoff time и total wall-clock time;
 - final result persisted / delivered / fetched;
 - active runs per session и rejected concurrent starts;
 - execution outcome отдельно от delivery outcome.
 
-Логирование не содержит raw tool results, secrets или полный пользовательский
-контент.
+Логирование не содержит raw tool results, secrets, полный пользовательский
+контент или скрытые task prompts/context manifests.
 
 ---
 
@@ -641,11 +925,18 @@ User-visible progress остаётся отдельным адаптирован
 7. Client delivery contracts and client-specific progress sinks.
 8. Progress event bus and Notification / Delivery boundary.
 9. Durable workflow/job/task domain and structured task outputs.
-10. Local task-DAG scheduler.
-11. Optional workflow decomposition and workflow-level scheduler.
+10. ExecutionMode models/selector with SINGLE_TASK compatibility fallback.
+11. TaskContextManifest, prompt profiles and isolated TaskRun executor.
+12. Local task-DAG scheduler.
+13. MCP discovery TaskRun and live registry revision validation.
+14. UserIntervention routing поверх durable CycleInbox.
+15. Safe read-only fork/join and structured WorkflowIntegrator.
+16. Optional workflow decomposition and workflow-level distributed scheduler.
 ```
 
-Монолит `v0.5` не переписывается целиком одним шагом.
+Монолит `v0.5` не переписывается целиком одним шагом. Текущий `AgentCycle` сначала
+оборачивается executor contract и остаётся реализацией `SINGLE_TASK`; новые уровни
+добавляются поверх него постепенно.
 
 ---
 
@@ -660,8 +951,11 @@ User-visible progress остаётся отдельным адаптирован
 - единый progress-модуль, смешивающий agent domain и client presentation;
 - automatic unsafe parallel actions;
 - обязательная декомпозиция каждого простого запроса;
+- произвольное копирование message indexes между task contexts;
+- LLM-authored system prompts и самостоятельное расширение permissions;
+- manager function, позволяющая бесконтрольно рекурсивно spawn self/sub-agents;
+- трактовка MCP registry snapshot как вечного списка servers/tools;
 - неограниченные recursive subworkflows;
 - преждевременная имитация account-level authorization до `v0.8`.
 
 ---
-
