@@ -13,6 +13,7 @@ from src.interaction.output_models import (
 )
 from src.interaction.output_store import build_ready_output_batch
 from src.interaction.rendering import CapabilityOutputRenderer
+from src.servers.telegram.output_batch_gateway import TelegramClaimedOutputGateway
 from src.servers.telegram.output_plan_executor import TelegramExecutionContext
 from src.servers.telegram.scoped_output_executor import (
     InstanceScopedTelegramOutputPlanExecutor,
@@ -20,18 +21,22 @@ from src.servers.telegram.scoped_output_executor import (
 from tests.telegram_fakes import FakeTelegramBot
 
 
-class _BindingGateway:
+class _ProductionGateway:
+    gateway_url = "http://gateway.test"
+    api_key = "secret"
     client_instance_id = "bot-1"
+    transport = None
+    delivery_spool_memory_bytes = 1024
 
+
+class _CapturingExecutor(InstanceScopedTelegramOutputPlanExecutor):
     def __init__(self):
-        self.bound: list[str] = []
-        self.released: list[str] = []
+        super().__init__()
+        self.seen_gateway = None
 
-    def bind_output_claim(self, batch):
-        self.bound.append(batch.output_batch_id)
-
-    def release_output_claim(self, output_batch_id):
-        self.released.append(output_batch_id)
+    async def _execute_group(self, **values):
+        self.seen_gateway = values["context"].gateway
+        return await super()._execute_group(**values)
 
 
 class TelegramScopedOutputExecutionTests(unittest.IsolatedAsyncioTestCase):
@@ -60,16 +65,17 @@ class TelegramScopedOutputExecutionTests(unittest.IsolatedAsyncioTestCase):
                 ),
             ),
         )
-        self.gateway = _BindingGateway()
+        self.gateway = _ProductionGateway()
+        self.bot = FakeTelegramBot()
         self.context = TelegramExecutionContext(
-            bot=FakeTelegramBot(),
+            bot=self.bot,
             gateway=self.gateway,
             session_id="session-1",
             chat_id=100,
         )
-        self.executor = InstanceScopedTelegramOutputPlanExecutor()
+        self.executor = _CapturingExecutor()
 
-    async def test_claim_projection_wraps_successful_execution(self):
+    async def test_execution_uses_immutable_output_batch_scoped_gateway(self):
         receipt = await self.executor.execute(
             batch=self.batch,
             plan=CapabilityOutputRenderer().plan(self.batch),
@@ -77,10 +83,21 @@ class TelegramScopedOutputExecutionTests(unittest.IsolatedAsyncioTestCase):
             context=self.context,
         )
         self.assertEqual(receipt.state.value, "delivered")
-        self.assertEqual(self.gateway.bound, [self.batch.output_batch_id])
-        self.assertEqual(self.gateway.released, [self.batch.output_batch_id])
+        self.assertIsInstance(
+            self.executor.seen_gateway,
+            TelegramClaimedOutputGateway,
+        )
+        self.assertEqual(
+            self.executor.seen_gateway.output_batch_id,
+            self.batch.output_batch_id,
+        )
+        self.assertEqual(
+            self.executor.seen_gateway.client_instance_id,
+            "bot-1",
+        )
+        self.assertIs(self.context.gateway, self.gateway)
 
-    async def test_claim_projection_releases_after_plan_validation_failure(self):
+    async def test_plan_validation_failure_never_mutates_shared_gateway(self):
         invalid_plan = OutputDeliveryPlan(
             output_batch_id=self.batch.output_batch_id,
             groups=(),
@@ -93,8 +110,8 @@ class TelegramScopedOutputExecutionTests(unittest.IsolatedAsyncioTestCase):
                 attempt_id=new_output_attempt_id(),
                 context=self.context,
             )
-        self.assertEqual(self.gateway.bound, [self.batch.output_batch_id])
-        self.assertEqual(self.gateway.released, [self.batch.output_batch_id])
+        self.assertIs(self.context.gateway, self.gateway)
+        self.assertEqual(self.bot.calls, [])
 
     async def test_gateway_instance_must_match_capability_snapshot(self):
         self.gateway.client_instance_id = "bot-2"
@@ -105,8 +122,8 @@ class TelegramScopedOutputExecutionTests(unittest.IsolatedAsyncioTestCase):
                 attempt_id=new_output_attempt_id(),
                 context=self.context,
             )
-        self.assertEqual(self.gateway.bound, [])
-        self.assertEqual(self.gateway.released, [])
+        self.assertIsNone(self.executor.seen_gateway)
+        self.assertEqual(self.bot.calls, [])
 
 
 if __name__ == "__main__":
