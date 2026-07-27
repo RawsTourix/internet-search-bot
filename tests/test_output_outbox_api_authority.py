@@ -33,10 +33,17 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
         self.temporary = tempfile.TemporaryDirectory()
         root = Path(self.temporary.name)
         self.store = FileSystemOutputBatchStore(root)
-        self.snapshot = build_default_capability_registry().resolve(
-            build_telegram_capability_declaration(),
+        registry = build_default_capability_registry()
+        declaration = build_telegram_capability_declaration()
+        self.snapshot = registry.resolve(
+            declaration,
             client_type="telegram",
             client_instance_id="bot-1",
+        )
+        self.other_snapshot = registry.resolve(
+            declaration,
+            client_type="telegram",
+            client_instance_id="bot-2",
         )
         batch = self._batch(
             cycle_id="cycle-1",
@@ -44,6 +51,14 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
         )
         asyncio.run(self.store.commit(batch))
         self.final_batch_id = batch.output_batch_id
+
+        other = self._batch(
+            cycle_id="cycle-other-instance",
+            kind=OutputBatchKind.FINAL,
+            snapshot=self.other_snapshot,
+        )
+        asyncio.run(self.store.commit(other))
+        self.other_batch_id = other.output_batch_id
 
         intermediate = self._batch(
             cycle_id="cycle-intermediate",
@@ -70,6 +85,11 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
                     "web-key": frozenset({"web"}),
                     "internal-key": frozenset({"*"}),
                 },
+                api_key_instance_scopes={
+                    "telegram-key": frozenset({("telegram", "bot-1")}),
+                    "web-key": frozenset({("web", "*")}),
+                    "internal-key": frozenset({("*", "*")}),
+                },
             )
         )
         self.client = TestClient(app, raise_server_exceptions=False)
@@ -79,44 +99,54 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
         self.temporary.cleanup()
 
     def test_transport_key_cannot_read_another_transport_outbox(self):
-        response = self.client.get(
-            "/internal/output-outbox/ready",
-            params={
-                "client_type": "telegram",
-                "client_instance_id": "bot-1",
-                "minimum_age_seconds": 0,
-            },
-            headers={"X-API-Key": "web-key"},
+        response = self._list(
+            key="web-key",
+            client_instance_id="bot-1",
         )
         self.assertEqual(response.status_code, 403)
 
     def test_matching_transport_key_can_read_exact_instance(self):
-        response = self.client.get(
-            "/internal/output-outbox/ready",
-            params={
-                "client_type": "telegram",
-                "client_instance_id": "bot-1",
-                "minimum_age_seconds": 0,
-            },
-            headers={"X-API-Key": "telegram-key"},
+        response = self._list(
+            key="telegram-key",
+            client_instance_id="bot-1",
         )
         self.assertEqual(response.status_code, 200)
         batches = response.json()["output_batches"]
         self.assertEqual(len(batches), 1)
         self.assertEqual(batches[0]["output_batch_id"], self.final_batch_id)
 
-    def test_internal_key_can_administer_transport_outbox(self):
-        response = self.client.get(
-            "/internal/output-outbox/ready",
-            params={
+    def test_transport_key_cannot_select_another_instance(self):
+        response = self._list(
+            key="telegram-key",
+            client_instance_id="bot-2",
+        )
+        self.assertEqual(response.status_code, 403)
+
+        claim = self.client.post(
+            f"/internal/output-outbox/{self.other_batch_id}/claim",
+            json={
+                "session_id": "session-1",
                 "client_type": "telegram",
-                "client_instance_id": "bot-1",
-                "minimum_age_seconds": 0,
+                "client_instance_id": "bot-2",
+                "claim_request_id": new_output_claim_request_id(),
             },
-            headers={"X-API-Key": "internal-key"},
+            headers={"X-API-Key": "telegram-key"},
+        )
+        self.assertEqual(claim.status_code, 403)
+        batch = asyncio.run(self.store.get(self.other_batch_id))
+        self.assertEqual(batch.state, OutputBatchState.READY)
+
+    def test_internal_key_can_administer_transport_outbox(self):
+        response = self._list(
+            key="internal-key",
+            client_instance_id="bot-2",
         )
         self.assertEqual(response.status_code, 200)
         self.assertEqual(len(response.json()["output_batches"]), 1)
+        self.assertEqual(
+            response.json()["output_batches"][0]["output_batch_id"],
+            self.other_batch_id,
+        )
 
     def test_direct_claim_rejects_non_final_batch_before_state_change(self):
         response = self.client.post(
@@ -133,7 +163,24 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
         batch = asyncio.run(self.store.get(self.intermediate_batch_id))
         self.assertEqual(batch.state, OutputBatchState.READY)
 
-    def _batch(self, *, cycle_id: str, kind: OutputBatchKind):
+    def _list(self, *, key: str, client_instance_id: str):
+        return self.client.get(
+            "/internal/output-outbox/ready",
+            params={
+                "client_type": "telegram",
+                "client_instance_id": client_instance_id,
+                "minimum_age_seconds": 0,
+            },
+            headers={"X-API-Key": key},
+        )
+
+    def _batch(
+        self,
+        *,
+        cycle_id: str,
+        kind: OutputBatchKind,
+        snapshot=None,
+    ):
         return build_ready_output_batch(
             session_id="session-1",
             cycle_id=cycle_id,
@@ -144,7 +191,7 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
                 conversation_id="100",
             ),
             locale="en",
-            capability_snapshot=self.snapshot,
+            capability_snapshot=snapshot or self.snapshot,
             parts=(
                 TextOutputPart(
                     part_id=new_output_part_id(),
