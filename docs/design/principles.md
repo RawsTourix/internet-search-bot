@@ -1,12 +1,14 @@
-﻿---
+---
 id: design.principles
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
+last_reviewed: 2026-07-27
 ---
+
 # Главные принципы
 
-> Некоторые пункты относятся к будущим версиям v0.4–v0.8 и становятся
+> Некоторые пункты относятся к будущим версиям v0.4–v0.10 и становятся
 > применимыми только в границах соответствующей version specification.
 > Текущий baseline определён в [`current.md`](current.md).
 
@@ -71,13 +73,12 @@ implementation_status: mixed
 59. Final result сохраняется до terminal status `succeeded`.
 60. Повтор Web request с тем же idempotency key не создаёт duplicate run.
 61. Per-attempt timeout/retry budget отделён от total run deadline.
-62. Execution outcome, delivery outcome и result retrieval наблюдаются
-    раздельно.
+62. Execution outcome, delivery outcome и result retrieval наблюдаются раздельно.
 63. `v0.6` различает workflow DAG крупных задач и local task DAG одной задачи.
 64. Planner/LLM определяет смысл и dependencies; scheduler обеспечивает жёсткое,
     идемпотентное и ресурсно ограниченное исполнение.
-65. Agent Executor по возможности получает одну ясно описанную ответственность,
-    bounded inputs и проверяемый output contract.
+65. Agent Executor получает одну ясно описанную ответственность, bounded inputs и
+    проверяемый output contract.
 66. Результаты между tasks передаются как structured summaries и exact/RAG refs,
     а не как полный producer context.
 67. Task lifecycle status, AgentActivity и domain task type являются разными
@@ -91,8 +92,43 @@ implementation_status: mixed
 71. `user` scope становится полноценно enforced только после Identity и
     Authorization layer `v0.8`.
 72. Account, Identity, AuthSession, Conversation, AgentRun, TaskRun и AgentCycle
-    не должны смешиваться в одну сущность `session`.
+    не смешиваются в одну сущность `session`.
 73. Security audit является release gate/hardening process, а не доказательством
     абсолютной безопасности или обычной product feature.
-74. Local и self-hosted deployment остаются first-class даже после появления
-    accounts и потенциального managed service.
+74. Local и self-hosted deployment остаются first-class после появления accounts
+    и потенциального managed service.
+75. `AgentRuntime`, а не MCP-specific client, является владельцем agent loop.
+76. MCP является одним из tool backends и не владеет application/session state.
+77. Новые runtime capabilities подключаются через composition, providers,
+    policies и hooks, а не через неограниченную цепочку subclasses/mixins.
+78. Concrete infrastructure создаётся в composition root; import модуля не
+    запускает application lifecycle.
+79. Domain/application code не импортирует FastAPI, SQLAlchemy, Redis, arq,
+    Docker или Kubernetes adapters.
+80. Process/network boundary вводится после стабилизации in-process contract.
+81. Python package или таблица не являются достаточной причиной для выделения
+    микросервиса.
+82. `AgentRun`, `TaskRun`, `AgentCycle` и `ExecutionAttempt` имеют отдельные
+    identity, lifecycle и retry semantics.
+83. `TaskRun` получает runtime-owned `TaskContextManifest`, а не произвольную
+    копию parent message history.
+84. Workflow revision является committed runtime artifact; executor не создаёт
+    бесконтрольные дочерние agents напрямую.
+85. User input во время active run становится durable intervention и применяется
+    только в safe boundary.
+86. Control plane и execution plane разделяются начиная с v0.9.
+87. Ephemeral sandbox привязывается к TaskRun/execution attempt, а не навсегда к
+    user или conversation.
+88. Sandbox не получает database, Redis, LLM provider или container-daemon
+    credentials.
+89. Network access sandbox запрещён по умолчанию и расширяется только policy.
+90. Sandbox output импортируется в durable storage до terminal completion и
+    teardown.
+91. `ExecutionBackend` скрывает local process, container и remote runner details.
+92. Distributed execution использует leases и fencing tokens; старый attempt не
+    может commit после выдачи нового lease generation.
+93. Потерянный runner не является source of truth о состоянии run.
+94. Object storage и exact immutable refs заменяют shared-local-filesystem
+    assumption в v0.10.
+95. Идентификатор принятого или начатого update стабилен и не меняется при
+    последующей реорганизации документации.
