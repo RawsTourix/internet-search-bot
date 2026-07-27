@@ -51,31 +51,62 @@ class OutputTransportReceiptRequest(OutputTransportAuthorityRequest):
     receipt: OutputDeliveryReceipt
 
 
+TransportInstanceScopes = Mapping[
+    str,
+    frozenset[tuple[str, str]],
+]
+
+
 def create_output_outbox_router(
     *,
     facade,
     auth_dependency,
     api_key_scopes: Mapping[str, frozenset[str]],
+    api_key_instance_scopes: TransportInstanceScopes | None = None,
 ) -> APIRouter:
     """Create the internal process-local outbox worker API.
 
     Only sufficiently old READY final batches are listed. DELIVERING and
     UNKNOWN batches are deliberately excluded because their transport outcome
-    may be ambiguous. The authenticated key must also own the requested client
-    transport; body/query fields alone never grant authority.
+    may be ambiguous. The authenticated credential must own both the requested
+    client transport and, when configured, the exact client instance; body and
+    query fields never grant authority by themselves.
     """
 
     router = APIRouter()
     service = ReadyOutputOutboxService(facade.api.output_store)
     claim_service = IdempotentOutputClaimService(facade.api.output_store)
 
-    def require_transport_scope(api_key: str, client_type: str) -> None:
-        normalized = client_type.strip().lower()
+    def require_transport_scope(
+        api_key: str,
+        client_type: str,
+        client_instance_id: str,
+    ) -> None:
+        normalized_client = client_type.strip().lower()
+        normalized_instance = client_instance_id.strip()
+        if not normalized_client or not normalized_instance:
+            raise HTTPException(
+                status_code=422,
+                detail="client_type and client_instance_id must not be empty",
+            )
         scopes = api_key_scopes.get(api_key, frozenset())
-        if "*" not in scopes and normalized not in scopes:
+        if "*" not in scopes and normalized_client not in scopes:
             raise HTTPException(
                 status_code=403,
                 detail="API key is not authorized for this output transport",
+            )
+        if api_key_instance_scopes is None:
+            return
+        instance_scopes = api_key_instance_scopes.get(api_key, frozenset())
+        accepted = {
+            ("*", "*"),
+            (normalized_client, "*"),
+            (normalized_client, normalized_instance),
+        }
+        if not accepted.intersection(instance_scopes):
+            raise HTTPException(
+                status_code=403,
+                detail="API key is not authorized for this client instance",
             )
 
     @router.get("/internal/output-outbox/ready")
@@ -90,7 +121,7 @@ def create_output_outbox_router(
         ),
         api_key: str = Depends(auth_dependency),
     ):
-        require_transport_scope(api_key, client_type)
+        require_transport_scope(api_key, client_type, client_instance_id)
         try:
             batches = await service.list_ready(
                 client_type=client_type,
@@ -115,7 +146,11 @@ def create_output_outbox_router(
         body: OutputTransportClaimRequest,
         api_key: str = Depends(auth_dependency),
     ):
-        require_transport_scope(api_key, body.client_type)
+        require_transport_scope(
+            api_key,
+            body.client_type,
+            body.client_instance_id,
+        )
         try:
             batch = await facade.api.output_store.get(output_batch_id)
             service.validate_authority(
@@ -159,7 +194,7 @@ def create_output_outbox_router(
     ):
         """Open exact bytes only through a claimed instance-owned OutputBatch."""
 
-        require_transport_scope(api_key, client_type)
+        require_transport_scope(api_key, client_type, client_instance_id)
         try:
             batch = await facade.api.output_store.get(output_batch_id)
             service.validate_authority(
@@ -241,7 +276,11 @@ def create_output_outbox_router(
         body: OutputTransportReceiptRequest,
         api_key: str = Depends(auth_dependency),
     ):
-        require_transport_scope(api_key, body.client_type)
+        require_transport_scope(
+            api_key,
+            body.client_type,
+            body.client_instance_id,
+        )
         try:
             batch = await facade.api.output_store.get(output_batch_id)
             service.validate_authority(
@@ -267,7 +306,12 @@ def create_output_outbox_router(
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (InteractionValidationError, ValueError) as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
-        except (InteractionIntegrityError, InteractionStorageError) as error:
+        except (
+            InteractionIntegrityError,
+            InteractionStorageError,
+            ArtifactStorageError,
+            ArtifactIntegrityError,
+        ) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
     return router
