@@ -12,7 +12,6 @@ from pathlib import Path
 from ..storage.file_backend import _fsync_directory
 from .errors import ArtifactStorageError
 from .file_store import FileSystemArtifactStore
-from .models import new_artifact_id
 
 
 logger = logging.getLogger("Artifacts.FileStore")
