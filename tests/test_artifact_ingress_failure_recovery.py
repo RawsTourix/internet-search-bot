@@ -72,7 +72,12 @@ class ArtifactIngressFailureRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self.temporary.cleanup()
 
-    def _file_envelope(self, suffix: str = "1") -> ClientInputEnvelope:
+    def _file_envelope(
+        self,
+        suffix: str = "1",
+        *,
+        group_suffix: str | None = None,
+    ) -> ClientInputEnvelope:
         return ClientInputEnvelope(
             idempotency_key=f"telegram:bot-1:update:file-{suffix}",
             client_type=ClientType.TELEGRAM,
@@ -83,7 +88,7 @@ class ArtifactIngressFailureRecoveryTests(unittest.IsolatedAsyncioTestCase):
             sender=ClientSenderRef(principal_id="user-1"),
             source_update_id=f"file-update-{suffix}",
             source_message_id=f"file-message-{suffix}",
-            source_group_id=f"album-{suffix}",
+            source_group_id=f"album-{group_suffix or suffix}",
             occurred_at=datetime.now(timezone.utc),
             attachment_slots=[
                 IngressAttachmentSlot(
@@ -137,40 +142,45 @@ class ArtifactIngressFailureRecoveryTests(unittest.IsolatedAsyncioTestCase):
             self.ingress.batch_store.root.glob("ibat_*/draft.json")
         )
 
-    async def test_storage_failure_closes_draft_and_next_package_can_join(self):
+    async def _create_failed_draft(self, suffix: str) -> str:
         original_create = self.artifacts.artifact_store.create_lineage
         self.artifacts.artifact_store.create_lineage = AsyncMock(
             side_effect=ArtifactStorageError("simulated publish failure")
         )
-        first = self._file_envelope("failed")
+        envelope = self._file_envelope(suffix)
         try:
             with self.assertRaises(ArtifactStorageError):
                 await self.service.submit_atomic(
-                    first,
+                    envelope,
                     session_id=self.session_id,
                     upload_streams={
-                        "slot-file-failed": chunks(b"hello")
+                        f"slot-file-{suffix}": chunks(b"hello")
                     },
                 )
         finally:
             self.artifacts.artifact_store.create_lineage = original_create
+        draft_paths = self._all_drafts()
+        self.assertEqual(len(draft_paths), 1)
+        return draft_paths[0].parent.name
+
+    async def test_storage_failure_closes_draft_and_next_package_can_join(self):
+        failed_id = await self._create_failed_draft("failed")
 
         open_drafts = await self.ingress.batch_store.list_open_drafts(
             session_id=self.session_id
         )
         self.assertEqual(open_drafts, [])
-        draft_paths = self._all_drafts()
-        self.assertEqual(len(draft_paths), 1)
-        failed_id = draft_paths[0].parent.name
         failed = await self.ingress.batch_store.get_draft(failed_id)
         self.assertEqual(failed.state, InputBatchDraftState.FAILED)
         self.assertEqual(
             failed.failure_code,
             "artifact_ingress_storage_failed",
         )
+        # The exact failed media-group key remains as a terminal tombstone,
+        # but it is not returned by list_open_drafts.
         self.assertEqual(
-            list(self.ingress.batch_store.group_index_dir.glob("*.json")),
-            [],
+            len(list(self.ingress.batch_store.group_index_dir.glob("*.json"))),
+            1,
         )
 
         second = self._file_envelope("next")
@@ -190,6 +200,31 @@ class ArtifactIngressFailureRecoveryTests(unittest.IsolatedAsyncioTestCase):
             instruction_result.input_batch_id,
         )
         self.assertNotEqual(file_result.input_batch_id, failed_id)
+
+    async def test_late_member_of_failed_group_reuses_terminal_tombstone(self):
+        failed_id = await self._create_failed_draft("failed-group")
+        late = self._file_envelope(
+            "late-member",
+            group_suffix="failed-group",
+        )
+        result = await self.service.submit_atomic(
+            late,
+            session_id=self.session_id,
+            upload_streams={"slot-file-late-member": chunks(b"hello")},
+        )
+        self.assertEqual(result.state, "failed")
+        self.assertEqual(result.input_batch_id, failed_id)
+        self.assertEqual(
+            result.error_code,
+            "artifact_ingress_storage_failed",
+        )
+        self.assertEqual(len(self._all_drafts()), 1)
+        self.assertEqual(
+            await self.ingress.batch_store.list_open_drafts(
+                session_id=self.session_id
+            ),
+            [],
+        )
 
     async def test_failed_draft_cannot_return_to_collecting(self):
         envelope = self._file_envelope("terminal")
