@@ -5,8 +5,8 @@ from unittest.mock import AsyncMock
 from telegram.ext import MessageHandler, filters
 
 from src.servers.telegram.input_handler_policy import (
-    replace_attachment_handler,
     route_semantic_or_attachment,
+    wrap_telegram_attachment_handler,
 )
 
 
@@ -51,60 +51,43 @@ class TelegramInputHandlerPolicyTests(unittest.IsolatedAsyncioTestCase):
         attachment_handler.assert_awaited_once_with(update, context)
         semantic_handler.assert_not_awaited()
 
-    def test_unique_registered_handler_preserves_filter_order_and_block(self):
-        async def before_callback(update, context):
-            return None
+    async def test_target_handler_is_wrapped_without_changing_filter_or_block(self):
+        semantic_handler = AsyncMock(return_value="semantic")
+        extract_attachments = lambda message: []
 
-        async def attachment_callback(update, context):
-            return None
+        async def attachment_handler(update, context):
+            return "attachment"
 
-        async def after_callback(update, context):
-            return None
+        attachment_handler.__module__ = "src.servers.telegram.telegram_server"
+        attachment_handler.__globals__["message_handler"] = semantic_handler
+        attachment_handler.__globals__[
+            "extract_telegram_attachments"
+        ] = extract_attachments
 
-        async def replacement_callback(update, context):
-            return None
-
-        before = MessageHandler(filters.COMMAND, before_callback)
         original = MessageHandler(
             filters.Document.ALL | filters.FORWARDED,
-            attachment_callback,
+            attachment_handler,
             block=False,
         )
-        after = MessageHandler(filters.TEXT, after_callback)
-        application = SimpleNamespace(handlers={0: [before, original, after]})
+        wrapped = wrap_telegram_attachment_handler(original)
 
-        replace_attachment_handler(
-            application,
-            original_callback=attachment_callback,
-            replacement_callback=replacement_callback,
+        self.assertIsInstance(wrapped, MessageHandler)
+        self.assertIsNot(wrapped, original)
+        self.assertEqual(wrapped.filters, original.filters)
+        self.assertFalse(wrapped.block)
+        self.assertIs(
+            getattr(wrapped.callback, "_telegram_original_callback"),
+            attachment_handler,
         )
 
-        replaced = application.handlers[0][1]
-        self.assertIs(application.handlers[0][0], before)
-        self.assertIs(application.handlers[0][2], after)
-        self.assertIsInstance(replaced, MessageHandler)
-        self.assertIs(replaced.callback, replacement_callback)
-        self.assertEqual(replaced.filters, original.filters)
-        self.assertFalse(replaced.block)
+        update = SimpleNamespace(effective_message=object())
+        result = await wrapped.callback(update, object())
+        self.assertEqual(result, "semantic")
+        semantic_handler.assert_awaited_once()
 
-    def test_missing_or_ambiguous_registration_is_rejected(self):
-        async def target(update, context):
-            return None
-
-        with self.assertRaises(RuntimeError):
-            replace_attachment_handler(
-                SimpleNamespace(handlers={0: []}),
-                original_callback=target,
-                replacement_callback=_noop,
-            )
-
-        duplicate = MessageHandler(filters.ALL, target)
-        with self.assertRaises(RuntimeError):
-            replace_attachment_handler(
-                SimpleNamespace(handlers={0: [duplicate, duplicate]}),
-                original_callback=target,
-                replacement_callback=_noop,
-            )
+    def test_unrelated_handler_is_not_wrapped(self):
+        handler = MessageHandler(filters.TEXT, _noop)
+        self.assertIs(wrap_telegram_attachment_handler(handler), handler)
 
 
 if __name__ == "__main__":
