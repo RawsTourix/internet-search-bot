@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-07-27
+last_reviewed: 2026-07-28
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -24,9 +24,15 @@ last_reviewed: 2026-07-27
 | 3 | [`v0.4-cycle-compaction`](v0.4-cycle-compaction.md) | implemented | `CycleWorkingMemory` и compaction закрытых segments |
 | 4 | [`v0.4-dag-planning`](v0.4-dag-planning.md) | implemented | Optional runtime-owned DAG без scheduler |
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
-| 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | implemented | Semantic input/output, capabilities, localization и `OutputBatch` |
+| 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-24` hardening) | Semantic input/output, capabilities, localization и `OutputBatch` |
 | 7 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
 | 8 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
+
+Основной контур update 6 реализован. Временный статус `partial` отражает активный
+`AF-24` hardening порядка `grouping → durable InputBatchDraft → streaming` после
+обнаруженной process-local гонки Telegram media group и отдельной инструкции.
+Статус возвращается в `implemented` после live verification исправленного
+workflow.
 
 Статус является навигационным и перед release проверяется по коду и тестам.
 
