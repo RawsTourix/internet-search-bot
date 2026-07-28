@@ -24,9 +24,12 @@ uvicorn src.servers.telegram.app:app --host 0.0.0.0 --port 8001
 
 Прямой запуск
 `src.servers.telegram.telegram_server:app` сохранён как низкоуровневый
-compatibility entrypoint для webhook-разработки. Он не является production
-composition root и не запускает READY-outbox worker. Использовать его для
-полного агентного runtime нельзя.
+compatibility entrypoint для webhook-разработки. Package-wide input policy
+сохраняет в нём ту же маршрутизацию semantic-only событий: forwarded text,
+location, contact и poll не входят в standalone-attachment commit path и могут
+безопасно присоединяться к открытому InputBatch. Однако этот entrypoint не
+запускает READY-outbox worker и не является полным production composition root.
+Для полного агентного runtime используйте только канонический entrypoint выше.
 
 Настройки process-local outbox:
 
