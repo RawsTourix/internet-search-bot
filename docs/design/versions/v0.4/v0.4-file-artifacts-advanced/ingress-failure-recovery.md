@@ -57,7 +57,9 @@ text event
 ```
 
 Команда `/reset` не помогала, потому что очищала только LLM session memory и не
-меняла durable ingress state.
+меняла durable ingress state. После перезапуска Gateway старый open draft также
+оставался активным: startup только пытался commit-нуть ready drafts, но не
+закрывал пакеты, прежние process-local owners которых уже исчезли.
 
 ## AF-25.2. Главные invariants
 
@@ -126,8 +128,8 @@ two real compatible open drafts
 ```
 
 Исправление не выбирает «последний» или «самый новый» draft эвристически. Оно
-устраняет ложного кандидата: infrastructure-failed draft больше не считается
-open.
+устраняет ложного кандидата: infrastructure-failed или restart-abandoned draft
+больше не считается open.
 
 ### Session reset
 
@@ -140,14 +142,35 @@ cancel all open drafts of exact session
 → clear LLM session memory
 ```
 
-Reset не удаляет:
+### Startup reconciliation
+
+`API.start` является общей границей восстановления для Telegram, Web, CLI и
+других будущих transport adapters. До подключения MCP-серверов и до приёма новых
+запросов shared ingress выполняет:
+
+```text
+scan ready drafts
+→ commit fully stored drafts whose durable deadline elapsed
+→ never start agent cycle for recovered commit
+→ mark every remaining open draft as ABANDONED
+→ failure_code=process_restart_abandoned
+→ release active grouping indexes
+→ finalize active presentation handles as failed
+```
+
+После process restart прежние upload streams, debounce tasks и commit owners не
+существуют. Поэтому оставшийся open draft нельзя считать реально продолжаемым.
+Он сохраняется как terminal audit record, но не должен загрязнять следующие
+logical inputs.
+
+Startup reconciliation не удаляет:
 
 - committed InputBatch;
 - content-addressed bytes;
 - artifact lineages и versions;
 - completed OutputBatch и receipts;
 - audit/recovery evidence;
-- terminal failed-group tombstones других уже завершённых attempts.
+- terminal failed-group tombstones уже завершённых attempts.
 
 ## AF-25.3. Граница ответственности
 
@@ -156,14 +179,22 @@ ResilientFileSystemArtifactStore
 → bounded transient directory-publish retry
 
 ResilientUnifiedArtifactIngressService
-→ convert post-reservation storage/integrity failure into terminal draft
+→ runtime failure recovery;
+→ shared API startup hook через commit_ready_drafts
 
 ResilientFileSystemCoordinatedInputBatchStore
-→ terminal-state enforcement, exact failed-group isolation,
-  failure/cancel persistence and active-index cleanup on reset
+→ terminal-state enforcement;
+→ exact failed-group isolation;
+→ CANCELLED/ABANDONED transitions;
+→ active group-index cleanup
+
+ingress.startup_recovery
+→ ready commit before abandonment;
+→ presentation finalization;
+→ structured recovery report
 
 session_reset
-→ session-level composition of ingress cancellation and memory reset
+→ exact-session cancellation and memory reset
 ```
 
 Эти классы являются filesystem v0.4 implementation detail. При PostgreSQL и
@@ -214,15 +245,26 @@ one open media-group draft
 → committed history and artifacts preserved
 ```
 
+### Restart recovery
+
+```text
+persist one ready draft and one incomplete open draft
+→ recreate storage/artifact/ingress services from same filesystem root
+→ API startup hook commits ready draft without agent run
+→ incomplete draft becomes ABANDONED
+→ group index released
+→ new media group + separate instruction join one new batch
+→ no InputGroupingAmbiguityError from historical state
+```
+
 ### Live regression
 
-Повторить robustness tests №2–4 на Windows без очистки `storage` между обычными
-успешными прогонами и подтвердить:
+Повторить robustness tests №2–4 на Windows без удаления `storage` и подтвердить:
 
-- transient publish retry либо clean terminal failure;
-- отсутствие zombie open drafts;
-- повторный пакет не присоединяется к failed draft;
-- `/reset` сообщает число отменённых незавершённых пакетов;
+- при старте появляется structured reconciliation log;
+- старый zombie draft автоматически становится `ABANDONED`;
+- ручной `/reset` для cleanup не требуется;
+- новый пакет не присоединяется к failed/abandoned draft;
 - нет files-only agent cycle из-за потерянной инструкции;
 - true ambiguity не маскируется эвристикой.
 
@@ -234,6 +276,7 @@ one open media-group draft
 src/artifacts/resilient_file_store.py
 src/ingress/resilient_service.py
 src/ingress/resilient_store.py
+src/ingress/startup_recovery.py
 src/api/session_reset.py
 src/core/message_processor.py
 ```
@@ -244,18 +287,20 @@ Regression tests:
 tests/test_artifact_ingress_failure_recovery.py
 tests/test_artifact_ingress_reservation_race.py
 tests/test_artifact_ingress_grouping.py
+tests/test_artifact_ingress_startup_recovery.py
 ```
 
 Автоматический validation workflow после патча:
 
 ```text
-artifact suite: 153 tests, success
-storage suite: 41 tests, success
-plans suite: 45 tests, success
-planning suite: 19 tests, success
-api suite: success
-compile: success
+artifact suite: 156 tests expected
+storage suite: 41 tests
+plans suite: 45 tests
+planning suite: 19 tests
+api suite
+compile
 ```
 
-`implementation_status` переводится в `implemented` после live Windows
-повторения robustness tests №2–4 и подтверждения отсутствия zombie drafts.
+`implementation_status` переводится в `implemented` после успешного CI на
+актуальном head, полного локального suite и live Windows повторения robustness
+теста №2 без ручного cleanup.
