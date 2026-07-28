@@ -284,7 +284,7 @@ src/api/attachment_provider.py
 Regression tests:
 
 ```text
-tests/test_ingress_reservation_race.py
+tests/test_artifact_ingress_reservation_race.py
 tests/test_unified_input_runtime_foundation.py
 tests/test_artifact_ingress_grouping.py
 tests/test_artifact_transport_failures.py
