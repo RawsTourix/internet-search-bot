@@ -2,7 +2,7 @@
 id: design.v0.4.file-artifacts-advanced
 version: v0.4
 spec_status: accepted
-implementation_status: partial
+implementation_status: implemented
 last_reviewed: 2026-07-28
 ---
 
@@ -42,7 +42,7 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 
 ## Статус реализации
 
-Основной контур реализован в filesystem runtime:
+Контур реализован в filesystem runtime:
 
 - server-owned capability registry и immutable snapshots;
 - общая ru/en локализация;
@@ -63,13 +63,15 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 - immutable per-OutputBatch byte facade без shared mutable claim mapping;
 - durable response route/anchor для normal и recovered delivery;
 - strict transport и artifact-content evidence перед aggregate completion;
-- canonical Telegram composition root `python -m src.servers.telegram`.
+- canonical Telegram composition root `python -m src.servers.telegram`;
+- `AF-24` durable ingress reservation: grouping и create/join
+  `InputBatchDraft` выполняются в короткой scoped critical section до attachment
+  streaming.
 
-После runtime-регрессии `10 files + later instruction` открыт точечный hardening
-`AF-24`: grouping и durable draft reservation должны завершаться в одной короткой
-scope critical section до attachment streaming. Кодовый патч и автоматический
-race-test добавлены, но статус всего update остаётся `partial` до успешной
-validation и повторного Telegram workflow.
+`AF-24` подтверждён автоматическими regression tests и live Telegram workflow
+2026-07-28. Media group из 10 файлов и отдельная поздняя инструкция сформировали
+один committed batch с `artifact_count=10`, `text_part_count=1`; был запущен один
+agent cycle. Полный локальный suite: 591 test, `skipped=4`, ошибок нет.
 
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
@@ -79,5 +81,5 @@ defaults, поэтому прежний конфигурационный фай�
 
 Точные пути модулей, stores, migrations и тестов перечислены в
 [`implementation.md`](implementation.md). Порядок reservation hardening и его
-release checks определены в
+verification evidence определены в
 [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md).
