@@ -6,14 +6,20 @@ import asyncio
 
 from .coordinated_store import FileSystemCoordinatedInputBatchStore
 from .grouping import _OPEN_STATES, _TERMINAL_UNCOMMITTED_STATES
-from .models import InputBatchDraft, InputBatchDraftState, utc_now
-from .store import IngressConflictError
+from .models import (
+    ClientIngressEvent,
+    InputBatchDraft,
+    InputBatchDraftState,
+    InputGroupingMode,
+    utc_now,
+)
+from .store import IngressConflictError, IngressNotFoundError
 
 
 class ResilientFileSystemCoordinatedInputBatchStore(
     FileSystemCoordinatedInputBatchStore
 ):
-    """Keep failed/cancelled drafts terminal and release their group indexes."""
+    """Keep failed/cancelled drafts terminal and isolate their group keys."""
 
     async def cancel_open_drafts(
         self,
@@ -26,6 +32,50 @@ class ResilientFileSystemCoordinatedInputBatchStore(
             session_id,
             code,
         )
+
+    def _get_or_append_sync(
+        self,
+        event: ClientIngressEvent,
+        session_id: str,
+        grouping_mode: InputGroupingMode,
+        grouping_key: str,
+    ) -> tuple[InputBatchDraft, bool]:
+        """Reject late members of an exact failed group without a new draft."""
+
+        with self._lock:
+            existing_draft, existing_committed = self._find_by_event_sync(
+                event.event_id
+            )
+            if existing_committed is not None:
+                return self._load_draft_sync(
+                    existing_committed.input_batch_id
+                ), True
+            if existing_draft is not None:
+                return existing_draft, True
+
+            if grouping_mode != InputGroupingMode.ATOMIC:
+                group_path = self._group_index_path(
+                    session_id=session_id,
+                    grouping_mode=grouping_mode,
+                    grouping_key=grouping_key,
+                )
+                if group_path.exists() or group_path.is_symlink():
+                    index = self._read_json(group_path)
+                    batch_id = str(index.get("input_batch_id") or "")
+                    try:
+                        draft = self._load_draft_sync(batch_id)
+                    except IngressNotFoundError:
+                        group_path.unlink(missing_ok=True)
+                    else:
+                        if draft.state in _TERMINAL_UNCOMMITTED_STATES:
+                            return draft, True
+
+            return super()._get_or_append_sync(
+                event,
+                session_id,
+                grouping_mode,
+                grouping_key,
+            )
 
     def _set_state_sync(
         self,
@@ -78,11 +128,12 @@ class ResilientFileSystemCoordinatedInputBatchStore(
             if current.state == InputBatchDraftState.COMMITTED:
                 return current
             if current.state in _TERMINAL_UNCOMMITTED_STATES:
-                self._release_group_index_sync(current)
                 return current
-            updated = super()._fail_sync(input_batch_id, code, slot_id)
-            self._release_group_index_sync(updated)
-            return updated
+            # Keep the exact group index as a terminal tombstone. The draft is
+            # excluded from generic open-draft grouping, while a late member of
+            # the same media_group_id receives the same failed batch instead of
+            # opening a partial replacement package.
+            return super()._fail_sync(input_batch_id, code, slot_id)
 
     def _cancel_open_drafts_sync(
         self,
