@@ -19,7 +19,7 @@ from .store import IngressConflictError, IngressNotFoundError
 class ResilientFileSystemCoordinatedInputBatchStore(
     FileSystemCoordinatedInputBatchStore
 ):
-    """Keep failed/cancelled drafts terminal and isolate their group keys."""
+    """Keep terminal drafts immutable and isolate their grouping keys."""
 
     async def cancel_open_drafts(
         self,
@@ -28,8 +28,24 @@ class ResilientFileSystemCoordinatedInputBatchStore(
         code: str = "session_reset",
     ) -> list[InputBatchDraft]:
         return await asyncio.to_thread(
-            self._cancel_open_drafts_sync,
+            self._transition_open_drafts_sync,
             session_id,
+            InputBatchDraftState.CANCELLED,
+            code,
+        )
+
+    async def abandon_open_drafts(
+        self,
+        *,
+        session_id: str | None = None,
+        code: str = "process_restart",
+    ) -> list[InputBatchDraft]:
+        """Abandon open drafts whose process-local owners no longer exist."""
+
+        return await asyncio.to_thread(
+            self._transition_open_drafts_sync,
+            session_id,
+            InputBatchDraftState.ABANDONED,
             code,
         )
 
@@ -129,26 +145,32 @@ class ResilientFileSystemCoordinatedInputBatchStore(
                 return current
             if current.state in _TERMINAL_UNCOMMITTED_STATES:
                 return current
-            # Keep the exact group index as a terminal tombstone. The draft is
-            # excluded from generic open-draft grouping, while a late member of
-            # the same media_group_id receives the same failed batch instead of
-            # opening a partial replacement package.
+            # Keep the exact failed group index as a terminal tombstone. The
+            # draft is excluded from generic open-draft grouping, while a late
+            # member of the same media_group_id receives the same failed batch.
             return super()._fail_sync(input_batch_id, code, slot_id)
 
-    def _cancel_open_drafts_sync(
+    def _transition_open_drafts_sync(
         self,
-        session_id: str,
+        session_id: str | None,
+        state: InputBatchDraftState,
         code: str,
     ) -> list[InputBatchDraft]:
+        if state not in {
+            InputBatchDraftState.CANCELLED,
+            InputBatchDraftState.ABANDONED,
+        }:
+            raise ValueError("Unsupported terminal transition for open drafts")
+
         with self._lock:
-            cancelled: list[InputBatchDraft] = []
+            transitioned: list[InputBatchDraft] = []
             for draft in self._list_open_drafts_sync(session_id):
                 current = self._load_draft_sync(draft.input_batch_id)
                 if current.state not in _OPEN_STATES:
                     continue
                 updated = current.model_copy(
                     update={
-                        "state": InputBatchDraftState.CANCELLED,
+                        "state": state,
                         "failure_code": code,
                         "updated_at": utc_now(),
                     }
@@ -161,5 +183,5 @@ class ResilientFileSystemCoordinatedInputBatchStore(
                     updated.model_dump(mode="json"),
                 )
                 self._release_group_index_sync(updated)
-                cancelled.append(updated)
-            return cancelled
+                transitioned.append(updated)
+            return transitioned
