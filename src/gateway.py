@@ -25,7 +25,6 @@ from .api.legacy_delivery_guard import LegacyTelegramDeliveryGuardMiddleware
 from .api.output_outbox_routes import create_output_outbox_router
 from .core.message_processor import MessageProcessor
 from .core.models import ClientType, MessageType, UnifiedMessage, WebMessage
-from .ingress.startup_recovery import reconcile_ingress_after_restart
 
 
 load_dotenv()
@@ -264,16 +263,6 @@ async def lifespan(app: FastAPI):
     logger.info("Запуск Multi-Protocol Gateway...")
     await telegram_adapter.initialize()
     await web_adapter.initialize()
-    recovery = await reconcile_ingress_after_restart(
-        API.ingress_services.ingress_service,
-        API.ingress_services.batch_store,
-    )
-    if recovery.committed_count or recovery.abandoned_count:
-        logger.warning(
-            "Ingress startup recovery: committed=%s abandoned=%s",
-            recovery.committed_count,
-            recovery.abandoned_count,
-        )
     await API.start()
     logger.info("Gateway успешно запущен")
     yield
