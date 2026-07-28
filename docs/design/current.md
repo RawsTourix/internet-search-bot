@@ -3,7 +3,7 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-07-28
 ---
 
 # Текущий архитектурный baseline
@@ -36,10 +36,16 @@ filesystem runtime:
 - `v0.4-result-compaction`;
 - `v0.4-cycle-compaction`;
 - `v0.4-dag-planning`;
-- `v0.4-file-artifacts`;
-- `v0.4-file-artifacts-advanced`.
+- `v0.4-file-artifacts`.
 
-Следующий основной функциональный этап:
+Основной semantic input/output и delivery-контур
+`v0.4-file-artifacts-advanced` реализован, но update временно имеет статус
+`partial`: выполняется точечный `AF-24` hardening durable ingress reservation
+после обнаруженной гонки `media group + later instruction`. Кодовый regression
+suite пройден; до возврата статуса `implemented` требуется повторная проверка
+реального Telegram workflow.
+
+После завершения hardening следующий основной функциональный этап:
 
 ```text
 v0.4-input-runtime
@@ -77,6 +83,8 @@ v0.6.
 
 1. используйте v0.3 как реализованный baseline;
 2. применяйте отмеченные реализованные updates v0.4;
-3. проверяйте затронутый код и тесты для точного implementation status;
-4. используйте незавершённый v0.4 и v0.5–v0.10 только как будущие ограничения;
-5. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun` в одну сущность.
+3. учитывайте `AF-24` как активный hardening advanced ingress до его live
+   verification;
+4. проверяйте затронутый код и тесты для точного implementation status;
+5. используйте незавершённый v0.4 и v0.5–v0.10 только как будущие ограничения;
+6. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun` в одну сущность.
