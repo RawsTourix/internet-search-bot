@@ -16,10 +16,6 @@ from .config import (
     TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
 )
-from .input_handler_policy import (
-    replace_attachment_handler,
-    route_semantic_or_attachment,
-)
 from .ready_outbox import TelegramReadyOutboxWorker
 from .scoped_artifact_bridge import InstanceScopedTelegramArtifactGatewayClient
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
@@ -39,28 +35,6 @@ artifact_gateway = InstanceScopedTelegramArtifactGatewayClient(
 telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
 server.telegram_output_executor = telegram_output_executor
-
-
-async def _semantic_or_attachment_handler(update, context):
-    return await route_semantic_or_attachment(
-        update,
-        context,
-        extract_attachments=server.extract_telegram_attachments,
-        attachment_handler=server.attachment_handler,
-        semantic_handler=server.message_handler,
-    )
-
-
-# Telegram filters such as FORWARDED, LOCATION, CONTACT and POLL may match
-# semantic-only messages with no binary attachment. Keep the original filter and
-# handler order, but route those events through the shared semantic input path.
-# This prevents a text/semantic event that Gateway joined to an open media-group
-# draft from issuing a second standalone commit.
-replace_attachment_handler(
-    server.application,
-    original_callback=server.attachment_handler,
-    replacement_callback=_semantic_or_attachment_handler,
-)
 
 
 ready_outbox_worker = TelegramReadyOutboxWorker(
