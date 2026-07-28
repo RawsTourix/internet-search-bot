@@ -17,7 +17,6 @@ from src.ingress import (
     InputGroupingMode,
     create_ingress_services,
 )
-from src.ingress.startup_recovery import reconcile_ingress_after_restart
 from src.storage import StorageConfigType, create_storage_services
 
 
@@ -103,16 +102,19 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(submission.state, "collecting")
 
-        report = await reconcile_ingress_after_restart(
-            self.service,
-            self.ingress.batch_store,
-        )
+        committed_batches = await self.service.commit_ready_drafts()
+        report = self.service.last_startup_recovery_report
 
+        self.assertEqual(len(committed_batches), 1)
         self.assertEqual(report.committed_count, 1)
         self.assertEqual(report.abandoned_count, 0)
         self.assertEqual(
             report.committed_input_batch_ids,
             (submission.input_batch_id,),
+        )
+        self.assertEqual(
+            committed_batches[0].input_batch_id,
+            submission.input_batch_id,
         )
         committed = await self.ingress.batch_store.get_committed(
             submission.input_batch_id
@@ -150,11 +152,10 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
-        report = await reconcile_ingress_after_restart(
-            self.service,
-            self.ingress.batch_store,
-        )
+        committed_batches = await self.service.commit_ready_drafts()
+        report = self.service.last_startup_recovery_report
 
+        self.assertEqual(committed_batches, [])
         self.assertEqual(report.committed_count, 0)
         self.assertEqual(report.abandoned_count, 1)
         self.assertEqual(
