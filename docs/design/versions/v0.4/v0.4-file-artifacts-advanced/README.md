@@ -70,7 +70,8 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
   `InputBatchDraft` выполняются в короткой scoped critical section до attachment
   streaming;
 - `AF-25` failure recovery: transient Windows metadata publish получает bounded
-  retry, а permanent post-reservation failure переводит draft в terminal state;
+  retry, permanent post-reservation failure переводит draft в terminal state, а
+  поздний member exact failed media group получает terminal tombstone;
 - `/reset` отменяет open drafts exact session и затем очищает LLM memory.
 
 `AF-24` подтверждён автоматическими regression tests и live Telegram workflow
@@ -81,7 +82,7 @@ agent cycle.
 Robustness tests №2–4 затем выявили `AF-25`: transient `WinError 5` при
 публикации artifact metadata оставлял zombie draft, который загрязнял следующие
 пакеты и создавал ложную grouping ambiguity. Кодовый patch и regression suite
-готовы; artifact suite содержит 152 успешных теста. Статус update временно
+готовы; artifact suite содержит 153 успешных теста. Статус update временно
 `partial` до повторного live Windows-прогона тестов №2–4.
 
 Runtime-конфигурация находится в корне
