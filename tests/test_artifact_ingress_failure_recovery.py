@@ -1,4 +1,3 @@
-import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -20,6 +19,7 @@ from src.ingress import (
     IngressConfigType,
     IngressTextPart,
     InputBatchDraftState,
+    InputGroupingMode,
     create_ingress_services,
 )
 from src.ingress.store import IngressConflictError
@@ -197,7 +197,7 @@ class ArtifactIngressFailureRecoveryTests(unittest.IsolatedAsyncioTestCase):
         draft, _ = await self.ingress.batch_store.create_for_event(
             event,
             session_id=self.session_id,
-            grouping_mode="media_group",
+            grouping_mode=InputGroupingMode.MEDIA_GROUP,
             grouping_key="terminal-group",
         )
         failed = await self.ingress.batch_store.fail(
