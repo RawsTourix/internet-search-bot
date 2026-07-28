@@ -2,7 +2,7 @@
 id: design.v0.4.ingress-reservation-hardening
 version: v0.4
 spec_status: accepted
-implementation_status: partial
+implementation_status: implemented
 last_reviewed: 2026-07-28
 ---
 
@@ -291,6 +291,65 @@ tests/test_artifact_transport_failures.py
 tests/test_attachment_provider.py
 ```
 
-`implementation_status` переводится в `implemented` только после успешного
-compile/test validation и повторного Telegram workflow без разделения instruction
-и artifacts на разные batches.
+## AF-24.10. Verification evidence
+
+### Автоматические проверки
+
+2026-07-28 выполнен полный локальный suite:
+
+```text
+python -X utf8 -m unittest discover -s tests
+Ran 591 tests
+OK (skipped=4)
+```
+
+CI validation для patch branch также завершён успешно. Специализированный
+artifact suite включает две deterministic race-проверки:
+
+- instruction ждёт незавершённую reservation первого file event;
+- attachment streaming не удерживает reservation lock после создания draft.
+
+### Live Telegram workflow
+
+Повторён исходный сценарий:
+
+```text
+10 Telegram documents in one media group
++ separate later instruction message
+```
+
+Instruction event поступил, пока несколько attachment streams ещё находились в
+состоянии ingestion. Shared resolver переопределил atomic hint:
+
+```text
+ingress_grouping_hint_overridden
+resolved_mode=media_group
+joined_input_batch_id=ibat_9257f4a3360c4a2aa2d323076f7312f0
+```
+
+Затем event был присоединён к точному draft:
+
+```text
+ingress_event_joined_exact_draft
+input_batch_id=ibat_9257f4a3360c4a2aa2d323076f7312f0
+text_part_count=1
+attachment_count=0
+```
+
+После завершения всех streams выполнены один commit и один runtime admission:
+
+```text
+api_ingress_commit_finished
+artifact_count=10
+text_part_count=1
+
+gateway_agent_batch_started
+artifact_count=10
+text_part_count=1
+```
+
+Десять входных artifacts были прочитаны успешно, четыре deliverable созданы и
+выбраны, а transport receipt подтвердил доставку всех output parts. Разделения
+на text-only и files-only batches не произошло.
+
+`AF-24` принят как `implemented` для текущего filesystem runtime.
