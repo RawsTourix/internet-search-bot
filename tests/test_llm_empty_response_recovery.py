@@ -70,6 +70,17 @@ class LLMEmptyResponseRecoveryTests(unittest.IsolatedAsyncioTestCase):
             ["llm_empty_response_retry", "llm_empty_response_recovered"],
         )
 
+    async def test_no_choices_sentinel_is_treated_as_empty(self):
+        client = _RecoveryClient([
+            {"content": "Получен пустой ответ от LLM"},
+            {"content": "result", "tool_calls": []},
+        ])
+
+        response = await client._call_llm_with_retries([], [])
+
+        self.assertEqual(response["content"], "result")
+        self.assertEqual(len(client.calls), 2)
+
     async def test_non_main_call_keeps_explicit_output_budget(self):
         client = _RecoveryClient([
             self._empty("stop", 0),
