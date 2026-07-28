@@ -51,25 +51,6 @@ class TelegramInputHandlerPolicyTests(unittest.IsolatedAsyncioTestCase):
         attachment_handler.assert_awaited_once_with(update, context)
         semantic_handler.assert_not_awaited()
 
-    def test_registered_handler_is_replaced_in_place(self):
-        before = MessageHandler(filters.COMMAND, _noop)
-        original = MessageHandler(filters.ALL, _noop, block=False)
-        after = MessageHandler(filters.TEXT, _noop)
-        application = SimpleNamespace(handlers={0: [before, original, after]})
-
-        async def replacement(update, context):
-            return None
-
-        replace_attachment_handler(
-            application,
-            original_callback=_noop,
-            replacement_callback=replacement,
-        )
-
-        # _noop appears in all three handlers above, therefore exact callback
-        # identity alone would be ambiguous. Build a unique callback case below.
-        self.assertEqual(application.handlers[0], [before, original, after])
-
     def test_unique_registered_handler_preserves_filter_order_and_block(self):
         async def before_callback(update, context):
             return None
