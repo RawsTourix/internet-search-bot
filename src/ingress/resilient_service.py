@@ -6,7 +6,11 @@ import logging
 from collections.abc import AsyncIterator, Mapping
 
 from ..artifacts.errors import ArtifactIntegrityError, ArtifactStorageError
-from .models import ClientInputEnvelope, InputSubmissionResult
+from .models import (
+    ClientInputEnvelope,
+    InputGroupingMode,
+    InputSubmissionResult,
+)
 from .unified_service import UnifiedArtifactIngressService
 
 
@@ -22,18 +26,17 @@ class ResilientUnifiedArtifactIngressService(UnifiedArtifactIngressService):
         *,
         session_id: str,
         upload_streams: Mapping[str, AsyncIterator[bytes]] | None = None,
-        grouping_mode=None,
+        grouping_mode: InputGroupingMode = InputGroupingMode.ATOMIC,
         grouping_key: str | None = None,
     ) -> InputSubmissionResult:
-        kwargs = {
-            "session_id": session_id,
-            "upload_streams": upload_streams,
-            "grouping_key": grouping_key,
-        }
-        if grouping_mode is not None:
-            kwargs["grouping_mode"] = grouping_mode
         try:
-            return await super().submit_atomic(envelope, **kwargs)
+            return await super().submit_atomic(
+                envelope,
+                session_id=session_id,
+                upload_streams=upload_streams,
+                grouping_mode=grouping_mode,
+                grouping_key=grouping_key,
+            )
         except (ArtifactStorageError, ArtifactIntegrityError) as error:
             error_code = (
                 "artifact_ingress_integrity_failed"
