@@ -11,6 +11,7 @@ from .models import (
     InputGroupingMode,
     InputSubmissionResult,
 )
+from .startup_recovery import reconcile_ingress_after_restart
 from .unified_service import UnifiedArtifactIngressService
 
 
@@ -18,7 +19,20 @@ logger = logging.getLogger("API.Ingress.Recovery")
 
 
 class ResilientUnifiedArtifactIngressService(UnifiedArtifactIngressService):
-    """Ensure a reserved draft cannot survive an infrastructure failure as open."""
+    """Recover reserved drafts across runtime failures and process restarts."""
+
+    async def commit_ready_drafts(self):
+        """Use the existing API startup hook for shared ingress reconciliation."""
+
+        report = await reconcile_ingress_after_restart(
+            self,
+            self.batch_store,
+        )
+        self.last_startup_recovery_report = report
+        return [
+            await self.batch_store.get_committed(input_batch_id)
+            for input_batch_id in report.committed_input_batch_ids
+        ]
 
     async def submit_atomic(
         self,
