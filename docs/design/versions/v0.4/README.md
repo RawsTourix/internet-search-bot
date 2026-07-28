@@ -32,10 +32,22 @@ last_reviewed: 2026-07-28
 подтверждён live Telegram workflow.
 
 Robustness tests №2–4 выявили follow-up `AF-25`: transient filesystem failure
-после reservation оставлял open zombie draft; `/reset` очищал только LLM memory.
-Кодовый patch и автоматические regression suites завершены успешно. Статус
-возвращается в `implemented` после повторного live Windows-прогона тестов №2–4
-без zombie drafts, files-only cycles и ложной ambiguity.
+после reservation оставлял open zombie draft; `/reset` очищал только LLM memory,
+а restart не закрывал drafts, прежние process-local owners которых уже исчезли.
+
+Кодовый patch и automatic regression suites завершены успешно:
+
+- runtime storage/integrity failure переводит draft в `FAILED`;
+- late member exact failed group получает terminal tombstone;
+- `/reset` отменяет open drafts exact session;
+- shared `API.start` commit-ит ready drafts без agent run и переводит все
+  оставшиеся open drafts в `ABANDONED` до приёма новых запросов;
+- artifact suite содержит 156 успешных тестов, включая реальное пересоздание
+  filesystem services и новый album + instruction после zombie cleanup.
+
+Статус возвращается в `implemented` после полного локального suite и повторного
+live Windows-прогона robustness теста №2 без ручного `/reset`, удаления
+`storage`, files-only cycle и ложной ambiguity.
 
 Статус является навигационным и перед release проверяется по коду и тестам.
 
