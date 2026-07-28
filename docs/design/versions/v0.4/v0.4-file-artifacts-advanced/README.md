@@ -70,9 +70,12 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
   `InputBatchDraft` выполняются в короткой scoped critical section до attachment
   streaming;
 - `AF-25` failure recovery: transient Windows metadata publish получает bounded
-  retry, permanent post-reservation failure переводит draft в terminal state, а
+  retry, permanent post-reservation failure переводит draft в terminal state,
   поздний member exact failed media group получает terminal tombstone;
-- `/reset` отменяет open drafts exact session и затем очищает LLM memory.
+- `/reset` отменяет open drafts exact session и затем очищает LLM memory;
+- shared `API.start` выполняет automatic ingress reconciliation: готовые drafts
+  commit-ятся без agent run, остальные open drafts становятся `ABANDONED`, их
+  group indexes освобождаются до приёма новых запросов.
 
 `AF-24` подтверждён автоматическими regression tests и live Telegram workflow
 2026-07-28: media group из 10 файлов и отдельная поздняя инструкция сформировали
@@ -81,9 +84,14 @@ agent cycle.
 
 Robustness tests №2–4 затем выявили `AF-25`: transient `WinError 5` при
 публикации artifact metadata оставлял zombie draft, который загрязнял следующие
-пакеты и создавал ложную grouping ambiguity. Кодовый patch и regression suite
-готовы; artifact suite содержит 153 успешных теста. Статус update временно
-`partial` до повторного live Windows-прогона тестов №2–4.
+пакеты и создавал ложную grouping ambiguity. Кодовый patch завершён; artifact
+suite содержит 156 успешных тестов. Startup tests пересоздают все filesystem
+services из того же storage root и подтверждают, что новый альбом с отдельной
+инструкцией корректно объединяется после automatic zombie cleanup.
+
+Статус update временно `partial` до полного локального suite и повторного live
+Windows-прогона robustness теста №2 без ручного `/reset` и без удаления
+`storage`.
 
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
