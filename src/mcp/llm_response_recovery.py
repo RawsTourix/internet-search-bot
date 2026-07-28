@@ -22,6 +22,10 @@ class LLMResponseRecoveryMixin:
     emitted and therefore no external side effect has started.
     """
 
+    EMPTY_RESPONSE_SENTINELS = frozenset({
+        "Получен пустой ответ от LLM",
+    })
+
     async def _call_llm_with_retries(
         self,
         messages,
@@ -149,8 +153,13 @@ class LLMResponseRecoveryMixin:
         if not isinstance(response, dict):
             return False
         content = response.get("content")
-        if isinstance(content, str) and content.strip():
-            return True
+        if isinstance(content, str):
+            normalized_content = content.strip()
+            if (
+                normalized_content
+                and normalized_content not in cls.EMPTY_RESPONSE_SENTINELS
+            ):
+                return True
         tool_calls = response.get("tool_calls")
         return isinstance(tool_calls, list) and bool(tool_calls)
 
