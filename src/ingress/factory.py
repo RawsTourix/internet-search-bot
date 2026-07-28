@@ -12,10 +12,10 @@ from ..interaction.presentation_service import InputPresentationCoordinator
 from ..interaction.presentation_store import FileSystemInputPresentationStore
 from ..localization.service import LocalizationService
 from .config import IngressConfigType
-from .coordinated_store import FileSystemCoordinatedInputBatchStore
+from .resilient_service import ResilientUnifiedArtifactIngressService
+from .resilient_store import ResilientFileSystemCoordinatedInputBatchStore
 from .service import ArtifactIngressService
 from .store import FileSystemIngressEventStore, FileSystemInputBatchStore
-from .unified_service import UnifiedArtifactIngressService
 
 
 @dataclass(slots=True)
@@ -39,7 +39,7 @@ def create_ingress_services(
 ) -> IngressServices:
     interaction = interaction_config or InteractionConfig()
     event_store = FileSystemIngressEventStore(storage_config)
-    batch_store = FileSystemCoordinatedInputBatchStore(
+    batch_store = ResilientFileSystemCoordinatedInputBatchStore(
         storage_config,
         ingress_config,
     )
@@ -61,7 +61,7 @@ def create_ingress_services(
     localization_service = LocalizationService.from_directory(
         config=interaction.localization
     )
-    ingress_service = UnifiedArtifactIngressService(
+    ingress_service = ResilientUnifiedArtifactIngressService(
         config=ingress_config,
         artifact_config=artifact_services.config,
         content_store=content_store,
