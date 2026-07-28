@@ -36,17 +36,28 @@ filesystem runtime:
 - `v0.4-result-compaction`;
 - `v0.4-cycle-compaction`;
 - `v0.4-dag-planning`;
-- `v0.4-file-artifacts`;
-- `v0.4-file-artifacts-advanced`, включая `AF-24` durable ingress reservation
-  hardening.
+- `v0.4-file-artifacts`.
 
-`AF-24` прошёл автоматические regression suites и повторный реальный Telegram
-workflow 2026-07-28: media group из 10 файлов и отдельная поздняя инструкция были
-собраны в один `CommittedInputBatch` с `artifact_count=10`, `text_part_count=1`
-и одним agent cycle. Полный локальный прогон завершён успешно: 591 test,
-`skipped=4`.
+`v0.4-file-artifacts-advanced` временно имеет статус `partial` из-за активного
+`AF-25` failure-recovery hardening.
 
-Следующий основной функциональный этап:
+`AF-24` durable reservation подтверждён live Telegram workflow 2026-07-28:
+media group из 10 файлов и отдельная инструкция сформировали один
+`CommittedInputBatch` с `artifact_count=10`, `text_part_count=1` и одним agent
+cycle.
+
+Robustness tests №2–4 выявили новый failure-path: transient Windows
+`PermissionError` при публикации artifact metadata оставлял open zombie draft;
+следующие инструкции могли присоединяться к нему либо получать ложную
+`InputGroupingAmbiguityError`. `/reset` очищал LLM memory, но не durable ingress.
+
+`AF-25` добавляет bounded retry только для immutable metadata publish, terminal
+failure для reserved draft, запрет resurrection FAILED/CANCELLED drafts и
+session-level отмену open inputs через `/reset`. Автоматический validation suite
+успешен; до статуса `implemented` требуется повторный live Windows-прогон
+robustness tests №2–4.
+
+Следующий основной функциональный этап после закрытия этого gate:
 
 ```text
 v0.4-input-runtime
@@ -84,7 +95,8 @@ v0.6.
 
 1. используйте v0.3 как реализованный baseline;
 2. применяйте отмеченные реализованные updates v0.4;
-3. учитывайте `AF-24` как реализованный filesystem hardening shared ingress;
-4. проверяйте затронутый код и тесты для точного implementation status;
-5. используйте незавершённый v0.4 и v0.5–v0.10 только как будущие ограничения;
-6. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun` в одну сущность.
+3. учитывайте `AF-24` как реализованный reservation hardening;
+4. учитывайте `AF-25` как активный live-verification gate failure recovery;
+5. проверяйте затронутый код и тесты для точного implementation status;
+6. используйте незавершённый v0.4 и v0.5–v0.10 только как будущие ограничения;
+7. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun` в одну сущность.
