@@ -17,10 +17,10 @@ from .delivery import (
     ArtifactDeliveryService,
     FileSystemArtifactDeliveryStore,
 )
-from .file_store import FileSystemArtifactStore
 from .format_registry import ArtifactFormatRegistry, build_default_format_registry
 from .interfaces import ArtifactStore
 from .promotion import ArtifactCandidatePromotionService
+from .resilient_file_store import ResilientFileSystemArtifactStore
 from .service import ArtifactService
 from .workspace import ArtifactWorkspaceManager
 
@@ -46,7 +46,7 @@ def create_artifact_services(
     allow_legacy_layout: bool = False,
 ) -> ArtifactServices:
     """Create the artifact domain independently from legacy storage APIs."""
-    artifact_store = FileSystemArtifactStore(
+    artifact_store = ResilientFileSystemArtifactStore(
         storage_config=storage_config,
         artifact_config=artifact_config,
         content_store=content_store,
