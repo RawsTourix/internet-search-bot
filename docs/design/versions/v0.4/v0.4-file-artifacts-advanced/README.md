@@ -2,7 +2,8 @@
 id: design.v0.4.file-artifacts-advanced
 version: v0.4
 spec_status: accepted
-implementation_status: implemented
+implementation_status: partial
+last_reviewed: 2026-07-28
 ---
 
 # v0.4-file-artifacts-advanced
@@ -24,6 +25,7 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 | `AF-12`–`AF-16` | [`artifact-interaction-policy.md`](artifact-interaction-policy.md) |
 | `AF-17`–`AF-20` | [`contracts-and-acceptance.md`](contracts-and-acceptance.md) |
 | `AF-21`–`AF-23` | [`implementation.md`](implementation.md) |
+| `AF-24` | [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md) |
 
 ## Порядок чтения
 
@@ -33,13 +35,14 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 4. [`artifact-interaction-policy.md`](artifact-interaction-policy.md)
 5. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
 6. [`implementation.md`](implementation.md)
+7. [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md)
 
 Общий реестр обновлений версии находится в
 [`../README.md`](../README.md).
 
 ## Статус реализации
 
-Контур реализован в filesystem runtime:
+Основной контур реализован в filesystem runtime:
 
 - server-owned capability registry и immutable snapshots;
 - общая ru/en локализация;
@@ -62,6 +65,12 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 - strict transport и artifact-content evidence перед aggregate completion;
 - canonical Telegram composition root `python -m src.servers.telegram`.
 
+После runtime-регрессии `10 files + later instruction` открыт точечный hardening
+`AF-24`: grouping и durable draft reservation должны завершаться в одной короткой
+scope critical section до attachment streaming. Кодовый патч и автоматический
+race-test добавлены, но статус всего update остаётся `partial` до успешной
+validation и повторного Telegram workflow.
+
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
 секциях `client_capabilities`, `localization`, `input_presentation`,
@@ -69,4 +78,6 @@ Runtime-конфигурация находится в корне
 defaults, поэтому прежний конфигурационный файл остаётся совместимым.
 
 Точные пути модулей, stores, migrations и тестов перечислены в
-[`implementation.md`](implementation.md).
+[`implementation.md`](implementation.md). Порядок reservation hardening и его
+release checks определены в
+[`ingress-reservation-hardening.md`](ingress-reservation-hardening.md).
