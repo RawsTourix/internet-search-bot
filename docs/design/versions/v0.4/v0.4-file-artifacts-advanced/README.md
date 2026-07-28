@@ -2,7 +2,7 @@
 id: design.v0.4.file-artifacts-advanced
 version: v0.4
 spec_status: accepted
-implementation_status: implemented
+implementation_status: partial
 last_reviewed: 2026-07-28
 ---
 
@@ -26,6 +26,7 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 | `AF-17`–`AF-20` | [`contracts-and-acceptance.md`](contracts-and-acceptance.md) |
 | `AF-21`–`AF-23` | [`implementation.md`](implementation.md) |
 | `AF-24` | [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md) |
+| `AF-25` | [`ingress-failure-recovery.md`](ingress-failure-recovery.md) |
 
 ## Порядок чтения
 
@@ -36,13 +37,14 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 5. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
 6. [`implementation.md`](implementation.md)
 7. [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md)
+8. [`ingress-failure-recovery.md`](ingress-failure-recovery.md)
 
 Общий реестр обновлений версии находится в
 [`../README.md`](../README.md).
 
 ## Статус реализации
 
-Контур реализован в filesystem runtime:
+Основной контур реализован в filesystem runtime:
 
 - server-owned capability registry и immutable snapshots;
 - общая ru/en локализация;
@@ -66,12 +68,21 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 - canonical Telegram composition root `python -m src.servers.telegram`;
 - `AF-24` durable ingress reservation: grouping и create/join
   `InputBatchDraft` выполняются в короткой scoped critical section до attachment
-  streaming.
+  streaming;
+- `AF-25` failure recovery: transient Windows metadata publish получает bounded
+  retry, а permanent post-reservation failure переводит draft в terminal state;
+- `/reset` отменяет open drafts exact session и затем очищает LLM memory.
 
 `AF-24` подтверждён автоматическими regression tests и live Telegram workflow
-2026-07-28. Media group из 10 файлов и отдельная поздняя инструкция сформировали
+2026-07-28: media group из 10 файлов и отдельная поздняя инструкция сформировали
 один committed batch с `artifact_count=10`, `text_part_count=1`; был запущен один
-agent cycle. Полный локальный suite: 591 test, `skipped=4`, ошибок нет.
+agent cycle.
+
+Robustness tests №2–4 затем выявили `AF-25`: transient `WinError 5` при
+публикации artifact metadata оставлял zombie draft, который загрязнял следующие
+пакеты и создавал ложную grouping ambiguity. Кодовый patch и regression suite
+готовы; artifact suite содержит 152 успешных теста. Статус update временно
+`partial` до повторного live Windows-прогона тестов №2–4.
 
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
@@ -80,6 +91,7 @@ Runtime-конфигурация находится в корне
 defaults, поэтому прежний конфигурационный файл остаётся совместимым.
 
 Точные пути модулей, stores, migrations и тестов перечислены в
-[`implementation.md`](implementation.md). Порядок reservation hardening и его
+[`implementation.md`](implementation.md). Порядок ingress hardening и его
 verification evidence определены в
-[`ingress-reservation-hardening.md`](ingress-reservation-hardening.md).
+[`ingress-reservation-hardening.md`](ingress-reservation-hardening.md) и
+[`ingress-failure-recovery.md`](ingress-failure-recovery.md).
