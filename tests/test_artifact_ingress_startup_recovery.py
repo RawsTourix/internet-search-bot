@@ -33,32 +33,37 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.storage_config = StorageConfigType(
             root_dir=str(self.root / "storage")
         )
+        self.artifact_config = ArtifactConfigType(
+            max_artifact_size_bytes=1024 * 1024,
+            max_patchable_text_bytes=1024 * 1024,
+            max_workspace_bytes=2 * 1024 * 1024,
+        )
+        self.ingress_config = IngressConfigType(
+            max_batch_total_bytes=2 * 1024 * 1024,
+            media_group_quiet_timeout_seconds=0.01,
+            media_group_sealing_grace_seconds=0.0,
+            media_group_maximum_wait_seconds=10.0,
+        )
+        self.session_id = "telegram:conversation:startup-recovery"
+        self._recreate_runtime()
+
+    async def asyncTearDown(self):
+        self.temporary.cleanup()
+
+    def _recreate_runtime(self) -> None:
         storage = create_storage_services(self.storage_config)
         self.artifacts = create_artifact_services(
             storage_config=self.storage_config,
-            artifact_config=ArtifactConfigType(
-                max_artifact_size_bytes=1024 * 1024,
-                max_patchable_text_bytes=1024 * 1024,
-                max_workspace_bytes=2 * 1024 * 1024,
-            ),
+            artifact_config=self.artifact_config,
             content_store=storage.content_store,
         )
         self.ingress = create_ingress_services(
             storage_config=self.storage_config,
-            ingress_config=IngressConfigType(
-                max_batch_total_bytes=2 * 1024 * 1024,
-                media_group_quiet_timeout_seconds=0.01,
-                media_group_sealing_grace_seconds=0.0,
-                media_group_maximum_wait_seconds=10.0,
-            ),
+            ingress_config=self.ingress_config,
             content_store=storage.content_store,
             artifact_services=self.artifacts,
         )
         self.service = self.ingress.ingress_service
-        self.session_id = "telegram:conversation:startup-recovery"
-
-    async def asyncTearDown(self):
-        self.temporary.cleanup()
 
     def _file_envelope(self, suffix: str) -> ClientInputEnvelope:
         return ClientInputEnvelope(
@@ -150,6 +155,7 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(submission.state, "collecting")
         await asyncio.sleep(0.02)
 
+        self._recreate_runtime()
         committed_batches = await self.service.commit_ready_drafts()
         report = self.service.last_startup_recovery_report
 
@@ -186,6 +192,7 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
             1,
         )
 
+        self._recreate_runtime()
         committed_batches = await self.service.commit_ready_drafts()
         report = self.service.last_startup_recovery_report
 
@@ -218,6 +225,7 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
     async def test_new_package_and_instruction_join_after_zombie_cleanup(self):
         old_draft = await self._create_incomplete_draft("old-zombie")
 
+        self._recreate_runtime()
         await self.service.commit_ready_drafts()
         old_after_recovery = await self.ingress.batch_store.get_draft(
             old_draft.input_batch_id
