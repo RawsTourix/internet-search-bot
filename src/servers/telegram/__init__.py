@@ -1,9 +1,10 @@
 """Telegram transport package-wide safety composition.
 
 The low-level webhook module remains import-compatible, but every Telegram
-control client uses exact instance-scoped claim/receipt routes and every
+control client uses exact instance-scoped claim/receipt routes, every
 ``TelegramOutputPlanExecutor`` uses immutable OutputBatch-scoped artifact byte
-access. The READY outbox worker itself is still owned only by
+access, and semantic-only Telegram events never enter attachment commit logic.
+The READY outbox worker itself is still owned only by
 ``src.servers.telegram.app``.
 """
 
@@ -11,11 +12,13 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from .input_handler_policy import install_attachment_handler_registration_policy
 from .output_batch_gateway import TelegramClaimedOutputGateway
 from .output_control_policy import install_output_control_policy
 from .output_plan_executor import TelegramOutputPlanExecutor
 
 
+install_attachment_handler_registration_policy()
 install_output_control_policy()
 _original_execute = TelegramOutputPlanExecutor.execute
 
