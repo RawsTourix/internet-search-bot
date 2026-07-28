@@ -290,17 +290,21 @@ tests/test_artifact_ingress_grouping.py
 tests/test_artifact_ingress_startup_recovery.py
 ```
 
-Автоматический validation workflow после патча:
+Автоматический validation workflow на code head `8c08336` завершён успешно:
 
 ```text
-artifact suite: 156 tests expected
-storage suite: 41 tests
-plans suite: 45 tests
-planning suite: 19 tests
-api suite
-compile
+artifact suite: 156 tests, success
+storage suite: 41 tests, success
+plans suite: 45 tests, success
+planning suite: 19 tests, success
+api suite: success
+compile: success
 ```
 
-`implementation_status` переводится в `implemented` после успешного CI на
-актуальном head, полного локального suite и live Windows повторения robustness
-теста №2 без ручного cleanup.
+Startup regression tests реально пересоздают storage, artifact и ingress
+services из одного filesystem root, а затем проверяют ready commit, automatic
+ABANDONED transition и успешное объединение нового альбома с отдельной
+инструкцией после zombie cleanup.
+
+`implementation_status` переводится в `implemented` после полного локального
+suite и live Windows повторения robustness теста №2 без ручного cleanup.
