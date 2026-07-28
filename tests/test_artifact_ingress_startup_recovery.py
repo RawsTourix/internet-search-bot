@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -45,7 +46,7 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
             storage_config=self.storage_config,
             ingress_config=IngressConfigType(
                 max_batch_total_bytes=2 * 1024 * 1024,
-                media_group_quiet_timeout_seconds=0.0,
+                media_group_quiet_timeout_seconds=0.01,
                 media_group_sealing_grace_seconds=0.0,
                 media_group_maximum_wait_seconds=10.0,
             ),
@@ -101,6 +102,7 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
             grouping_key="ready-group",
         )
         self.assertEqual(submission.state, "collecting")
+        await asyncio.sleep(0.02)
 
         committed_batches = await self.service.commit_ready_drafts()
         report = self.service.last_startup_recovery_report
