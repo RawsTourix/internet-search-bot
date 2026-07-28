@@ -101,6 +101,18 @@ FAILED, CANCELLED и ABANDONED являются terminal uncommitted states. П�
 parallel member не может вернуть такой draft в `INGESTING` или `COLLECTING` и не
 может дописать attachment state.
 
+Для exact failed `media_group_id` сохраняется terminal group tombstone:
+
+```text
+late member of the same failed media group
+→ resolves to the same FAILED batch
+→ upload stream не потребляется
+→ partial replacement draft не создаётся
+```
+
+Tombstone не участвует в generic `list_open_drafts`, поэтому не влияет на
+следующие независимые пакеты и text-only grouping.
+
 ### Grouping ambiguity
 
 Принятая policy сохраняется:
@@ -134,7 +146,8 @@ Reset не удаляет:
 - content-addressed bytes;
 - artifact lineages и versions;
 - completed OutputBatch и receipts;
-- audit/recovery evidence.
+- audit/recovery evidence;
+- terminal failed-group tombstones других уже завершённых attempts.
 
 ## AF-25.3. Граница ответственности
 
@@ -146,7 +159,8 @@ ResilientUnifiedArtifactIngressService
 → convert post-reservation storage/integrity failure into terminal draft
 
 ResilientFileSystemCoordinatedInputBatchStore
-→ terminal-state enforcement, failure/cancel persistence, group-index cleanup
+→ terminal-state enforcement, exact failed-group isolation,
+  failure/cancel persistence and active-index cleanup on reset
 
 session_reset
 → session-level composition of ingress cancellation and memory reset
@@ -175,7 +189,8 @@ first immutable metadata publish raises PermissionError
 attachment artifact creation raises ArtifactStorageError
 → reserved draft becomes FAILED
 → no open draft remains for session
-→ group index no longer routes future logical input to failed draft
+→ exact failed media-group key returns the same terminal batch
+→ late same-group member does not create a replacement draft
 → next independent file package + instruction joins one new batch
 ```
 
@@ -234,7 +249,7 @@ tests/test_artifact_ingress_grouping.py
 Автоматический validation workflow после патча:
 
 ```text
-artifact suite: 152 tests, success
+artifact suite: 153 tests, success
 storage suite: 41 tests, success
 plans suite: 45 tests, success
 planning suite: 19 tests, success
