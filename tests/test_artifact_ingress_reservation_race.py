@@ -108,6 +108,33 @@ class IngressReservationRaceTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    async def _assert_joined_batch(
+        self,
+        file_result,
+        instruction_result,
+        *,
+        reason: str,
+    ) -> None:
+        self.assertEqual(file_result.state, "collecting")
+        self.assertEqual(instruction_result.state, "collecting")
+        self.assertEqual(
+            file_result.input_batch_id,
+            instruction_result.input_batch_id,
+        )
+
+        batch, duplicate = await self.ingress.batch_store.commit_batch(
+            file_result.input_batch_id,
+            session_id=self.session_id,
+            reason=reason,
+        )
+        self.assertFalse(duplicate)
+        self.assertEqual(len(batch.artifact_refs), 1)
+        self.assertEqual(
+            [part.text for part in batch.text_parts],
+            ["Process the attached files"],
+        )
+        self.assertEqual(len(batch.source_event_ids), 2)
+
     async def test_instruction_waits_for_file_draft_reservation(self):
         file_envelope = self._file_envelope()
         instruction_envelope = self._instruction_envelope()
@@ -178,25 +205,55 @@ class IngressReservationRaceTests(unittest.IsolatedAsyncioTestCase):
                 return_exceptions=True,
             )
 
-        self.assertEqual(file_result.state, "collecting")
-        self.assertEqual(instruction_result.state, "collecting")
-        self.assertEqual(
-            file_result.input_batch_id,
-            instruction_result.input_batch_id,
-        )
-
-        batch, duplicate = await self.ingress.batch_store.commit_batch(
-            file_result.input_batch_id,
-            session_id=self.session_id,
+        await self._assert_joined_batch(
+            file_result,
+            instruction_result,
             reason="test_reservation_race",
         )
-        self.assertFalse(duplicate)
-        self.assertEqual(len(batch.artifact_refs), 1)
-        self.assertEqual(
-            [part.text for part in batch.text_parts],
-            ["Process the attached files"],
+
+    async def test_attachment_streaming_does_not_hold_reservation_lock(self):
+        file_envelope = self._file_envelope()
+        instruction_envelope = self._instruction_envelope()
+        stream_started = asyncio.Event()
+        release_stream = asyncio.Event()
+
+        async def blocked_stream():
+            stream_started.set()
+            await release_stream.wait()
+            yield b"hello"
+
+        file_task = asyncio.create_task(
+            self.service.submit_atomic(
+                file_envelope,
+                session_id=self.session_id,
+                upload_streams={"slot-file-1": blocked_stream()},
+            )
         )
-        self.assertEqual(len(batch.source_event_ids), 2)
+        try:
+            await asyncio.wait_for(stream_started.wait(), timeout=1)
+            instruction_result = await asyncio.wait_for(
+                self.service.submit_atomic(
+                    instruction_envelope,
+                    session_id=self.session_id,
+                ),
+                timeout=1,
+            )
+            self.assertEqual(instruction_result.state, "collecting")
+            self.assertFalse(file_task.done())
+
+            release_stream.set()
+            file_result = await asyncio.wait_for(file_task, timeout=1)
+        finally:
+            release_stream.set()
+            if not file_task.done():
+                file_task.cancel()
+            await asyncio.gather(file_task, return_exceptions=True)
+
+        await self._assert_joined_batch(
+            file_result,
+            instruction_result,
+            reason="test_stream_outside_reservation_lock",
+        )
 
 
 if __name__ == "__main__":
