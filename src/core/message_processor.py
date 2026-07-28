@@ -8,6 +8,7 @@ from .models import ClientType, MessageType, UnifiedMessage, UnifiedResponse
 from .response_metadata import agent_result_metadata
 from .session_ids import resolve_message_session_id
 from ..api.api import API
+from ..api.session_reset import reset_runtime_session
 from ..ingress import CommittedInputBatch, legacy_message_to_input_envelope
 from ..localization.models import LocalizationMessage
 
@@ -241,7 +242,16 @@ class MessageProcessor:
             return self._get_help_text()
         if command == "/reset":
             try:
-                await API.reset(self._build_session_id(message))
+                result = await reset_runtime_session(
+                    API,
+                    self._build_session_id(message),
+                )
+                if result.cancelled_input_batch_count:
+                    return (
+                        "✅ Память успешно очищена. "
+                        "Незавершённых входных пакетов отменено: "
+                        f"{result.cancelled_input_batch_count}."
+                    )
                 return "✅ Память успешно очищена."
             except Exception as error:
                 return f"⚠️ Ошибка очистки памяти: {error}."
