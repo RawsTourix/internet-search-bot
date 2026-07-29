@@ -56,9 +56,12 @@ def _route_forwarded_text_through_text_handler() -> None:
     )
     for handlers in server.application.handlers.values():
         for handler in handlers:
+            if not isinstance(handler, MessageHandler):
+                continue
+            callback_name = getattr(handler.callback, "__name__", "")
             if (
-                isinstance(handler, MessageHandler)
-                and handler.callback is server.attachment_handler
+                handler.filters is server.attachment_filter
+                or callback_name == "attachment_handler"
             ):
                 handler.filters = narrowed
                 return
