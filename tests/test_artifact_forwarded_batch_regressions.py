@@ -178,13 +178,25 @@ class ForwardedTextAlbumRaceTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        self.client = InstanceScopedTelegramArtifactGatewayClient(
+        self.transport = httpx.MockTransport(handler)
+        self.client = self._client(
+            input_text_join_window_seconds=10,
+            forwarded_text_join_wait_seconds=0.5,
+        )
+
+    def _client(
+        self,
+        *,
+        input_text_join_window_seconds: float,
+        forwarded_text_join_wait_seconds: float,
+    ) -> InstanceScopedTelegramArtifactGatewayClient:
+        return InstanceScopedTelegramArtifactGatewayClient(
             gateway_url="http://gateway.test",
             api_key="key",
             client_instance_id="default",
-            transport=httpx.MockTransport(handler),
-            input_text_join_window_seconds=10,
-            forwarded_text_join_wait_seconds=0.5,
+            transport=self.transport,
+            input_text_join_window_seconds=input_text_join_window_seconds,
+            forwarded_text_join_wait_seconds=forwarded_text_join_wait_seconds,
         )
 
     @staticmethod
@@ -300,6 +312,20 @@ class ForwardedTextAlbumRaceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["input_batch_id"], self.group_batches["atomic"])
         self.assertIsNone(self.requests[-1].get("source_group_id"))
+
+    def test_forwarded_wait_rejects_negative_value(self):
+        with self.assertRaisesRegex(ValueError, "must not be negative"):
+            self._client(
+                input_text_join_window_seconds=10,
+                forwarded_text_join_wait_seconds=-0.1,
+            )
+
+    def test_forwarded_wait_cannot_exceed_join_window(self):
+        with self.assertRaisesRegex(ValueError, "must not exceed"):
+            self._client(
+                input_text_join_window_seconds=1,
+                forwarded_text_join_wait_seconds=1.1,
+            )
 
 
 if __name__ == "__main__":
