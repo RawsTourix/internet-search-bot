@@ -33,6 +33,7 @@ from src.interaction.capabilities import (
     build_default_capability_registry,
     build_telegram_capability_declaration,
 )
+from src.interaction.config import LocalizationConfigType
 from src.interaction.ids import new_output_attempt_id, new_output_part_id
 from src.interaction.output_models import (
     ArtifactOutputPart,
@@ -49,7 +50,6 @@ from src.interaction.output_store import (
 )
 from src.interaction.rendering import CapabilityOutputRenderer
 from src.localization.service import LocalizationService
-from src.interaction.config import LocalizationConfigType
 from src.servers.telegram import app as telegram_app
 from src.servers.telegram.output_plan_executor import TelegramExecutionContext
 from src.servers.telegram.scoped_artifact_bridge import (
@@ -280,24 +280,51 @@ class TelegramNativeDocumentGroupHardeningTests(
         )
         return receipt, bot
 
-    async def test_native_group_uses_direct_handles_with_filenames(self):
+    async def test_native_group_uses_streaming_input_files_with_filenames(self):
         receipt, bot = await self._execute(FakeTelegramBot())
         self.assertEqual(receipt.state, OutputDeliveryReceiptState.DELIVERED)
         name, kwargs = bot.calls[0]
         self.assertEqual(name, "send_media_group")
         self.assertEqual(
-            [item.filename for item in kwargs["media"]],
+            [item.media.filename for item in kwargs["media"]],
             [
                 f"{receipt.part_receipts[0].delivery_id}.bin",
                 f"{receipt.part_receipts[1].delivery_id}.bin",
             ],
         )
 
-    async def test_bad_request_is_logged_exactly_then_falls_back(self):
+    async def test_stream_bad_request_retries_bounded_eager_media(self):
         bot = FakeTelegramBot()
         bot.queue(
             "send_media_group",
             BadRequest("wrong file identifier/HTTP URL specified"),
+        )
+        with self.assertLogs(
+            "TelegramServer.OutputExecutor",
+            level="INFO",
+        ) as captured:
+            receipt, bot = await self._execute(bot)
+        self.assertEqual(receipt.state, OutputDeliveryReceiptState.DELIVERED)
+        self.assertEqual(
+            [name for name, _ in bot.calls],
+            ["send_media_group", "send_media_group"],
+        )
+        self.assertTrue(
+            any(
+                "wrong file identifier/HTTP URL specified" in line
+                for line in captured.output
+            )
+        )
+        self.assertTrue(
+            any("telegram_document_group_retry_eager" in line for line in captured.output)
+        )
+
+    async def test_two_bad_requests_then_individual_fallback(self):
+        bot = FakeTelegramBot()
+        bot.queue(
+            "send_media_group",
+            BadRequest("stream representation rejected"),
+            BadRequest("eager representation rejected"),
         )
         with self.assertLogs(
             "TelegramServer.OutputExecutor",
@@ -307,13 +334,18 @@ class TelegramNativeDocumentGroupHardeningTests(
         self.assertEqual(receipt.state, OutputDeliveryReceiptState.DELIVERED)
         self.assertEqual(
             [name for name, _ in bot.calls],
-            ["send_media_group", "send_document", "send_document"],
+            [
+                "send_media_group",
+                "send_media_group",
+                "send_document",
+                "send_document",
+            ],
         )
         self.assertTrue(
-            any(
-                "wrong file identifier/HTTP URL specified" in line
-                for line in captured.output
-            )
+            any("stream representation rejected" in line for line in captured.output)
+        )
+        self.assertTrue(
+            any("eager representation rejected" in line for line in captured.output)
         )
 
     async def test_reply_target_error_retries_group_without_reply(self):
