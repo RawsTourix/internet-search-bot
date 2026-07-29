@@ -164,7 +164,7 @@ v0.4-input-runtime
 - forwarded text маршрутизируется как text с отдельным provenance;
 - forwarded text может bounded-wait более ранний album при конкурентной доставке;
 - ordinary text не получает wait;
-- thematic artifact suite содержит 177 успешных тестов.
+- thematic artifact suite содержит 179 успешных тестов.
 
 Следующий основной этап после live-проверки mixed-forward workflow — shared
 `InputDraftControlService` до Telegram wiring `/collect`, `/send` и `/cancel`.
