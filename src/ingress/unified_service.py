@@ -252,7 +252,9 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
                             duplicate=duplicate_event,
                         )
             else:
-                event, duplicate_event = await self._persist_event(envelope)
+                event, duplicate_event = (
+                    await self._persist_event_with_idempotency(envelope)
+                )
                 draft, duplicate_batch = await self._reserve_event_record(
                     event,
                     session_id=session_id,
@@ -294,6 +296,13 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
         return result
 
     async def _persist_event(self, envelope: ClientInputEnvelope):
+        event, _ = await self._persist_event_with_idempotency(envelope)
+        return event
+
+    async def _persist_event_with_idempotency(
+        self,
+        envelope: ClientInputEnvelope,
+    ):
         self._validate_envelope_limits(envelope)
         capability_snapshot, resolved_locale = await self._resolve_interaction(
             envelope
