@@ -61,25 +61,32 @@ Invariants:
 
 ## AF-26.2. Native Telegram document group
 
-Native group использует PTB direct file-handle representation:
+Основной native path использует exact claimed bytes через PTB `InputFile` с
+открытым spool handle и explicit filename:
 
 ```text
 open exact claimed delivery bytes
 → keep SpooledTemporaryFile handles open
-→ InputMediaDocument(media=handle, filename=exact_filename)
+→ InputFile(handle, filename, read_file_handle=false)
+→ InputMediaDocument(media=InputFile)
 → send_media_group
 ```
 
 При `BadRequest` лог сохраняет bounded sanitized сообщение Telegram вместе с
-числом частей и filenames. Receipt error category остаётся стабильной и не
-включает произвольный transport text.
+representation, числом частей и filenames. Receipt error category остаётся
+стабильной и не включает произвольный transport text.
 
 Безопасные retry/fallback правила:
 
-- reply-target `BadRequest` известен как unsent: group один раз повторяется без
-  reply metadata;
-- другой `BadRequest` известен как unsent: разрешён существующий individual
-  document fallback;
+- reply-target `BadRequest` известен как unsent: streaming group один раз
+  повторяется без reply metadata;
+- другой `BadRequest` известен как unsent: если все sizes известны и суммарный
+  объём не превышает configured spool-memory budget, выполняется один bounded
+  eager retry с теми же exact bytes;
+- второй `BadRequest` после eager retry известен как unsent и разрешает
+  существующий individual document fallback;
+- если eager representation превышает budget, individual fallback выполняется
+  сразу после первого known-unsent `BadRequest`;
 - timeout/network error после начала send остаётся `UNKNOWN` и не повторяется;
 - receipt mismatch остаётся `UNKNOWN`;
 - fallback не скрывает original diagnostic evidence.
@@ -170,13 +177,16 @@ two active media groups in exact scope
 
 ```text
 two documents
-→ one send_media_group with direct handles and exact filenames
+→ one send_media_group with streaming InputFile objects and exact filenames
 
 known reply-target BadRequest
-→ one retry without reply metadata
+→ one streaming retry without reply metadata
 
-other BadRequest
+other BadRequest within eager budget
 → exact bounded diagnostic log
+→ one eager retry
+
+second known-unsent BadRequest
 → safe individual fallback
 ```
 
@@ -202,13 +212,40 @@ send-new exhausts network retries
 System protocol contains no extension-to-format runtime heuristic. It requires
 explicit format selection and verification of returned metadata.
 
-## AF-26.7. Live gate
+## AF-26.7. Automated validation
+
+Current thematic validation:
+
+```text
+artifact suite: 165 tests, success
+storage suite: 41 tests, success
+plans suite: 45 tests, success
+planning suite: 19 tests, success
+api suite: success
+compile: success
+```
+
+AF-26 regression module входит в существующий `test_artifact*.py` discovery и
+проверяет:
+
+- конкурентный text submit при заблокированном file HTTP request;
+- ordinary text после закрытия album;
+- explicit ambiguity для двух active albums;
+- streaming InputFile filenames;
+- bounded eager group retry;
+- individual fallback после двух known-unsent BadRequest;
+- reply-target retry без reply metadata;
+- legacy/current READY authority reconciliation;
+- terminal status fallback;
+- отсутствие extension-to-format heuristic в system protocol.
+
+## AF-26.8. Live gate
 
 Повторить robustness tests №2–6 и подтвердить:
 
 - text и active album всегда дают один InputBatch;
 - native document group либо работает, либо exact Telegram error объясняет
-  fallback;
+  eager/individual fallback;
 - старые legacy READY больше не появляются в recoverable startup count;
 - текущие remaining READY имеют понятную exact authority;
 - terminal LLM/network error остаётся видимой пользователю;
