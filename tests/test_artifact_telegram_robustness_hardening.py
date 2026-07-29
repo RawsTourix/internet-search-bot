@@ -94,9 +94,28 @@ class TelegramActiveAlbumTextJoinTests(unittest.IsolatedAsyncioTestCase):
                     },
                 )
             if request.url.path.endswith("/commit"):
+                payload = json.loads(request.content.decode("utf-8"))
+                self.assertFalse(payload["run"])
+                input_batch_id = request.url.path.split("/")[-2]
                 return httpx.Response(
                     200,
-                    json={"status": "committed", "duplicate": False},
+                    json={
+                        "status": "committed",
+                        "input_batch_id": input_batch_id,
+                        "duplicate": False,
+                        "committed_batch": {
+                            "input_batch_id": input_batch_id,
+                        },
+                    },
+                )
+            if request.url.path.endswith("/run"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "status": "ok",
+                        "response": "done",
+                        "metadata": {},
+                    },
                 )
             raise AssertionError(f"unexpected request: {request.url}")
 
