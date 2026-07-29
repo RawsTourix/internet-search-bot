@@ -25,8 +25,9 @@ last_reviewed: 2026-07-29
 | 4 | [`v0.4-dag-planning`](v0.4-dag-planning.md) | implemented | Optional runtime-owned DAG без scheduler |
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25`/`AF-26` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
-| 7 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
-| 8 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
+| 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | partial | AUTO/EXPLICIT InputBatch assembly, presentation relocation, output grouping и artifact access scopes |
+| 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
+| 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
 
 `AF-24` порядка `grouping → durable InputBatchDraft → streaming` реализован и
 подтверждён live Telegram workflow.
@@ -49,12 +50,17 @@ Robustness tests выявили два follow-up hardening-этапа:
 - document group проверяется через streaming, bounded eager retry и safe fallback;
 - legacy sentinel READY становится `CANCELLED`, valid READY сохраняет authority;
 - terminal send timeout обновляет exact status message;
-- runtime не определяет `format_id` по расширению;
-- artifact suite содержит **165 успешных тестов**.
+- runtime не определяет `format_id` по расширению.
 
-Статус возвращается в `implemented` после полного локального suite и live
-Windows-проверки AF-25/AF-26 без ручного `/reset`, удаления `storage`, files-only
-cycle, ложной ambiguity и необъяснимого document-group fallback.
+`v0.4-batch-workflows` выделен отдельным update, чтобы не смешивать client-facing
+сборку logical input с будущим active-cycle runtime. Он фиксирует:
+
+- text-only AUTO input без artificial delay;
+- file-first AUTO draft и explicit commit intent для files-only workflow;
+- `/collect`, `/send`, `/cancel` через общий control service;
+- safe presentation relocation;
+- stable semantic OutputPart grouping и правильный Telegram multipart mapping;
+- bounded current artifact manifest при сохранении доступа к истории.
 
 Статус является навигационным и перед release проверяется по коду и тестам.
 
@@ -78,8 +84,9 @@ v0.4-storage-foundation
 ├── v0.4-dag-planning
 └── v0.4-file-artifacts
     └── v0.4-file-artifacts-advanced
-        └── v0.4-input-runtime
-            └── v0.4-runtime-modularization
+        └── v0.4-batch-workflows
+            └── v0.4-input-runtime
+                └── v0.4-runtime-modularization
 ```
 
 ## Как читать
@@ -87,6 +94,8 @@ v0.4-storage-foundation
 - Для последовательного проектирования идите по реестру сверху вниз.
 - Для конкретного патча открывайте документ с тем же именем, что и обновление.
 - Для крупного update сначала открывайте README его папки.
+- `v0.4-batch-workflows` не реализует сообщения во время active cycle: он
+  завершает draft assembly и client interaction до admission.
 - `v0.4-runtime-modularization` не добавляет новый product feature: он сохраняет
   принятые contracts и меняет ownership/границы реализации.
 
