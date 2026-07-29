@@ -248,7 +248,7 @@ tests/test_artifact_forwarded_batch_regressions.py
 Тематический CI после patch:
 
 ```text
-artifact suite: 177 tests, success
+artifact suite: 179 tests, success
 storage suite: 41 tests, success
 plans suite: 45 tests, success
 planning suite: 19 tests, success
