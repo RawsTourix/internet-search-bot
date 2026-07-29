@@ -174,9 +174,20 @@ class TelegramClaimedOutputGateway:
         spool: SpooledTemporaryFile,
         filename: str,
     ) -> InputFile:
+        """Build one multipart-attached file for ``InputMedia*``.
+
+        ``sendMediaGroup`` serializes media as JSON and uploads bytes as
+        separate multipart fields. ``attach=True`` gives PTB a unique
+        ``attach_name`` so the JSON ``attach://...`` URI resolves to the exact
+        multipart part. A pre-built ``InputFile`` without this flag is not
+        reparsed by ``InputMediaDocument`` and Telegram reports
+        ``Can't parse inputmedia: media not found``.
+        """
+
         return InputFile(
             spool,
             filename=filename,
+            attach=True,
             read_file_handle=False,
         )
 
