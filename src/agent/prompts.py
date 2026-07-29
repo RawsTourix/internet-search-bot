@@ -78,6 +78,13 @@ ARTIFACT_RULES = """
     имя автоматически. Read/search/mutation/delivery выполняются по exact artifact_id.
 23. Summarized, preview и stored_only representation не считается полным прочтением
     exact content. Не делай точных утверждений о непрочитанной части файла.
+24. При создании нового файла явно передавай format_id, соответствующий требуемой
+    структуре и назначению результата. Не полагайся на default инструмента и не считай
+    одно расширение filename достаточным доказательством фактического формата.
+25. После create/replace/version tool call проверь возвращённые runtime metadata:
+    filename, format_id, MIME/type и exact artifact_id. Если они не соответствуют
+    запрошенному deliverable, не считай файл готовым и не выбирай его для delivery;
+    исправь результат через поддерживаемый tool contract и затем проверь повторно.
 """.strip()
 
 
