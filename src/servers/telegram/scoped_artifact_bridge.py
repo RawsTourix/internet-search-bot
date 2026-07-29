@@ -105,6 +105,9 @@ class InstanceScopedTelegramArtifactGatewayClient(
                 progress_locale=progress_locale,
             )
         except BaseException:
+            # A failed original album member invalidates this local transport
+            # workflow. A failed joined text request does not: the exact album
+            # remains active so an idempotent text retry can use the same key.
             if original_group_key is not None:
                 await self._close_input_group(group_key)
             raise
