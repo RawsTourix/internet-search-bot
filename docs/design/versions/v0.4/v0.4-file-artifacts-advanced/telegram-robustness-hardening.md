@@ -98,7 +98,8 @@ representation, числом частей и filenames. Receipt error category �
 worker не имеет права claim-ить такую authority, поэтому batch навсегда
 оставался `READY`.
 
-На startup Gateway:
+В текущем runtime reconciliation вызывается Gateway composition root до общего
+`API.start`, то есть до открытия Gateway для transport requests:
 
 ```text
 scan recoverable READY OutputBatch
@@ -107,6 +108,10 @@ scan recoverable READY OutputBatch
 → error_code=unclaimable_legacy_client_instance
 → immutable manifest/history preserved
 ```
+
+Сам reconciler transport-independent и может использоваться будущими
+composition roots. При modularization его ownership переносится в общий runtime
+startup coordinator, чтобы Web/CLI/worker entrypoints не повторяли wiring.
 
 Другие `READY` batches автоматически не отменяются. Для них startup log обязан
 показывать:
