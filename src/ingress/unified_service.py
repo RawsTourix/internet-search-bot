@@ -98,6 +98,8 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
             )
 
         joined_result: InputSubmissionResult | None = None
+        reserved_input_batch_id: str | None = None
+        original_duplicate: bool | None = None
         scope_key = self._reservation_scope_key(envelope, session_id=session_id)
         async with self._reservation_locks.hold(scope_key):
             list_open = getattr(self.batch_store, "list_open_drafts", None)
@@ -226,11 +228,13 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
                             envelope,
                             open_drafts=(),
                         )
-                        await self._reserve_event_record(
+                        draft, duplicate_batch = await self._reserve_event_record(
                             event,
                             session_id=session_id,
                             decision=decision,
                         )
+                        reserved_input_batch_id = draft.input_batch_id
+                        original_duplicate = duplicate_event or duplicate_batch
                     else:
                         logger.info(
                             "ingress_event_joined_exact_draft "
@@ -248,35 +252,57 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
                             duplicate=duplicate_event,
                         )
             else:
-                event = await self._persist_event(envelope)
-                await self._reserve_event_record(
+                event, duplicate_event = await self._persist_event(envelope)
+                draft, duplicate_batch = await self._reserve_event_record(
                     event,
                     session_id=session_id,
                     decision=decision,
                 )
+                reserved_input_batch_id = draft.input_batch_id
+                original_duplicate = duplicate_event or duplicate_batch
 
         if joined_result is not None:
             return await self._decorate_result(joined_result, envelope=envelope)
 
-        return await super().submit_atomic(
+        result = await super().submit_atomic(
             envelope,
             session_id=session_id,
             upload_streams=upload_streams,
             grouping_mode=decision.mode,
             grouping_key=decision.key,
         )
+        # The base service intentionally re-enters idempotent event/draft stores
+        # after the short reservation lock. Those internal lookups must not turn
+        # a first logical submission into a transport duplicate. Preserve the
+        # idempotency result observed by the authoritative first reservation.
+        if (
+            reserved_input_batch_id is not None
+            and result.input_batch_id == reserved_input_batch_id
+            and original_duplicate is not None
+            and result.duplicate != original_duplicate
+        ):
+            logger.info(
+                "ingress_internal_duplicate_normalized input_batch_id=%s "
+                "source_message_id=%s internal_duplicate=%s "
+                "original_duplicate=%s",
+                result.input_batch_id,
+                envelope.source_message_id,
+                result.duplicate,
+                original_duplicate,
+            )
+            result = result.model_copy(update={"duplicate": original_duplicate})
+        return result
 
     async def _persist_event(self, envelope: ClientInputEnvelope):
         self._validate_envelope_limits(envelope)
         capability_snapshot, resolved_locale = await self._resolve_interaction(
             envelope
         )
-        event, _ = await self.event_store.save_if_absent(
+        return await self.event_store.save_if_absent(
             envelope,
             capability_snapshot=capability_snapshot,
             resolved_locale=resolved_locale,
         )
-        return event
 
     async def _reserve_event_record(
         self,
@@ -284,7 +310,7 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
         *,
         session_id: str,
         decision: InputGroupingDecision,
-    ) -> None:
+    ):
         draft, duplicate_batch = await self.batch_store.create_for_event(
             event,
             session_id=session_id,
@@ -299,6 +325,7 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
             decision.mode.value,
             duplicate_batch,
         )
+        return draft, duplicate_batch
 
     @staticmethod
     def _reservation_scope_key(
