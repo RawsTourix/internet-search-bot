@@ -46,6 +46,12 @@ TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS = float(
 TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS = float(
     os.getenv("TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS", "10")
 )
+# Forwarded text updates can overtake earlier forwarded album updates because
+# webhook processing is concurrent. Only forwarded text may wait briefly for
+# that exact earlier album to become active; ordinary text remains immediate.
+TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS = float(
+    os.getenv("TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS", "1.5")
+)
 # Emergency ceiling for one Telegram album workflow. Expiry never commits a
 # partial batch; the group ends with a transport-level error instead.
 TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS = float(
@@ -55,6 +61,10 @@ if TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS <= 0:
     raise ValueError("TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS must be positive")
 if TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS <= 0:
     raise ValueError("TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS must be positive")
+if TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS < 0:
+    raise ValueError(
+        "TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS must not be negative"
+    )
 if TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS <= 0:
     raise ValueError("TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS must be positive")
 if (
@@ -72,6 +82,14 @@ if (
     raise ValueError(
         "TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS must not exceed "
         "TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS"
+    )
+if (
+    TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS
+    > TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS
+):
+    raise ValueError(
+        "TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS must not exceed "
+        "TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS"
     )
 
 TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES = int(
