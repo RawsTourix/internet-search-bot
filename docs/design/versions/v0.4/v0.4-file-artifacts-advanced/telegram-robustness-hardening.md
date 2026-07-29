@@ -59,18 +59,59 @@ Invariants:
 - текстовое содержимое не анализируется для принятия grouping-решения;
 - shared ingress ambiguity policy не ослабляется.
 
+Live Telegram workflow 2026-07-29 подтвердил эту policy: три файла и отдельная
+поздняя инструкция с первого прогона сформировали один InputBatch с
+`artifact_count=3`, `text_part_count=1`.
+
 ## AF-26.2. Native Telegram document group
 
-Основной native path использует exact claimed bytes через PTB `InputFile` с
-открытым spool handle и explicit filename:
+### Correct multipart mapping
+
+`sendMediaGroup` передаёт media descriptions как JSON, а file bytes — отдельными
+multipart parts. Поэтому каждый `InputFile` внутри `InputMediaDocument` обязан
+иметь unique attach name и JSON URI вида:
+
+```text
+attach://<attach_name>
+```
+
+Первоначальный AF-26 path создавал:
+
+```text
+InputFile(handle, filename, read_file_handle=false)
+```
+
+без `attach=True`. Уже готовый `InputFile` не перепарсивался
+`InputMediaDocument`, matching multipart reference отсутствовала, и live
+Telegram вернул:
+
+```text
+BadRequest: Can't parse inputmedia: media not found
+```
+
+Исправленный streaming path:
 
 ```text
 open exact claimed delivery bytes
 → keep SpooledTemporaryFile handles open
-→ InputFile(handle, filename, read_file_handle=false)
+→ InputFile(
+     handle,
+     filename,
+     attach=true,
+     read_file_handle=false,
+   )
 → InputMediaDocument(media=InputFile)
 → send_media_group
 ```
+
+PTB создаёт unique `attach_name`, `attach_uri=attach://...` и matching multipart
+field. Handles остаются открытыми до завершения request.
+
+Следующий `v0.4-batch-workflows` закрепляет предпочтительный SDK-owned path, где
+raw handle/bytes передаются прямо в `InputMedia*`; текущий low-level
+`attach=True` path является официально поддерживаемым и закрывает live defect.
+
+### Diagnostics and fallback
 
 При `BadRequest` лог сохраняет bounded sanitized сообщение Telegram вместе с
 representation, числом частей и filenames. Receipt error category остаётся
@@ -182,7 +223,8 @@ two active media groups in exact scope
 
 ```text
 two documents
-→ one send_media_group with streaming InputFile objects and exact filenames
+→ each InputFile has unique non-empty attach_uri
+→ one send_media_group with open streaming handles and exact filenames
 
 known reply-target BadRequest
 → one streaming retry without reply metadata
@@ -222,7 +264,7 @@ explicit format selection and verification of returned metadata.
 Current thematic validation:
 
 ```text
-artifact suite: 165 tests, success
+artifact suite: 168 tests, success
 storage suite: 41 tests, success
 plans suite: 45 tests, success
 planning suite: 19 tests, success
@@ -230,13 +272,14 @@ api suite: success
 compile: success
 ```
 
-AF-26 regression module входит в существующий `test_artifact*.py` discovery и
-проверяет:
+AF-26 regression modules входят в существующий `test_artifact*.py` discovery и
+проверяют:
 
 - конкурентный text submit при заблокированном file HTTP request;
 - ordinary text после закрытия album;
 - explicit ambiguity для двух active albums;
 - streaming InputFile filenames;
+- unique non-empty `attach_uri` и lazy open handles;
 - bounded eager group retry;
 - individual fallback после двух known-unsent BadRequest;
 - reply-target retry без reply metadata;
@@ -246,11 +289,10 @@ AF-26 regression module входит в существующий `test_artifact*
 
 ## AF-26.8. Live gate
 
-Повторить robustness tests №2–6 и подтвердить:
+Повторить targeted Telegram delivery и подтвердить:
 
 - text и active album всегда дают один InputBatch;
-- native document group либо работает, либо exact Telegram error объясняет
-  eager/individual fallback;
+- native document group после `attach=True` доставляется одним album;
 - старые legacy READY больше не появляются в recoverable startup count;
 - текущие remaining READY имеют понятную exact authority;
 - terminal LLM/network error остаётся видимой пользователю;
