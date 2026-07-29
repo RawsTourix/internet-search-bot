@@ -12,6 +12,7 @@ from .config import (
     TELEGRAM_API_KEY,
     TELEGRAM_BOT_INSTANCE_ID,
     TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES,
+    TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS,
     TELEGRAM_READY_OUTBOX_BATCH_LIMIT,
     TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
@@ -31,6 +32,9 @@ artifact_gateway = InstanceScopedTelegramArtifactGatewayClient(
     client_instance_id=TELEGRAM_BOT_INSTANCE_ID,
     delivery_spool_memory_bytes=TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES,
     media_group_activity=server.media_group_activity,
+    input_text_join_window_seconds=(
+        TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS
+    ),
 )
 telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
