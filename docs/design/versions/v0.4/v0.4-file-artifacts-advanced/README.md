@@ -10,7 +10,7 @@ last_reviewed: 2026-07-29
 
 Это самостоятельное именованное обновление между
 [`v0.4-file-artifacts`](../v0.4-file-artifacts.md) и
-[`v0.4-input-runtime`](../v0.4-input-runtime.md).
+[`v0.4-batch-workflows`](../v0.4-batch-workflows/README.md).
 
 Обновление завершает transport-independent контур semantic input/output,
 client capabilities, локализации, `OutputBatch`, delivery и artifact policy.
@@ -80,8 +80,9 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
   group indexes освобождаются до приёма новых запросов;
 - `AF-26` Telegram sequencing связывает отдельную инструкцию с exact active
   album до Gateway, не анализируя текст и не ослабляя shared ambiguity policy;
-- native document group получает exact diagnostic logging, bounded eager retry
-  после подтверждённого `BadRequest` и safe individual fallback;
+- native document group получает exact diagnostic logging, unique
+  `attach://...` mapping, bounded eager retry после подтверждённого `BadRequest`
+  и safe individual fallback;
 - unclaimable legacy `READY OutputBatch` переводятся в `CANCELLED` с audit code,
   а authority остальных READY выводится явно;
 - terminal text после ambiguous send timeout обновляет известный status handle;
@@ -93,26 +94,36 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 один committed batch с `artifact_count=10`, `text_part_count=1`; был запущен один
 agent cycle.
 
-Robustness tests затем выявили `AF-25` и `AF-26`. Кодовые patches завершены;
-artifact validation suite содержит **165 успешных тестов**. В suite входят:
+Live Telegram workflow 2026-07-29 подтвердил AF-26 sequencing: три файла и
+отдельная инструкция сформировали один batch с `artifact_count=3` и
+`text_part_count=1`. Точный document-group defect локализован до отсутствующего
+PTB `attach=True`; ordered individual fallback сохранил delivery correctness.
+
+Artifact validation suite содержит **168 успешных тестов**. В suite входят:
 
 - реальное пересоздание filesystem services и automatic zombie cleanup;
 - новый album + instruction после process restart;
 - конкурентный text submit при заблокированном file HTTP request;
 - explicit ambiguity для двух active albums;
 - streaming/eager/individual Telegram document-group paths;
+- unique media-group `attach_uri` и lazy open handles;
 - legacy READY authority reconciliation;
 - terminal status fallback;
 - prompt-contract без filename-format эвристики.
 
 Статус update временно `partial` до полного локального suite и live Windows
-проверки AF-25/AF-26 без ручного cleanup и без удаления `storage`.
+проверки native group после attach-mapping fix.
 
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
 секциях `client_capabilities`, `localization`, `input_presentation`,
 `output_runtime` и `telegram_output`. Отсутствующие секции получают безопасные
 defaults, поэтому прежний конфигурационный файл остаётся совместимым.
+
+Следующий update — [`v0.4-batch-workflows`](../v0.4-batch-workflows/README.md):
+AUTO/EXPLICIT draft assembly, presentation relocation, stable output grouping и
+artifact access scopes. `CycleInbox` и active-cycle additions остаются после него
+в [`v0.4-input-runtime`](../v0.4-input-runtime.md).
 
 Точные пути модулей, stores, migrations и тестов перечислены в
 [`implementation.md`](implementation.md). Порядок hardening и verification
