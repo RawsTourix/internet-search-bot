@@ -57,7 +57,6 @@ ready_outbox_worker = TelegramReadyOutboxWorker(
 
 
 _base_deliver_agent_result = server._deliver_agent_result
-_base_finish_status_or_send_reply = server.finish_status_or_send_reply
 
 
 async def _strict_markdown_reply(update, text: str):
@@ -81,59 +80,77 @@ async def _strict_markdown_reply(update, text: str):
     return sent
 
 
-async def _finish_status_or_send_reply(**values):
-    """Use a known status message after an ambiguous send-new timeout.
-
-    A timeout after ``reply_text`` may mean the new message was accepted, so the
-    same non-idempotent send is not repeated again. Updating the already known
-    status message is a separate deterministic operation and guarantees that a
-    terminal error remains visible even when the direct final send is uncertain.
-    """
-
-    original_sender = server.send_telegram_markdown_reply
-    server.send_telegram_markdown_reply = _strict_markdown_reply
+async def _edit_known_status(update, status_message, text: str):
+    chunks = server.split_markdown_for_telegram(text or "")
+    chunk = chunks[0] if chunks else (text or "")
+    if len(chunks) > 1:
+        chunk = chunk.rstrip() + "\n\n…"
     try:
-        return await _base_finish_status_or_send_reply(**values)
-    except (TimedOut, NetworkError) as error:
-        status_message = values.get("status_message")
-        update = values.get("update")
-        text = str(values.get("text") or "")
-        if status_message is None or update is None:
-            server.logger.error(
-                "telegram_terminal_text_delivery_unknown "
-                "status_message_available=false error_type=%s",
+        await server.edit_telegram_message_with_retries(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text=server.markdown_to_telegram_html(chunk),
+            parse_mode=ParseMode.HTML,
+        )
+    except BadRequest:
+        await server.edit_telegram_message_with_retries(
+            chat_id=update.effective_chat.id,
+            message_id=status_message.message_id,
+            text=server.markdown_to_plain_text(chunk),
+            parse_mode=None,
+        )
+    return status_message
+
+
+async def _finish_status_or_send_reply(
+    *,
+    update,
+    status_message,
+    text: str,
+    force_reply_if_long: bool = False,
+    delivery_mode: str | None = None,
+):
+    """Deliver terminal text without repeating an ambiguous send-new action."""
+
+    mode = (
+        delivery_mode or server.TELEGRAM_FINAL_DELIVERY_MODE
+    ).lower().strip()
+    if mode not in {"send_new", "edit_status", "auto"}:
+        mode = "send_new"
+    if status_message is None:
+        return await _strict_markdown_reply(update, text)
+
+    await server.stop_progress_edits(
+        chat_id=update.effective_chat.id,
+        message_id=status_message.message_id,
+    )
+    raw = text or ""
+    chunks = server.split_markdown_for_telegram(raw)
+    send_new = (
+        mode == "send_new"
+        or force_reply_if_long
+        or len(raw) > server.TELEGRAM_FINAL_EDIT_MAX_LENGTH
+        or len(chunks) != 1
+    )
+
+    if send_new:
+        try:
+            return await _strict_markdown_reply(update, raw)
+        except (TimedOut, NetworkError) as error:
+            await _edit_known_status(update, status_message, raw)
+            server.logger.warning(
+                "telegram_terminal_text_fell_back_to_status "
+                "chat_id=%s message_id=%s original_error_type=%s",
+                update.effective_chat.id,
+                status_message.message_id,
                 type(error).__name__,
             )
-            raise
+            return status_message
 
-        chunks = server.split_markdown_for_telegram(text)
-        chunk = chunks[0] if chunks else text
-        if len(chunks) > 1:
-            chunk = chunk.rstrip() + "\n\n…"
-        try:
-            await server.edit_telegram_message_with_retries(
-                chat_id=update.effective_chat.id,
-                message_id=status_message.message_id,
-                text=server.markdown_to_telegram_html(chunk),
-                parse_mode=ParseMode.HTML,
-            )
-        except BadRequest:
-            await server.edit_telegram_message_with_retries(
-                chat_id=update.effective_chat.id,
-                message_id=status_message.message_id,
-                text=server.markdown_to_plain_text(chunk),
-                parse_mode=None,
-            )
-        server.logger.warning(
-            "telegram_terminal_text_fell_back_to_status "
-            "chat_id=%s message_id=%s original_error_type=%s",
-            update.effective_chat.id,
-            status_message.message_id,
-            type(error).__name__,
-        )
-        return status_message
-    finally:
-        server.send_telegram_markdown_reply = original_sender
+    try:
+        return await _edit_known_status(update, status_message, raw)
+    except (TimedOut, NetworkError):
+        return await _strict_markdown_reply(update, raw)
 
 
 async def _deliver_agent_result(**values):
