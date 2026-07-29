@@ -41,9 +41,10 @@ class InstanceScopedTelegramArtifactGatewayClient(
     adjacent text update in the same chat/thread can be given the exact album
     ``source_group_id`` before either request reaches shared ingress.
 
-    This is transport sequencing, not semantic guessing: no active album means
-    ordinary atomic text, while more than one active album is an explicit
-    ambiguity error.
+    This is transport sequencing, not semantic guessing: ordinary text never
+    waits, while forwarded text may briefly wait for an earlier forwarded album
+    update from the same bot/chat/thread. More than one active album remains an
+    explicit ambiguity error.
     """
 
     def __init__(
@@ -51,6 +52,7 @@ class InstanceScopedTelegramArtifactGatewayClient(
         *,
         client_instance_id: str,
         input_text_join_window_seconds: float = 10.0,
+        forwarded_text_join_wait_seconds: float = 1.5,
         **values: Any,
     ) -> None:
         super().__init__(**values)
@@ -64,7 +66,25 @@ class InstanceScopedTelegramArtifactGatewayClient(
         )
         if self.input_text_join_window_seconds <= 0:
             raise ValueError("Telegram text join window must be positive")
+        if isinstance(forwarded_text_join_wait_seconds, bool):
+            raise TypeError("Telegram forwarded text join wait must be numeric")
+        self.forwarded_text_join_wait_seconds = float(
+            forwarded_text_join_wait_seconds
+        )
+        if self.forwarded_text_join_wait_seconds < 0:
+            raise ValueError(
+                "Telegram forwarded text join wait must not be negative"
+            )
+        if (
+            self.forwarded_text_join_wait_seconds
+            > self.input_text_join_window_seconds
+        ):
+            raise ValueError(
+                "Telegram forwarded text join wait must not exceed the text "
+                "join window"
+            )
         self._input_group_lock = asyncio.Lock()
+        self._input_group_condition = asyncio.Condition(self._input_group_lock)
         self._input_groups: dict[str, _ActiveInputGroup] = {}
         self._input_batch_groups: dict[str, str] = {}
 
@@ -82,7 +102,15 @@ class InstanceScopedTelegramArtifactGatewayClient(
             and list(getattr(envelope, "text_parts", None) or [])
             and not list(getattr(envelope, "attachment_slots", None) or [])
         ):
-            active = await self._resolve_single_active_group(envelope)
+            wait_seconds = (
+                self.forwarded_text_join_wait_seconds
+                if self._is_forwarded_text(envelope)
+                else 0.0
+            )
+            active = await self._resolve_single_active_group(
+                envelope,
+                wait_seconds=wait_seconds,
+            )
             if active is not None:
                 envelope = envelope.model_copy(
                     update={"source_group_id": active.source_group_id}
@@ -90,10 +118,12 @@ class InstanceScopedTelegramArtifactGatewayClient(
                 group_key = active.group_key
                 logger.info(
                     "telegram_text_bound_to_active_media_group "
-                    "group_key=%s input_batch_id=%s source_message_id=%s",
+                    "group_key=%s input_batch_id=%s source_message_id=%s "
+                    "forwarded=%s",
                     active.group_key,
                     active.input_batch_id,
                     getattr(envelope, "source_message_id", None),
+                    bool(wait_seconds),
                 )
 
         if group_key is not None:
@@ -114,12 +144,13 @@ class InstanceScopedTelegramArtifactGatewayClient(
 
         batch_id = str(payload.get("input_batch_id") or "").strip()
         if group_key is not None and batch_id:
-            async with self._input_group_lock:
+            async with self._input_group_condition:
                 current = self._input_groups.get(group_key)
                 if current is not None:
                     current.input_batch_id = batch_id
                     current.last_activity = time.monotonic()
                     self._input_batch_groups[batch_id] = group_key
+                    self._input_group_condition.notify_all()
         return payload
 
     async def commit_and_run(
@@ -277,7 +308,7 @@ class InstanceScopedTelegramArtifactGatewayClient(
         if not scope_key or not source_group_id:
             return
         now = time.monotonic()
-        async with self._input_group_lock:
+        async with self._input_group_condition:
             self._purge_expired_input_groups(now)
             current = self._input_groups.get(group_key)
             if current is None:
@@ -290,41 +321,85 @@ class InstanceScopedTelegramArtifactGatewayClient(
                 )
             else:
                 current.last_activity = now
+            self._input_group_condition.notify_all()
 
-    async def _resolve_single_active_group(self, envelope) -> _ActiveInputGroup | None:
+    async def _resolve_single_active_group(
+        self,
+        envelope,
+        *,
+        wait_seconds: float = 0.0,
+    ) -> _ActiveInputGroup | None:
         scope_key = self._input_scope_key(envelope)
         if not scope_key:
             return None
-        now = time.monotonic()
-        async with self._input_group_lock:
-            self._purge_expired_input_groups(now)
-            candidates = [
-                item
-                for item in self._input_groups.values()
-                if item.scope_key == scope_key
-            ]
-            if len(candidates) > 1:
-                raise TelegramArtifactBridgeError(
-                    "Text input matches multiple active Telegram media groups"
-                )
-            return candidates[0] if candidates else None
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        waiting_logged = False
+        async with self._input_group_condition:
+            while True:
+                now = time.monotonic()
+                self._purge_expired_input_groups(now)
+                candidates = [
+                    item
+                    for item in self._input_groups.values()
+                    if item.scope_key == scope_key
+                ]
+                if len(candidates) > 1:
+                    raise TelegramArtifactBridgeError(
+                        "Text input matches multiple active Telegram media groups"
+                    )
+                if candidates:
+                    return candidates[0]
+                remaining = deadline - now
+                if remaining <= 0:
+                    if waiting_logged:
+                        logger.info(
+                            "telegram_forwarded_text_join_wait_expired "
+                            "scope_key=%s source_message_id=%s",
+                            scope_key,
+                            getattr(envelope, "source_message_id", None),
+                        )
+                    return None
+                if not waiting_logged:
+                    logger.info(
+                        "telegram_forwarded_text_waiting_for_media_group "
+                        "scope_key=%s source_message_id=%s wait_seconds=%s",
+                        scope_key,
+                        getattr(envelope, "source_message_id", None),
+                        wait_seconds,
+                    )
+                    waiting_logged = True
+                try:
+                    await asyncio.wait_for(
+                        self._input_group_condition.wait(),
+                        timeout=remaining,
+                    )
+                except asyncio.TimeoutError:
+                    logger.info(
+                        "telegram_forwarded_text_join_wait_expired "
+                        "scope_key=%s source_message_id=%s",
+                        scope_key,
+                        getattr(envelope, "source_message_id", None),
+                    )
+                    return None
 
     async def _close_group_for_batch(self, input_batch_id: str) -> None:
         normalized = input_batch_id.strip()
         if not normalized:
             return
-        async with self._input_group_lock:
+        async with self._input_group_condition:
             group_key = self._input_batch_groups.pop(normalized, None)
             if group_key is not None:
                 self._input_groups.pop(group_key, None)
+                self._input_group_condition.notify_all()
 
     async def _close_input_group(self, group_key: str | None) -> None:
         if not group_key:
             return
-        async with self._input_group_lock:
+        async with self._input_group_condition:
             current = self._input_groups.pop(group_key, None)
             if current is not None and current.input_batch_id:
                 self._input_batch_groups.pop(current.input_batch_id, None)
+            self._input_group_condition.notify_all()
 
     def _purge_expired_input_groups(self, now: float) -> None:
         expired = [
@@ -347,6 +422,15 @@ class InstanceScopedTelegramArtifactGatewayClient(
         thread_id = getattr(conversation, "thread_id", None)
         thread = str(thread_id) if thread_id is not None else "-"
         return f"{self.client_instance_id}:{conversation_id}:{thread}"
+
+    @staticmethod
+    def _is_forwarded_text(envelope) -> bool:
+        for part in list(getattr(envelope, "semantic_parts", None) or []):
+            raw_type = getattr(part, "type", None)
+            part_type = getattr(raw_type, "value", raw_type)
+            if str(part_type or "") == "forwarded_message_input":
+                return True
+        return False
 
     async def _post_json_with_retry(
         self,
