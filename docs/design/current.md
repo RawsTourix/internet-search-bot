@@ -86,28 +86,58 @@ Transient Windows `PermissionError` при публикации artifact metadat
 - базовые system-prompt rules для explicit `format_id` и проверки returned
   artifact metadata без runtime-эвристики по расширению.
 
-Автоматический validation suite успешен: artifact suite содержит **165 тестов**,
-включая конкурентный text submit при заблокированном file HTTP request,
-document-group representation paths, output authority reconciliation, terminal
-status fallback и prompt-contract.
+Live Telegram-проверка 2026-07-29 подтвердила исправление file-first sequencing:
+три файла и отдельная поздняя инструкция сформировали один batch с тремя
+artifacts и одним text part с первого прогона. Точный native group error теперь
+известен: вручную созданный PTB `InputFile` не получил корректное
+`attach://...` mapping, поэтому Telegram вернул `Can't parse inputmedia: media
+not found`; ordered individual fallback доставил все файлы.
 
-До статуса `implemented` остаются полный локальный suite и live Windows-проверка
-AF-25/AF-26 без ручного cleanup или удаления `storage`.
+## v0.4-batch-workflows
 
-Следующий основной функциональный этап после закрытия этого gate:
+Следующий активный именованный этап:
+
+```text
+v0.4-batch-workflows
+```
+
+Он расположен между file-artifacts-advanced и input-runtime и завершает
+client-facing workflows до admission в agent cycle:
+
+- AUTO policy без задержки обычного text-only input;
+- file-first draft с несколькими файлами/сообщениями;
+- explicit `/collect → /send | /cancel` для text-first/files-first/mixed input;
+- safe presentation relocation после новых user messages;
+- stable semantic output grouping и SDK-owned Telegram multipart mapping;
+- bounded active artifact manifest при сохранении явного доступа к session и
+  workspace history.
+
+Главный принцип AUTO:
+
+```text
+text first  → immediate batch
+files first → collecting draft, затем text parts или explicit /send
+```
+
+Reverse guessing не выполняется. Для `text → files` в одном batch пользователь
+заранее включает explicit collection mode.
+
+`v0.4-batch-workflows` не реализует сообщения во время active agent cycle. После
+его завершения следующим функциональным этапом остаётся:
 
 ```text
 v0.4-input-runtime
 ```
 
-После его завершения запланирован архитектурный этап:
+Он добавит `CycleInbox`, safe checkpoints, control inbox и finalization races.
+После него запланирован:
 
 ```text
 v0.4-runtime-modularization
 ```
 
-Он декомпозирует центральный orchestration core без изменения принятого
-поведения v0.4 и подготавливает ports/repositories/composition root для v0.5 и
+Он декомпозирует центральный orchestration core без изменения принятых
+контрактов v0.4 и подготавливает ports/repositories/composition root для v0.5 и
 v0.6.
 
 Канонический индекс: [`versions/v0.4/README.md`](versions/v0.4/README.md).
@@ -133,7 +163,9 @@ v0.6.
 1. используйте v0.3 как реализованный baseline;
 2. применяйте отмеченные реализованные updates v0.4;
 3. учитывайте `AF-24` как реализованный reservation hardening;
-4. учитывайте `AF-25` и `AF-26` как code-complete, live-pending hardening;
-5. проверяйте затронутый код и тесты для точного implementation status;
-6. используйте незавершённый v0.4 и v0.5–v0.10 только как будущие ограничения;
-7. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun` в одну сущность.
+4. учитывайте `AF-25` и `AF-26` как code-complete, live-verified частично;
+5. учитывайте `v0.4-batch-workflows` как accepted/partial следующую границу;
+6. не приписывайте AUTO/EXPLICIT controls текущему runtime до их code evidence;
+7. проверяйте затронутый код и тесты для точного implementation status;
+8. используйте v0.5–v0.10 только как будущие ограничения;
+9. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun` в одну сущность.
