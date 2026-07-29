@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-07-28
+last_reviewed: 2026-07-29
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -24,30 +24,37 @@ last_reviewed: 2026-07-28
 | 3 | [`v0.4-cycle-compaction`](v0.4-cycle-compaction.md) | implemented | `CycleWorkingMemory` и compaction закрытых segments |
 | 4 | [`v0.4-dag-planning`](v0.4-dag-planning.md) | implemented | Optional runtime-owned DAG без scheduler |
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
-| 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable ingress recovery |
+| 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25`/`AF-26` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
 | 8 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
 
 `AF-24` порядка `grouping → durable InputBatchDraft → streaming` реализован и
 подтверждён live Telegram workflow.
 
-Robustness tests №2–4 выявили follow-up `AF-25`: transient filesystem failure
-после reservation оставлял open zombie draft; `/reset` очищал только LLM memory,
-а restart не закрывал drafts, прежние process-local owners которых уже исчезли.
+Robustness tests выявили два follow-up hardening-этапа:
 
-Кодовый patch и automatic regression suites завершены успешно:
+- `AF-25`: terminal failure, failed-group tombstone, `/reset` и automatic
+  process-restart reconciliation для open drafts;
+- `AF-26`: exact active-album sequencing до Gateway, native document-group
+  diagnostics/retry, legacy READY authority cleanup, terminal status fallback и
+  базовый prompt contract для явного artifact format.
+
+Кодовые patches и automatic regression suites завершены успешно:
 
 - runtime storage/integrity failure переводит draft в `FAILED`;
-- late member exact failed group получает terminal tombstone;
-- `/reset` отменяет open drafts exact session;
-- shared `API.start` commit-ит ready drafts без agent run и переводит все
-  оставшиеся open drafts в `ABANDONED` до приёма новых запросов;
-- artifact suite содержит 156 успешных тестов, включая реальное пересоздание
-  filesystem services и новый album + instruction после zombie cleanup.
+- ready drafts после restart commit-ятся без agent run, остальные становятся
+  `ABANDONED` до приёма новых запросов;
+- text при заблокированном file HTTP request получает exact album group key;
+- два active albums дают explicit ambiguity вместо guessing;
+- document group проверяется через streaming, bounded eager retry и safe fallback;
+- legacy sentinel READY становится `CANCELLED`, valid READY сохраняет authority;
+- terminal send timeout обновляет exact status message;
+- runtime не определяет `format_id` по расширению;
+- artifact suite содержит **165 успешных тестов**.
 
-Статус возвращается в `implemented` после полного локального suite и повторного
-live Windows-прогона robustness теста №2 без ручного `/reset`, удаления
-`storage`, files-only cycle и ложной ambiguity.
+Статус возвращается в `implemented` после полного локального suite и live
+Windows-проверки AF-25/AF-26 без ручного `/reset`, удаления `storage`, files-only
+cycle, ложной ambiguity и необъяснимого document-group fallback.
 
 Статус является навигационным и перед release проверяется по коду и тестам.
 
