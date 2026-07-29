@@ -3,9 +3,15 @@
 from __future__ import annotations
 
 import logging
+import re
+from tempfile import SpooledTemporaryFile
 from typing import Any, Mapping
 
+from telegram import InputMediaDocument
+from telegram.error import BadRequest, NetworkError, TimedOut
+
 from ...interaction.output_models import (
+    ArtifactContentReceiptState,
     ArtifactOutputPart,
     OutputBatch,
     OutputDeliveryGroup,
@@ -149,6 +155,230 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
             [item.state.value for item in fallback_receipts],
         )
         return fallback_receipts
+
+    async def _send_document_group(
+        self,
+        *,
+        parts: list[OutputPart],
+        context: TelegramExecutionContext,
+        reply_to_message_id: int | None,
+    ) -> list[OutputPartReceipt]:
+        """Use PTB's direct file-handle form and retain exact failure evidence."""
+
+        if not 2 <= len(parts) <= 10:
+            return [
+                self._receipt(
+                    part,
+                    state=OutputPartReceiptState.FAILED,
+                    error_category="invalid_document_group_size",
+                )
+                for part in parts
+            ]
+
+        opened: list[tuple[SpooledTemporaryFile, str]] = []
+        send_started = False
+        try:
+            for part in parts:
+                if not isinstance(part, ArtifactOutputPart):
+                    raise ValueError(
+                        "document group contains a non-artifact part"
+                    )
+                opened.append(
+                    await context.gateway.open_delivery_file(
+                        part.delivery_id,
+                        session_id=context.session_id,
+                    )
+                )
+
+            media = [
+                InputMediaDocument(media=spool, filename=filename)
+                for spool, filename in opened
+            ]
+            kwargs = self._message_kwargs(
+                context,
+                reply_to_message_id=reply_to_message_id,
+                media=media,
+            )
+            try:
+                send_started = True
+                sent = list(await context.bot.send_media_group(**kwargs))
+            except BadRequest as error:
+                logger.warning(
+                    "telegram_document_group_bad_request part_count=%s "
+                    "filenames=%s error=%s",
+                    len(parts),
+                    [filename for _, filename in opened],
+                    self._safe_telegram_error(error),
+                )
+                if (
+                    reply_to_message_id is None
+                    or not self._is_reply_target_error(error)
+                ):
+                    return self._group_failure_receipts(
+                        parts,
+                        error_category=(
+                            "telegram_bad_request:"
+                            f"{type(error).__name__}"
+                        ),
+                    )
+                retry_kwargs = dict(kwargs)
+                retry_kwargs.pop("reply_to_message_id", None)
+                retry_kwargs.pop("allow_sending_without_reply", None)
+                logger.info(
+                    "telegram_document_group_retry_without_reply "
+                    "part_count=%s",
+                    len(parts),
+                )
+                sent = list(
+                    await context.bot.send_media_group(**retry_kwargs)
+                )
+
+            if len(sent) != len(parts):
+                return [
+                    self._receipt(
+                        part,
+                        state=OutputPartReceiptState.UNKNOWN,
+                        artifact_content_state=(
+                            ArtifactContentReceiptState.UNKNOWN
+                        ),
+                        client_message_ids=(
+                            (str(sent[index].message_id),)
+                            if index < len(sent)
+                            and getattr(
+                                sent[index], "message_id", None
+                            ) is not None
+                            else ()
+                        ),
+                        error_category=(
+                            "telegram_media_group_receipt_mismatch"
+                        ),
+                    )
+                    for index, part in enumerate(parts)
+                ]
+            return [
+                self._receipt(
+                    part,
+                    state=OutputPartReceiptState.DELIVERED,
+                    artifact_content_state=(
+                        ArtifactContentReceiptState.DELIVERED
+                    ),
+                    client_message_ids=(str(message.message_id),),
+                )
+                for part, message in zip(parts, sent, strict=True)
+            ]
+        except BadRequest as error:
+            logger.warning(
+                "telegram_document_group_bad_request part_count=%s "
+                "filenames=%s error=%s",
+                len(parts),
+                [filename for _, filename in opened],
+                self._safe_telegram_error(error),
+            )
+            return self._group_failure_receipts(
+                parts,
+                error_category=(
+                    "telegram_bad_request:"
+                    f"{type(error).__name__}"
+                ),
+            )
+        except (TimedOut, NetworkError) as error:
+            logger.warning(
+                "telegram_document_group_transport_unknown part_count=%s "
+                "error=%s",
+                len(parts),
+                self._safe_telegram_error(error),
+            )
+            return [
+                self._receipt(
+                    part,
+                    state=(
+                        OutputPartReceiptState.UNKNOWN
+                        if send_started
+                        else OutputPartReceiptState.FAILED
+                    ),
+                    artifact_content_state=(
+                        ArtifactContentReceiptState.UNKNOWN
+                        if send_started
+                        else ArtifactContentReceiptState.NOT_DELIVERED
+                    ),
+                    error_category=(
+                        "telegram_group_transport:"
+                        f"{type(error).__name__}"
+                    ),
+                )
+                for part in parts
+            ]
+        except Exception as error:
+            logger.exception(
+                "telegram_document_group_error part_count=%s "
+                "send_started=%s error=%s",
+                len(parts),
+                send_started,
+                self._safe_telegram_error(error),
+            )
+            return [
+                self._receipt(
+                    part,
+                    state=(
+                        OutputPartReceiptState.UNKNOWN
+                        if send_started
+                        else OutputPartReceiptState.FAILED
+                    ),
+                    artifact_content_state=(
+                        ArtifactContentReceiptState.UNKNOWN
+                        if send_started
+                        else ArtifactContentReceiptState.NOT_DELIVERED
+                    ),
+                    error_category=(
+                        "telegram_group_error:"
+                        f"{type(error).__name__}"
+                    ),
+                )
+                for part in parts
+            ]
+        finally:
+            for spool, _ in opened:
+                spool.close()
+
+    @classmethod
+    def _group_failure_receipts(
+        cls,
+        parts: list[OutputPart],
+        *,
+        error_category: str,
+    ) -> list[OutputPartReceipt]:
+        return [
+            cls._receipt(
+                part,
+                state=OutputPartReceiptState.FAILED,
+                artifact_content_state=(
+                    ArtifactContentReceiptState.NOT_DELIVERED
+                ),
+                error_category=error_category,
+            )
+            for part in parts
+        ]
+
+    @staticmethod
+    def _is_reply_target_error(error: BadRequest) -> bool:
+        message = str(error).lower()
+        return any(
+            marker in message
+            for marker in (
+                "message to be replied",
+                "reply message",
+                "replied message",
+                "reply_to_message",
+            )
+        )
+
+    @staticmethod
+    def _safe_telegram_error(error: BaseException) -> str:
+        message = re.sub(r"\s+", " ", str(error)).strip()
+        value = type(error).__name__
+        if message:
+            value += f": {message}"
+        return value[:1_000]
 
     @staticmethod
     def _can_fallback_document_group(
