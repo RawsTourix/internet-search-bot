@@ -34,6 +34,7 @@ last_reviewed: 2026-07-29
 | Раздел | Документ |
 |---|---|
 | `BW-1`–`BW-4` | [`input-assembly.md`](input-assembly.md) |
+| `BW-2A` | [`forwarded-sequencing-hardening.md`](forwarded-sequencing-hardening.md) |
 | `BW-5`–`BW-6` | [`presentation-and-controls.md`](presentation-and-controls.md) |
 | `BW-7`–`BW-8` | [`output-grouping.md`](output-grouping.md) |
 | `BW-9` | [`artifact-access.md`](artifact-access.md) |
@@ -43,11 +44,12 @@ last_reviewed: 2026-07-29
 ## Порядок чтения
 
 1. [`input-assembly.md`](input-assembly.md)
-2. [`presentation-and-controls.md`](presentation-and-controls.md)
-3. [`output-grouping.md`](output-grouping.md)
-4. [`artifact-access.md`](artifact-access.md)
-5. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
-6. [`shutdown-and-execution.md`](shutdown-and-execution.md)
+2. [`forwarded-sequencing-hardening.md`](forwarded-sequencing-hardening.md)
+3. [`presentation-and-controls.md`](presentation-and-controls.md)
+4. [`output-grouping.md`](output-grouping.md)
+5. [`artifact-access.md`](artifact-access.md)
+6. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
+7. [`shutdown-and-execution.md`](shutdown-and-execution.md)
 
 ## Главные инварианты
 
@@ -81,6 +83,12 @@ last_reviewed: 2026-07-29
     `InputBatch` и не классифицируется как commit failure.
 14. MCP transport contexts создаются и закрываются одной lifespan task; authority
     middleware не создаёт скрытый cancellation task layer.
+15. Forwarding является provenance, а не attachment type. Только forwarded
+    text-only update может кратко ждать более ранний forwarded album того же
+    exact scope; обычный текст остаётся немедленным, а смысл текста не
+    анализируется.
+16. Внешний `duplicate` определяется authoritative первой reservation. Повторный
+    внутренний store pass не превращает новый logical input в transport retry.
 
 ## Положение в архитектуре
 
@@ -106,7 +114,9 @@ v0.4-input-runtime
 - добавить request-level и live regression tests;
 - сохранить safe individual fallback и exact receipts;
 - разделить durable commit и long-running agent execution;
-- обеспечить cancellation-safe Gateway/MCP shutdown.
+- обеспечить cancellation-safe Gateway/MCP shutdown;
+- исправить original idempotency semantics reservation;
+- закрыть concurrent forwarded text/media sequencing без задержки обычного текста.
 
 ### BW-P2. Shared explicit draft control
 
@@ -147,9 +157,24 @@ v0.4-input-runtime
 - durable commit и AgentCycle разделены transport-stage boundary;
 - Gateway lifespan и authority middleware hardened для cancellation.
 
-Следующий основной этап — shared `InputDraftControlService` до Telegram wiring
-`/collect`, `/send` и `/cancel`.
+Дополнительный code-complete/live-pending slice:
 
-Любой новый параметр `.env` или `mcp.config` в рамках этого обновления обязан в
-том же patch обновлять соответствующий `.example`; release notes отдельно
-перечисляют новые keys и defaults.
+- первый atomic submit сохраняет `duplicate=False`, настоящий retry —
+  `duplicate=True`;
+- forwarded text маршрутизируется как text с отдельным provenance;
+- forwarded text может bounded-wait более ранний album при конкурентной доставке;
+- ordinary text не получает wait;
+- thematic artifact suite содержит 177 успешных тестов.
+
+Следующий основной этап после live-проверки mixed-forward workflow — shared
+`InputDraftControlService` до Telegram wiring `/collect`, `/send` и `/cancel`.
+
+Новый параметр этого slice:
+
+```env
+TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
+```
+
+Он добавлен в `.env.example`; в `mcp.config` новых keys нет. Любой следующий
+параметр `.env` или `mcp.config` обязан в том же patch обновлять соответствующий
+`.example`; release notes отдельно перечисляют новые keys и defaults.
