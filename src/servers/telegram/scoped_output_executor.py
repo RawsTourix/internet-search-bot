@@ -7,7 +7,7 @@ import re
 from tempfile import SpooledTemporaryFile
 from typing import Any, Mapping
 
-from telegram import InputMediaDocument
+from telegram import InputFile, InputMediaDocument
 from telegram.error import BadRequest, NetworkError, TimedOut
 
 from ...interaction.output_models import (
@@ -163,7 +163,7 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
         context: TelegramExecutionContext,
         reply_to_message_id: int | None,
     ) -> list[OutputPartReceipt]:
-        """Use PTB's direct file-handle form and retain exact failure evidence."""
+        """Try streaming handles, then one bounded eager representation."""
 
         if not 2 <= len(parts) <= 10:
             return [
@@ -191,7 +191,12 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
                 )
 
             media = [
-                InputMediaDocument(media=spool, filename=filename)
+                InputMediaDocument(
+                    media=context.gateway.telegram_input_file(
+                        spool,
+                        filename,
+                    )
+                )
                 for spool, filename in opened
             ]
             kwargs = self._message_kwargs(
@@ -204,16 +209,54 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
                 sent = list(await context.bot.send_media_group(**kwargs))
             except BadRequest as error:
                 logger.warning(
-                    "telegram_document_group_bad_request part_count=%s "
-                    "filenames=%s error=%s",
+                    "telegram_document_group_bad_request representation=stream "
+                    "part_count=%s filenames=%s error=%s",
                     len(parts),
                     [filename for _, filename in opened],
                     self._safe_telegram_error(error),
                 )
                 if (
-                    reply_to_message_id is None
-                    or not self._is_reply_target_error(error)
+                    reply_to_message_id is not None
+                    and self._is_reply_target_error(error)
                 ):
+                    retry_kwargs = dict(kwargs)
+                    retry_kwargs.pop("reply_to_message_id", None)
+                    retry_kwargs.pop("allow_sending_without_reply", None)
+                    logger.info(
+                        "telegram_document_group_retry_without_reply "
+                        "representation=stream part_count=%s",
+                        len(parts),
+                    )
+                    sent = list(
+                        await context.bot.send_media_group(**retry_kwargs)
+                    )
+                elif self._can_eager_retry(parts, context):
+                    eager_media = []
+                    for spool, filename in opened:
+                        spool.seek(0)
+                        eager_media.append(
+                            InputMediaDocument(
+                                media=InputFile(
+                                    spool.read(),
+                                    filename=filename,
+                                )
+                            )
+                        )
+                    eager_kwargs = self._message_kwargs(
+                        context,
+                        reply_to_message_id=reply_to_message_id,
+                        media=eager_media,
+                    )
+                    logger.info(
+                        "telegram_document_group_retry_eager "
+                        "part_count=%s total_bytes=%s",
+                        len(parts),
+                        sum(int(part.size_bytes or 0) for part in parts),
+                    )
+                    sent = list(
+                        await context.bot.send_media_group(**eager_kwargs)
+                    )
+                else:
                     return self._group_failure_receipts(
                         parts,
                         error_category=(
@@ -221,17 +264,6 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
                             f"{type(error).__name__}"
                         ),
                     )
-                retry_kwargs = dict(kwargs)
-                retry_kwargs.pop("reply_to_message_id", None)
-                retry_kwargs.pop("allow_sending_without_reply", None)
-                logger.info(
-                    "telegram_document_group_retry_without_reply "
-                    "part_count=%s",
-                    len(parts),
-                )
-                sent = list(
-                    await context.bot.send_media_group(**retry_kwargs)
-                )
 
             if len(sent) != len(parts):
                 return [
@@ -268,8 +300,8 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
             ]
         except BadRequest as error:
             logger.warning(
-                "telegram_document_group_bad_request part_count=%s "
-                "filenames=%s error=%s",
+                "telegram_document_group_bad_request representation=retry "
+                "part_count=%s filenames=%s error=%s",
                 len(parts),
                 [filename for _, filename in opened],
                 self._safe_telegram_error(error),
@@ -339,6 +371,27 @@ class InstanceScopedTelegramOutputPlanExecutor(TelegramOutputPlanExecutor):
         finally:
             for spool, _ in opened:
                 spool.close()
+
+    @staticmethod
+    def _can_eager_retry(
+        parts: list[OutputPart],
+        context: TelegramExecutionContext,
+    ) -> bool:
+        if not all(
+            isinstance(part, ArtifactOutputPart)
+            and part.size_bytes is not None
+            for part in parts
+        ):
+            return False
+        budget = int(
+            getattr(
+                context.gateway,
+                "delivery_spool_memory_bytes",
+                8 * 1024 * 1024,
+            )
+        )
+        total = sum(int(part.size_bytes or 0) for part in parts)
+        return budget > 0 and total <= budget
 
     @classmethod
     def _group_failure_receipts(
