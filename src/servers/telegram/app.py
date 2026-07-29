@@ -5,6 +5,8 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import httpx
+from telegram.constants import ParseMode
+from telegram.error import BadRequest, NetworkError, TimedOut
 
 from . import telegram_server as server
 from .config import (
@@ -55,6 +57,83 @@ ready_outbox_worker = TelegramReadyOutboxWorker(
 
 
 _base_deliver_agent_result = server._deliver_agent_result
+_base_finish_status_or_send_reply = server.finish_status_or_send_reply
+
+
+async def _strict_markdown_reply(update, text: str):
+    """Do not swallow an exhausted Telegram transport retry sequence."""
+
+    sent = []
+    for markdown_chunk in server.split_markdown_for_telegram(text or ""):
+        try:
+            message = await server.telegram_reply_with_retries(
+                update,
+                server.markdown_to_telegram_html(markdown_chunk),
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            message = await server.telegram_reply_with_retries(
+                update,
+                server.markdown_to_plain_text(markdown_chunk),
+                parse_mode=None,
+            )
+        sent.append(message)
+    return sent
+
+
+async def _finish_status_or_send_reply(**values):
+    """Use a known status message after an ambiguous send-new timeout.
+
+    A timeout after ``reply_text`` may mean the new message was accepted, so the
+    same non-idempotent send is not repeated again. Updating the already known
+    status message is a separate deterministic operation and guarantees that a
+    terminal error remains visible even when the direct final send is uncertain.
+    """
+
+    original_sender = server.send_telegram_markdown_reply
+    server.send_telegram_markdown_reply = _strict_markdown_reply
+    try:
+        return await _base_finish_status_or_send_reply(**values)
+    except (TimedOut, NetworkError) as error:
+        status_message = values.get("status_message")
+        update = values.get("update")
+        text = str(values.get("text") or "")
+        if status_message is None or update is None:
+            server.logger.error(
+                "telegram_terminal_text_delivery_unknown "
+                "status_message_available=false error_type=%s",
+                type(error).__name__,
+            )
+            raise
+
+        chunks = server.split_markdown_for_telegram(text)
+        chunk = chunks[0] if chunks else text
+        if len(chunks) > 1:
+            chunk = chunk.rstrip() + "\n\n…"
+        try:
+            await server.edit_telegram_message_with_retries(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text=server.markdown_to_telegram_html(chunk),
+                parse_mode=ParseMode.HTML,
+            )
+        except BadRequest:
+            await server.edit_telegram_message_with_retries(
+                chat_id=update.effective_chat.id,
+                message_id=status_message.message_id,
+                text=server.markdown_to_plain_text(chunk),
+                parse_mode=None,
+            )
+        server.logger.warning(
+            "telegram_terminal_text_fell_back_to_status "
+            "chat_id=%s message_id=%s original_error_type=%s",
+            update.effective_chat.id,
+            status_message.message_id,
+            type(error).__name__,
+        )
+        return status_message
+    finally:
+        server.send_telegram_markdown_reply = original_sender
 
 
 async def _deliver_agent_result(**values):
@@ -79,6 +158,7 @@ async def _deliver_agent_result(**values):
         raise
 
 
+server.finish_status_or_send_reply = _finish_status_or_send_reply
 server._deliver_agent_result = _deliver_agent_result
 
 
