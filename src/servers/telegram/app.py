@@ -7,6 +7,7 @@ from contextlib import asynccontextmanager
 import httpx
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
+from telegram.ext import MessageHandler, filters
 
 from . import telegram_server as server
 from .config import (
@@ -14,6 +15,7 @@ from .config import (
     TELEGRAM_API_KEY,
     TELEGRAM_BOT_INSTANCE_ID,
     TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES,
+    TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS,
     TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS,
     TELEGRAM_READY_OUTBOX_BATCH_LIMIT,
     TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
@@ -37,10 +39,33 @@ artifact_gateway = InstanceScopedTelegramArtifactGatewayClient(
     input_text_join_window_seconds=(
         TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS
     ),
+    forwarded_text_join_wait_seconds=(
+        TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS
+    ),
 )
 telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
 server.telegram_output_executor = telegram_output_executor
+
+
+def _route_forwarded_text_through_text_handler() -> None:
+    """Forwarding is provenance, not an attachment media type."""
+
+    narrowed = server.attachment_filter & ~(
+        filters.FORWARDED & filters.TEXT
+    )
+    for handlers in server.application.handlers.values():
+        for handler in handlers:
+            if (
+                isinstance(handler, MessageHandler)
+                and handler.callback is server.attachment_handler
+            ):
+                handler.filters = narrowed
+                return
+    raise RuntimeError("Telegram attachment handler is not registered")
+
+
+_route_forwarded_text_through_text_handler()
 
 
 ready_outbox_worker = TelegramReadyOutboxWorker(
