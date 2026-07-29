@@ -3,7 +3,7 @@ id: design.v0.4.file-artifacts-advanced
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-07-28
+last_reviewed: 2026-07-29
 ---
 
 # v0.4-file-artifacts-advanced
@@ -27,6 +27,7 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 | `AF-21`–`AF-23` | [`implementation.md`](implementation.md) |
 | `AF-24` | [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md) |
 | `AF-25` | [`ingress-failure-recovery.md`](ingress-failure-recovery.md) |
+| `AF-26` | [`telegram-robustness-hardening.md`](telegram-robustness-hardening.md) |
 
 ## Порядок чтения
 
@@ -38,6 +39,7 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 6. [`implementation.md`](implementation.md)
 7. [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md)
 8. [`ingress-failure-recovery.md`](ingress-failure-recovery.md)
+9. [`telegram-robustness-hardening.md`](telegram-robustness-hardening.md)
 
 Общий реестр обновлений версии находится в
 [`../README.md`](../README.md).
@@ -75,23 +77,36 @@ client capabilities, локализации, `OutputBatch`, delivery и artifact
 - `/reset` отменяет open drafts exact session и затем очищает LLM memory;
 - shared `API.start` выполняет automatic ingress reconciliation: готовые drafts
   commit-ятся без agent run, остальные open drafts становятся `ABANDONED`, их
-  group indexes освобождаются до приёма новых запросов.
+  group indexes освобождаются до приёма новых запросов;
+- `AF-26` Telegram sequencing связывает отдельную инструкцию с exact active
+  album до Gateway, не анализируя текст и не ослабляя shared ambiguity policy;
+- native document group получает exact diagnostic logging, bounded eager retry
+  после подтверждённого `BadRequest` и safe individual fallback;
+- unclaimable legacy `READY OutputBatch` переводятся в `CANCELLED` с audit code,
+  а authority остальных READY выводится явно;
+- terminal text после ambiguous send timeout обновляет известный status handle;
+- system protocol требует explicit `format_id` и проверки returned artifact
+  metadata без runtime-эвристики по расширению.
 
 `AF-24` подтверждён автоматическими regression tests и live Telegram workflow
 2026-07-28: media group из 10 файлов и отдельная поздняя инструкция сформировали
 один committed batch с `artifact_count=10`, `text_part_count=1`; был запущен один
 agent cycle.
 
-Robustness tests №2–4 затем выявили `AF-25`: transient `WinError 5` при
-публикации artifact metadata оставлял zombie draft, который загрязнял следующие
-пакеты и создавал ложную grouping ambiguity. Кодовый patch завершён; artifact
-suite содержит 156 успешных тестов. Startup tests пересоздают все filesystem
-services из того же storage root и подтверждают, что новый альбом с отдельной
-инструкцией корректно объединяется после automatic zombie cleanup.
+Robustness tests затем выявили `AF-25` и `AF-26`. Кодовые patches завершены;
+artifact validation suite содержит **165 успешных тестов**. В suite входят:
 
-Статус update временно `partial` до полного локального suite и повторного live
-Windows-прогона robustness теста №2 без ручного `/reset` и без удаления
-`storage`.
+- реальное пересоздание filesystem services и automatic zombie cleanup;
+- новый album + instruction после process restart;
+- конкурентный text submit при заблокированном file HTTP request;
+- explicit ambiguity для двух active albums;
+- streaming/eager/individual Telegram document-group paths;
+- legacy READY authority reconciliation;
+- terminal status fallback;
+- prompt-contract без filename-format эвристики.
+
+Статус update временно `partial` до полного локального suite и live Windows
+проверки AF-25/AF-26 без ручного cleanup и без удаления `storage`.
 
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
@@ -100,7 +115,7 @@ Runtime-конфигурация находится в корне
 defaults, поэтому прежний конфигурационный файл остаётся совместимым.
 
 Точные пути модулей, stores, migrations и тестов перечислены в
-[`implementation.md`](implementation.md). Порядок ingress hardening и его
-verification evidence определены в
-[`ingress-reservation-hardening.md`](ingress-reservation-hardening.md) и
-[`ingress-failure-recovery.md`](ingress-failure-recovery.md).
+[`implementation.md`](implementation.md). Порядок hardening и verification
+evidence определены в [`ingress-reservation-hardening.md`](ingress-reservation-hardening.md),
+[`ingress-failure-recovery.md`](ingress-failure-recovery.md) и
+[`telegram-robustness-hardening.md`](telegram-robustness-hardening.md).
