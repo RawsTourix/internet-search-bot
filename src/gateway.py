@@ -25,6 +25,9 @@ from .api.legacy_delivery_guard import LegacyTelegramDeliveryGuardMiddleware
 from .api.output_outbox_routes import create_output_outbox_router
 from .core.message_processor import MessageProcessor
 from .core.models import ClientType, MessageType, UnifiedMessage, WebMessage
+from .interaction.output_startup_recovery import (
+    reconcile_unclaimable_legacy_ready,
+)
 
 
 load_dotenv()
@@ -263,6 +266,26 @@ async def lifespan(app: FastAPI):
     logger.info("Запуск Multi-Protocol Gateway...")
     await telegram_adapter.initialize()
     await web_adapter.initialize()
+    output_recovery = await reconcile_unclaimable_legacy_ready(
+        API.output_store
+    )
+    if output_recovery.cancelled_count:
+        logger.warning(
+            "Cancelled %s unclaimable legacy READY OutputBatch records: %s",
+            output_recovery.cancelled_count,
+            list(output_recovery.cancelled_legacy_output_batch_ids),
+        )
+    for item in output_recovery.remaining_ready:
+        logger.warning(
+            "Recoverable READY OutputBatch remains: "
+            "output_batch_id=%s session_id=%s kind=%s "
+            "client_type=%s client_instance_id=%s",
+            item.output_batch_id,
+            item.session_id,
+            item.kind,
+            item.client_type,
+            item.client_instance_id,
+        )
     await API.start()
     logger.info("Gateway успешно запущен")
     yield
