@@ -41,6 +41,11 @@ TELEGRAM_BOT_INSTANCE_ID = os.getenv(
 TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS = float(
     os.getenv("TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS", "2.5")
 )
+# A separate Telegram text message may be bound to exactly one active album in
+# the same chat/thread only during this short transport-level window.
+TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS = float(
+    os.getenv("TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS", "10")
+)
 # Emergency ceiling for one Telegram album workflow. Expiry never commits a
 # partial batch; the group ends with a transport-level error instead.
 TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS = float(
@@ -48,6 +53,8 @@ TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS = float(
 )
 if TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS <= 0:
     raise ValueError("TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS must be positive")
+if TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS <= 0:
+    raise ValueError("TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS must be positive")
 if TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS <= 0:
     raise ValueError("TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS must be positive")
 if (
@@ -57,6 +64,14 @@ if (
     raise ValueError(
         "TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS must not be shorter than "
         "TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS"
+    )
+if (
+    TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS
+    > TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS
+):
+    raise ValueError(
+        "TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS must not exceed "
+        "TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS"
     )
 
 TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES = int(
