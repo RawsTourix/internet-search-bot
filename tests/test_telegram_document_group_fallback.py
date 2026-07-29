@@ -48,9 +48,13 @@ class TelegramDocumentGroupFallbackTests(unittest.IsolatedAsyncioTestCase):
             required=True,
         )
 
-    async def test_confirmed_group_bad_request_falls_back_to_documents(self):
+    async def test_two_confirmed_group_bad_requests_fall_back_to_documents(self):
         bot = FakeTelegramBot()
-        bot.queue("send_media_group", BadRequest("group rejected"))
+        bot.queue(
+            "send_media_group",
+            BadRequest("stream representation rejected"),
+            BadRequest("eager representation rejected"),
+        )
         gateway = FakeTelegramGateway()
 
         receipts = await self.executor._execute_group(
@@ -63,7 +67,12 @@ class TelegramDocumentGroupFallbackTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             [name for name, _ in bot.calls],
-            ["send_media_group", "send_document", "send_document"],
+            [
+                "send_media_group",
+                "send_media_group",
+                "send_document",
+                "send_document",
+            ],
         )
         self.assertTrue(
             all(
@@ -71,8 +80,8 @@ class TelegramDocumentGroupFallbackTests(unittest.IsolatedAsyncioTestCase):
                 for receipt in receipts
             )
         )
-        self.assertEqual(bot.calls[1][1]["reply_to_message_id"], 77)
-        self.assertNotIn("reply_to_message_id", bot.calls[2][1])
+        self.assertEqual(bot.calls[2][1]["reply_to_message_id"], 77)
+        self.assertNotIn("reply_to_message_id", bot.calls[3][1])
 
     async def test_preflight_failure_falls_back_before_any_group_send(self):
         bot = FakeTelegramBot()
