@@ -80,6 +80,21 @@ async def _strict_markdown_reply(update, text: str):
     return sent
 
 
+# Keep the public low-level seam authoritative for tests and compatibility
+# callers, while allowing tests focused on this composition root to patch the
+# private strict implementation directly. The selector below supports either
+# patch point without changing runtime behavior.
+_installed_strict_markdown_reply = _strict_markdown_reply
+server.send_telegram_markdown_reply = _installed_strict_markdown_reply
+
+
+def _terminal_reply_sender():
+    public_sender = server.send_telegram_markdown_reply
+    if public_sender is _installed_strict_markdown_reply:
+        return _strict_markdown_reply
+    return public_sender
+
+
 async def _edit_known_status(update, status_message, text: str):
     chunks = server.split_markdown_for_telegram(text or "")
     chunk = chunks[0] if chunks else (text or "")
@@ -118,7 +133,7 @@ async def _finish_status_or_send_reply(
     if mode not in {"send_new", "edit_status", "auto"}:
         mode = "send_new"
     if status_message is None:
-        return await _strict_markdown_reply(update, text)
+        return await _terminal_reply_sender()(update, text)
 
     await server.stop_progress_edits(
         chat_id=update.effective_chat.id,
@@ -135,7 +150,7 @@ async def _finish_status_or_send_reply(
 
     if send_new:
         try:
-            return await _strict_markdown_reply(update, raw)
+            return await _terminal_reply_sender()(update, raw)
         except (TimedOut, NetworkError) as error:
             await _edit_known_status(update, status_message, raw)
             server.logger.warning(
@@ -150,7 +165,7 @@ async def _finish_status_or_send_reply(
     try:
         return await _edit_known_status(update, status_message, raw)
     except (TimedOut, NetworkError):
-        return await _strict_markdown_reply(update, raw)
+        return await _terminal_reply_sender()(update, raw)
 
 
 async def _deliver_agent_result(**values):
