@@ -129,12 +129,100 @@ class InstanceScopedTelegramArtifactGatewayClient(
         session_id: str,
         progress_locale: str,
     ) -> dict[str, Any]:
+        """Commit durably first, then run the agent as a distinct HTTP stage.
+
+        The historical endpoint accepted ``run=true`` and kept one HTTP request
+        open for the complete LLM workflow. If Gateway was stopped after commit,
+        Telegram logged the whole operation as a commit failure. Splitting the
+        stages makes the durable boundary explicit without pretending that the
+        current in-process AgentCycle is a recoverable background job.
+        """
+
         await self._close_group_for_batch(input_batch_id)
-        return await super().commit_and_run(
+        logger.info(
+            "telegram_input_batch_commit_started input_batch_id=%s "
+            "session_id=%s",
             input_batch_id,
-            session_id=session_id,
-            progress_locale=progress_locale,
+            session_id,
         )
+        try:
+            async with self._client(read_timeout=30.0) as client:
+                response = await client.post(
+                    f"{self.gateway_url}/input-batches/{input_batch_id}/commit",
+                    json={
+                        "session_id": session_id,
+                        "progress_locale": progress_locale,
+                        "run": False,
+                    },
+                )
+                response.raise_for_status()
+                commit_payload = response.json()
+        except asyncio.CancelledError:
+            logger.info(
+                "telegram_input_batch_commit_cancelled input_batch_id=%s",
+                input_batch_id,
+            )
+            raise
+        except Exception as error:
+            logger.exception(
+                "telegram_input_batch_commit_failed input_batch_id=%s error=%s",
+                input_batch_id,
+                type(error).__name__,
+            )
+            raise
+
+        if not isinstance(commit_payload, dict):
+            raise TelegramArtifactBridgeError(
+                "Gateway commit response is invalid"
+            )
+
+        duplicate = bool(commit_payload.get("duplicate"))
+        commit_payload["run_skipped_duplicate"] = duplicate
+        logger.info(
+            "telegram_input_batch_commit_finished input_batch_id=%s "
+            "status=%s duplicate=%s",
+            input_batch_id,
+            commit_payload.get("status"),
+            duplicate,
+        )
+        if duplicate:
+            return commit_payload
+
+        logger.info(
+            "telegram_agent_run_started input_batch_id=%s session_id=%s",
+            input_batch_id,
+            session_id,
+        )
+        try:
+            run_payload = await super().run_committed(
+                input_batch_id,
+                session_id=session_id,
+                progress_locale=progress_locale,
+            )
+        except asyncio.CancelledError:
+            logger.info(
+                "telegram_agent_run_cancelled input_batch_id=%s "
+                "committed=true",
+                input_batch_id,
+            )
+            raise
+        except Exception as error:
+            logger.exception(
+                "telegram_agent_run_failed input_batch_id=%s committed=true "
+                "error_type=%s",
+                input_batch_id,
+                type(error).__name__,
+            )
+            raise
+
+        commit_payload["response"] = str(run_payload.get("response") or "")
+        commit_payload["metadata"] = dict(run_payload.get("metadata") or {})
+        logger.info(
+            "telegram_agent_run_finished input_batch_id=%s status=%s",
+            input_batch_id,
+            run_payload.get("status"),
+        )
+        return commit_payload
 
     def _output_authority(self, session_id: str) -> dict[str, str]:
         normalized_session = session_id.strip()
