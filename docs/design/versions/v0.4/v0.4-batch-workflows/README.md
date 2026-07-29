@@ -21,7 +21,9 @@ last_reviewed: 2026-07-29
   пользователя;
 - корректная multipart-отправка Telegram media groups;
 - стабильная совместимая группировка `OutputPart` без изменения порядка;
-- bounded current manifest и явный доступ к session/workspace artifact history.
+- bounded current manifest и явный доступ к session/workspace artifact history;
+- явная граница durable commit и in-process agent execution;
+- cancellation-safe Gateway/MCP shutdown.
 
 Обновление не реализует `CycleInbox`, safe checkpoints и additions во время
 активного agent cycle. Эти обязанности остаются у следующего
@@ -36,6 +38,7 @@ last_reviewed: 2026-07-29
 | `BW-7`–`BW-8` | [`output-grouping.md`](output-grouping.md) |
 | `BW-9` | [`artifact-access.md`](artifact-access.md) |
 | `BW-10`–`BW-12` | [`contracts-and-acceptance.md`](contracts-and-acceptance.md) |
+| `BW-13` | [`shutdown-and-execution.md`](shutdown-and-execution.md) |
 
 ## Порядок чтения
 
@@ -44,6 +47,7 @@ last_reviewed: 2026-07-29
 3. [`output-grouping.md`](output-grouping.md)
 4. [`artifact-access.md`](artifact-access.md)
 5. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
+6. [`shutdown-and-execution.md`](shutdown-and-execution.md)
 
 ## Главные инварианты
 
@@ -73,6 +77,10 @@ last_reviewed: 2026-07-29
     себе не запрещает повторную отправку.
 12. Client adapters вызывают общие draft-control и presentation services; Telegram
     команды не становятся domain logic.
+13. Durable commit завершается до AgentCycle. Cancellation agent run не откатывает
+    `InputBatch` и не классифицируется как commit failure.
+14. MCP transport contexts создаются и закрываются одной lifespan task; authority
+    middleware не создаёт скрытый cancellation task layer.
 
 ## Положение в архитектуре
 
@@ -82,7 +90,8 @@ v0.4-file-artifacts-advanced
 
 v0.4-batch-workflows
 → user-controlled draft assembly, presentation relocation,
-  output grouping, artifact activation/catalog scopes
+  output grouping, artifact activation/catalog scopes,
+  staged execution and shutdown ownership
 
 v0.4-input-runtime
 → CycleInbox, active-cycle additions, safe checkpoints,
@@ -95,7 +104,9 @@ v0.4-input-runtime
 
 - исправить PTB multipart attachment mapping для document groups;
 - добавить request-level и live regression tests;
-- сохранить safe individual fallback и exact receipts.
+- сохранить safe individual fallback и exact receipts;
+- разделить durable commit и long-running agent execution;
+- обеспечить cancellation-safe Gateway/MCP shutdown.
 
 ### BW-P2. Shared explicit draft control
 
@@ -125,12 +136,19 @@ v0.4-input-runtime
 - full Windows suite;
 - Telegram live scenarios;
 - multi-client contract tests;
-- документация и examples синхронизированы с каждым новым параметром.
+- documentation и examples синхронизированы с каждым новым параметром.
 
 ## Статус
 
-Спецификация принята. Реализация начата с `BW-P1`: устранения текущей ошибки
-Telegram `sendMediaGroup` вида `Can't parse inputmedia: media not found`.
+Спецификация принята. `BW-P1` частично реализован и подтверждён live:
+
+- Telegram `sendMediaGroup` доставляет три deliverable одним native album;
+- `attach://...` mapping формируется корректно;
+- durable commit и AgentCycle разделены transport-stage boundary;
+- Gateway lifespan и authority middleware hardened для cancellation.
+
+Следующий основной этап — shared `InputDraftControlService` до Telegram wiring
+`/collect`, `/send` и `/cancel`.
 
 Любой новый параметр `.env` или `mcp.config` в рамках этого обновления обязан в
 том же patch обновлять соответствующий `.example`; release notes отдельно
