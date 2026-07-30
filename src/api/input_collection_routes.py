@@ -136,8 +136,9 @@ def create_input_collection_router(
             InputDraftControlStatus.PROMOTED_AUTO_DRAFT,
         }:
             return
+        runtime_client = getattr(api, "mcp_client", None)
         abandon = getattr(
-            api.mcp_client,
+            runtime_client,
             "abandon_pending_cycle_for_new_task",
             None,
         )
