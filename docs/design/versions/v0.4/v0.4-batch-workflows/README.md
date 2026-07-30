@@ -42,17 +42,19 @@ last_reviewed: 2026-07-30
 | `BW-10`–`BW-12` | [`contracts-and-acceptance.md`](contracts-and-acceptance.md) |
 | `BW-13` | [`shutdown-and-execution.md`](shutdown-and-execution.md) |
 | `BW-14` | [`progress-events.md`](progress-events.md) |
+| `BW-15` | [`draft-control-foundation.md`](draft-control-foundation.md) |
 
 ## Порядок чтения
 
 1. [`input-assembly.md`](input-assembly.md)
-2. [`forwarded-sequencing-hardening.md`](forwarded-sequencing-hardening.md)
-3. [`presentation-and-controls.md`](presentation-and-controls.md)
-4. [`progress-events.md`](progress-events.md)
-5. [`output-grouping.md`](output-grouping.md)
-6. [`artifact-access.md`](artifact-access.md)
-7. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
-8. [`shutdown-and-execution.md`](shutdown-and-execution.md)
+2. [`draft-control-foundation.md`](draft-control-foundation.md)
+3. [`forwarded-sequencing-hardening.md`](forwarded-sequencing-hardening.md)
+4. [`presentation-and-controls.md`](presentation-and-controls.md)
+5. [`progress-events.md`](progress-events.md)
+6. [`output-grouping.md`](output-grouping.md)
+7. [`artifact-access.md`](artifact-access.md)
+8. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
+9. [`shutdown-and-execution.md`](shutdown-and-execution.md)
 
 ## Главные инварианты
 
@@ -67,32 +69,34 @@ last_reviewed: 2026-07-30
    завершил пакет.
 5. `/cancel` никогда не запускает agent cycle и не удаляет audit evidence.
 6. На exact principal scope допускается не более одного active explicit draft.
-7. Presentation relocation сначала создаёт и durable-bind новый handle и только
+7. Пустой explicit collection хранится отдельным `InputCollectionRecord` и не
+   ослабляет инвариант `InputBatchDraft.source_event_ids != []`.
+8. Presentation relocation сначала создаёт и durable-bind новый handle и только
    потом best-effort удаляет старый. Неудалённый старый handle остаётся архивным
    и больше не редактируется.
-8. Output grouping сохраняет `OutputPart.index` и группирует только непрерывные
+9. Output grouping сохраняет `OutputPart.index` и группирует только непрерывные
    совместимые участки.
-9. Telegram media upload использует корректное `attach://...` multipart mapping,
-   формируемое SDK из raw bytes/file handles, а не вручную собранный неполный
-   `InputFile`.
-10. Все авторизованные historical artifacts остаются доступны. В prompt
+10. Telegram media upload использует корректное `attach://...` multipart mapping,
+    формируемое SDK из raw bytes/file handles, а не вручную собранный неполный
+    `InputFile`.
+11. Все авторизованные historical artifacts остаются доступны. В prompt
     автоматически попадает только bounded active manifest; история открывается
     через явный catalog/search/get workflow.
-11. Delivery выбирает exact immutable `artifact_id`; возраст артефакта сам по
+12. Delivery выбирает exact immutable `artifact_id`; возраст артефакта сам по
     себе не запрещает повторную отправку.
-12. Client adapters вызывают общие draft-control и presentation services; Telegram
+13. Client adapters вызывают общие draft-control и presentation services; Telegram
     команды не становятся domain logic.
-13. Durable commit завершается до AgentCycle. Cancellation agent run не откатывает
+14. Durable commit завершается до AgentCycle. Cancellation agent run не откатывает
     `InputBatch` и не классифицируется как commit failure.
-14. MCP transport contexts создаются и закрываются одной lifespan task; authority
+15. MCP transport contexts создаются и закрываются одной lifespan task; authority
     middleware не создаёт скрытый cancellation task layer.
-15. Forwarding является provenance, а не attachment type. Только forwarded
+16. Forwarding является provenance, а не attachment type. Только forwarded
     text-only update может кратко ждать более ранний forwarded album того же
     exact scope; обычный текст остаётся немедленным, а смысл текста не
     анализируется.
-16. Внешний `duplicate` определяется authoritative первой reservation. Повторный
+17. Внешний `duplicate` определяется authoritative первой reservation. Повторный
     внутренний store pass не превращает новый logical input в transport retry.
-17. Progress `message` обязан соответствовать scope aggregate operation.
+18. Progress `message` обязан соответствовать scope aggregate operation.
     Structured `data` хранит полный перечень, а человекочитаемая строка использует
     cardinality-aware bounded projection.
 
@@ -127,10 +131,11 @@ v0.4-input-runtime
 
 ### BW-P2. Shared explicit draft control
 
-- domain enums и persisted draft policy;
+- durable `InputCollectionRecord` для пустого explicit mode;
+- exact `InputDraftScope` и persisted explicit commit policy;
 - `InputDraftControlService`;
 - `/collect`, `/send`, `/cancel` и aliases;
-- один active explicit draft на exact scope;
+- один active explicit collection на exact scope;
 - text-only/files-only/mixed explicit commit.
 
 ### BW-P3. Presentation relocation
@@ -157,7 +162,7 @@ v0.4-input-runtime
 
 ## Статус
 
-Спецификация принята. `BW-P1` реализован и подтверждён основными live-сценариями:
+`BW-P1` реализован и подтверждён основными live-сценариями:
 
 - Telegram `sendMediaGroup` доставляет три deliverable одним native album;
 - `attach://...` mapping формируется корректно;
@@ -173,11 +178,21 @@ v0.4-input-runtime
 - aggregate delivery progress корректно отражает один или несколько файлов,
   сохраняя полный structured evidence и bounded preview.
 
+`BW-P2A` foundation реализован:
+
+- persisted empty `InputCollectionRecord`;
+- exact scope включает client instance, conversation/thread и principal;
+- start/inspect/bind/commit/cancel transport-neutral service;
+- files-only explicit commit разрешён;
+- in-flight `/send` сохраняет `commit_requested`;
+- exact cancel не затрагивает соседние scopes;
+- action idempotency key нельзя переиспользовать с другим action/scope.
+
 Validation evidence на 2026-07-30:
 
 ```text
 full local Windows suite: 622 tests, OK (skipped=4)
-thematic artifact suite: 185 tests, OK
+thematic artifact suite: 193 tests, OK
 storage suite: 41 tests, OK
 plans suite: 45 tests, OK
 planning suite: 19 tests, OK
@@ -185,8 +200,9 @@ API suite: OK
 compile: OK
 ```
 
-Следующий основной этап — shared `InputDraftControlService` до Telegram wiring
-`/collect`, `/send` и `/cancel`.
+Следующий основной slice — shared HTTP control routes и Telegram wiring
+`/collect`, `/send`, `/cancel`, после чего active explicit collection начнёт
+принимать новые transport events.
 
 Новый параметр forwarded sequencing slice:
 
@@ -194,7 +210,7 @@ compile: OK
 TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
 ```
 
-Он добавлен в `.env.example`; в `mcp.config` новых keys нет. Progress projection
-не добавляет новых параметров. Любой следующий параметр `.env` или `mcp.config`
-обязан в том же patch обновлять соответствующий `.example`; release notes
-отдельно перечисляют новые keys и defaults.
+Он добавлен в `.env.example`; в `mcp.config` новых keys нет. BW-P2A и progress
+projection не добавляют новых параметров. Любой следующий параметр `.env` или
+`mcp.config` обязан в том же patch обновлять соответствующий `.example`; release
+notes отдельно перечисляют новые keys и defaults.
