@@ -11,7 +11,10 @@ from .collection_models import (
     InputDraftScope,
 )
 from .draft_control import InputDraftControlService
-from .explicit_policy import is_explicit_collection_draft
+from .explicit_policy import (
+    is_explicit_collection_draft,
+    is_legacy_explicit_collection_draft,
+)
 from .models import ClientResponseRoute, InputBatchDraftState
 
 
@@ -227,7 +230,10 @@ class ExplicitInputDraftControlService(InputDraftControlService):
                 InputBatchDraftState.SEALING,
                 InputBatchDraftState.INGESTING,
                 InputBatchDraftState.READY_TO_COMMIT,
-            } and not is_explicit_collection_draft(draft):
+            } and (
+                not is_explicit_collection_draft(draft)
+                or is_legacy_explicit_collection_draft(draft)
+            ):
                 await self.batch_store.promote_to_explicit_collection(
                     draft.input_batch_id,
                     collection_id=collection.collection_id,
@@ -247,6 +253,11 @@ class ExplicitInputDraftControlService(InputDraftControlService):
                 failure_code="explicit_collection_scope_mismatch",
             )
             raise RuntimeError("Explicit collection draft authority mismatch")
+        if is_legacy_explicit_collection_draft(draft):
+            draft = await self.batch_store.promote_to_explicit_collection(
+                draft.input_batch_id,
+                collection_id=collection.collection_id,
+            )
         return await self.collection_store.bind(
             collection.collection_id,
             draft.input_batch_id,
