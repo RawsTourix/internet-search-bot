@@ -2,7 +2,7 @@
 id: design.v0.4.batch-workflows
 version: v0.4
 spec_status: accepted
-implementation_status: partial
+implementation_status: implemented
 last_reviewed: 2026-07-30
 ---
 
@@ -74,6 +74,8 @@ last_reviewed: 2026-07-30
     в structured `data`.
 18. Client-supplied collection metadata очищается и не предоставляет authority.
 19. Explicit draft не имеет transport quiet/deadline semantics и не auto-commit-ится.
+20. Persisted canonical grouping mode — `explicit_collection`; rollout-era
+    `immediate_text` records читаются и переписываются при reconcile.
 
 ## Положение в архитектуре
 
@@ -112,7 +114,7 @@ v0.4-input-runtime
 - transport auto-commit guard;
 - `/send → commit → run` boundary.
 
-### BW-P3. Presentation relocation — реализован и покрыт CI
+### BW-P3. Presentation relocation — реализован
 
 - schema-v2 presentation generations;
 - schema-v1 read upgrade;
@@ -124,35 +126,37 @@ v0.4-input-runtime
 - Telegram transport executor;
 - old handle остаётся неизменным при failed deletion.
 
-### BW-P4. Artifact access scopes — следующий feature slice
+### BW-P4. Artifact access scopes — реализован
 
 - bounded current activation set;
 - `artifact_list(scope=current|session|workspace)`;
+- opaque scope-bound cursor;
 - exact activation provenance;
-- historical delivery без скрытого запрета.
+- historical read/search/delivery после activation;
+- filesystem workspace projection объявляет `effective_scope=session`.
 
-### BW-P5. Integration and release gate
+### BW-P5. Integration and acceptance — ожидает maintainer live gate
 
-- named persisted `EXPLICIT_COLLECTION` migration;
-- старый intermediate JSON regression;
-- full Windows suite;
-- Telegram live scenarios `/collect`, `/send`, `/cancel`, relocation;
-- multi-client contract tests;
-- documentation/examples sync.
+- named persisted `EXPLICIT_COLLECTION` migration — реализована;
+- rollout-era JSON/index regression — реализован;
+- CI thematic suites — зелёные;
+- новый full Windows suite — требуется;
+- Telegram live scenarios `/collect`, `/send`, `/cancel`, relocation — требуются;
+- multi-client live environment — переносится к появлению Web/CLI adapters.
 
 ## Текущий статус
 
-`BW-P1`, `BW-P2A`, `BW-P2B` и `BW-P3` реализованы.
+Кодовые этапы `BW-P1`–`BW-P4` и structural migration реализованы.
 
-Последний CI head `a9e82a3c5bcef2b1d694d19642200605f0726356`:
+Последний CI head `c67e822a771a4a90de4bc25295ebd8a29717267d`:
 
 ```text
 compile: success
-artifact suite: 219 tests, OK
-storage suite: success
-plans suite: success
-planning suite: success
-API suite: success
+artifact suite: 224 tests, OK
+storage suite: 41 tests, OK
+plans suite: 45 tests, OK
+planning suite: 19 tests, OK
+API suite: 1 test, OK
 ```
 
 Последняя предоставленная полная локальная Windows suite до BW-P2B:
@@ -161,19 +165,8 @@ API suite: success
 622 tests, OK (skipped=4)
 ```
 
-Для новых BW-P2B/BW-P3 изменений ещё нужны новый полный Windows run и live Telegram
-gates.
-
-Текущая schema-v2 explicit collection реализация пока использует ранее
-неиспользовавшийся persisted slot `InputGroupingMode.IMMEDIATE_TEXT`. Public policy
-остаётся `assembly_mode=explicit`/`commit_policy=explicit`; named
-`EXPLICIT_COLLECTION` structural migration остаётся обязательной частью BW-P5.
-
-Следующий основной feature slice:
-
-```text
-BW-P4 — artifact access scopes and explicit history activation
-```
+Перед переводом PR из draft требуется новый Windows full run и живые Telegram
+сценарии canonical commands и status relocation.
 
 Новый параметр forwarded sequencing slice:
 
@@ -181,6 +174,6 @@ BW-P4 — artifact access scopes and explicit history activation
 TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
 ```
 
-Он присутствует в `.env.example`; в `mcp.config` новых keys нет. BW-P2A, BW-P2B и
-BW-P3 не добавляют параметров. Каждый будущий ключ обязан в том же patch обновлять
-example, validation, tests и release notes.
+Он присутствует в `.env.example`; в `mcp.config` новых keys нет. BW-P2A, BW-P2B,
+BW-P3, BW-P4 и migration не добавляют параметров. Каждый будущий ключ обязан в том
+же patch обновлять example, validation, tests и release notes.
