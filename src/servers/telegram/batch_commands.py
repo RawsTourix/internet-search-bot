@@ -52,21 +52,53 @@ def _counts(payload: dict[str, Any]) -> dict[str, int]:
     }
 
 
-async def _retire_terminal_collection_status(
+async def _finalize_collection_snapshot(
     *,
     update: Update,
     payload: dict[str, Any],
-    status_message,
+    locale: str,
+    message_key: str,
 ) -> None:
-    retire = getattr(server, "retire_input_collection_status", None)
-    if not callable(retire):
+    """Terminalize the collection presentation without deleting its evidence."""
+
+    value = payload.get("_telegram_previous_status_message_id")
+    if value is None:
         return
-    await retire(
-        update=update,
-        previous_message_id=payload.get(
-            "_telegram_previous_status_message_id"
-        ),
-        processing_status_message=status_message,
+    try:
+        message_id = int(value)
+    except (TypeError, ValueError):
+        return
+
+    await server.stop_progress_edits(
+        chat_id=update.effective_chat.id,
+        message_id=message_id,
+    )
+    text = server._localized(
+        message_key,
+        locale=locale,
+        **_counts(payload),
+    )
+    try:
+        await server.edit_telegram_message_with_retries(
+            chat_id=update.effective_chat.id,
+            message_id=message_id,
+            text=text,
+            parse_mode=None,
+        )
+    except Exception as error:
+        # The collection snapshot is historical presentation only.  Failure to
+        # terminalize it must not block the already-authoritative commit/cancel.
+        server.logger.warning(
+            "telegram_collection_snapshot_terminalize_failed "
+            "message_id=%s error_type=%s",
+            message_id,
+            type(error).__name__,
+        )
+        return
+    server.logger.info(
+        "telegram_collection_snapshot_terminalized message_id=%s state=%s",
+        message_id,
+        message_key,
     )
 
 
@@ -115,16 +147,18 @@ async def _handle_input_collection_command(
                 **common,
                 idempotency_key=_idempotency_key(update, "cancel"),
             )
+            control_status = str(payload.get("status") or "")
+            if control_status == "cancelled":
+                await _finalize_collection_snapshot(
+                    update=update,
+                    payload=payload,
+                    locale=locale,
+                    message_key="input_collection.cancelled_summary",
+                )
             key = {
                 "cancelled": "input_collection.cancelled",
                 "not_found": "input_collection.not_found",
-            }.get(str(payload.get("status")), "input_collection.failed")
-            if str(payload.get("status")) == "cancelled":
-                await _retire_terminal_collection_status(
-                    update=update,
-                    payload=payload,
-                    status_message=status_message,
-                )
+            }.get(control_status, "input_collection.failed")
             await server.finish_status_or_send_reply(
                 update=update,
                 status_message=status_message,
@@ -170,18 +204,24 @@ async def _handle_input_collection_command(
                 )
                 return
 
-            # The collection presentation is terminal after commit. Redirect
-            # every immutable/stale progress target to the status created below
-            # /send, then retire the older collection message before AgentCycle.
-            await _retire_terminal_collection_status(
+            # Collection and execution have separate public presentations.  The
+            # former remains as a durable package summary; the latter was just
+            # created below /send and is the only target for AgentCycle progress.
+            await _finalize_collection_snapshot(
                 update=update,
                 payload=payload,
-                status_message=status_message,
+                locale=locale,
+                message_key="input_collection.committed_summary",
             )
             run_payload = await server.artifact_gateway.run_committed(
                 batch_id,
                 session_id=session_id,
                 progress_locale=locale,
+                progress_metadata=server._progress_metadata(
+                    update,
+                    status_message,
+                    request_id=batch_id,
+                ),
             )
             metadata = dict(run_payload.get("metadata") or {})
             metadata.setdefault("progress_locale", locale)
