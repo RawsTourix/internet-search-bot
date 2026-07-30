@@ -96,6 +96,17 @@ async def apply_relocating_input_ack_policy(
             chat_id=update.effective_chat.id,
             message_id=old_message_id_int,
         )
+    except BadRequest as error:
+        # BadRequest is a NetworkError subclass in python-telegram-bot, so it
+        # must be classified before the broader transport exception.
+        deletion_state = "failed"
+        server.logger.warning(
+            "telegram_presentation_old_handle_delete_failed "
+            "presentation_id=%s message_id=%s error=%s",
+            ref.get("presentation_id"),
+            old_message_id_int,
+            error,
+        )
     except (TimedOut, NetworkError) as error:
         deletion_state = "unknown"
         server.logger.warning(
@@ -104,15 +115,6 @@ async def apply_relocating_input_ack_policy(
             ref.get("presentation_id"),
             old_message_id_int,
             type(error).__name__,
-        )
-    except BadRequest as error:
-        deletion_state = "failed"
-        server.logger.warning(
-            "telegram_presentation_old_handle_delete_failed "
-            "presentation_id=%s message_id=%s error=%s",
-            ref.get("presentation_id"),
-            old_message_id_int,
-            error,
         )
     except Exception as error:
         deletion_state = "failed"
