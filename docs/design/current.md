@@ -55,19 +55,29 @@ AgentCycle:
 - shared HTTP control plane проверяет exact client-instance authority;
 - persisted canonical grouping mode — `explicit_collection`;
 - rollout-era `immediate_text` drafts/indexes migration-ятся при reconcile;
-- presentation relocation использует generations и
+- active-collection presentation relocation использует generations и
   `create → durable bind → supersede → best-effort delete`;
-- failed deletion оставляет старое сообщение архивным и невritable;
+- collection snapshot после `/send`/`/cancel` остаётся terminal audit evidence и не
+  удаляется ради запуска;
+- AgentCycle progress получает отдельный run status под `/send` через
+  execution-scoped non-persisted metadata overlay;
+- durable `InputBatch.response_route` не мутируется ради UI presentation;
+- obsolete progress redirect registry удалён;
+- exact Telegram conversation/thread использует один FIFO dispatcher на входе
+  `Application.process_update`, а разные sessions остаются параллельными;
+- успешный новый `/collect` является fresh-task boundary и не продолжает старый
+  `WAITING_USER` cycle;
+- late album callback после `/send`/`/cancel` подавляется terminal tombstone;
 - `artifact_list(scope=current|session|workspace)` активирует exact historical
   versions в bounded current-cycle manifest;
 - historical read/search/delivery разрешены после explicit activation;
 - output grouping и native Telegram multipart delivery сохраняют порядок.
 
-Thematic CI:
+Thematic CI head `5d9edb4b1e3eafb7b3ad58deab920e147d5bb8e0`:
 
 ```text
 compile: success
-artifact suite: 224 tests, OK
+artifact suite: 238 tests, OK
 storage suite: 41 tests, OK
 plans suite: 45 tests, OK
 planning suite: 19 tests, OK
@@ -77,8 +87,12 @@ API suite: 1 test, OK
 Перед переводом PR из draft остаются:
 
 - новый полный Windows suite;
-- live Telegram `/collect`, `/send`, `/cancel`;
-- live relocation status message;
+- повторный live Telegram `/collect`, `/send`, `/cancel`;
+- подтверждение сохранения collection snapshot;
+- подтверждение execution progress под `/send`;
+- rapid-command/FIFO scenario;
+- fresh-task boundary после прежнего `WAITING_USER`;
+- отмена до завершения album quiet period;
 - финальный acceptance audit.
 
 Канонический документ:
@@ -90,9 +104,9 @@ API suite: 1 test, OK
 v0.4-input-runtime
 ```
 
-Он добавит `CycleInbox`, safe checkpoints, control inbox и finalization races для
-сообщений, поступающих уже во время active AgentCycle. Эти обязанности не входят в
-`v0.4-batch-workflows`.
+Он добавит durable `CycleInbox`, safe checkpoints, control inbox и finalization races
+для сообщений, поступающих уже во время active AgentCycle. Текущий in-process
+Telegram FIFO dispatcher не подменяет этот runtime и не переживает restart.
 
 После него запланирован:
 
@@ -125,7 +139,7 @@ test или migration evidence.
 2. применяйте отмеченные реализованные updates v0.4;
 3. учитывайте AF-24–AF-26 по их code/live status;
 4. учитывайте `v0.4-batch-workflows` как code-complete, acceptance-pending;
-5. не приписывайте active-cycle additions до `v0.4-input-runtime`;
+5. не приписывайте durable active-cycle additions до `v0.4-input-runtime`;
 6. проверяйте затронутый код и tests для точного implementation status;
 7. используйте v0.5–v0.10 только как будущие ограничения;
 8. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`.
