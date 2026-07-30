@@ -54,7 +54,7 @@ server.telegram_output_executor = telegram_output_executor
 # command text never becomes an InputBatch text part.
 server.application.add_handler(
     CommandHandler(
-        ["collect", "batch", "send", "done", "cancel"],
+        ["collect", "send", "cancel"],
         input_collection_command_handler,
     ),
     group=-1,
