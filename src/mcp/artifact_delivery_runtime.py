@@ -8,11 +8,13 @@ from .artifact_composite_recovery import ArtifactCompositeRecoveryMixin
 from .artifact_delivery_client import ArtifactDeliveryMixin
 from .artifact_delivery_progress import ArtifactDeliveryProgressMixin
 from .artifact_history_isolation import ArtifactHistoryIsolationMixin
+from .fresh_task_boundary import FreshTaskBoundaryMixin
 from .llm_response_recovery import LLMResponseRecoveryMixin
 from .planning_runtime import FinalizingPlanningMCPClient
 
 
 class FinalizingArtifactDeliveryPlanningMCPClient(
+    FreshTaskBoundaryMixin,
     LLMResponseRecoveryMixin,
     ArtifactCompositeBudgetMixin,
     ArtifactCompositeRecoveryMixin,
