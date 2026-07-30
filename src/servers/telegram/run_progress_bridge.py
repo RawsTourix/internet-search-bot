@@ -42,6 +42,7 @@ class RunScopedProgressTelegramGatewayClient(
             str,
             dict[str, Any],
         ] = OrderedDict()
+        self._completed_output_states: OrderedDict[str, str] = OrderedDict()
 
     async def remember_run_presentation(
         self,
@@ -62,11 +63,7 @@ class RunScopedProgressTelegramGatewayClient(
         async with self._run_presentation_lock:
             self._pending_run_presentations[normalized] = metadata
             self._pending_run_presentations.move_to_end(normalized)
-            while (
-                len(self._pending_run_presentations)
-                > self._maximum_pending_run_presentations
-            ):
-                self._pending_run_presentations.popitem(last=False)
+            self._trim_locked(self._pending_run_presentations)
 
     async def discard_run_presentation(self, input_batch_id: str) -> None:
         normalized = input_batch_id.strip()
@@ -83,6 +80,41 @@ class RunScopedProgressTelegramGatewayClient(
             return dict(
                 self._pending_run_presentations.pop(input_batch_id, {})
             )
+
+    async def take_completed_output_state(
+        self,
+        output_batch_id: str,
+    ) -> str | None:
+        """Consume the terminal receipt state observed for one OutputBatch."""
+
+        normalized = output_batch_id.strip()
+        if not normalized:
+            return None
+        async with self._run_presentation_lock:
+            return self._completed_output_states.pop(normalized, None)
+
+    async def complete_output_batch(
+        self,
+        output_batch_id: str,
+        *,
+        session_id: str,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        payload = await super().complete_output_batch(
+            output_batch_id,
+            session_id=session_id,
+            receipt=receipt,
+        )
+        terminal_state = str(
+            payload.get("state") or receipt.get("state") or ""
+        ).strip()
+        normalized = output_batch_id.strip()
+        if normalized and terminal_state:
+            async with self._run_presentation_lock:
+                self._completed_output_states[normalized] = terminal_state
+                self._completed_output_states.move_to_end(normalized)
+                self._trim_locked(self._completed_output_states)
+        return payload
 
     async def run_committed(
         self,
@@ -118,3 +150,7 @@ class RunScopedProgressTelegramGatewayClient(
                 "Gateway run response is invalid"
             )
         return payload
+
+    def _trim_locked(self, mapping: OrderedDict) -> None:
+        while len(mapping) > self._maximum_pending_run_presentations:
+            mapping.popitem(last=False)
