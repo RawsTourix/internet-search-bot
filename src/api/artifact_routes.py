@@ -9,7 +9,7 @@ from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import UploadFile
 
 from ..artifacts import (
@@ -60,6 +60,12 @@ class InputPresentationBindRequest(BaseModel):
     session_id: str
     presentation_token: str
     client_message_id: str
+
+
+class RunCommittedBatchWithProgressRequest(RunCommittedBatchRequest):
+    """One execution request with a non-persisted presentation overlay."""
+
+    progress_metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 ProgressCallbackFactory = Callable[[Any], Any]
@@ -134,6 +140,20 @@ def _submission_payload(
     return payload
 
 
+def _with_run_progress_metadata(batch, metadata: dict[str, Any] | None):
+    """Return an in-memory route overlay without mutating durable InputBatch."""
+
+    overlay = dict(metadata or {})
+    if not overlay:
+        return batch
+    route = batch.response_route
+    merged = dict(route.metadata or {})
+    merged.update(overlay)
+    return batch.model_copy(update={
+        "response_route": route.model_copy(update={"metadata": merged})
+    })
+
+
 def create_artifact_router(
     *,
     facade: ArtifactTransportFacade,
@@ -142,9 +162,18 @@ def create_artifact_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    async def run_batch(batch, *, progress_locale: str):
+    async def run_batch(
+        batch,
+        *,
+        progress_locale: str,
+        progress_metadata: dict[str, Any] | None = None,
+    ):
+        presentation_batch = _with_run_progress_metadata(
+            batch,
+            progress_metadata,
+        )
         callback = (
-            progress_callback_factory(batch)
+            progress_callback_factory(presentation_batch)
             if progress_callback_factory is not None
             else None
         )
@@ -386,7 +415,7 @@ def create_artifact_router(
     )
     async def run_input_batch(
         input_batch_id: str,
-        body: RunCommittedBatchRequest,
+        body: RunCommittedBatchWithProgressRequest,
     ):
         try:
             batch = await facade.api.ingress_services.batch_store.get_committed(
@@ -397,6 +426,7 @@ def create_artifact_router(
             response = await run_batch(
                 batch,
                 progress_locale=body.progress_locale,
+                progress_metadata=body.progress_metadata,
             )
             return {
                 "status": "ok",
