@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Mapping
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -20,6 +21,7 @@ from ..ingress import (
 )
 
 
+logger = logging.getLogger("Gateway.InputCollection")
 TransportInstanceScopes = Mapping[
     str,
     frozenset[tuple[str, str]],
@@ -125,6 +127,34 @@ def create_input_collection_router(
     def payload(result):
         return result.model_dump(mode="json")
 
+    def abandon_waiting_cycle_for_new_collection(
+        body: InputCollectionStartRequest,
+        status: InputDraftControlStatus,
+    ) -> None:
+        if status not in {
+            InputDraftControlStatus.STARTED,
+            InputDraftControlStatus.PROMOTED_AUTO_DRAFT,
+        }:
+            return
+        abandon = getattr(
+            api.mcp_client,
+            "abandon_pending_cycle_for_new_task",
+            None,
+        )
+        if not callable(abandon):
+            return
+        abandoned_cycle_id = abandon(
+            body.session_id,
+            reason="explicit_collection_started",
+        )
+        if abandoned_cycle_id is not None:
+            logger.info(
+                "pending_agent_cycle_abandoned_for_collection "
+                "session_id=%s cycle_id=%s",
+                body.session_id,
+                abandoned_cycle_id,
+            )
+
     @router.post("/start")
     async def start_collection(
         body: InputCollectionStartRequest,
@@ -143,6 +173,7 @@ def create_input_collection_router(
                 locale=body.locale,
                 idempotency_key=body.idempotency_key,
             )
+            abandon_waiting_cycle_for_new_collection(body, result.status)
             return payload(result)
         except InputDraftControlConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
