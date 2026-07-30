@@ -1,5 +1,6 @@
 """Production composition of delivery, DAG planning, and finalization guards."""
 
+from .artifact_access_scope import ArtifactAccessScopeMixin
 from .artifact_composite_budget import ArtifactCompositeBudgetMixin
 from .artifact_composite_compaction import ArtifactCompositeCompactionMixin
 from .artifact_composite_preview import ArtifactCompositePreviewMixin
@@ -18,6 +19,7 @@ class FinalizingArtifactDeliveryPlanningMCPClient(
     ArtifactCompositeCompactionMixin,
     ArtifactDeliveryProgressMixin,
     ArtifactDeliveryMixin,
+    ArtifactAccessScopeMixin,
     FinalizingPlanningMCPClient,
 ):
-    """Production agent client with planning and durable artifact delivery."""
+    """Production agent client with scoped artifact access and delivery."""
