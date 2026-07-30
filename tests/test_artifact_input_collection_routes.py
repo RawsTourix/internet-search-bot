@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import httpx
 from fastapi import FastAPI, Header
@@ -41,10 +41,14 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
                 )
             ),
         )
+        self.mcp_client = SimpleNamespace(
+            abandon_pending_cycle_for_new_task=Mock(return_value="cycle-old"),
+        )
         api = SimpleNamespace(
             ingress_services=SimpleNamespace(
                 draft_control_service=self.service,
-            )
+            ),
+            mcp_client=self.mcp_client,
         )
 
         async def auth(x_api_key: str | None = Header(default=None)) -> str:
@@ -84,23 +88,26 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
             "principal_id": "user-1",
         }
 
-    async def test_authorized_start_uses_exact_scope_and_idempotency(self):
-        body = {
-            **self._scope(),
+    @classmethod
+    def _start_body(cls, *, route_conversation_id="chat-1"):
+        return {
+            **cls._scope(),
             "idempotency_key": "collect-update-1",
             "locale": "ru",
             "response_route": {
                 "route_type": "telegram",
-                "conversation_id": "chat-1",
+                "conversation_id": route_conversation_id,
                 "thread_id": None,
                 "reply_to_message_id": "11",
                 "metadata": {},
             },
         }
+
+    async def test_authorized_start_uses_exact_scope_and_idempotency(self):
         response = await self.client.post(
             "/internal/input-collections/start",
             headers={"X-API-Key": "telegram-key"},
-            json=body,
+            json=self._start_body(),
         )
 
         self.assertEqual(response.status_code, 200)
@@ -113,6 +120,35 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scope.principal_id, "user-1")
         self.assertEqual(call.kwargs["idempotency_key"], "collect-update-1")
 
+    async def test_new_collection_abandons_waiting_cycle_as_fresh_task(self):
+        response = await self.client.post(
+            "/internal/input-collections/start",
+            headers={"X-API-Key": "telegram-key"},
+            json=self._start_body(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.mcp_client.abandon_pending_cycle_for_new_task.assert_called_once_with(
+            "telegram:conversation:chat-1",
+            reason="explicit_collection_started",
+        )
+
+    async def test_already_active_collection_does_not_abandon_waiting_cycle(self):
+        self.service.start_collection.return_value = InputDraftControlResult(
+            action=InputDraftControlAction.START,
+            status=InputDraftControlStatus.ALREADY_ACTIVE,
+        )
+
+        response = await self.client.post(
+            "/internal/input-collections/start",
+            headers={"X-API-Key": "telegram-key"},
+            json=self._start_body(),
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["status"], "already_active")
+        self.mcp_client.abandon_pending_cycle_for_new_task.assert_not_called()
+
     async def test_transport_key_cannot_control_another_instance(self):
         response = await self.client.post(
             "/internal/input-collections/inspect",
@@ -124,18 +160,8 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
         self.service.inspect.assert_not_awaited()
 
     async def test_start_rejects_response_route_outside_scope(self):
-        body = {
-            **self._scope(),
-            "idempotency_key": "collect-update-2",
-            "locale": "ru",
-            "response_route": {
-                "route_type": "telegram",
-                "conversation_id": "another-chat",
-                "thread_id": None,
-                "reply_to_message_id": "12",
-                "metadata": {},
-            },
-        }
+        body = self._start_body(route_conversation_id="another-chat")
+        body["idempotency_key"] = "collect-update-2"
         response = await self.client.post(
             "/internal/input-collections/start",
             headers={"X-API-Key": "telegram-key"},
@@ -144,6 +170,7 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 422)
         self.service.start_collection.assert_not_awaited()
+        self.mcp_client.abandon_pending_cycle_for_new_task.assert_not_called()
 
     async def test_send_commits_without_starting_agent_in_router(self):
         response = await self.client.post(
