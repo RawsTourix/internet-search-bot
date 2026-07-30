@@ -8,7 +8,7 @@ last_reviewed: 2026-07-30
 
 # BW-16 — Explicit collection control plane
 
-## 1. Реализованная граница
+## 1. Каноническая граница
 
 ```text
 /collect
@@ -26,7 +26,80 @@ last_reviewed: 2026-07-30
 немедленным, files-first AUTO draft сохраняет transport grouping policy до
 возможного `/collect` promotion.
 
-## 2. Persisted explicit grouping
+## 2. Две разные presentation-роли
+
+Collection и AgentCycle больше не делят один Telegram status handle.
+
+```text
+collection snapshot
+→ показывает состав собираемого пакета
+→ принадлежит InputCollection/InputBatchDraft
+→ обновляется во время сбора
+→ после /send или /cancel становится terminal snapshot
+→ не удаляется ради запуска AgentCycle
+
+run status
+→ создаётся непосредственно под /send
+→ принадлежит только одному /run invocation
+→ принимает cycle/tool/final progress
+→ завершается через обычную terminal delivery policy
+```
+
+Это разделение является transport-neutral правилом. Adapter может отображать роли
+по-разному, но не должен превращать collection presentation в execution
+presentation.
+
+### 2.1. Terminal collection snapshot
+
+После `/send` прежнее сообщение состава пакета остаётся в истории и редактируется в:
+
+```text
+📦 Пакет передан в обработку.
+
+Файлы: N
+Сообщения: M
+```
+
+После `/cancel`:
+
+```text
+📦 Сбор пакета отменён.
+
+Файлы: N
+Сообщения: M
+```
+
+Ошибка редактирования этого исторического snapshot не откатывает уже
+authoritative commit/cancel. Удалять snapshot при terminal transition запрещено.
+
+### 2.2. Execution-scoped progress overlay
+
+`CommittedInputBatch.response_route` хранит durable reply provenance исходного
+пакета. Он не обязан указывать на status, созданный позднее командой `/send`.
+
+Поэтому `/run` принимает неперсистентный overlay:
+
+```json
+{
+  "session_id": "telegram:conversation:...",
+  "progress_locale": "ru",
+  "progress_metadata": {
+    "progress_callback_url": "...",
+    "progress_target": {
+      "chat_id": 123,
+      "message_id": 456
+    },
+    "status_message_id": 456,
+    "progress_request_id": "ibat_..."
+  }
+}
+```
+
+Gateway создаёт in-memory copy response route для callback factory. Durable
+`CommittedInputBatch` не изменяется. Значит, correctness больше не зависит от
+redirect chain между старыми presentation generations.
+
+## 3. Persisted explicit grouping
 
 Public/domain policy:
 
@@ -57,7 +130,7 @@ inspect, send, cancel или bind reconciliation store:
 Batch ID, collection ID, source events, attachment/text parts и state не меняются.
 Regression старого JSON входит в CI.
 
-## 3. Shared ingress admission
+## 4. Shared ingress admission
 
 `ExplicitCollectionIngressService` строит exact scope:
 
@@ -92,7 +165,7 @@ Presentation params:
 }
 ```
 
-## 4. Crash-safe promotion и recovery
+## 5. Crash-safe promotion и recovery
 
 `ExplicitInputDraftControlService`:
 
@@ -113,7 +186,48 @@ commit_reason = explicit_collection_commit
 
 Transport commit reason получает conflict.
 
-## 5. Authenticated HTTP control API
+## 6. Один FIFO admission lane на Telegram session
+
+Набор `asyncio.Lock` вокруг отдельных handlers обеспечивает mutual exclusion, но
+не гарантирует порядок уже созданных asyncio tasks. Поэтому serialization
+выполняется один раз на входе `Application.process_update`.
+
+```text
+process_update(update)
+→ synchronous enqueue по exact conversation/thread session key
+→ один FIFO worker выполняет updates последовательно
+```
+
+В ту же lane входит internal media-group completion callback.
+
+Инварианты:
+
+- порядок admission соответствует порядку вызовов `process_update`;
+- внутри одной session одновременно не выполняются два ingress/run workflow;
+- разные session продолжают работать параллельно;
+- late album completion не обгоняет `/send` или `/cancel`;
+- terminal explicit-batch tombstone остаётся последним safety guard;
+- dispatcher не является durable `CycleInbox` и не переживает process restart.
+
+## 7. Fresh task boundary
+
+Обычное сообщение после `WAITING_USER` по-прежнему продолжает pending AgentCycle.
+Явный `/collect` имеет другую семантику: пользователь открыл новый пакет задачи.
+
+При успешном `STARTED` или `PROMOTED_AUTO_DRAFT`:
+
+```text
+pending WAITING_USER cycle
+→ trace: pending_cycle_abandoned
+→ session.pending_cycle = None
+→ будущий /send запускает новый AgentCycle
+```
+
+`ALREADY_ACTIVE` не сбрасывает pending cycle повторно. Полноценное добавление новых
+committed batches в активный цикл остаётся обязанностью `v0.4-input-runtime` и
+`CycleInbox`.
+
+## 8. Authenticated HTTP control API
 
 ```text
 POST /internal/input-collections/start
@@ -128,7 +242,7 @@ conversation/thread. Mutations имеют idempotency key.
 
 `/send` durable-коммитит batch, но не запускает AgentCycle внутри control route.
 
-## 6. Telegram adapter
+## 9. Telegram adapter
 
 Регистрируются только:
 
@@ -147,30 +261,42 @@ Adapter:
 - принимает explicit state только из authoritative presentation params;
 - подавляет прежний transport `commit_and_run`;
 - `/send` после durable commit отдельно вызывает `run_committed`;
+- передаёт execution-scoped progress metadata exact run status;
+- terminalizes collection snapshot без удаления;
 - `/cancel` не запускает agent.
 
-## 7. Validation
+## 10. Validation
 
-Итоговый CI head `c67e822a771a4a90de4bc25295ebd8a29717267d`:
+CI head `5d9edb4b1e3eafb7b3ad58deab920e147d5bb8e0`:
 
 ```text
 compile: success
-artifact suite: 224 tests, OK
+artifact suite: 238 tests, OK
 storage suite: 41 tests, OK
 plans suite: 45 tests, OK
 planning suite: 19 tests, OK
 API suite: 1 test, OK
 ```
 
-Покрыты explicit text/files/mixed flows, promotion, recovery, spoof resistance,
-HTTP authority, Telegram command isolation, canonical command set и legacy
-`immediate_text → explicit_collection` rewrite.
+Новые regressions покрывают:
 
-Live Telegram gate остаётся maintainer acceptance step.
+- execution-scoped progress overlay без мутации durable response route;
+- exact progress target в Telegram `/run` request;
+- persistent terminal collection snapshot;
+- отсутствие snapshot mutation при empty `/send`;
+- FIFO same-session ordering;
+- concurrency разных Telegram sessions;
+- nested same-lane callback без deadlock;
+- fresh `/collect` boundary для `WAITING_USER`;
+- no-op boundary при отсутствии pending cycle;
+- late media-group suppression после `/send` и `/cancel`.
 
-## 8. Дальнейшая граница
+Повторный live Telegram gate остаётся maintainer acceptance step.
 
-Presentation relocation и scoped artifact activation реализованы в BW-P3/BW-P4.
-`CycleInbox` остаётся следующему `v0.4-input-runtime`.
+## 11. Дальнейшая граница
 
-Новых `.env` или `mcp.config` keys control plane и migration не добавляют.
+Presentation relocation внутри ещё активного collection и scoped artifact
+activation реализованы в BW-P3/BW-P4. Durable `CycleInbox`, active-cycle additions
+и restart-safe execution queue остаются следующему `v0.4-input-runtime`.
+
+Новых `.env` или `mcp.config` keys этот refactor не добавляет.
