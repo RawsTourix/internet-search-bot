@@ -7,6 +7,7 @@ from typing import Any
 from telegram import Update
 from telegram.ext import ApplicationHandlerStop, ContextTypes
 
+from ...agent.progress_messages import progress_text
 from . import telegram_server as server
 from .config import TELEGRAM_BOT_INSTANCE_ID
 
@@ -86,7 +87,7 @@ async def _finalize_collection_snapshot(
             parse_mode=None,
         )
     except Exception as error:
-        # The collection snapshot is historical presentation only.  Failure to
+        # The collection snapshot is historical presentation only. Failure to
         # terminalize it must not block the already-authoritative commit/cancel.
         server.logger.warning(
             "telegram_collection_snapshot_terminalize_failed "
@@ -99,6 +100,35 @@ async def _finalize_collection_snapshot(
         "telegram_collection_snapshot_terminalized message_id=%s state=%s",
         message_id,
         message_key,
+    )
+
+
+async def _finalize_delivered_run_status(
+    *,
+    update: Update,
+    status_message,
+    metadata: dict[str, Any],
+    locale: str,
+) -> None:
+    """Replace `result_ready` only after transport confirmed delivery."""
+
+    output_batch = dict(metadata.get("output_batch") or {})
+    output_batch_id = str(output_batch.get("output_batch_id") or "").strip()
+    take_state = getattr(
+        server.artifact_gateway,
+        "take_completed_output_state",
+        None,
+    )
+    if not output_batch_id or not callable(take_state):
+        return
+    terminal_state = await take_state(output_batch_id)
+    if terminal_state != "delivered":
+        return
+    await server.finish_status_or_send_reply(
+        update=update,
+        status_message=status_message,
+        text=progress_text("cycle_done", locale),
+        delivery_mode="edit_status",
     )
 
 
@@ -204,7 +234,7 @@ async def _handle_input_collection_command(
                 )
                 return
 
-            # Collection and execution have separate public presentations.  The
+            # Collection and execution have separate public presentations. The
             # former remains as a durable package summary; the latter was just
             # created below /send and is the only target for AgentCycle progress.
             await _finalize_collection_snapshot(
@@ -232,6 +262,12 @@ async def _handle_input_collection_command(
                 message=str(run_payload.get("response") or ""),
                 metadata=metadata,
                 session_id=session_id,
+            )
+            await _finalize_delivered_run_status(
+                update=update,
+                status_message=status_message,
+                metadata=metadata,
+                locale=locale,
             )
             return
 
