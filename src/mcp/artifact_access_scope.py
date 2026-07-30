@@ -58,6 +58,7 @@ class ArtifactAccessScopeMixin:
                 context,
             )
             await self._record_artifact_outcome(outcome, context)
+            await self._refresh_artifact_state(context)
             return outcome.payload
 
         tools["artifact_list"] = ManagerToolSpec(
