@@ -1,9 +1,9 @@
-"""Coordinator for structured, single-handle InputBatch acknowledgements."""
+"""Coordinator for structured, generational InputBatch acknowledgements."""
 
 from __future__ import annotations
 
-import secrets
 import logging
+import secrets
 from datetime import datetime, timezone
 
 from ..localization.models import LocalizationMessage
@@ -66,19 +66,49 @@ class InputPresentationCoordinator:
             text_part_count=text_part_count,
             response_anchor=response_anchor,
         )
+
+        previous_updated_at = stored.updated_at
+        previous_update_count = stored.update_count
+        relocation_reserved = False
+        previous_message_id: str | None = None
         if not created:
-            previous_updated_at = stored.updated_at
-            previous_update_count = stored.update_count
-            stored = await self.store.update(
-                stored.presentation_id,
-                message=message,
-                file_count=file_count,
-                text_part_count=text_part_count,
+            if self._should_relocate(
+                stored,
+                state=state,
                 response_anchor=response_anchor,
-            )
+            ):
+                previous_message_id = stored.client_message_id
+                stored = await self.store.reserve_relocation(
+                    stored.presentation_id,
+                    token=token,
+                    expected_generation=stored.presentation_generation,
+                    message=message,
+                    file_count=file_count,
+                    text_part_count=text_part_count,
+                    response_anchor=response_anchor,
+                )
+                relocation_reserved = True
+                logger.info(
+                    "input_batch_presentation_relocation_reserved "
+                    "input_batch_id=%s presentation_id=%s generation=%s "
+                    "anchor_message_id=%s",
+                    input_batch_id,
+                    stored.presentation_id,
+                    stored.pending_relocation_generation,
+                    response_anchor.client_message_id,
+                )
+            else:
+                stored = await self.store.update(
+                    stored.presentation_id,
+                    message=message,
+                    file_count=file_count,
+                    text_part_count=text_part_count,
+                    response_anchor=response_anchor,
+                )
+
         logger.info(
             "%s input_batch_id=%s presentation_id=%s file_count=%s "
-            "text_part_count=%s",
+            "text_part_count=%s generation=%s",
             (
                 "input_batch_presentation_created"
                 if created
@@ -88,6 +118,7 @@ class InputPresentationCoordinator:
             stored.presentation_id,
             file_count,
             text_part_count,
+            stored.presentation_generation,
         )
         if response_anchor is not None:
             logger.info(
@@ -97,6 +128,7 @@ class InputPresentationCoordinator:
                 response_anchor.anchor_id,
                 response_anchor.kind.value,
             )
+
         if state in {"committed", "failed"}:
             terminal = (
                 PresentationState.CLOSED
@@ -119,38 +151,46 @@ class InputPresentationCoordinator:
                         None if state == "committed" else "input_batch_failed"
                     ),
                 )
-        policy = (
-            PresentationAckPolicy.CREATE
-            if created
-            else (
-                PresentationAckPolicy.SILENT
-                if (
-                    not stored.client_message_id
-                    or previous_update_count >= self.config.max_updates_per_batch
-                )
-                else (
-                    PresentationAckPolicy.THROTTLED_UPDATE
-                    if (
-                        datetime.now(timezone.utc) - previous_updated_at
-                    ).total_seconds() < self.config.update_throttle_seconds
-                    else PresentationAckPolicy.UPDATE_EXISTING
-                )
-            )
-        )
+
+        if created:
+            policy = PresentationAckPolicy.CREATE
+        elif relocation_reserved:
+            policy = PresentationAckPolicy.RELOCATE
+        elif stored.pending_relocation_generation is not None:
+            # A client already owns the create/bind attempt for the next
+            # generation. Do not edit the current handle or create another one.
+            policy = PresentationAckPolicy.SILENT
+        elif (
+            not stored.client_message_id
+            or previous_update_count >= self.config.max_updates_per_batch
+        ):
+            policy = PresentationAckPolicy.SILENT
+        elif (
+            datetime.now(timezone.utc) - previous_updated_at
+        ).total_seconds() < self.config.update_throttle_seconds:
+            policy = PresentationAckPolicy.THROTTLED_UPDATE
+        else:
+            policy = PresentationAckPolicy.UPDATE_EXISTING
+
         event = InputPresentationEvent(
             message_key=message.message_key,
             severity="error" if state == "failed" else "info",
             params=params,
             locale=locale,
         )
+        public_token = token if created or relocation_reserved else None
         return (
             policy,
             event,
             PublicPresentationRef(
                 presentation_id=stored.presentation_id,
-                presentation_token=token if created else None,
+                presentation_token=public_token,
                 client_message_id=stored.client_message_id,
+                active_client_message_id=stored.client_message_id,
                 state=stored.state,
+                presentation_generation=stored.presentation_generation,
+                relocation_generation=stored.pending_relocation_generation,
+                previous_client_message_id=previous_message_id,
             ),
         )
 
@@ -193,3 +233,25 @@ class InputPresentationCoordinator:
             text_part_count=text_part_count,
             response_anchor=response_anchor,
         )
+
+    @staticmethod
+    def _should_relocate(stored, *, state: str, response_anchor) -> bool:
+        if (
+            state != "collecting"
+            or stored.state != PresentationState.BOUND
+            or stored.pending_relocation_generation is not None
+            or stored.client_message_id is None
+            or response_anchor is None
+        ):
+            return False
+        # v0.4 enables client-order relocation for the Telegram adapter. Other
+        # transports keep their current handle until they expose an equivalent
+        # ordered-message capability contract.
+        if not stored.client_binding_id.startswith("telegram:"):
+            return False
+        try:
+            active_order = int(stored.client_message_id)
+            anchor_order = int(response_anchor.client_message_id)
+        except (TypeError, ValueError):
+            return False
+        return anchor_order > active_order
