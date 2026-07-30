@@ -6,19 +6,18 @@ implementation_status: implemented
 last_reviewed: 2026-07-30
 ---
 
-# BW-5–BW-6 — Presentation relocation and user controls
+# BW-5–BW-6 — Collection presentation and user controls
 
-## BW-5. Durable presentation relocation
+## BW-5. Collection presentation relocation
 
-### BW-5.1. Проблема
+### BW-5.1. Scope
 
-Один стабильный status/progress message удобен для редактирования, restart recovery
-и terminal fallback. Но если пользователь добавил новое сообщение в тот же
-`InputBatchDraft`, прежний status остаётся выше новой части и перестаёт быть
-актуальным центром workflow.
+Relocation относится только к ещё активному `InputBatchDraft`/collection. Её цель —
+переместить актуальный snapshot состава пакета ниже новых user parts, пока пакет
+продолжает собираться.
 
-Удалять старое сообщение до создания и durable bind нового нельзя: transport
-ошибка оставит batch без presentation handle.
+Relocation не является механизмом выбора AgentCycle progress target после `/send`.
+Collection snapshot и execution status имеют разные роли и lifecycle.
 
 ### BW-5.2. Persisted generation model
 
@@ -26,7 +25,7 @@ last_reviewed: 2026-07-30
 
 ```text
 presentation_generation: int
-client_message_id: str | None          # active compatibility field
+client_message_id: str | None
 anchor_source_message_id: str | None
 superseded_handles: list[SupersededPresentationHandle]
 pending_relocation_token_hash: str | None
@@ -85,31 +84,31 @@ Webhook processing time, filename, текст инструкции и смысл
 используются. Duplicate/internal transport events сами по себе relocation не
 вызывают.
 
-### BW-5.4. Безопасный протокол
+### BW-5.4. Безопасный active-collection протокол
 
 ```text
 1. Server reserve relocation generation N+1 и выдаёт одноразовый token.
-2. Telegram отправляет новый status после последнего user message.
+2. Telegram отправляет новый collection snapshot после последнего user message.
 3. Telegram получает new client_message_id.
 4. Atomic durable bind:
    - generation N+1 становится active;
    - new ID становится client_message_id;
    - old generation переносится в superseded_handles.
 5. Только после успешного bind прекращаются edits old generation.
-6. Telegram best-effort удаляет old message.
+6. Telegram best-effort удаляет old active-collection snapshot.
 7. deletion receipt сохраняет deleted / failed / unknown.
 ```
 
-Если создание нового status не удалось, old handle остаётся active.
+Если создание нового snapshot не удалось, old handle остаётся active.
 
-Если новый status создан, но durable bind не удался:
+Если новый snapshot создан, но durable bind не удался:
 
 ```text
 old handle остаётся active
 new unbound message удаляется best-effort
 ```
 
-Если bind выполнен, но удалить old message не удалось:
+Если bind выполнен, но удалить old snapshot не удалось:
 
 ```text
 new handle остаётся authoritative
@@ -123,7 +122,8 @@ old generation никогда больше не редактируется
 - редактировать old message текстом «перенесено ниже» после failed deletion;
 - считать relocation успешным без durable bind;
 - откатываться к superseded generation после restart;
-- принимать stale `expected_generation`.
+- принимать stale `expected_generation`;
+- использовать relocation для передачи authority execution status.
 
 ### BW-5.5. Concurrency и idempotency
 
@@ -159,17 +159,47 @@ Authority проверяет:
 - expected generation.
 
 Telegram adapter выполняет transport create/delete, а shared store владеет
-presentation state machine. Другие adapters смогут использовать тот же протокол,
-когда объявят эквивалентный ordered-message capability.
+collection presentation state machine. Другие adapters смогут использовать тот же
+протокол, когда объявят эквивалентный ordered-message capability.
 
-### BW-5.7. Terminal behavior
+### BW-5.7. Terminal collection behavior
 
-После terminal state:
+После `/send` или `/cancel` relocation больше не резервируется.
 
-- relocation не резервируется;
-- current active handle остаётся единственным writable status handle;
-- superseded handles не меняются, кроме idempotent deletion receipt;
-- final answer и OutputBatch delivery используют существующую terminal policy.
+Текущий active collection snapshot:
+
+- перестаёт принимать progress updates;
+- остаётся в Telegram history;
+- best-effort редактируется в terminal summary с final file/text counts;
+- не удаляется ради запуска AgentCycle;
+- не становится execution progress target.
+
+Ошибка terminal edit не меняет authoritative commit/cancel state.
+
+## BW-5A. Execution presentation
+
+### BW-5A.1. Отдельный status под `/send`
+
+`/send` создаёт processing status непосредственно под командой. Этот status
+принадлежит exact `/run` invocation и получает:
+
+```text
+cycle_started / cycle_resumed
+tool progress
+final processing
+result_ready
+terminal delivery state
+```
+
+### BW-5A.2. Non-persisted run overlay
+
+`CommittedInputBatch.response_route` остаётся durable provenance исходного пакета.
+Для запуска Telegram передаёт `/run` отдельный `progress_metadata` overlay с exact
+processing message ID.
+
+Gateway применяет overlay только к in-memory batch copy для callback factory.
+Durable InputBatch не изменяется. Redirect registry между presentation generations
+не используется и удалён.
 
 ## BW-6. User-friendly controls
 
@@ -188,7 +218,7 @@ presentation state machine. Другие adapters смогут использо�
 bridge. После handler применяется `ApplicationHandlerStop`, поэтому command text
 не становится `InputBatch.text_parts`.
 
-### BW-6.2. Локализованные сообщения
+### BW-6.2. Локализованные состояния
 
 #### Collection started
 
@@ -196,8 +226,9 @@ bridge. После handler применяется `ApplicationHandlerStop`, по
 📦 Режим сбора включён.
 
 Все следующие сообщения и файлы войдут в один пакет.
-Сообщений: 0
-Файлов: 0
+
+Файлы: 0
+Сообщения: 0
 
 /send — отправить пакет
 /cancel — отменить
@@ -208,12 +239,29 @@ bridge. После handler применяется `ApplicationHandlerStop`, по
 ```text
 📦 Пакет собирается.
 
-Сообщений: {text_count}
-Файлов: {artifact_count}
-Загрузка: {stored_count}/{attachment_count}
+Файлы: {file_count}
+Сообщения: {text_part_count}
 
-/send — отправить
+/send — отправить пакет
 /cancel — отменить
+```
+
+#### Submitted snapshot
+
+```text
+📦 Пакет передан в обработку.
+
+Файлы: {file_count}
+Сообщения: {text_part_count}
+```
+
+#### Cancelled snapshot
+
+```text
+📦 Сбор пакета отменён.
+
+Файлы: {file_count}
+Сообщения: {text_part_count}
 ```
 
 #### Empty send
@@ -222,25 +270,13 @@ bridge. После handler применяется `ApplicationHandlerStop`, по
 Пакет пока пуст. Отправьте сообщение или файл либо используйте /cancel.
 ```
 
-#### Cancelled
-
-```text
-Сбор пакета отменён. Агент не запускался.
-```
-
-#### No active draft
-
-```text
-Сейчас нет собираемого пакета.
-```
-
 Все строки находятся в ru/en localization catalogs, а не внутри Telegram handler.
 
 ### BW-6.3. Command semantics
 
 | Команда | Нет draft | AUTO draft | EXPLICIT draft |
 |---|---|---|---|
-| `/collect` | Создать EXPLICIT | Upgrade AUTO → EXPLICIT | Idempotent inspect |
+| `/collect` | Создать EXPLICIT + fresh-task boundary | Upgrade AUTO → EXPLICIT + boundary | Idempotent inspect |
 | `/send` | No active draft | Explicit commit intent | Commit + separate run |
 | `/cancel` | Idempotent no-op | Cancel | Cancel |
 | `/status` | Runtime status | Runtime + draft summary | Runtime + draft summary |
@@ -248,7 +284,13 @@ bridge. После handler применяется `ApplicationHandlerStop`, по
 
 `/send` и `/cancel` являются control actions и не входят в `text_parts`.
 
-### BW-6.4. Permission and scope
+### BW-6.4. Ordering boundary
+
+Telegram updates enqueue-ятся в один FIFO dispatcher exact conversation/thread до
+создания handler task. Это относится к commands, text, attachments и album
+completion. Разные sessions остаются параллельными.
+
+### BW-6.5. Permission and scope
 
 В private chat sender совпадает с principal scope.
 
@@ -263,28 +305,19 @@ bridge. После handler применяется `ApplicationHandlerStop`, по
 
 ## Validation
 
-CI head `a9e82a3c5bcef2b1d694d19642200605f0726356`:
+CI head `5d9edb4b1e3eafb7b3ad58deab920e147d5bb8e0`:
 
 ```text
 compile: success
-artifact suite: 219 tests, OK
-storage suite: success
-plans suite: success
-planning suite: success
-API suite: success
+artifact suite: 238 tests, OK
+storage suite: 41 tests, OK
+plans suite: 45 tests, OK
+planning suite: 19 tests, OK
+API suite: 1 test, OK
 ```
 
-Regressions покрывают:
+Regressions покрывают active-collection relocation, persistent terminal snapshot,
+run-scoped progress target, durable route immutability, FIFO dispatcher, fresh-task
+boundary и canonical `/collect`, `/send`, `/cancel` only.
 
-- schema-v1 read upgrade;
-- initial bind generation 1;
-- reserve/bind generation 2;
-- superseded audit record;
-- stale generation rejection;
-- pending relocation suppression;
-- create → bind → delete order;
-- bind failure без удаления active old handle;
-- failed/unknown old deletion без rollback;
-- canonical `/collect`, `/send`, `/cancel` only.
-
-Новых `.env` или `mcp.config` keys BW-P3 не добавляет.
+Новых `.env` или `mcp.config` keys refactor не добавляет.
