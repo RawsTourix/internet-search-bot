@@ -177,7 +177,7 @@ unknown/non-delivery progress event
 → прежний rendering path
 ```
 
-## BW-14.7. Реализация
+## BW-14.7. Реализация и проверки
 
 ```text
 src/artifacts/progress.py
@@ -188,5 +188,25 @@ tests/test_artifact_delivery_progress_projection.py
 
 `ArtifactDeliveryProgressMixin` является отдельным composition layer и не
 смешивает delivery state machine, tool execution и presentation projection.
+
+Regression suite проверяет:
+
+- singular и plural start messages;
+- select и cancel operations;
+- соответствие completion message полному structured списку;
+- bounded preview и omitted count;
+- RU/EN rendering;
+- подключение production MRO.
+
+Тематический validation workflow 2026-07-30:
+
+```text
+artifact suite: 185 tests, success
+storage suite: 41 tests, success
+plans suite: 45 tests, success
+planning suite: 19 tests, success
+API suite: success
+compile: success
+```
 
 Новых параметров `.env` или `mcp.config` этот patch не добавляет.
