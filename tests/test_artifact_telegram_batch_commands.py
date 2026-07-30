@@ -69,6 +69,12 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
                 "_deliver_agent_result",
                 new=AsyncMock(),
             ),
+            patch.object(
+                batch_commands.server,
+                "retire_input_collection_status",
+                new=AsyncMock(),
+                create=True,
+            ),
         )
 
     async def test_collect_calls_shared_control_and_renders_started_state(self):
@@ -83,7 +89,8 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         status, *patches = self._server_patches(gateway)
         with patches[0], patches[1], patches[2], patches[3] as send_initial, \
-                patches[4] as finish, patches[5], patches[6], patches[7]:
+                patches[4] as finish, patches[5], patches[6], patches[7], \
+                patches[8]:
             await batch_commands._handle_input_collection_command(
                 self._update("/collect"),
                 None,
@@ -103,7 +110,7 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
             "input_collection.started",
         )
 
-    async def test_send_commits_then_runs_and_delivers_agent_result(self):
+    async def test_send_retires_collection_status_then_runs_and_delivers(self):
         gateway = SimpleNamespace(
             send_collection=AsyncMock(
                 return_value={
@@ -112,6 +119,7 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
                     "input_batch_id": "ibat_" + "1" * 32,
                     "file_count": 2,
                     "text_part_count": 1,
+                    "_telegram_previous_status_message_id": "250",
                 }
             ),
             run_committed=AsyncMock(
@@ -124,13 +132,23 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         status, *patches = self._server_patches(gateway)
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
-                patches[5], patches[6], patches[7] as deliver:
+                patches[5], patches[6], patches[7] as deliver, \
+                patches[8] as retire:
             await batch_commands._handle_input_collection_command(
                 self._update("/send", update_id=101, message_id=201),
                 None,
             )
 
         gateway.send_collection.assert_awaited_once()
+        retire.assert_awaited_once()
+        self.assertEqual(
+            retire.await_args.kwargs["previous_message_id"],
+            "250",
+        )
+        self.assertIs(
+            retire.await_args.kwargs["processing_status_message"],
+            status,
+        )
         gateway.run_committed.assert_awaited_once_with(
             "ibat_" + "1" * 32,
             session_id="telegram:conversation:12345",
@@ -153,13 +171,15 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         _, *patches = self._server_patches(gateway)
         with patches[0], patches[1], patches[2], patches[3], \
-                patches[4] as finish, patches[5], patches[6], patches[7]:
+                patches[4] as finish, patches[5], patches[6], patches[7], \
+                patches[8] as retire:
             await batch_commands._handle_input_collection_command(
                 self._update("/send", update_id=102, message_id=202),
                 None,
             )
 
         gateway.run_committed.assert_not_awaited()
+        retire.assert_not_awaited()
         self.assertEqual(
             finish.await_args.kwargs["text"],
             "input_collection.empty",
@@ -177,7 +197,7 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
         )
         _, *patches = self._server_patches(gateway)
         with patches[0], patches[1], patches[2], patches[3], patches[4], \
-                patches[5], patches[6], patches[7]:
+                patches[5], patches[6], patches[7], patches[8]:
             with self.assertRaises(ApplicationHandlerStop):
                 await batch_commands.input_collection_command_handler(
                     self._update("/cancel", update_id=103, message_id=203),
