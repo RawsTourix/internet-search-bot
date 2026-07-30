@@ -59,8 +59,12 @@ AgentCycle:
   `create → durable bind → supersede → best-effort delete`;
 - collection snapshot после `/send`/`/cancel` остаётся terminal audit evidence и не
   удаляется ради запуска;
-- AgentCycle progress получает отдельный run status под `/send` через
-  execution-scoped non-persisted metadata overlay;
+- AgentCycle progress получает отдельный run status через execution-scoped
+  non-persisted metadata overlay;
+- explicit `/send` передаёт exact run status напрямую;
+- committed AUTO text, чей status создаётся после ingress, использует bounded
+  one-shot binding `input_batch_id → run progress metadata`, потребляемый exact
+  `/run` один раз;
 - durable `InputBatch.response_route` не мутируется ради UI presentation;
 - obsolete progress redirect registry удалён;
 - exact Telegram conversation/thread использует один FIFO dispatcher на входе
@@ -73,11 +77,11 @@ AgentCycle:
 - historical read/search/delivery разрешены после explicit activation;
 - output grouping и native Telegram multipart delivery сохраняют порядок.
 
-Thematic CI head `5d9edb4b1e3eafb7b3ad58deab920e147d5bb8e0`:
+Thematic CI head `1ce84a02742bd94624b6c7b32d966a3e87c5b14f`:
 
 ```text
 compile: success
-artifact suite: 238 tests, OK
+artifact suite: 242 tests, OK
 storage suite: 41 tests, OK
 plans suite: 45 tests, OK
 planning suite: 19 tests, OK
@@ -90,6 +94,7 @@ API suite: 1 test, OK
 - повторный live Telegram `/collect`, `/send`, `/cancel`;
 - подтверждение сохранения collection snapshot;
 - подтверждение execution progress под `/send`;
+- подтверждение progress обычного committed AUTO text;
 - rapid-command/FIFO scenario;
 - fresh-task boundary после прежнего `WAITING_USER`;
 - отмена до завершения album quiet period;
