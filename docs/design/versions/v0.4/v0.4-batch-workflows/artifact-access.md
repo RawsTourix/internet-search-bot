@@ -2,13 +2,13 @@
 id: design.v0.4.batch-workflows.artifact-access
 version: v0.4
 spec_status: accepted
-implementation_status: planned
-last_reviewed: 2026-07-29
+implementation_status: implemented
+last_reviewed: 2026-07-30
 ---
 
 # BW-9 — Artifact access, visibility and activation
 
-## BW-9.1. Three separate concepts
+## BW-9.1. Раздельные понятия
 
 Artifact policy разделяет:
 
@@ -19,213 +19,230 @@ authorization/access
 ≠ delivery selection
 ```
 
-Жёсткое правило «исторические артефакты запрещены» не принимается. Агент должен
-уметь вернуться к любому exact artifact version, доступному текущему
-workspace/session/principal.
+Исторические артефакты не запрещены. Агент может вернуться к exact immutable
+version, доступной текущей session/workspace authority. Ограничивается объём
+автоматической проекции в LLM context и неявность выбора.
 
-Ограничивается не доступ как таковой, а объём автоматической проекции в LLM
-context и неявность выбора.
+## BW-9.2. Bounded active manifest
 
-## BW-9.2. Authorization scope
-
-Store/API проверяет access policy до возврата metadata/content:
-
-```text
-workspace ownership
-session visibility
-principal/client authorization
-artifact/version existence
-retention state
-```
-
-Filesystem v0.4 использует текущую session/workspace policy. PostgreSQL v0.5 и
-multi-user v0.8 заменят backend/authorization implementation, но не tool
-contract.
-
-Agent не может расширить scope произвольным `session_id`, local path или guessed
-artifact ID.
-
-## BW-9.3. Bounded active manifest
-
-В каждый agent input автоматически включается только bounded active manifest:
+В agent runtime автоматически включается только bounded active manifest:
 
 ```text
 current InputBatch artifacts
-+ explicit referenced_artifact_refs
++ explicit current-cycle refs
 + artifacts created/modified in current cycle
-+ currently selected deliverables
-+ artifacts explicitly activated current-cycle tools
++ selected deliverables
++ exact artifacts activated authoritative tools
 ```
 
-Manifest содержит metadata exact versions:
+Manifest содержит metadata, но не bytes, local paths, transport locators или
+secrets. `ArtifactManifestItem` дополнительно проецирует:
 
 ```json
 {
   "artifact_id": "art_...",
-  "artifact_lineage_id": "aln_...",
   "filename": "report.csv",
-  "format_id": "csv",
-  "size_bytes": 1024,
-  "purpose": "input",
-  "activation_reason": "current_input_batch"
+  "activation_reason": "catalog_result",
+  "activation_scope": "session",
+  "activation_source_operation_id": "artifact_list:session:0"
 }
 ```
 
-Manifest:
+Content исторических artifacts читается только через exact read/search tools.
 
-- bounded по количеству и serialized size;
-- не содержит bytes, local paths, transport locators или secrets;
-- восстанавливается из runtime/store после compaction;
-- не является полным каталогом workspace;
-- не меняет authorization.
+## BW-9.3. Catalog scopes
 
-## BW-9.4. Catalog scopes
-
-`artifact_list` получает server-validated scope:
+Production `artifact_list` принимает:
 
 ```python
 scope: Literal["current", "session", "workspace"] = "current"
+limit: int
+cursor: str | None
 ```
 
-Semantics:
+### current
 
 ```text
-current
-→ active manifest/current cycle working set
-
-session
-→ доступные exact versions, связанные с текущей session history
-
-workspace
-→ все авторизованные workspace artifacts в bounded pagination
+→ exact refs уже active в текущем AgentCycle
+→ не расширяет runtime authority
 ```
 
-Обязательные параметры для session/workspace listing:
+### session
 
 ```text
-limit
-cursor
-optional filename/format/purpose filters
+→ bounded exact versions, связанные с текущей session history
+→ возвращённая page активируется в текущем cycle
 ```
 
-Нельзя возвращать неограниченный полный каталог в один tool result.
+### workspace
 
-В v0.5 добавляется semantic search/RAG, но `artifact_list` остаётся точным
-metadata catalog operation.
+```text
+→ bounded workspace-authorized catalog
+```
 
-## BW-9.5. Activation
+В filesystem v0.4 отдельной multi-user workspace authority ещё нет. Поэтому
+`workspace` возвращает явную projection:
 
-Artifact становится active в текущем cycle, если exact version:
+```json
+{
+  "scope": "workspace",
+  "effective_scope": "session",
+  "workspace_scope_note": "filesystem_v0.4_workspace_equals_session"
+}
+```
 
-1. пришла в current `InputBatch`;
-2. передана через `referenced_artifact_refs`;
-3. создана/изменена текущим cycle;
-4. возвращена текущим вызовом `artifact_list`, `artifact_search`, `artifact_get`
-   или другого authoritative manager tool;
-5. выбрана пользователем через client UI/reply binding.
+Это не скрытая подмена контракта: v0.8 заменит backend authority, сохранив public
+scope.
 
-Runtime сохраняет bounded activation record:
+## BW-9.4. Opaque pagination
+
+Catalog result возвращает `next_cursor`, если page truncated. Cursor:
+
+- opaque для модели и клиента;
+- содержит versioned server payload;
+- привязан к requested scope;
+- не принимается вместе с non-zero legacy offset;
+- invalid/cross-scope cursor возвращает structured retryable validation error;
+- не предоставляет дополнительную authority.
+
+Полный неограниченный каталог одним tool result запрещён.
+
+## BW-9.5. Activation record
+
+Returned page items получают bounded runtime record:
 
 ```python
 class ArtifactActivation(BaseModel):
     artifact_id: str
     cycle_id: str
-    reason: Literal[
-        "current_input_batch",
-        "explicit_reference",
-        "created_in_cycle",
-        "modified_in_cycle",
-        "catalog_result",
-        "search_result",
-        "client_selection",
-    ]
+    reason: ArtifactActivationReason
+    scope: ArtifactCatalogScope
     source_operation_id: str | None
     activated_at: datetime
 ```
 
-Activation не копирует artifact и не создаёт новую version.
-
-## BW-9.6. Historical use and delivery
-
-`artifact_set_delivery` может выбрать historical exact artifact, если:
+Причины:
 
 ```text
-artifact авторизован
-+ exact version существует
-+ artifact активирован в текущем cycle
-+ purpose/delivery policy разрешает отправку
+current_input_batch
+explicit_reference
+created_in_cycle
+modified_in_cycle
+catalog_result
+search_result
+client_selection
 ```
 
-Возраст, другой origin cycle или прежний filename не являются блокировкой.
+Activation:
 
-Tool result для historical artifact явно сообщает provenance:
+- добавляет exact `artifact_id` в current-cycle authority;
+- не копирует bytes;
+- не создаёт новую version;
+- не расширяет session boundary;
+- ограничена `max_artifacts_per_cycle`;
+- сохраняется в `ActiveAgentCycle.artifact_activations` и survives runtime
+  compaction вместе с cycle state.
 
-```json
-{
-  "artifact_id": "art_...",
-  "filename": "report.csv",
-  "scope": "session_history",
-  "origin_input_batch_id": "ibat_...",
-  "origin_cycle_id": "cycle_...",
-  "version_number": 3,
-  "activation_reason": "catalog_result"
-}
-```
+Если catalog page превысит оставшийся activation budget, операция отклоняется с
+предложением уменьшить `limit` или сузить filters.
 
-Prompt/runtime может предупреждать модель:
+## BW-9.6. Historical read/search/delivery
+
+После session/workspace catalog activation exact historical version проходит через
+тот же existing pipeline:
 
 ```text
-Выбран артефакт из предыдущего цикла; проверьте, что пользователь действительно
-просит повторно использовать эту exact version.
+artifact_list(scope=session|workspace)
+→ exact artifact_id activated current cycle
+→ artifact_read_text / artifact_search_text
+→ artifact_set_delivery(selected=true)
 ```
 
-Это soft correctness warning, а не запрет.
+Delivery проверяет current runtime authority и immutable ID. Возраст, origin cycle
+или знакомое filename сами по себе не блокируют и не разрешают отправку.
 
-## BW-9.7. Preventing accidental stale selection
+До activation historical ID остаётся недоступным existing read/search/delivery
+controllers.
 
-Проблема старого прогона формулируется так:
+## BW-9.7. Session isolation
+
+Catalog enumeration выполняется только через authoritative `context.session_id`.
+Модель не передаёт произвольный `session_id`, path или workspace root.
+
+```text
+session A artifact
+→ visible in session A session/workspace scope
+→ absent in session B
+```
+
+`workspace` filesystem projection также не пересекает session boundary.
+
+## BW-9.8. Preventing stale accidental selection
+
+Старый проблемный сценарий:
 
 ```text
 files-only batch without instruction
-+ previous deliverables already visible
-→ LLM selected familiar old artifact IDs
++ previous deliverables automatically visible
+→ LLM selected familiar old IDs
 ```
 
-Исправление состоит из двух независимых мер:
+Закрыт двумя независимыми мерами:
 
-1. AUTO files-only drafts не запускают agent cycle без explicit `/send`.
-2. Base manifest не включает всю историю автоматически; historical artifacts
-   требуют текущего catalog/search/get activation.
+1. explicit files-only workflow требует `/send`;
+2. base manifest не содержит весь history catalog — historical exact versions
+   требуют current catalog activation.
 
-Runtime не определяет «нужность» файла по filename similarity и не запрещает
-историю целиком.
+Runtime не использует filename similarity и не запрещает историю целиком.
 
-## BW-9.8. Exact version semantics
+## BW-9.9. Production composition
 
-Любая операция использует exact immutable `artifact_id`.
+Scoped behavior подключён отдельным `ArtifactAccessScopeMixin` в production MRO:
 
 ```text
-lineage latest
-filename
-creation time
+FinalizingArtifactDeliveryPlanningMCPClient
+→ ArtifactAccessScopeMixin
+→ existing ArtifactMCPClient / delivery / planning layers
 ```
 
-не заменяют exact version reference.
+Compatibility-класс `ArtifactMCPClient` не меняет старые direct-construction
+contracts. Production `artifact_list` получает scoped schema и
+`ScopedArtifactToolController`; остальные manager tools остаются прежними и видят
+активированные refs через existing access context.
 
-Если пользователь просит «последнюю версию», manager tool сначала разрешает
-lineage/latest по authoritative store, возвращает exact artifact ID и только
-после этого version активируется.
+Progress protocol зарегистрировал internal event:
 
-## BW-9.9. Context compaction
+```text
+artifact_catalog_activated
+```
 
-После cycle compaction:
+Full structured activation evidence хранится в cycle trace/runtime state.
 
-- current activation records сохраняются bounded runtime state;
-- content исторических artifacts не удерживается в LLM context;
-- повторное чтение идёт через exact artifact tools;
-- manifest summary не превращается в source of truth content.
+## BW-9.10. Validation
 
-## BW-9.10. Future scaling
+CI head `dac7085cb5cb8b3316b1aba7ded5e2b991a15a92`:
+
+```text
+compile: success
+artifact suite: 223 tests, OK
+storage suite: 41 tests, OK
+plans suite: 45 tests, OK
+planning suite: 19 tests, OK
+API suite: 1 test, OK
+```
+
+Regressions проверяют:
+
+- current scope не показывает неактивную history;
+- session catalog активирует historical exact version;
+- activated history доступна read и delivery;
+- activation provenance попадает в bounded manifest;
+- opaque cursor продолжает pagination;
+- cursor нельзя перенести между scopes;
+- filesystem workspace projection объявлена явно;
+- другая session не получает metadata или activation.
+
+## BW-9.11. Future scaling
 
 ```text
 v0.4 filesystem
@@ -238,8 +255,13 @@ v0.6 workers
 → background extraction/indexing, same exact refs
 
 v0.8 multi-user
-→ workspace/role authorization around same scopes
+→ real workspace/role authorization around same scopes
 ```
 
-Таким образом, backend и discovery становятся богаче, но базовая модель
-`authorized → discovered → activated → used/selected` сохраняется.
+Базовая модель остаётся:
+
+```text
+authorized → discovered → activated → used/selected
+```
+
+Новых `.env` или `mcp.config` keys BW-P4 не добавляет.
