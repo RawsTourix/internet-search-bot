@@ -14,8 +14,12 @@ from ..localization.service import LocalizationService
 from .collection_store import FileSystemInputCollectionStore
 from .config import IngressConfigType
 from .draft_control import InputDraftControlService
-from .resilient_service import ResilientUnifiedArtifactIngressService
-from .resilient_store import ResilientFileSystemCoordinatedInputBatchStore
+from .explicit_control import ExplicitInputDraftControlService
+from .explicit_service import ExplicitCollectionIngressService
+from .explicit_store import (
+    ExplicitCollectionInputBatchStore,
+    FileSystemExplicitInputCollectionStore,
+)
 from .service import ArtifactIngressService
 from .store import FileSystemIngressEventStore, FileSystemInputBatchStore
 
@@ -43,12 +47,13 @@ def create_ingress_services(
 ) -> IngressServices:
     interaction = interaction_config or InteractionConfig()
     event_store = FileSystemIngressEventStore(storage_config)
-    batch_store = ResilientFileSystemCoordinatedInputBatchStore(
+    collection_store = FileSystemExplicitInputCollectionStore(storage_config)
+    batch_store = ExplicitCollectionInputBatchStore(
         storage_config,
         ingress_config,
+        collection_store=collection_store,
     )
-    collection_store = FileSystemInputCollectionStore(storage_config)
-    draft_control_service = InputDraftControlService(
+    draft_control_service = ExplicitInputDraftControlService(
         event_store=event_store,
         batch_store=batch_store,
         collection_store=collection_store,
@@ -71,13 +76,15 @@ def create_ingress_services(
     localization_service = LocalizationService.from_directory(
         config=interaction.localization
     )
-    ingress_service = ResilientUnifiedArtifactIngressService(
+    ingress_service = ExplicitCollectionIngressService(
         config=ingress_config,
         artifact_config=artifact_services.config,
         content_store=content_store,
         artifact_services=artifact_services,
         event_store=event_store,
         batch_store=batch_store,
+        collection_store=collection_store,
+        draft_control_service=draft_control_service,
         capability_store=capability_store,
         localization_service=localization_service,
         presentation_coordinator=(
