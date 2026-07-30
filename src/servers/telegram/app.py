@@ -5,11 +5,14 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 
 import httpx
+from telegram import BotCommand
 from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
-from telegram.ext import MessageHandler, filters
+from telegram.ext import CommandHandler, MessageHandler, filters
 
 from . import telegram_server as server
+from .batch_commands import input_collection_command_handler
+from .collection_bridge import ExplicitCollectionTelegramGatewayClient
 from .config import (
     GATEWAY_URL,
     TELEGRAM_API_KEY,
@@ -22,7 +25,6 @@ from .config import (
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
 )
 from .ready_outbox import TelegramReadyOutboxWorker
-from .scoped_artifact_bridge import InstanceScopedTelegramArtifactGatewayClient
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 
 
@@ -30,7 +32,7 @@ from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 # response path, the recovery outbox worker and delivery-content streaming.
 # Handler functions in telegram_server resolve these module globals at call
 # time, so replacing them here does not duplicate ingress or Telegram state.
-artifact_gateway = InstanceScopedTelegramArtifactGatewayClient(
+artifact_gateway = ExplicitCollectionTelegramGatewayClient(
     gateway_url=GATEWAY_URL,
     api_key=TELEGRAM_API_KEY,
     client_instance_id=TELEGRAM_BOT_INSTANCE_ID,
@@ -46,6 +48,17 @@ artifact_gateway = InstanceScopedTelegramArtifactGatewayClient(
 telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
 server.telegram_output_executor = telegram_output_executor
+
+
+# Explicit controls are handled before the legacy generic command bridge, so
+# command text never becomes an InputBatch text part.
+server.application.add_handler(
+    CommandHandler(
+        ["collect", "batch", "send", "done", "cancel"],
+        input_collection_command_handler,
+    ),
+    group=-1,
+)
 
 
 def _route_forwarded_text_through_text_handler() -> None:
@@ -197,7 +210,22 @@ async def _finish_status_or_send_reply(
 
 
 async def _deliver_agent_result(**values):
-    """Let the durable worker win a rare synchronous/outbox claim race."""
+    """Handle explicit collection status and rare synchronous/outbox races."""
+
+    metadata = dict(values.get("metadata") or {})
+    if metadata.get("input_collection_pending"):
+        locale = str(metadata.get("progress_locale") or "ru")
+        return await server.finish_status_or_send_reply(
+            update=values["update"],
+            status_message=values.get("status_message"),
+            text=server._localized(
+                "input_collection.collecting",
+                locale=locale,
+                file_count=int(metadata.get("file_count") or 0),
+                text_part_count=int(metadata.get("text_part_count") or 0),
+            ),
+            delivery_mode="edit_status",
+        )
 
     try:
         return await _base_deliver_agent_result(**values)
@@ -209,7 +237,7 @@ async def _deliver_agent_result(**values):
             and request.url.path.endswith("/claim")
             and "/internal/output-outbox/" in request.url.path
         ):
-            output_batch = (values.get("metadata") or {}).get("output_batch") or {}
+            output_batch = metadata.get("output_batch") or {}
             server.logger.info(
                 "telegram_output_claim_already_owned output_batch_id=%s",
                 output_batch.get("output_batch_id"),
@@ -229,6 +257,15 @@ async def lifespan(app):
     # the bot application is shut down. This composition owns exactly one
     # worker and one Telegram Application instance per process.
     async with server.lifespan(app):
+        await server.application.bot.set_my_commands([
+            BotCommand("start", "Приветствие"),
+            BotCommand("status", "Статус системы"),
+            BotCommand("collect", "Начать сбор пакета"),
+            BotCommand("send", "Отправить собранный пакет"),
+            BotCommand("cancel", "Отменить сбор пакета"),
+            BotCommand("reset", "Очистка памяти"),
+            BotCommand("help", "Справка"),
+        ])
         await ready_outbox_worker.start()
         app.state.telegram_ready_outbox = ready_outbox_worker
         try:
