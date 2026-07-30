@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from telegram import Update
-from telegram.ext import ContextTypes
+from telegram.ext import ApplicationHandlerStop, ContextTypes
 
 from . import telegram_server as server
 from .config import TELEGRAM_BOT_INSTANCE_ID
@@ -52,7 +52,7 @@ def _counts(payload: dict[str, Any]) -> dict[str, int]:
     }
 
 
-async def input_collection_command_handler(
+async def _handle_input_collection_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ):
@@ -178,3 +178,13 @@ async def input_collection_command_handler(
             metadata={"progress_locale": locale},
             session_id=session_id,
         )
+
+
+async def input_collection_command_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+):
+    """Handle one collection command and stop lower-priority command groups."""
+
+    await _handle_input_collection_command(update, context)
+    raise ApplicationHandlerStop
