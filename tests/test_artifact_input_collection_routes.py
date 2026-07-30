@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock
 
 import httpx
 from fastapi import FastAPI, Header
@@ -42,7 +42,7 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
         self.mcp_client = SimpleNamespace(
-            abandon_pending_cycle_for_new_task=Mock(return_value="cycle-old"),
+            abandon_pending_cycle_for_new_task=AsyncMock(),
         )
         api = SimpleNamespace(
             ingress_services=SimpleNamespace(
@@ -120,7 +120,7 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(scope.principal_id, "user-1")
         self.assertEqual(call.kwargs["idempotency_key"], "collect-update-1")
 
-    async def test_new_collection_abandons_waiting_cycle_as_fresh_task(self):
+    async def test_new_collection_does_not_abandon_waiting_cycle(self):
         response = await self.client.post(
             "/internal/input-collections/start",
             headers={"X-API-Key": "telegram-key"},
@@ -128,10 +128,7 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(response.status_code, 200)
-        self.mcp_client.abandon_pending_cycle_for_new_task.assert_called_once_with(
-            "telegram:conversation:chat-1",
-            reason="explicit_collection_started",
-        )
+        self.mcp_client.abandon_pending_cycle_for_new_task.assert_not_awaited()
 
     async def test_already_active_collection_does_not_abandon_waiting_cycle(self):
         self.service.start_collection.return_value = InputDraftControlResult(
@@ -147,7 +144,7 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json()["status"], "already_active")
-        self.mcp_client.abandon_pending_cycle_for_new_task.assert_not_called()
+        self.mcp_client.abandon_pending_cycle_for_new_task.assert_not_awaited()
 
     async def test_transport_key_cannot_control_another_instance(self):
         response = await self.client.post(
@@ -170,7 +167,7 @@ class InputCollectionRouteTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(response.status_code, 422)
         self.service.start_collection.assert_not_awaited()
-        self.mcp_client.abandon_pending_cycle_for_new_task.assert_not_called()
+        self.mcp_client.abandon_pending_cycle_for_new_task.assert_not_awaited()
 
     async def test_send_commits_without_starting_agent_in_router(self):
         response = await self.client.post(
