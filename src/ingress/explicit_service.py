@@ -102,6 +102,10 @@ class ExplicitCollectionIngressService(ResilientUnifiedArtifactIngressService):
 
         if collect_into is None:
             return result
+        result = self._with_explicit_presentation(
+            result,
+            collection_id=collect_into.collection_id,
+        )
         if result.state == "failed":
             latest = await self.collection_store.get_active(scope)
             if latest is not None and latest.collection_id == collect_into.collection_id:
@@ -160,3 +164,29 @@ class ExplicitCollectionIngressService(ResilientUnifiedArtifactIngressService):
             update={"metadata": metadata}
         )
         return envelope.model_copy(update={"response_route": route})
+
+    @staticmethod
+    def _with_explicit_presentation(
+        result: InputSubmissionResult,
+        *,
+        collection_id: str,
+    ) -> InputSubmissionResult:
+        event = result.presentation_event
+        if event is None:
+            return result
+        params = dict(event.params or {})
+        params.update(
+            {
+                "assembly_mode": "explicit",
+                "commit_policy": "explicit",
+                "auto_commit_allowed": False,
+                "collection_id": collection_id,
+            }
+        )
+        return result.model_copy(
+            update={
+                "presentation_event": event.model_copy(
+                    update={"params": params}
+                )
+            }
+        )
