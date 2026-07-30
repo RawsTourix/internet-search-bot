@@ -10,9 +10,6 @@ last_reviewed: 2026-07-30
 
 ## 1. Реализованная граница
 
-BW-P2B завершает transport-neutral explicit collection workflow поверх
-`InputCollectionRecord` и `InputBatchDraft`:
-
 ```text
 /collect
 → active InputCollectionRecord exact scope
@@ -26,32 +23,43 @@ BW-P2B завершает transport-neutral explicit collection workflow пов�
 ```
 
 Обычный AUTO input не изменён. Text-only input без active collection остаётся
-немедленным, files-first AUTO draft сохраняет прежнюю transport grouping policy.
+немедленным, files-first AUTO draft сохраняет transport grouping policy до
+возможного `/collect` promotion.
 
 ## 2. Persisted explicit grouping
 
-Public/domain policy остаётся явной:
+Public/domain policy:
 
 ```text
 assembly_mode = explicit
 commit_policy = explicit
 ```
 
-Explicit draft не получает `quiet_deadline`, `sealing_deadline` или
-`maximum_deadline`. Transport debounce и startup recovery не имеют права
-автоматически его коммитить.
+Canonical persisted marker:
 
-Текущая schema-v2 реализация использует ранее неиспользовавшийся persisted slot
-`InputGroupingMode.IMMEDIATE_TEXT` как внутренний маркер explicit collection. Это
-compatibility detail, не попадающая в public contracts. Перед release gate
-требуется structural migration на именованный persisted mode
-`EXPLICIT_COLLECTION` с чтением промежуточных records и regression test старого
-JSON.
+```text
+InputGroupingMode.EXPLICIT_COLLECTION = "explicit_collection"
+```
+
+Explicit draft не получает `quiet_deadline`, `sealing_deadline` или
+`maximum_deadline`. Transport debounce/recovery не auto-commit-ит его.
+
+Rollout-era `grouping_mode="immediate_text"` остаётся читаемым. При startup,
+inspect, send, cancel или bind reconciliation store:
+
+```text
+читает legacy draft
+→ освобождает legacy group index
+→ сохраняет тот же draft с explicit_collection
+→ создаёт canonical group index
+```
+
+Batch ID, collection ID, source events, attachment/text parts и state не меняются.
+Regression старого JSON входит в CI.
 
 ## 3. Shared ingress admission
 
-`ExplicitCollectionIngressService` перед каждым submit строит exact
-`InputDraftScope`:
+`ExplicitCollectionIngressService` строит exact scope:
 
 ```text
 session_id
@@ -62,19 +70,18 @@ optional thread_id
 principal_id
 ```
 
-Если scope имеет active collection в состоянии `COLLECTING`, service:
+При active `COLLECTING` collection service:
 
-1. очищает возможный client-supplied server metadata key;
-2. добавляет authoritative collection ID только после server-side lookup;
-3. маршрутизирует event в explicit grouping key;
-4. после reservation связывает collection с exact `input_batch_id`;
-5. при failure переводит collection в terminal `FAILED`.
+1. удаляет client-supplied server metadata key;
+2. добавляет authoritative collection ID после server-side lookup;
+3. маршрутизирует event в canonical explicit grouping key;
+4. связывает collection с exact `input_batch_id`;
+5. при failure переводит collection в `FAILED`.
 
-Первый реальный event создаёт draft. Следующие text/file/semantic events входят в
-тот же batch. Attachment events проходят обычный streaming ingestion path;
-text-only event может использовать exact append path.
+Text/file/semantic events входят в один draft. Attachment events сохраняют обычный
+streaming ingestion pipeline.
 
-Presentation params содержат transport-neutral admission signal:
+Presentation params:
 
 ```json
 {
@@ -85,32 +92,28 @@ Presentation params содержат transport-neutral admission signal:
 }
 ```
 
-Client adapter не определяет explicit mode по локальному Telegram state, filename
-или содержимому текста.
-
 ## 4. Crash-safe promotion и recovery
 
 `ExplicitInputDraftControlService`:
 
-- promotion AUTO files-first draft выполняет до сохранения idempotent action result;
-- очищает transport deadlines и переносит draft на collection grouping key;
-- восстанавливает bind после crash между draft mutation и collection bind;
-- при startup reconciles active collections до generic ingress recovery;
-- сохраняет open explicit draft только при наличии authoritative active collection;
-- orphan explicit draft переводится в `ABANDONED` с audit evidence;
-- terminal draft синхронизирует terminal state collection.
+- promotion выполняет до сохранения idempotent action result;
+- очищает transport deadlines;
+- восстанавливает bind после crash;
+- reconciles active collections до generic recovery;
+- сохраняет open explicit draft только при authoritative active collection;
+- orphan draft переводит в `ABANDONED`;
+- terminal draft синхронизирует terminal collection state;
+- legacy explicit marker переписывает в canonical mode.
 
-Explicit draft принимает только commit reason:
+Explicit draft принимает только:
 
 ```text
-explicit_collection_commit
+commit_reason = explicit_collection_commit
 ```
 
-Transport commit reason получает conflict и не публикует batch.
+Transport commit reason получает conflict.
 
 ## 5. Authenticated HTTP control API
-
-Shared Gateway router:
 
 ```text
 POST /internal/input-collections/start
@@ -119,21 +122,15 @@ POST /internal/input-collections/send
 POST /internal/input-collections/cancel
 ```
 
-Request scope не является authority. API key должен быть авторизован одновременно
-для:
+Request fields не предоставляют authority. API key проверяется для requested
+`client_type` и exact `client_instance_id`; start route обязан совпадать с exact
+conversation/thread. Mutations имеют idempotency key.
 
-- requested `client_type`;
-- exact `client_instance_id` либо разрешённого wildcard;
-- response route того же conversation/thread для `start`.
-
-Mutating actions используют explicit idempotency key. Domain conflicts возвращают
-409, missing objects — 404, storage/integrity failures — 503.
-
-`/send` выполняет durable commit, но не запускает AgentCycle внутри control route.
+`/send` durable-коммитит batch, но не запускает AgentCycle внутри control route.
 
 ## 6. Telegram adapter
 
-Canonical Telegram composition регистрирует с priority group `-1` только:
+Регистрируются только:
 
 ```text
 /collect
@@ -141,61 +138,39 @@ Canonical Telegram composition регистрирует с priority group `-1` �
 /cancel
 ```
 
-`/batch` и `/done` не поддерживаются: одинаковая функция не получает второе имя
-без отдельной пользовательской семантики.
+`/batch` и `/done` отсутствуют. После handler применяется
+`ApplicationHandlerStop`, поэтому command text не становится `InputBatch.text_parts`.
 
-После command handler выбрасывает `ApplicationHandlerStop`, поэтому legacy generic
-command bridge не превращает command text в `InputBatch.text_parts`.
+Adapter:
 
-`ExplicitCollectionTelegramGatewayClient`:
+- вызывает shared controls с exact bot/chat/thread/principal scope;
+- принимает explicit state только из authoritative presentation params;
+- подавляет прежний transport `commit_and_run`;
+- `/send` после durable commit отдельно вызывает `run_committed`;
+- `/cancel` не запускает agent.
 
-- вызывает shared HTTP controls с exact bot instance/chat/thread/principal scope;
-- запоминает explicit batch только по authoritative presentation params;
-- перехватывает прежний transport `commit_and_run` и возвращает
-  `input_collection_pending` без commit/run;
-- `/send` durable-коммитит collection, затем command handler отдельно вызывает
-  `run_committed`;
-- `/cancel` очищает local grouping handle и не запускает agent;
-- команды и статусы локализованы для RU/EN.
+## 7. Validation
 
-## 7. Validation evidence
-
-BW-P2B + BW-P3 CI head `a9e82a3c5bcef2b1d694d19642200605f0726356`:
+Итоговый CI head `c67e822a771a4a90de4bc25295ebd8a29717267d`:
 
 ```text
 compile: success
-artifact suite: 219 tests, OK
-storage suite: success
-plans suite: success
-planning suite: success
-API suite: success
+artifact suite: 224 tests, OK
+storage suite: 41 tests, OK
+plans suite: 45 tests, OK
+planning suite: 19 tests, OK
+API suite: 1 test, OK
 ```
 
-Focused regressions покрывают:
+Покрыты explicit text/files/mixed flows, promotion, recovery, spoof resistance,
+HTTP authority, Telegram command isolation, canonical command set и legacy
+`immediate_text → explicit_collection` rewrite.
 
-- text-only, files-only и mixed explicit collection;
-- promotion files-first AUTO draft;
-- отсутствие quiet/deadline semantics;
-- transport auto-commit rejection;
-- startup preservation и orphan abandonment;
-- client spoofing server-owned collection metadata;
-- HTTP transport/client-instance authority;
-- Telegram suppression преждевременного commit/run;
-- единственные команды `/collect`, `/send`, `/cancel`;
-- `/send → durable commit → explicit run`;
-- command isolation через `ApplicationHandlerStop`.
+Live Telegram gate остаётся maintainer acceptance step.
 
-Live Telegram gate для команд ещё не выполнен и остаётся частью BW-P5.
+## 8. Дальнейшая граница
 
-## 8. Следующая граница
+Presentation relocation и scoped artifact activation реализованы в BW-P3/BW-P4.
+`CycleInbox` остаётся следующему `v0.4-input-runtime`.
 
-BW-P3 presentation generations и safe relocation реализован отдельно в
-[`presentation-and-controls.md`](presentation-and-controls.md).
-
-Следующий feature slice:
-
-```text
-BW-P4 — artifact access scopes and explicit history activation
-```
-
-`CycleInbox` остаётся границей следующего `v0.4-input-runtime`.
+Новых `.env` или `mcp.config` keys control plane и migration не добавляют.
