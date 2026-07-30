@@ -1,4 +1,4 @@
-"""Telegram client for shared explicit InputBatch collection controls."""
+"""Telegram client for explicit InputBatch controls and presentation relocation."""
 
 from __future__ import annotations
 
@@ -162,6 +162,64 @@ class ExplicitCollectionTelegramGatewayClient(
             async with self._explicit_batch_lock:
                 self._explicit_batches.pop(batch_id, None)
             await self._close_group_for_batch(batch_id)
+        return payload
+
+    async def relocate_input_presentation(
+        self,
+        presentation_ref: dict[str, Any],
+        *,
+        session_id: str,
+        client_message_id: str,
+    ) -> dict[str, Any]:
+        presentation_id = str(presentation_ref.get("presentation_id") or "").strip()
+        token = str(presentation_ref.get("presentation_token") or "").strip()
+        generation = int(presentation_ref.get("presentation_generation") or 0)
+        if not presentation_id or not token or generation < 1:
+            raise RuntimeError("Presentation relocation reference is incomplete")
+        async with self._client(read_timeout=30.0) as client:
+            response = await client.post(
+                f"{self.gateway_url}/internal/input-presentations/"
+                f"{presentation_id}/relocate",
+                json={
+                    "session_id": session_id,
+                    "presentation_token": token,
+                    "client_message_id": str(client_message_id),
+                    "expected_generation": generation,
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Gateway presentation relocation response is invalid")
+        return payload
+
+    async def record_input_presentation_deletion(
+        self,
+        presentation_ref: dict[str, Any],
+        *,
+        session_id: str,
+        generation: int,
+        deletion_state: str,
+    ) -> dict[str, Any]:
+        presentation_id = str(presentation_ref.get("presentation_id") or "").strip()
+        token = str(presentation_ref.get("presentation_token") or "").strip()
+        if not presentation_id or not token:
+            raise RuntimeError("Presentation deletion receipt reference is incomplete")
+        async with self._client(read_timeout=30.0) as client:
+            response = await client.post(
+                f"{self.gateway_url}/internal/input-presentations/"
+                f"{presentation_id}/superseded-deletion",
+                json={
+                    "session_id": session_id,
+                    "presentation_token": token,
+                    "generation": int(generation),
+                    "deletion_state": str(deletion_state),
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+        if not isinstance(payload, dict):
+            raise RuntimeError("Gateway presentation deletion response is invalid")
         return payload
 
     async def _collection_control(
