@@ -8,13 +8,13 @@ from .artifact_composite_recovery import ArtifactCompositeRecoveryMixin
 from .artifact_delivery_client import ArtifactDeliveryMixin
 from .artifact_delivery_progress import ArtifactDeliveryProgressMixin
 from .artifact_history_isolation import ArtifactHistoryIsolationMixin
-from .fresh_task_boundary import FreshTaskBoundaryMixin
 from .llm_response_recovery import LLMResponseRecoveryMixin
 from .planning_runtime import FinalizingPlanningMCPClient
+from .waiting_user_batch_continuation import WaitingUserBatchContinuationMixin
 
 
 class FinalizingArtifactDeliveryPlanningMCPClient(
-    FreshTaskBoundaryMixin,
+    WaitingUserBatchContinuationMixin,
     LLMResponseRecoveryMixin,
     ArtifactCompositeBudgetMixin,
     ArtifactCompositeRecoveryMixin,
@@ -26,4 +26,4 @@ class FinalizingArtifactDeliveryPlanningMCPClient(
     ArtifactAccessScopeMixin,
     FinalizingPlanningMCPClient,
 ):
-    """Production agent client with explicit scoped artifact history access."""
+    """Production agent client with scoped history and paused-cycle continuation."""
