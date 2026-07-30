@@ -43,18 +43,20 @@ last_reviewed: 2026-07-30
 | `BW-13` | [`shutdown-and-execution.md`](shutdown-and-execution.md) |
 | `BW-14` | [`progress-events.md`](progress-events.md) |
 | `BW-15` | [`draft-control-foundation.md`](draft-control-foundation.md) |
+| `BW-16` | [`explicit-control-plane.md`](explicit-control-plane.md) |
 
 ## Порядок чтения
 
 1. [`input-assembly.md`](input-assembly.md)
 2. [`draft-control-foundation.md`](draft-control-foundation.md)
-3. [`forwarded-sequencing-hardening.md`](forwarded-sequencing-hardening.md)
-4. [`presentation-and-controls.md`](presentation-and-controls.md)
-5. [`progress-events.md`](progress-events.md)
-6. [`output-grouping.md`](output-grouping.md)
-7. [`artifact-access.md`](artifact-access.md)
-8. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
-9. [`shutdown-and-execution.md`](shutdown-and-execution.md)
+3. [`explicit-control-plane.md`](explicit-control-plane.md)
+4. [`forwarded-sequencing-hardening.md`](forwarded-sequencing-hardening.md)
+5. [`presentation-and-controls.md`](presentation-and-controls.md)
+6. [`progress-events.md`](progress-events.md)
+7. [`output-grouping.md`](output-grouping.md)
+8. [`artifact-access.md`](artifact-access.md)
+9. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
+10. [`shutdown-and-execution.md`](shutdown-and-execution.md)
 
 ## Главные инварианты
 
@@ -99,6 +101,10 @@ last_reviewed: 2026-07-30
 18. Progress `message` обязан соответствовать scope aggregate operation.
     Structured `data` хранит полный перечень, а человекочитаемая строка использует
     cardinality-aware bounded projection.
+19. Active explicit collection определяется server-side exact scope lookup.
+    Client-supplied collection metadata очищается и не предоставляет authority.
+20. Explicit draft не получает transport quiet/deadline semantics и не может быть
+    автоматически committed transport/recovery path.
 
 ## Положение в архитектуре
 
@@ -133,10 +139,12 @@ v0.4-input-runtime
 
 - durable `InputCollectionRecord` для пустого explicit mode;
 - exact `InputDraftScope` и persisted explicit commit policy;
-- `InputDraftControlService`;
-- `/collect`, `/send`, `/cancel` и aliases;
+- `InputDraftControlService` и crash-safe reconciliation;
+- shared authenticated HTTP control routes;
+- `/collect`, `/send`, `/cancel` и aliases `/batch`, `/done`;
 - один active explicit collection на exact scope;
-- text-only/files-only/mixed explicit commit.
+- text-only/files-only/mixed explicit commit;
+- запрет transport auto-commit и отдельный `/send → commit → run` boundary.
 
 ### BW-P3. Presentation relocation
 
@@ -155,6 +163,8 @@ v0.4-input-runtime
 ### BW-P5. Integration and release gate
 
 - recovery/migration;
+- structural migration interim explicit grouping marker на именованный persisted
+  `EXPLICIT_COLLECTION`;
 - full Windows suite;
 - Telegram live scenarios;
 - multi-client contract tests;
@@ -190,22 +200,48 @@ v0.4-input-runtime
 - active collection и cached action result переживают process restart;
 - terminal collection освобождает exact scope для следующего пакета.
 
-Validation evidence на 2026-07-30:
+`BW-P2B` control plane реализован и покрыт CI:
+
+- active collection принимает новые text/file/semantic events через shared ingress;
+- server-owned collection metadata нельзя подделать client payload;
+- AUTO files-first draft promotion очищает transport deadlines;
+- startup сохраняет authoritative explicit draft и abandon-ит orphan draft;
+- explicit draft принимает только `explicit_collection_commit`;
+- authenticated HTTP routes проверяют transport и exact client instance authority;
+- Telegram поддерживает `/collect`, `/batch`, `/send`, `/done`, `/cancel`;
+- command text не становится `InputBatch.text_parts`;
+- adapter suppresses прежний transport auto-commit;
+- `/send` durable-коммитит batch и только затем отдельно запускает AgentCycle.
+
+Validation evidence на CI head `4fef809546a64c20b19308cada110b285d5a1a17`:
 
 ```text
-full local Windows suite: 622 tests, OK (skipped=4)
-thematic artifact suite: 195 tests, OK
+compile: success
+artifact suite: 210 tests, OK
 storage suite: 41 tests, OK
 plans suite: 45 tests, OK
 planning suite: 19 tests, OK
-API suite: OK
-compile: OK
+API suite: 1 test, OK
 ```
 
-Следующий основной slice — dedicated explicit grouping mode, shared HTTP control
-routes и Telegram wiring `/collect`, `/send`, `/cancel`, после чего active
-explicit collection начнёт принимать новые transport events без transport quiet
-или recovery semantics media groups.
+Последняя предоставленная полная локальная Windows suite до BW-P2B:
+
+```text
+622 tests, OK (skipped=4)
+```
+
+Для BW-P2B ещё требуется новый полный Windows run и live Telegram gate команд.
+
+Текущая schema-v2 реализация использует ранее неиспользовавшийся persisted slot
+`InputGroupingMode.IMMEDIATE_TEXT` как внутренний explicit marker. Public policy
+остаётся `assembly_mode=explicit`/`commit_policy=explicit`; именованная structural
+migration остаётся частью BW-P5, а не скрывается как уже выполненная.
+
+Следующий основной feature slice:
+
+```text
+BW-P3 — presentation generations and safe relocation
+```
 
 Новый параметр forwarded sequencing slice:
 
@@ -213,7 +249,7 @@ explicit collection начнёт принимать новые transport events 
 TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
 ```
 
-Он добавлен в `.env.example`; в `mcp.config` новых keys нет. BW-P2A и progress
-projection не добавляют новых параметров. Любой следующий параметр `.env` или
-`mcp.config` обязан в том же patch обновлять соответствующий `.example`; release
-notes отдельно перечисляют новые keys и defaults.
+Он добавлен в `.env.example`; в `mcp.config` новых keys нет. BW-P2A, BW-P2B и
+progress projection не добавляют новых параметров. Любой следующий параметр
+`.env` или `mcp.config` обязан в том же patch обновлять соответствующий `.example`;
+release notes отдельно перечисляют новые keys и defaults.
