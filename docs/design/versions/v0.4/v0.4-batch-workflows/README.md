@@ -186,13 +186,15 @@ v0.4-input-runtime
 - files-only explicit commit разрешён;
 - in-flight `/send` сохраняет `commit_requested`;
 - exact cancel не затрагивает соседние scopes;
-- action idempotency key нельзя переиспользовать с другим action/scope.
+- action idempotency key нельзя переиспользовать с другим action/scope;
+- active collection и cached action result переживают process restart;
+- terminal collection освобождает exact scope для следующего пакета.
 
 Validation evidence на 2026-07-30:
 
 ```text
 full local Windows suite: 622 tests, OK (skipped=4)
-thematic artifact suite: 193 tests, OK
+thematic artifact suite: 195 tests, OK
 storage suite: 41 tests, OK
 plans suite: 45 tests, OK
 planning suite: 19 tests, OK
@@ -200,9 +202,10 @@ API suite: OK
 compile: OK
 ```
 
-Следующий основной slice — shared HTTP control routes и Telegram wiring
-`/collect`, `/send`, `/cancel`, после чего active explicit collection начнёт
-принимать новые transport events.
+Следующий основной slice — dedicated explicit grouping mode, shared HTTP control
+routes и Telegram wiring `/collect`, `/send`, `/cancel`, после чего active
+explicit collection начнёт принимать новые transport events без transport quiet
+или recovery semantics media groups.
 
 Новый параметр forwarded sequencing slice:
 
