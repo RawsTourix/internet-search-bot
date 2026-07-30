@@ -74,9 +74,8 @@ class RunProgressOverlayTests(unittest.IsolatedAsyncioTestCase):
             "original-user-message",
         )
 
-    async def test_telegram_run_request_carries_exact_processing_status(self):
-        captured: list[httpx.Request] = []
-
+    @staticmethod
+    def _bridge(captured: list[httpx.Request], *, maximum: int = 2048):
         async def handler(request: httpx.Request) -> httpx.Response:
             captured.append(request)
             return httpx.Response(
@@ -89,12 +88,17 @@ class RunProgressOverlayTests(unittest.IsolatedAsyncioTestCase):
                 },
             )
 
-        bridge = RunScopedProgressTelegramGatewayClient(
+        return RunScopedProgressTelegramGatewayClient(
             gateway_url="http://gateway",
             api_key="telegram-key",
             client_instance_id="bot-1",
+            maximum_pending_run_presentations=maximum,
             transport=httpx.MockTransport(handler),
         )
+
+    async def test_telegram_run_request_carries_exact_processing_status(self):
+        captured: list[httpx.Request] = []
+        bridge = self._bridge(captured)
         progress_metadata = {
             "progress_callback_url": "http://telegram/internal/progress",
             "progress_target": {"chat_id": 1, "message_id": 200},
@@ -119,6 +123,123 @@ class RunProgressOverlayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["session_id"], "telegram:conversation:chat-1")
         self.assertEqual(body["progress_locale"], "ru")
         self.assertEqual(body["progress_metadata"], progress_metadata)
+
+    async def test_auto_status_is_consumed_once_by_exact_committed_run(self):
+        captured: list[httpx.Request] = []
+        bridge = self._bridge(captured)
+        batch_id = "ibat_" + "3" * 32
+        remembered = {
+            "progress_callback_url": "http://telegram/internal/progress",
+            "progress_target": {"chat_id": 1, "message_id": 300},
+            "status_message_id": 300,
+        }
+        await bridge.remember_run_presentation(
+            batch_id,
+            progress_metadata=remembered,
+        )
+
+        await bridge.run_committed(
+            batch_id,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+        )
+        await bridge.run_committed(
+            batch_id,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+        )
+
+        first = json.loads(captured[0].content)
+        second = json.loads(captured[1].content)
+        self.assertEqual(first["progress_metadata"], remembered)
+        self.assertEqual(second["progress_metadata"], {})
+
+    async def test_explicit_run_metadata_overrides_and_consumes_remembered_status(self):
+        captured: list[httpx.Request] = []
+        bridge = self._bridge(captured)
+        batch_id = "ibat_" + "4" * 32
+        await bridge.remember_run_presentation(
+            batch_id,
+            progress_metadata={
+                "progress_callback_url": "http://telegram/internal/progress",
+                "progress_target": {"chat_id": 1, "message_id": 400},
+            },
+        )
+        explicit = {
+            "progress_callback_url": "http://telegram/internal/progress",
+            "progress_target": {"chat_id": 1, "message_id": 401},
+        }
+
+        await bridge.run_committed(
+            batch_id,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+            progress_metadata=explicit,
+        )
+        await bridge.run_committed(
+            batch_id,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+        )
+
+        first = json.loads(captured[0].content)
+        second = json.loads(captured[1].content)
+        self.assertEqual(first["progress_metadata"], explicit)
+        self.assertEqual(second["progress_metadata"], {})
+
+    async def test_pending_auto_bindings_are_bounded(self):
+        captured: list[httpx.Request] = []
+        bridge = self._bridge(captured, maximum=2)
+        metadata = lambda message_id: {
+            "progress_callback_url": "http://telegram/internal/progress",
+            "progress_target": {"chat_id": 1, "message_id": message_id},
+        }
+        first = "ibat_" + "5" * 32
+        second = "ibat_" + "6" * 32
+        third = "ibat_" + "7" * 32
+        await bridge.remember_run_presentation(
+            first,
+            progress_metadata=metadata(500),
+        )
+        await bridge.remember_run_presentation(
+            second,
+            progress_metadata=metadata(600),
+        )
+        await bridge.remember_run_presentation(
+            third,
+            progress_metadata=metadata(700),
+        )
+
+        await bridge.run_committed(
+            first,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+        )
+        await bridge.run_committed(
+            second,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+        )
+        await bridge.run_committed(
+            third,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+        )
+
+        bodies = [json.loads(request.content) for request in captured]
+        self.assertEqual(bodies[0]["progress_metadata"], {})
+        self.assertEqual(
+            bodies[1]["progress_metadata"]["progress_target"]["message_id"],
+            600,
+        )
+        self.assertEqual(
+            bodies[2]["progress_metadata"]["progress_target"]["message_id"],
+            700,
+        )
+
+    def test_pending_run_presentation_limit_must_be_positive(self):
+        with self.assertRaises(ValueError):
+            self._bridge([], maximum=0)
 
 
 if __name__ == "__main__":
