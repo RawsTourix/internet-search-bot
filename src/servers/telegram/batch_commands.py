@@ -74,21 +74,18 @@ async def _finalize_collection_snapshot(
         chat_id=update.effective_chat.id,
         message_id=message_id,
     )
-    text = server._localized(
-        message_key,
-        locale=locale,
-        **_counts(payload),
-    )
     try:
         await server.edit_telegram_message_with_retries(
             chat_id=update.effective_chat.id,
             message_id=message_id,
-            text=text,
+            text=server._localized(
+                message_key,
+                locale=locale,
+                **_counts(payload),
+            ),
             parse_mode=None,
         )
     except Exception as error:
-        # The collection snapshot is historical presentation only. Failure to
-        # terminalize it must not block the already-authoritative commit/cancel.
         server.logger.warning(
             "telegram_collection_snapshot_terminalize_failed "
             "message_id=%s error_type=%s",
@@ -121,13 +118,12 @@ async def _finalize_delivered_run_status(
     )
     if not output_batch_id or not callable(take_state):
         return
-    terminal_state = await take_state(output_batch_id)
-    if terminal_state != "delivered":
+    if await take_state(output_batch_id) != "delivered":
         return
     await server.finish_status_or_send_reply(
         update=update,
         status_message=status_message,
-        text=progress_text("cycle_done", locale),
+        text=progress_text("cycle_done", locale_name=locale),
         delivery_mode="edit_status",
     )
 
@@ -197,81 +193,77 @@ async def _handle_input_collection_command(
             )
             return
 
-        if command == _SEND_COMMAND:
-            payload = await server.artifact_gateway.send_collection(
-                **common,
-                idempotency_key=_idempotency_key(update, "send"),
-            )
-            control_status = str(payload.get("status") or "")
-            if control_status != "committed":
-                key = {
-                    "empty": "input_collection.empty",
-                    "commit_requested": "input_collection.commit_requested",
-                    "not_found": "input_collection.not_found",
-                    "conflict": "input_collection.conflict",
-                    "failed": "input_collection.failed",
-                }.get(control_status, "input_collection.failed")
-                await server.finish_status_or_send_reply(
-                    update=update,
-                    status_message=status_message,
-                    text=server._localized(key, locale=locale, **_counts(payload)),
-                    delivery_mode="edit_status",
-                )
-                return
+        if command != _SEND_COMMAND:
+            raise RuntimeError(f"Unsupported input collection command: {command}")
 
-            batch_id = str(payload.get("input_batch_id") or "").strip()
-            if not batch_id:
-                raise RuntimeError("Committed collection returned no input batch ID")
-            if payload.get("duplicate"):
-                await server.finish_status_or_send_reply(
-                    update=update,
-                    status_message=status_message,
-                    text=server._localized(
-                        "input_collection.already_sent",
-                        locale=locale,
-                    ),
-                    delivery_mode="edit_status",
-                )
-                return
-
-            # Collection and execution have separate public presentations. The
-            # former remains as a durable package summary; the latter was just
-            # created below /send and is the only target for AgentCycle progress.
-            await _finalize_collection_snapshot(
-                update=update,
-                payload=payload,
-                locale=locale,
-                message_key="input_collection.committed_summary",
-            )
-            run_payload = await server.artifact_gateway.run_committed(
-                batch_id,
-                session_id=session_id,
-                progress_locale=locale,
-                progress_metadata=server._progress_metadata(
-                    update,
-                    status_message,
-                    request_id=batch_id,
-                ),
-            )
-            metadata = dict(run_payload.get("metadata") or {})
-            metadata.setdefault("progress_locale", locale)
-            await server._deliver_agent_result(
+        payload = await server.artifact_gateway.send_collection(
+            **common,
+            idempotency_key=_idempotency_key(update, "send"),
+        )
+        control_status = str(payload.get("status") or "")
+        if control_status != "committed":
+            key = {
+                "empty": "input_collection.empty",
+                "commit_requested": "input_collection.commit_requested",
+                "not_found": "input_collection.not_found",
+                "conflict": "input_collection.conflict",
+                "failed": "input_collection.failed",
+            }.get(control_status, "input_collection.failed")
+            await server.finish_status_or_send_reply(
                 update=update,
                 status_message=status_message,
-                success=True,
-                message=str(run_payload.get("response") or ""),
-                metadata=metadata,
-                session_id=session_id,
-            )
-            await _finalize_delivered_run_status(
-                update=update,
-                status_message=status_message,
-                metadata=metadata,
-                locale=locale,
+                text=server._localized(key, locale=locale, **_counts(payload)),
+                delivery_mode="edit_status",
             )
             return
 
-        raise RuntimeError(f"Unsupported input collection command: {command}")
+        batch_id = str(payload.get("input_batch_id") or "").strip()
+        if not batch_id:
+            raise RuntimeError("Committed collection returned no input batch ID")
+        if payload.get("duplicate"):
+            await server.finish_status_or_send_reply(
+                update=update,
+                status_message=status_message,
+                text=server._localized(
+                    "input_collection.already_sent",
+                    locale=locale,
+                ),
+                delivery_mode="edit_status",
+            )
+            return
+
+        await _finalize_collection_snapshot(
+            update=update,
+            payload=payload,
+            locale=locale,
+            message_key="input_collection.committed_summary",
+        )
+        run_payload = await server.artifact_gateway.run_committed(
+            batch_id,
+            session_id=session_id,
+            progress_locale=locale,
+            progress_metadata=server._progress_metadata(
+                update,
+                status_message,
+                request_id=batch_id,
+            ),
+        )
+        metadata = dict(run_payload.get("metadata") or {})
+        metadata.setdefault("progress_locale", locale)
+        await server._deliver_agent_result(
+            update=update,
+            status_message=status_message,
+            success=True,
+            message=str(run_payload.get("response") or ""),
+            metadata=metadata,
+            session_id=session_id,
+        )
+        await _finalize_delivered_run_status(
+            update=update,
+            status_message=status_message,
+            metadata=metadata,
+            locale=locale,
+        )
     except Exception as error:
         server.logger.exception(
             "Telegram input collection command failed command=%s error=%r",
