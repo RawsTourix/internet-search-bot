@@ -21,6 +21,32 @@ class ResilientFileSystemCoordinatedInputBatchStore(
 ):
     """Keep terminal drafts immutable and isolate their grouping keys."""
 
+    async def cancel_draft(
+        self,
+        input_batch_id: str,
+        *,
+        code: str = "explicit_collection_cancelled",
+    ) -> InputBatchDraft:
+        return await asyncio.to_thread(
+            self._transition_draft_sync,
+            input_batch_id,
+            InputBatchDraftState.CANCELLED,
+            code,
+        )
+
+    async def abandon_draft(
+        self,
+        input_batch_id: str,
+        *,
+        code: str = "explicit_collection_timeout",
+    ) -> InputBatchDraft:
+        return await asyncio.to_thread(
+            self._transition_draft_sync,
+            input_batch_id,
+            InputBatchDraftState.ABANDONED,
+            code,
+        )
+
     async def cancel_open_drafts(
         self,
         *,
@@ -150,6 +176,44 @@ class ResilientFileSystemCoordinatedInputBatchStore(
             # member of the same media_group_id receives the same failed batch.
             return super()._fail_sync(input_batch_id, code, slot_id)
 
+    def _transition_draft_sync(
+        self,
+        input_batch_id: str,
+        state: InputBatchDraftState,
+        code: str,
+    ) -> InputBatchDraft:
+        if state not in {
+            InputBatchDraftState.CANCELLED,
+            InputBatchDraftState.ABANDONED,
+        }:
+            raise ValueError("Unsupported terminal transition for input draft")
+        with self._lock:
+            current = self._load_draft_sync(input_batch_id)
+            if current.state == InputBatchDraftState.COMMITTED:
+                return current
+            if current.state in _TERMINAL_UNCOMMITTED_STATES:
+                if current.state == state:
+                    return current
+                raise IngressConflictError(
+                    f"Input batch in {current.state.value!r} state is terminal"
+                )
+            updated = current.model_copy(
+                update={
+                    "state": state,
+                    "failure_code": code,
+                    "updated_at": utc_now(),
+                }
+            )
+            updated = InputBatchDraft.model_validate(
+                updated.model_dump(mode="python")
+            )
+            self._write_json(
+                self.root / updated.input_batch_id / "draft.json",
+                updated.model_dump(mode="json"),
+            )
+            self._release_group_index_sync(updated)
+            return updated
+
     def _transition_open_drafts_sync(
         self,
         session_id: str | None,
@@ -168,20 +232,10 @@ class ResilientFileSystemCoordinatedInputBatchStore(
                 current = self._load_draft_sync(draft.input_batch_id)
                 if current.state not in _OPEN_STATES:
                     continue
-                updated = current.model_copy(
-                    update={
-                        "state": state,
-                        "failure_code": code,
-                        "updated_at": utc_now(),
-                    }
+                updated = self._transition_draft_sync(
+                    current.input_batch_id,
+                    state,
+                    code,
                 )
-                updated = InputBatchDraft.model_validate(
-                    updated.model_dump(mode="python")
-                )
-                self._write_json(
-                    self.root / updated.input_batch_id / "draft.json",
-                    updated.model_dump(mode="json"),
-                )
-                self._release_group_index_sync(updated)
                 transitioned.append(updated)
             return transitioned
