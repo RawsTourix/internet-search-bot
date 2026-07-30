@@ -155,7 +155,7 @@ class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
         with patches[0], patches[1], patches[2], patches[3], \
                 patches[4] as finish, patches[5], patches[6], patches[7]:
             await batch_commands._handle_input_collection_command(
-                self._update("/done", update_id=102, message_id=202),
+                self._update("/send", update_id=102, message_id=202),
                 None,
             )
 
