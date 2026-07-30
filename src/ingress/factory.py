@@ -11,7 +11,9 @@ from ..interaction.config import InteractionConfig
 from ..interaction.presentation_service import InputPresentationCoordinator
 from ..interaction.presentation_store import FileSystemInputPresentationStore
 from ..localization.service import LocalizationService
+from .collection_store import FileSystemInputCollectionStore
 from .config import IngressConfigType
+from .draft_control import InputDraftControlService
 from .resilient_service import ResilientUnifiedArtifactIngressService
 from .resilient_store import ResilientFileSystemCoordinatedInputBatchStore
 from .service import ArtifactIngressService
@@ -24,6 +26,8 @@ class IngressServices:
     event_store: FileSystemIngressEventStore
     batch_store: FileSystemInputBatchStore
     ingress_service: ArtifactIngressService
+    collection_store: FileSystemInputCollectionStore | None = None
+    draft_control_service: InputDraftControlService | None = None
     capability_store: FileSystemCapabilitySnapshotStore | None = None
     presentation_store: FileSystemInputPresentationStore | None = None
     localization_service: LocalizationService | None = None
@@ -42,6 +46,12 @@ def create_ingress_services(
     batch_store = ResilientFileSystemCoordinatedInputBatchStore(
         storage_config,
         ingress_config,
+    )
+    collection_store = FileSystemInputCollectionStore(storage_config)
+    draft_control_service = InputDraftControlService(
+        event_store=event_store,
+        batch_store=batch_store,
+        collection_store=collection_store,
     )
     registry = build_default_capability_registry(
         interaction.client_capabilities.contract_version
@@ -90,6 +100,8 @@ def create_ingress_services(
         event_store=event_store,
         batch_store=batch_store,
         ingress_service=ingress_service,
+        collection_store=collection_store,
+        draft_control_service=draft_control_service,
         capability_store=capability_store,
         presentation_store=presentation_store,
         localization_service=localization_service,
