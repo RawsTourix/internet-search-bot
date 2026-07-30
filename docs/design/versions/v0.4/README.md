@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-07-29
+last_reviewed: 2026-07-30
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -25,44 +25,46 @@ last_reviewed: 2026-07-29
 | 4 | [`v0.4-dag-planning`](v0.4-dag-planning.md) | implemented | Optional runtime-owned DAG без scheduler |
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25`/`AF-26` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
-| 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | partial | AUTO/EXPLICIT InputBatch assembly, presentation relocation, output grouping и artifact access scopes |
+| 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented; acceptance pending | AUTO/EXPLICIT assembly, canonical controls, presentation generations, output grouping и scoped artifact history |
 | 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
 
 `AF-24` порядка `grouping → durable InputBatchDraft → streaming` реализован и
 подтверждён live Telegram workflow.
 
-Robustness tests выявили два follow-up hardening-этапа:
+Robustness tests выявили follow-up hardening:
 
 - `AF-25`: terminal failure, failed-group tombstone, `/reset` и automatic
-  process-restart reconciliation для open drafts;
-- `AF-26`: exact active-album sequencing до Gateway, native document-group
-  diagnostics/retry, legacy READY authority cleanup, terminal status fallback и
-  базовый prompt contract для явного artifact format.
+  process-restart reconciliation;
+- `AF-26`: exact active-album sequencing, native document-group delivery,
+  READY authority cleanup, terminal status fallback и явный artifact format.
 
-Кодовые patches и automatic regression suites завершены успешно:
-
-- runtime storage/integrity failure переводит draft в `FAILED`;
-- ready drafts после restart commit-ятся без agent run, остальные становятся
-  `ABANDONED` до приёма новых запросов;
-- text при заблокированном file HTTP request получает exact album group key;
-- два active albums дают explicit ambiguity вместо guessing;
-- document group проверяется через streaming, bounded eager retry и safe fallback;
-- legacy sentinel READY становится `CANCELLED`, valid READY сохраняет authority;
-- terminal send timeout обновляет exact status message;
-- runtime не определяет `format_id` по расширению.
-
-`v0.4-batch-workflows` выделен отдельным update, чтобы не смешивать client-facing
-сборку logical input с будущим active-cycle runtime. Он фиксирует:
+`v0.4-batch-workflows` реализует:
 
 - text-only AUTO input без artificial delay;
-- file-first AUTO draft и explicit commit intent для files-only workflow;
-- `/collect`, `/send`, `/cancel` через общий control service;
-- safe presentation relocation;
-- stable semantic OutputPart grouping и правильный Telegram multipart mapping;
-- bounded current artifact manifest при сохранении доступа к истории.
+- file-first AUTO draft и explicit text/files/mixed collection;
+- только `/collect`, `/send`, `/cancel`;
+- authenticated shared control plane;
+- canonical persisted `EXPLICIT_COLLECTION` с migration старых records;
+- safe presentation relocation через generations;
+- stable semantic OutputPart grouping и Telegram multipart mapping;
+- bounded current artifact manifest;
+- `artifact_list(scope=current|session|workspace)` и exact history activation.
 
-Статус является навигационным и перед release проверяется по коду и тестам.
+Thematic CI на кодовом head:
+
+```text
+compile: success
+artifact suite: 224 tests, OK
+storage suite: 41 tests, OK
+plans suite: 45 tests, OK
+planning suite: 19 tests, OK
+API suite: 1 test, OK
+```
+
+Перед закрытием acceptance остаются новый full Windows run и живые Telegram
+сценарии canonical commands/status relocation. Статус перед release всегда
+проверяется по коду, тестам и live evidence.
 
 ## Связующие документы версии
 
@@ -71,9 +73,6 @@ Robustness tests выявили два follow-up hardening-этапа:
 | [`overview.md`](overview.md) | Цель и граница v0.4 |
 | [`v0.4-unified-input-artifact-architecture.md`](v0.4-unified-input-artifact-architecture.md) | Сквозная связь ingress, input batches, artifacts и runtime |
 | [`v0.4-release-plan.md`](v0.4-release-plan.md) | Порядок реализации и общие acceptance criteria |
-
-Связующие документы не являются дополнительными релизными обновлениями и не
-меняют порядок таблицы выше.
 
 ## Зависимости обновлений
 
@@ -93,11 +92,9 @@ v0.4-storage-foundation
 
 - Для последовательного проектирования идите по реестру сверху вниз.
 - Для конкретного патча открывайте документ с тем же именем, что и обновление.
-- Для крупного update сначала открывайте README его папки.
-- `v0.4-batch-workflows` не реализует сообщения во время active cycle: он
-  завершает draft assembly и client interaction до admission.
-- `v0.4-runtime-modularization` не добавляет новый product feature: он сохраняет
-  принятые contracts и меняет ownership/границы реализации.
+- `v0.4-batch-workflows` заканчивается до active-cycle additions.
+- `v0.4-input-runtime` отвечает за `CycleInbox` и safe checkpoints.
+- `v0.4-runtime-modularization` меняет ownership, а не product semantics.
 
 PostgreSQL/RAG начинаются в [`../v0.5/README.md`](../v0.5/README.md), workers и
 distributed orchestration — в [`../v0.6/README.md`](../v0.6/README.md).
