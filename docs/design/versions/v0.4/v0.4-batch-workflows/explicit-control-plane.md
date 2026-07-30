@@ -14,10 +14,10 @@ BW-P2B завершает transport-neutral explicit collection workflow пов�
 `InputCollectionRecord` и `InputBatchDraft`:
 
 ```text
-/collect | /batch
+/collect
 → active InputCollectionRecord exact scope
 → новые transport events входят в один explicit InputBatchDraft
-→ /send | /done durable-коммитит batch
+→ /send durable-коммитит batch
 → отдельный /run запускает AgentCycle
 
 /cancel
@@ -41,12 +41,12 @@ Explicit draft не получает `quiet_deadline`, `sealing_deadline` или
 `maximum_deadline`. Transport debounce и startup recovery не имеют права
 автоматически его коммитить.
 
-Текущая schema-v2 реализация временно использует ранее зарезервированный и не
-использовавшийся persisted slot `InputGroupingMode.IMMEDIATE_TEXT` как внутренний
-маркер explicit collection. Это compatibility detail, не попадающая в public
-contracts. Перед integration/release gate требуется отдельная structural migration
-на именованный persisted mode `EXPLICIT_COLLECTION` с чтением промежуточных
-records и regression test старого JSON.
+Текущая schema-v2 реализация использует ранее неиспользовавшийся persisted slot
+`InputGroupingMode.IMMEDIATE_TEXT` как внутренний маркер explicit collection. Это
+compatibility detail, не попадающая в public contracts. Перед release gate
+требуется structural migration на именованный persisted mode
+`EXPLICIT_COLLECTION` с чтением промежуточных records и regression test старого
+JSON.
 
 ## 3. Shared ingress admission
 
@@ -85,8 +85,8 @@ Presentation params содержат transport-neutral admission signal:
 }
 ```
 
-Client adapter не определяет explicit mode по локальному Telegram state или
-filename.
+Client adapter не определяет explicit mode по локальному Telegram state, filename
+или содержимому текста.
 
 ## 4. Crash-safe promotion и recovery
 
@@ -133,13 +133,16 @@ Mutating actions используют explicit idempotency key. Domain conflicts
 
 ## 6. Telegram adapter
 
-Canonical Telegram composition регистрирует команды с priority group `-1`:
+Canonical Telegram composition регистрирует с priority group `-1` только:
 
 ```text
-/collect, /batch
-/send, /done
+/collect
+/send
 /cancel
 ```
+
+`/batch` и `/done` не поддерживаются: одинаковая функция не получает второе имя
+без отдельной пользовательской семантики.
 
 После command handler выбрасывает `ApplicationHandlerStop`, поэтому legacy generic
 command bridge не превращает command text в `InputBatch.text_parts`.
@@ -157,15 +160,15 @@ command bridge не превращает command text в `InputBatch.text_parts`
 
 ## 7. Validation evidence
 
-CI head `4fef809546a64c20b19308cada110b285d5a1a17`:
+BW-P2B + BW-P3 CI head `a9e82a3c5bcef2b1d694d19642200605f0726356`:
 
 ```text
 compile: success
-artifact suite: 210 tests, OK
-storage suite: 41 tests, OK
-plans suite: 45 tests, OK
-planning suite: 19 tests, OK
-API suite: 1 test, OK
+artifact suite: 219 tests, OK
+storage suite: success
+plans suite: success
+planning suite: success
+API suite: success
 ```
 
 Focused regressions покрывают:
@@ -178,7 +181,7 @@ Focused regressions покрывают:
 - client spoofing server-owned collection metadata;
 - HTTP transport/client-instance authority;
 - Telegram suppression преждевременного commit/run;
-- `/collect`, `/send`, `/cancel` и aliases;
+- единственные команды `/collect`, `/send`, `/cancel`;
 - `/send → durable commit → explicit run`;
 - command isolation через `ApplicationHandlerStop`.
 
@@ -186,11 +189,13 @@ Live Telegram gate для команд ещё не выполнен и оста�
 
 ## 8. Следующая граница
 
+BW-P3 presentation generations и safe relocation реализован отдельно в
+[`presentation-and-controls.md`](presentation-and-controls.md).
+
 Следующий feature slice:
 
 ```text
-BW-P3 — presentation generations and safe relocation
+BW-P4 — artifact access scopes and explicit history activation
 ```
 
-BW-P2B не реализует relocation status message, artifact access scopes или
-`CycleInbox`.
+`CycleInbox` остаётся границей следующего `v0.4-input-runtime`.
