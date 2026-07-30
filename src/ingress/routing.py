@@ -150,12 +150,18 @@ def resolve_input_grouping(
             raise InputGroupingAmbiguityError(
                 "Explicit collection matches multiple open input drafts."
             )
+        # Exact joins bypass the streaming path and therefore are only valid for
+        # events without attachment slots. Attachment events reuse the exact
+        # group key through create_for_event(), then continue through ingestion.
+        joined_input_batch_id = (
+            candidates[0].input_batch_id
+            if candidates and not envelope.attachment_slots
+            else None
+        )
         return InputGroupingDecision(
             mode=EXPLICIT_COLLECTION_GROUPING_MODE,
             key=collection_id,
-            joined_input_batch_id=(
-                candidates[0].input_batch_id if candidates else None
-            ),
+            joined_input_batch_id=joined_input_batch_id,
         )
 
     if envelope.client_type == ClientType.TELEGRAM and envelope.attachment_slots:
