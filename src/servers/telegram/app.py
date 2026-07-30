@@ -24,6 +24,7 @@ from .config import (
     TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
 )
+from .presentation_relocation import apply_relocating_input_ack_policy
 from .ready_outbox import TelegramReadyOutboxWorker
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 
@@ -82,6 +83,29 @@ def _route_forwarded_text_through_text_handler() -> None:
 
 
 _route_forwarded_text_through_text_handler()
+
+
+# Preserve the original transport-neutral acknowledgement executor across test
+# re-imports. The wrapper only intercepts the explicit RELOCATE policy.
+_base_apply_input_ack_policy = getattr(
+    server,
+    "_v04_base_apply_input_ack_policy",
+    server.apply_input_ack_policy,
+)
+server._v04_base_apply_input_ack_policy = _base_apply_input_ack_policy
+
+
+async def _apply_input_ack_policy(*, update, submission, session_id):
+    return await apply_relocating_input_ack_policy(
+        base_apply=_base_apply_input_ack_policy,
+        server=server,
+        update=update,
+        submission=submission,
+        session_id=session_id,
+    )
+
+
+server.apply_input_ack_policy = _apply_input_ack_policy
 
 
 ready_outbox_worker = TelegramReadyOutboxWorker(
