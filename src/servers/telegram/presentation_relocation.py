@@ -85,6 +85,17 @@ async def apply_relocating_input_ack_policy(
             )
         return SimpleNamespace(message_id=old_message_id_int)
 
+    # Immutable committed batches may still contain an older progress target.
+    # Redirect it before deleting the superseded handle, so every future event
+    # reaches the new writable generation instead of raising "message not found".
+    register_redirect = getattr(server, "register_progress_redirect", None)
+    if callable(register_redirect):
+        register_redirect(
+            chat_id=int(update.effective_chat.id),
+            old_message_id=old_message_id_int,
+            new_message_id=new_message_id,
+        )
+
     await server.stop_progress_edits(
         chat_id=update.effective_chat.id,
         message_id=old_message_id_int,
