@@ -35,6 +35,7 @@ class ActiveAgentCycle:
     artifact_refs: list[str] = field(default_factory=list)
     read_artifact_refs: list[str] = field(default_factory=list)
     artifact_candidate_refs: list[str] = field(default_factory=list)
+    artifact_activations: list[dict[str, Any]] = field(default_factory=list)
     artifact_state: ArtifactRuntimeState | None = None
     original_input_batch_id: str | None = None
     blocked_artifact_batch_signatures: list[str] = field(default_factory=list)
