@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from functools import wraps
 
 import httpx
 from telegram import BotCommand
@@ -25,7 +26,9 @@ from .config import (
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
 )
 from .presentation_relocation import apply_relocating_input_ack_policy
+from .progress_redirect import TelegramProgressRedirects
 from .ready_outbox import TelegramReadyOutboxWorker
+from .runtime_state import KeyedAsyncLockPool
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 
 
@@ -49,6 +52,91 @@ artifact_gateway = ExplicitCollectionTelegramGatewayClient(
 telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
 server.telegram_output_executor = telegram_output_executor
+
+
+# Immutable InputBatch response routes can outlive several public Telegram
+# presentation generations. Resolve every stale callback target to the latest
+# writable message, including the processing status created directly below
+# /send.
+progress_redirects = TelegramProgressRedirects()
+_base_enqueue_progress_message = getattr(
+    server,
+    "_v04_base_enqueue_progress_message",
+    server.enqueue_progress_message,
+)
+server._v04_base_enqueue_progress_message = _base_enqueue_progress_message
+
+
+def _register_progress_redirect(
+    *,
+    chat_id: int,
+    old_message_id: int,
+    new_message_id: int,
+) -> None:
+    progress_redirects.register(
+        chat_id=int(chat_id),
+        old_message_id=int(old_message_id),
+        new_message_id=int(new_message_id),
+    )
+
+
+def _enqueue_redirected_progress_message(
+    *,
+    chat_id: int,
+    message_id: int,
+    text: str,
+):
+    resolved = progress_redirects.resolve(
+        chat_id=int(chat_id),
+        message_id=int(message_id),
+    )
+    if resolved != int(message_id):
+        server.logger.debug(
+            "telegram_progress_target_redirected chat_id=%s old_message_id=%s "
+            "new_message_id=%s",
+            chat_id,
+            message_id,
+            resolved,
+        )
+    return _base_enqueue_progress_message(
+        chat_id=int(chat_id),
+        message_id=resolved,
+        text=text,
+    )
+
+
+server.register_progress_redirect = _register_progress_redirect
+server.enqueue_progress_message = _enqueue_redirected_progress_message
+
+
+# Initial status creation is part of the public workflow, not an optional
+# cosmetic side effect. A single Telegram timeout must not leave the entire
+# AgentCycle without a visible tracking handle.
+_base_send_initial_status_message = getattr(
+    server,
+    "_v04_base_send_initial_status_message",
+    server.send_initial_status_message,
+)
+server._v04_base_send_initial_status_message = _base_send_initial_status_message
+
+
+async def _retrying_initial_status_message(update, text: str):
+    try:
+        return await server.telegram_reply_with_retries(
+            update,
+            text,
+            max_retries=3,
+            base_delay=0.5,
+        )
+    except (TimedOut, NetworkError) as error:
+        server.logger.warning(
+            "Failed to send initial Telegram status after retries: %r",
+            error,
+        )
+        return None
+
+
+server.send_initial_status_message = _retrying_initial_status_message
 
 
 # Explicit controls are handled before the legacy generic command bridge, so
@@ -85,6 +173,60 @@ def _route_forwarded_text_through_text_handler() -> None:
 _route_forwarded_text_through_text_handler()
 
 
+# python-telegram-bot accepts webhook updates concurrently. Until CycleInbox is
+# implemented, one exact Telegram session must have one FIFO admission/run lane;
+# otherwise commands, new inputs and album completion can start overlapping
+# AgentCycles and attach results to the wrong user message.
+session_update_locks = KeyedAsyncLockPool()
+_SERIALIZED_CALLBACKS = {
+    "command_handler",
+    "message_handler",
+    "attachment_handler",
+    "input_collection_command_handler",
+}
+
+
+def _serialized_handler(callback):
+    if getattr(callback, "_v04_session_serialized", False):
+        return callback
+
+    @wraps(callback)
+    async def wrapped(update, context):
+        async with session_update_locks.hold(server._session_for_update(update)):
+            return await callback(update, context)
+
+    wrapped._v04_session_serialized = True
+    return wrapped
+
+
+def _install_session_serialization() -> None:
+    for handlers in server.application.handlers.values():
+        for handler in handlers:
+            callback = getattr(handler, "callback", None)
+            if callback is None:
+                continue
+            if getattr(callback, "__name__", "") not in _SERIALIZED_CALLBACKS:
+                continue
+            handler.callback = _serialized_handler(callback)
+
+
+_install_session_serialization()
+_base_finish_group = getattr(
+    server,
+    "_v04_base_finish_group",
+    server._finish_group,
+)
+server._v04_base_finish_group = _base_finish_group
+
+
+async def _serialized_finish_group(group):
+    async with session_update_locks.hold(group.session_id):
+        return await _base_finish_group(group)
+
+
+server._finish_group = _serialized_finish_group
+
+
 # Preserve the original transport-neutral acknowledgement executor across test
 # re-imports. The wrapper only intercepts the explicit RELOCATE policy.
 _base_apply_input_ack_policy = getattr(
@@ -95,17 +237,105 @@ _base_apply_input_ack_policy = getattr(
 server._v04_base_apply_input_ack_policy = _base_apply_input_ack_policy
 
 
+async def _remember_presentation_handle(submission, status_message) -> None:
+    message_id = getattr(status_message, "message_id", None)
+    if message_id is None:
+        return
+    await artifact_gateway.remember_input_presentation_handle(
+        submission,
+        client_message_id=str(message_id),
+    )
+
+
 async def _apply_input_ack_policy(*, update, submission, session_id):
-    return await apply_relocating_input_ack_policy(
+    status_message = await apply_relocating_input_ack_policy(
         base_apply=_base_apply_input_ack_policy,
         server=server,
         update=update,
         submission=submission,
         session_id=session_id,
     )
+    await _remember_presentation_handle(submission, status_message)
+    return status_message
 
 
 server.apply_input_ack_policy = _apply_input_ack_policy
+
+
+# Media/standalone paths bind presentations directly rather than through the
+# acknowledgement dispatcher, so keep the same latest-handle cache there too.
+_base_bind_input_presentation_status = getattr(
+    server,
+    "_v04_base_bind_input_presentation_status",
+    server.bind_input_presentation_status,
+)
+server._v04_base_bind_input_presentation_status = (
+    _base_bind_input_presentation_status
+)
+
+
+async def _bind_input_presentation_status(*, submission, status_message, session_id):
+    await _base_bind_input_presentation_status(
+        submission=submission,
+        status_message=status_message,
+        session_id=session_id,
+    )
+    await _remember_presentation_handle(submission, status_message)
+
+
+server.bind_input_presentation_status = _bind_input_presentation_status
+
+
+async def _retire_input_collection_status(
+    *,
+    update,
+    previous_message_id,
+    processing_status_message,
+) -> None:
+    """Move run progress below /send and retire the closed collection status."""
+
+    new_message_id = getattr(processing_status_message, "message_id", None)
+    if previous_message_id is None or new_message_id is None:
+        return
+    try:
+        old_message_id = int(previous_message_id)
+        new_message_id = int(new_message_id)
+    except (TypeError, ValueError):
+        return
+    if old_message_id == new_message_id:
+        return
+
+    _register_progress_redirect(
+        chat_id=int(update.effective_chat.id),
+        old_message_id=old_message_id,
+        new_message_id=new_message_id,
+    )
+    await server.stop_progress_edits(
+        chat_id=update.effective_chat.id,
+        message_id=old_message_id,
+    )
+    try:
+        await server.application.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=old_message_id,
+        )
+        deletion_state = "deleted"
+    except BadRequest:
+        deletion_state = "failed"
+    except (TimedOut, NetworkError):
+        deletion_state = "unknown"
+    except Exception:
+        deletion_state = "failed"
+    server.logger.info(
+        "telegram_collection_status_retired old_message_id=%s "
+        "processing_message_id=%s deletion_state=%s",
+        old_message_id,
+        new_message_id,
+        deletion_state,
+    )
+
+
+server.retire_input_collection_status = _retire_input_collection_status
 
 
 ready_outbox_worker = TelegramReadyOutboxWorker(
@@ -237,6 +467,19 @@ async def _deliver_agent_result(**values):
     """Handle explicit collection status and rare synchronous/outbox races."""
 
     metadata = dict(values.get("metadata") or {})
+    if metadata.get("input_collection_terminal_suppressed"):
+        status_message = values.get("status_message")
+        if status_message is not None:
+            await server.stop_progress_edits(
+                chat_id=values["update"].effective_chat.id,
+                message_id=status_message.message_id,
+            )
+        server.logger.info(
+            "telegram_late_collection_group_suppressed input_batch_action=%s",
+            metadata.get("terminal_action"),
+        )
+        return None
+
     if metadata.get("input_collection_pending"):
         locale = str(metadata.get("progress_locale") or "ru")
         return await server.finish_status_or_send_reply(
