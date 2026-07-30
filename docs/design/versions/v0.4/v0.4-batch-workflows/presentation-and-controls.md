@@ -2,8 +2,8 @@
 id: design.v0.4.batch-workflows.presentation-controls
 version: v0.4
 spec_status: accepted
-implementation_status: planned
-last_reviewed: 2026-07-29
+implementation_status: implemented
+last_reviewed: 2026-07-30
 ---
 
 # BW-5–BW-6 — Presentation relocation and user controls
@@ -12,23 +12,26 @@ last_reviewed: 2026-07-29
 
 ### BW-5.1. Проблема
 
-Один стабильный status/progress message удобен для редактирования, restart
-recovery и terminal fallback. Но если пользователь добавил новое сообщение в тот
-же `InputBatchDraft`, прежний status остаётся выше новой части и визуально
-перестаёт быть актуальным центром workflow.
+Один стабильный status/progress message удобен для редактирования, restart recovery
+и terminal fallback. Но если пользователь добавил новое сообщение в тот же
+`InputBatchDraft`, прежний status остаётся выше новой части и перестаёт быть
+актуальным центром workflow.
 
-Нельзя решать это удалением старого сообщения до создания нового: transport
+Удалять старое сообщение до создания и durable bind нового нельзя: transport
 ошибка оставит batch без presentation handle.
 
-### BW-5.2. Presentation generation
+### BW-5.2. Persisted generation model
 
-Durable input presentation получает:
+`InputBatchPresentationRef` schema v2 хранит:
 
 ```text
 presentation_generation: int
-active_client_message_id: str | None
+client_message_id: str | None          # active compatibility field
 anchor_source_message_id: str | None
 superseded_handles: list[SupersededPresentationHandle]
+pending_relocation_token_hash: str | None
+pending_relocation_generation: int | None
+pending_anchor_source_message_id: str | None
 ```
 
 ```python
@@ -44,127 +47,148 @@ class SupersededPresentationHandle(BaseModel):
     ]
 ```
 
-Только handle текущего `presentation_generation` является writable.
+Только `client_message_id` текущего `presentation_generation` является writable.
+Superseded handles сохраняются как audit evidence и после restart не возвращаются
+в active state.
 
-Progress event обязан содержать или резолвить authoritative generation. Event
-для старого generation не редактирует superseded message.
+Старые schema-v1 records читаются structural upgrade-слоем:
 
-### BW-5.3. Когда требуется relocation
+```text
+bound schema v1 → generation 1
+reserved schema v1 → generation 0
+superseded_handles → []
+```
+
+### BW-5.3. Trigger
 
 Relocation выполняется, если одновременно истинно:
 
 ```text
-batch не terminal
-+ существует active presentation handle
-+ в draft принят новый user-visible source message
-+ новое source message расположено после текущего status в client order
-+ transport capability поддерживает создание нового status handle
+batch state = collecting
++ presentation state = bound
++ pending relocation отсутствует
++ принят новый user-visible response anchor
++ anchor расположен после active status в client order
++ adapter умеет безопасно создать новый handle
 ```
 
-Для Telegram client order определяется integer `message_id` exact chat/thread.
-Webhook processing time не заменяет client order.
+В текущей v0.4-реализации client-order trigger включён только для Telegram:
 
-File members одного Telegram album могут иметь несколько message IDs. Anchor
-для relocation — максимальный accepted user message ID, относящийся к draft.
+```text
+client_binding_id starts with telegram:
++ active client_message_id является integer
++ anchor client_message_id является integer
++ anchor ID > active status ID
+```
 
-Internal retries, duplicates и transport-only events relocation не вызывают.
+Webhook processing time, filename, текст инструкции и смысл сообщения не
+используются. Duplicate/internal transport events сами по себе relocation не
+вызывают.
 
 ### BW-5.4. Безопасный протокол
 
 ```text
-1. Render актуальный status для нового generation.
-2. Отправить новое status message после последнего user message.
-3. Получить подтверждённый new client_message_id.
+1. Server reserve relocation generation N+1 и выдаёт одноразовый token.
+2. Telegram отправляет новый status после последнего user message.
+3. Telegram получает new client_message_id.
 4. Atomic durable bind:
-   - generation += 1
-   - active_client_message_id = new ID
-   - old handle → superseded
-5. Только после успешного bind best-effort удалить old message.
-6. Если delete не удался:
-   - сохранить deletion_state=failed/unknown;
-   - оставить старое сообщение без изменений;
-   - никогда больше его не редактировать.
+   - generation N+1 становится active;
+   - new ID становится client_message_id;
+   - old generation переносится в superseded_handles.
+5. Только после успешного bind прекращаются edits old generation.
+6. Telegram best-effort удаляет old message.
+7. deletion receipt сохраняет deleted / failed / unknown.
+```
+
+Если создание нового status не удалось, old handle остаётся active.
+
+Если новый status создан, но durable bind не удался:
+
+```text
+old handle остаётся active
+new unbound message удаляется best-effort
+```
+
+Если bind выполнен, но удалить old message не удалось:
+
+```text
+new handle остаётся authoritative
+old message не изменяется
+old generation никогда больше не редактируется
 ```
 
 Запрещено:
 
-- сначала удалять старое сообщение;
-- редактировать старое текстом «перенесено ниже» после failed deletion;
+- сначала удалять old message;
+- редактировать old message текстом «перенесено ниже» после failed deletion;
 - считать relocation успешным без durable bind;
-- возвращаться к старому handle после restart, если новый bind опубликован.
+- откатываться к superseded generation после restart;
+- принимать stale `expected_generation`.
 
-### BW-5.5. Concurrency
+### BW-5.5. Concurrency и idempotency
 
-Relocation сериализуется по exact `input_batch_id`.
-
-Если во время отправки нового status пришла ещё одна user part:
+Relocation использует generation compare-and-set:
 
 ```text
-relocation generation N in flight
-→ принять part durably
-→ после bind проверить latest anchor
-→ при необходимости запланировать generation N+1
+reserve expected_generation=N
+→ pending_generation=N+1
+→ bind допускается только для N и exact pending token
 ```
 
-Coalescing допустим как оптимизация: несколько частей, пришедших в коротком
-окне, могут вызвать один relocation к последнему anchor. Но correctness не
-зависит от таймера coalescing.
+Stale caller не может перезаписать новый active handle. Пока один transport caller
+владеет pending relocation, последующие ingress updates получают `SILENT`, а не
+создают параллельное поколение и не редактируют старое сообщение.
 
-### BW-5.6. Restart recovery
+После bind новая user part может инициировать следующее поколение обычным путём.
+Correctness не зависит от debounce/coalescing timer.
 
-После restart:
+### BW-5.6. HTTP и adapter boundary
 
-- durable active handle остаётся authoritative;
-- partially created, но не bound message не считается active;
-- bound new handle с неуспешным delete старого остаётся active;
-- superseded handles не восстанавливаются как writable;
-- для restored explicit draft без usable active handle создаётся новый
-  generation.
+Shared authenticated routes:
+
+```text
+POST /internal/input-presentations/{presentation_id}/relocate
+POST /internal/input-presentations/{presentation_id}/superseded-deletion
+```
+
+Authority проверяет:
+
+- transport scope API key;
+- session ownership exact `InputBatchDraft`;
+- presentation token;
+- expected generation.
+
+Telegram adapter выполняет transport create/delete, а shared store владеет
+presentation state machine. Другие adapters смогут использовать тот же протокол,
+когда объявят эквивалентный ordered-message capability.
 
 ### BW-5.7. Terminal behavior
 
 После terminal state:
 
-- final status/answer использует current active handle либо OutputBatch policy;
-- relocation больше не выполняется;
-- superseded handles не меняются;
-- terminal send timeout может редактировать только current active handle.
+- relocation не резервируется;
+- current active handle остаётся единственным writable status handle;
+- superseded handles не меняются, кроме idempotent deletion receipt;
+- final answer и OutputBatch delivery используют существующую terminal policy.
 
 ## BW-6. User-friendly controls
 
-### BW-6.1. Канонические команды
+### BW-6.1. Единственные канонические команды
 
 ```text
-/collect — начать или продолжить сбор пакета
-/send    — отправить собранный пакет агенту
-/cancel  — отменить сбор пакета
+/collect — начать или показать сбор пакета
+/send    — завершить сбор и запустить обработку
+/cancel  — отменить текущий пакет
 ```
 
-Aliases:
+`/batch` и `/done` не являются aliases и не регистрируются. Одинаковая функция не
+должна иметь несколько названий без отдельной пользовательской семантики.
 
-```text
-/batch → /collect
-/done  → /send
-```
+Команды присутствуют в Telegram command menu и обрабатываются до legacy command
+bridge. После handler применяется `ApplicationHandlerStop`, поэтому command text
+не становится `InputBatch.text_parts`.
 
-Публичное меню Telegram и `/help` показывают основные команды. Aliases не
-обязаны отображаться.
-
-### BW-6.2. Inline controls
-
-Если client capabilities поддерживают buttons, collection presentation содержит:
-
-```text
-[Отправить пакет] [Отменить]
-```
-
-Callback actions используют opaque server-issued action tokens и проходят тот же
-`InputDraftControlService`, что slash-команды.
-
-Callback data не содержит filesystem path, session secret или authoritative
-state mutation payload.
-
-### BW-6.3. Локализованные сообщения
+### BW-6.2. Локализованные сообщения
 
 #### Collection started
 
@@ -192,22 +216,6 @@ state mutation payload.
 /cancel — отменить
 ```
 
-#### AUTO attachment draft awaiting user
-
-```text
-📎 Файлы приняты: {artifact_count}.
-Отправьте задачу для этого пакета или используйте /send для обработки без
-отдельной инструкции.
-```
-
-#### Commit requested
-
-```text
-📦 Завершаю приём пакета…
-Файлы: {artifact_count}
-Сообщения: {text_count}
-```
-
 #### Empty send
 
 ```text
@@ -226,29 +234,21 @@ state mutation payload.
 Сейчас нет собираемого пакета.
 ```
 
-#### Conflict
+Все строки находятся в ru/en localization catalogs, а не внутри Telegram handler.
 
-```text
-Уже собирается другой пакет в этом чате.
-Завершите его командой /send или отмените командой /cancel.
-```
-
-Все строки находятся в ru/en localization catalogs, а не внутри Telegram
-handler.
-
-### BW-6.4. Command semantics
+### BW-6.3. Command semantics
 
 | Команда | Нет draft | AUTO draft | EXPLICIT draft |
 |---|---|---|---|
 | `/collect` | Создать EXPLICIT | Upgrade AUTO → EXPLICIT | Idempotent inspect |
-| `/send` | No active draft | Explicit commit intent | Commit |
+| `/send` | No active draft | Explicit commit intent | Commit + separate run |
 | `/cancel` | Idempotent no-op | Cancel | Cancel |
 | `/status` | Runtime status | Runtime + draft summary | Runtime + draft summary |
 | `/reset` | Clear dialog context | Cancel + clear context | Cancel + clear context |
 
 `/send` и `/cancel` являются control actions и не входят в `text_parts`.
 
-### BW-6.5. Permission and scope
+### BW-6.4. Permission and scope
 
 В private chat sender совпадает с principal scope.
 
@@ -258,18 +258,33 @@ handler.
 - того же conversation/thread;
 - того же sender, если collaborative collection не включена явно.
 
-Другой участник не может commit/cancel чужой draft только потому, что знает его
-существование.
+Другой участник не может commit/cancel чужой draft только потому, что знает о его
+существовании.
 
-### BW-6.6. UX после `/reset`
+## Validation
 
-Ответ обязан явно сообщать границу операции:
+CI head `a9e82a3c5bcef2b1d694d19642200605f0726356`:
 
 ```text
-✅ Контекст диалога очищен.
-Незавершённых пакетов отменено: {count}.
-Сохранённые файлы и история артефактов не удалены.
+compile: success
+artifact suite: 219 tests, OK
+storage suite: success
+plans suite: success
+planning suite: success
+API suite: success
 ```
 
-Если `count=0`, строка о пакетах может быть опущена, но сохранение workspace
-должно оставаться понятным пользователю через `/help` и документацию.
+Regressions покрывают:
+
+- schema-v1 read upgrade;
+- initial bind generation 1;
+- reserve/bind generation 2;
+- superseded audit record;
+- stale generation rejection;
+- pending relocation suppression;
+- create → bind → delete order;
+- bind failure без удаления active old handle;
+- failed/unknown old deletion без rollback;
+- canonical `/collect`, `/send`, `/cancel` only.
+
+Новых `.env` или `mcp.config` keys BW-P3 не добавляет.
