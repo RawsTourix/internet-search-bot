@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Mapping
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -14,14 +13,12 @@ from ..ingress import (
     ClientConversationRef,
     ClientResponseRoute,
     InputDraftControlConflictError,
-    InputDraftControlStatus,
     InputDraftScope,
     IngressConflictError,
     IngressNotFoundError,
 )
 
 
-logger = logging.getLogger("Gateway.InputCollection")
 TransportInstanceScopes = Mapping[
     str,
     frozenset[tuple[str, str]],
@@ -74,6 +71,10 @@ def create_input_collection_router(
     authenticated API key must own the requested client transport and exact
     client instance. Mutating actions remain idempotent through their explicit
     idempotency keys.
+
+    Starting collection is a packaging action. It deliberately does not clear a
+    suspended ``WAITING_USER`` AgentCycle: the committed package may be the
+    user's multi-message or multi-file continuation of that same task.
     """
 
     router = APIRouter(prefix="/internal/input-collections")
@@ -127,35 +128,6 @@ def create_input_collection_router(
     def payload(result):
         return result.model_dump(mode="json")
 
-    def abandon_waiting_cycle_for_new_collection(
-        body: InputCollectionStartRequest,
-        status: InputDraftControlStatus,
-    ) -> None:
-        if status not in {
-            InputDraftControlStatus.STARTED,
-            InputDraftControlStatus.PROMOTED_AUTO_DRAFT,
-        }:
-            return
-        runtime_client = getattr(api, "mcp_client", None)
-        abandon = getattr(
-            runtime_client,
-            "abandon_pending_cycle_for_new_task",
-            None,
-        )
-        if not callable(abandon):
-            return
-        abandoned_cycle_id = abandon(
-            body.session_id,
-            reason="explicit_collection_started",
-        )
-        if abandoned_cycle_id is not None:
-            logger.info(
-                "pending_agent_cycle_abandoned_for_collection "
-                "session_id=%s cycle_id=%s",
-                body.session_id,
-                abandoned_cycle_id,
-            )
-
     @router.post("/start")
     async def start_collection(
         body: InputCollectionStartRequest,
@@ -174,7 +146,6 @@ def create_input_collection_router(
                 locale=body.locale,
                 idempotency_key=body.idempotency_key,
             )
-            abandon_waiting_cycle_for_new_collection(body, result.status)
             return payload(result)
         except InputDraftControlConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
