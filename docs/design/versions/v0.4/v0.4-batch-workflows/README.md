@@ -3,7 +3,7 @@ id: design.v0.4.batch-workflows
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-07-29
+last_reviewed: 2026-07-30
 ---
 
 # v0.4-batch-workflows
@@ -23,7 +23,8 @@ last_reviewed: 2026-07-29
 - стабильная совместимая группировка `OutputPart` без изменения порядка;
 - bounded current manifest и явный доступ к session/workspace artifact history;
 - явная граница durable commit и in-process agent execution;
-- cancellation-safe Gateway/MCP shutdown.
+- cancellation-safe Gateway/MCP shutdown;
+- согласованные aggregate progress events для многофайловых операций.
 
 Обновление не реализует `CycleInbox`, safe checkpoints и additions во время
 активного agent cycle. Эти обязанности остаются у следующего
@@ -40,16 +41,18 @@ last_reviewed: 2026-07-29
 | `BW-9` | [`artifact-access.md`](artifact-access.md) |
 | `BW-10`–`BW-12` | [`contracts-and-acceptance.md`](contracts-and-acceptance.md) |
 | `BW-13` | [`shutdown-and-execution.md`](shutdown-and-execution.md) |
+| `BW-14` | [`progress-events.md`](progress-events.md) |
 
 ## Порядок чтения
 
 1. [`input-assembly.md`](input-assembly.md)
 2. [`forwarded-sequencing-hardening.md`](forwarded-sequencing-hardening.md)
 3. [`presentation-and-controls.md`](presentation-and-controls.md)
-4. [`output-grouping.md`](output-grouping.md)
-5. [`artifact-access.md`](artifact-access.md)
-6. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
-7. [`shutdown-and-execution.md`](shutdown-and-execution.md)
+4. [`progress-events.md`](progress-events.md)
+5. [`output-grouping.md`](output-grouping.md)
+6. [`artifact-access.md`](artifact-access.md)
+7. [`contracts-and-acceptance.md`](contracts-and-acceptance.md)
+8. [`shutdown-and-execution.md`](shutdown-and-execution.md)
 
 ## Главные инварианты
 
@@ -89,6 +92,9 @@ last_reviewed: 2026-07-29
     анализируется.
 16. Внешний `duplicate` определяется authoritative первой reservation. Повторный
     внутренний store pass не превращает новый logical input в transport retry.
+17. Progress `message` обязан соответствовать scope aggregate operation.
+    Structured `data` хранит полный перечень, а человекочитаемая строка использует
+    cardinality-aware bounded projection.
 
 ## Положение в архитектуре
 
@@ -99,7 +105,7 @@ v0.4-file-artifacts-advanced
 v0.4-batch-workflows
 → user-controlled draft assembly, presentation relocation,
   output grouping, artifact activation/catalog scopes,
-  staged execution and shutdown ownership
+  staged execution, progress projection and shutdown ownership
 
 v0.4-input-runtime
 → CycleInbox, active-cycle additions, safe checkpoints,
@@ -116,7 +122,8 @@ v0.4-input-runtime
 - разделить durable commit и long-running agent execution;
 - обеспечить cancellation-safe Gateway/MCP shutdown;
 - исправить original idempotency semantics reservation;
-- закрыть concurrent forwarded text/media sequencing без задержки обычного текста.
+- закрыть concurrent forwarded text/media sequencing без задержки обычного текста;
+- сделать aggregate artifact delivery progress cardinality-aware и bounded.
 
 ### BW-P2. Shared explicit draft control
 
@@ -150,31 +157,44 @@ v0.4-input-runtime
 
 ## Статус
 
-Спецификация принята. `BW-P1` частично реализован и подтверждён live:
+Спецификация принята. `BW-P1` реализован и подтверждён основными live-сценариями:
 
 - Telegram `sendMediaGroup` доставляет три deliverable одним native album;
 - `attach://...` mapping формируется корректно;
 - durable commit и AgentCycle разделены transport-stage boundary;
-- Gateway lifespan и authority middleware hardened для cancellation.
-
-Дополнительный code-complete/live-pending slice:
-
+- Gateway lifespan и authority middleware hardened для cancellation;
 - первый atomic submit сохраняет `duplicate=False`, настоящий retry —
   `duplicate=True`;
 - forwarded text маршрутизируется как text с отдельным provenance;
 - forwarded text может bounded-wait более ранний album при конкурентной доставке;
 - ordinary text не получает wait;
-- thematic artifact suite содержит 179 успешных тестов.
+- mixed-forward live workflow сформировал один batch с `artifact_count=3` и
+  `text_part_count=1`;
+- aggregate delivery progress корректно отражает один или несколько файлов,
+  сохраняя полный structured evidence и bounded preview.
 
-Следующий основной этап после live-проверки mixed-forward workflow — shared
-`InputDraftControlService` до Telegram wiring `/collect`, `/send` и `/cancel`.
+Validation evidence на 2026-07-30:
 
-Новый параметр этого slice:
+```text
+full local Windows suite: 622 tests, OK (skipped=4)
+thematic artifact suite: 185 tests, OK
+storage suite: 41 tests, OK
+plans suite: 45 tests, OK
+planning suite: 19 tests, OK
+API suite: OK
+compile: OK
+```
+
+Следующий основной этап — shared `InputDraftControlService` до Telegram wiring
+`/collect`, `/send` и `/cancel`.
+
+Новый параметр forwarded sequencing slice:
 
 ```env
 TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
 ```
 
-Он добавлен в `.env.example`; в `mcp.config` новых keys нет. Любой следующий
-параметр `.env` или `mcp.config` обязан в том же patch обновлять соответствующий
-`.example`; release notes отдельно перечисляют новые keys и defaults.
+Он добавлен в `.env.example`; в `mcp.config` новых keys нет. Progress projection
+не добавляет новых параметров. Любой следующий параметр `.env` или `mcp.config`
+обязан в том же patch обновлять соответствующий `.example`; release notes
+отдельно перечисляют новые keys и defaults.
