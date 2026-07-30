@@ -13,6 +13,7 @@ from .explicit_policy import (
     EXPLICIT_COLLECTION_COMMIT_REASON,
     EXPLICIT_COLLECTION_GROUPING_MODE,
     is_explicit_collection_draft,
+    is_legacy_explicit_collection_draft,
 )
 from .grouping import _OPEN_STATES
 from .models import InputBatchDraft, InputBatchDraftState, utc_now
@@ -171,14 +172,19 @@ class ExplicitCollectionInputBatchStore(
                     raise IngressConflictError(
                         "Input draft belongs to another explicit collection"
                     )
-                if any(
-                    value is not None
-                    for value in (
-                        current.quiet_deadline,
-                        current.sealing_deadline,
-                        current.maximum_deadline,
+                requires_rewrite = (
+                    is_legacy_explicit_collection_draft(current)
+                    or any(
+                        value is not None
+                        for value in (
+                            current.quiet_deadline,
+                            current.sealing_deadline,
+                            current.maximum_deadline,
+                        )
                     )
-                ):
+                )
+                if requires_rewrite:
+                    self._release_group_index_sync(current)
                     current = self._write_explicit_draft_sync(
                         current,
                         normalized_collection_id,
