@@ -52,6 +52,24 @@ def _counts(payload: dict[str, Any]) -> dict[str, int]:
     }
 
 
+async def _retire_terminal_collection_status(
+    *,
+    update: Update,
+    payload: dict[str, Any],
+    status_message,
+) -> None:
+    retire = getattr(server, "retire_input_collection_status", None)
+    if not callable(retire):
+        return
+    await retire(
+        update=update,
+        previous_message_id=payload.get(
+            "_telegram_previous_status_message_id"
+        ),
+        processing_status_message=status_message,
+    )
+
+
 async def _handle_input_collection_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -101,6 +119,12 @@ async def _handle_input_collection_command(
                 "cancelled": "input_collection.cancelled",
                 "not_found": "input_collection.not_found",
             }.get(str(payload.get("status")), "input_collection.failed")
+            if str(payload.get("status")) == "cancelled":
+                await _retire_terminal_collection_status(
+                    update=update,
+                    payload=payload,
+                    status_message=status_message,
+                )
             await server.finish_status_or_send_reply(
                 update=update,
                 status_message=status_message,
@@ -146,6 +170,14 @@ async def _handle_input_collection_command(
                 )
                 return
 
+            # The collection presentation is terminal after commit. Redirect
+            # every immutable/stale progress target to the status created below
+            # /send, then retire the older collection message before AgentCycle.
+            await _retire_terminal_collection_status(
+                update=update,
+                payload=payload,
+                status_message=status_message,
+            )
             run_payload = await server.artifact_gateway.run_committed(
                 batch_id,
                 session_id=session_id,
