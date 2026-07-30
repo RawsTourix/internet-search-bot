@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
-from functools import wraps
 
 import httpx
 from telegram import BotCommand
@@ -13,7 +12,6 @@ from telegram.ext import CommandHandler, MessageHandler, filters
 
 from . import telegram_server as server
 from .batch_commands import input_collection_command_handler
-from .collection_bridge import ExplicitCollectionTelegramGatewayClient
 from .config import (
     GATEWAY_URL,
     TELEGRAM_API_KEY,
@@ -26,9 +24,9 @@ from .config import (
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
 )
 from .presentation_relocation import apply_relocating_input_ack_policy
-from .progress_redirect import TelegramProgressRedirects
 from .ready_outbox import TelegramReadyOutboxWorker
-from .runtime_state import KeyedAsyncLockPool
+from .run_progress_bridge import RunScopedProgressTelegramGatewayClient
+from .runtime_state import TelegramSessionDispatcher
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 
 
@@ -36,7 +34,7 @@ from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 # response path, the recovery outbox worker and delivery-content streaming.
 # Handler functions in telegram_server resolve these module globals at call
 # time, so replacing them here does not duplicate ingress or Telegram state.
-artifact_gateway = ExplicitCollectionTelegramGatewayClient(
+artifact_gateway = RunScopedProgressTelegramGatewayClient(
     gateway_url=GATEWAY_URL,
     api_key=TELEGRAM_API_KEY,
     client_instance_id=TELEGRAM_BOT_INSTANCE_ID,
@@ -52,61 +50,6 @@ artifact_gateway = ExplicitCollectionTelegramGatewayClient(
 telegram_output_executor = InstanceScopedTelegramOutputPlanExecutor()
 server.artifact_gateway = artifact_gateway
 server.telegram_output_executor = telegram_output_executor
-
-
-# Immutable InputBatch response routes can outlive several public Telegram
-# presentation generations. Resolve every stale callback target to the latest
-# writable message, including the processing status created directly below
-# /send.
-progress_redirects = TelegramProgressRedirects()
-_base_enqueue_progress_message = getattr(
-    server,
-    "_v04_base_enqueue_progress_message",
-    server.enqueue_progress_message,
-)
-server._v04_base_enqueue_progress_message = _base_enqueue_progress_message
-
-
-def _register_progress_redirect(
-    *,
-    chat_id: int,
-    old_message_id: int,
-    new_message_id: int,
-) -> None:
-    progress_redirects.register(
-        chat_id=int(chat_id),
-        old_message_id=int(old_message_id),
-        new_message_id=int(new_message_id),
-    )
-
-
-def _enqueue_redirected_progress_message(
-    *,
-    chat_id: int,
-    message_id: int,
-    text: str,
-):
-    resolved = progress_redirects.resolve(
-        chat_id=int(chat_id),
-        message_id=int(message_id),
-    )
-    if resolved != int(message_id):
-        server.logger.debug(
-            "telegram_progress_target_redirected chat_id=%s old_message_id=%s "
-            "new_message_id=%s",
-            chat_id,
-            message_id,
-            resolved,
-        )
-    return _base_enqueue_progress_message(
-        chat_id=int(chat_id),
-        message_id=resolved,
-        text=text,
-    )
-
-
-server.register_progress_redirect = _register_progress_redirect
-server.enqueue_progress_message = _enqueue_redirected_progress_message
 
 
 # Initial status creation is part of the public workflow, not an optional
@@ -173,44 +116,33 @@ def _route_forwarded_text_through_text_handler() -> None:
 _route_forwarded_text_through_text_handler()
 
 
-# python-telegram-bot accepts webhook updates concurrently. Until CycleInbox is
-# implemented, one exact Telegram session must have one FIFO admission/run lane;
-# otherwise commands, new inputs and album completion can start overlapping
-# AgentCycles and attach results to the wrong user message.
-session_update_locks = KeyedAsyncLockPool()
-_SERIALIZED_CALLBACKS = {
-    "command_handler",
-    "message_handler",
-    "attachment_handler",
-    "input_collection_command_handler",
-}
+# Admission order is owned once, before python-telegram-bot creates a task for
+# the update.  This is a real per-session FIFO queue, not several handler locks
+# whose acquisition order depends on event-loop scheduling.
+session_dispatcher = TelegramSessionDispatcher()
+_base_process_update = getattr(
+    server.application,
+    "_v04_base_process_update",
+    server.application.process_update,
+)
+server.application._v04_base_process_update = _base_process_update
 
 
-def _serialized_handler(callback):
-    if getattr(callback, "_v04_session_serialized", False):
-        return callback
-
-    @wraps(callback)
-    async def wrapped(update, context):
-        async with session_update_locks.hold(server._session_for_update(update)):
-            return await callback(update, context)
-
-    wrapped._v04_session_serialized = True
-    return wrapped
+def _queued_process_update(update):
+    session_id = server._session_for_update(update)
+    return session_dispatcher.submit(
+        session_id,
+        lambda: _base_process_update(update),
+    )
 
 
-def _install_session_serialization() -> None:
-    for handlers in server.application.handlers.values():
-        for handler in handlers:
-            callback = getattr(handler, "callback", None)
-            if callback is None:
-                continue
-            if getattr(callback, "__name__", "") not in _SERIALIZED_CALLBACKS:
-                continue
-            handler.callback = _serialized_handler(callback)
+server.application.process_update = _queued_process_update
 
 
-_install_session_serialization()
+# Media-group completion is an internal callback rather than a Telegram update,
+# but it belongs to the same session lane.  A late callback therefore cannot
+# overtake /send or /cancel; the explicit-batch tombstone remains the final
+# safety check after it reaches its turn.
 _base_finish_group = getattr(
     server,
     "_v04_base_finish_group",
@@ -219,16 +151,19 @@ _base_finish_group = getattr(
 server._v04_base_finish_group = _base_finish_group
 
 
-async def _serialized_finish_group(group):
-    async with session_update_locks.hold(group.session_id):
-        return await _base_finish_group(group)
+async def _queued_finish_group(group):
+    return await session_dispatcher.run(
+        group.session_id,
+        lambda: _base_finish_group(group),
+    )
 
 
-server._finish_group = _serialized_finish_group
+server._finish_group = _queued_finish_group
 
 
 # Preserve the original transport-neutral acknowledgement executor across test
-# re-imports. The wrapper only intercepts the explicit RELOCATE policy.
+# re-imports. The wrapper only intercepts the explicit RELOCATE policy used
+# while a collection is still active. Run progress never uses this path.
 _base_apply_input_ack_policy = getattr(
     server,
     "_v04_base_apply_input_ack_policy",
@@ -284,58 +219,6 @@ async def _bind_input_presentation_status(*, submission, status_message, session
 
 
 server.bind_input_presentation_status = _bind_input_presentation_status
-
-
-async def _retire_input_collection_status(
-    *,
-    update,
-    previous_message_id,
-    processing_status_message,
-) -> None:
-    """Move run progress below /send and retire the closed collection status."""
-
-    new_message_id = getattr(processing_status_message, "message_id", None)
-    if previous_message_id is None or new_message_id is None:
-        return
-    try:
-        old_message_id = int(previous_message_id)
-        new_message_id = int(new_message_id)
-    except (TypeError, ValueError):
-        return
-    if old_message_id == new_message_id:
-        return
-
-    _register_progress_redirect(
-        chat_id=int(update.effective_chat.id),
-        old_message_id=old_message_id,
-        new_message_id=new_message_id,
-    )
-    await server.stop_progress_edits(
-        chat_id=update.effective_chat.id,
-        message_id=old_message_id,
-    )
-    try:
-        await server.application.bot.delete_message(
-            chat_id=update.effective_chat.id,
-            message_id=old_message_id,
-        )
-        deletion_state = "deleted"
-    except BadRequest:
-        deletion_state = "failed"
-    except (TimedOut, NetworkError):
-        deletion_state = "unknown"
-    except Exception:
-        deletion_state = "failed"
-    server.logger.info(
-        "telegram_collection_status_retired old_message_id=%s "
-        "processing_message_id=%s deletion_state=%s",
-        old_message_id,
-        new_message_id,
-        deletion_state,
-    )
-
-
-server.retire_input_collection_status = _retire_input_collection_status
 
 
 ready_outbox_worker = TelegramReadyOutboxWorker(
@@ -535,10 +418,12 @@ async def lifespan(app):
         ])
         await ready_outbox_worker.start()
         app.state.telegram_ready_outbox = ready_outbox_worker
+        app.state.telegram_session_dispatcher = session_dispatcher
         try:
             yield
         finally:
             await ready_outbox_worker.stop()
+            await session_dispatcher.shutdown()
 
 
 server.app.router.lifespan_context = lifespan
