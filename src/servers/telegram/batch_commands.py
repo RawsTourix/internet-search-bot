@@ -11,9 +11,9 @@ from . import telegram_server as server
 from .config import TELEGRAM_BOT_INSTANCE_ID
 
 
-_COLLECT_COMMANDS = {"/collect", "/batch"}
-_SEND_COMMANDS = {"/send", "/done"}
-_CANCEL_COMMANDS = {"/cancel"}
+_COLLECT_COMMAND = "/collect"
+_SEND_COMMAND = "/send"
+_CANCEL_COMMAND = "/cancel"
 
 
 def _command(update: Update) -> str:
@@ -72,7 +72,7 @@ async def _handle_input_collection_command(
     }
 
     try:
-        if command in _COLLECT_COMMANDS:
+        if command == _COLLECT_COMMAND:
             payload = await server.artifact_gateway.start_collection(
                 **common,
                 idempotency_key=_idempotency_key(update, "start"),
@@ -92,7 +92,7 @@ async def _handle_input_collection_command(
             )
             return
 
-        if command in _CANCEL_COMMANDS:
+        if command == _CANCEL_COMMAND:
             payload = await server.artifact_gateway.cancel_collection(
                 **common,
                 idempotency_key=_idempotency_key(update, "cancel"),
@@ -109,7 +109,7 @@ async def _handle_input_collection_command(
             )
             return
 
-        if command in _SEND_COMMANDS:
+        if command == _SEND_COMMAND:
             payload = await server.artifact_gateway.send_collection(
                 **common,
                 idempotency_key=_idempotency_key(update, "send"),
