@@ -112,6 +112,31 @@ def _register_input_collection_routes(app: FastAPI) -> None:
     app.state.input_collection_routes_registered = True
 
 
+def _register_presentation_relocation_routes(app: FastAPI) -> None:
+    if getattr(app.state, "presentation_relocation_routes_registered", False):
+        return
+    scopes, _ = _configured_transport_authority()
+    if not scopes:
+        logger.debug(
+            "Presentation relocation routes skipped: no transport API keys configured"
+        )
+        return
+
+    from .api import API
+    from .presentation_relocation_routes import (
+        create_presentation_relocation_router,
+    )
+
+    app.include_router(
+        create_presentation_relocation_router(
+            api=API,
+            auth_dependency=_domain_api_key_auth,
+            api_key_scopes=scopes,
+        )
+    )
+    app.state.presentation_relocation_routes_registered = True
+
+
 def register_domain_exception_handlers(app: FastAPI) -> None:
     """Register authoritative HTTP error policy and shared domain routes."""
 
@@ -200,3 +225,4 @@ def register_domain_exception_handlers(app: FastAPI) -> None:
         app.add_exception_handler(error_type, handle_unavailable)
 
     _register_input_collection_routes(app)
+    _register_presentation_relocation_routes(app)
