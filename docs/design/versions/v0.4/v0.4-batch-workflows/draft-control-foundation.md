@@ -2,7 +2,7 @@
 id: design.v0.4.batch-workflows.draft-control-foundation
 version: v0.4
 spec_status: accepted
-implementation_status: partial
+implementation_status: implemented
 last_reviewed: 2026-07-30
 ---
 
@@ -46,10 +46,14 @@ assembly_mode = explicit
 commit_policy = explicit
 ```
 
-AUTO policy существующего transport draft не копируется и не переписывается.
-`/collect` поверх совместимого files-first draft создаёт explicit collection и
-привязывает его к существующему batch. До Telegram wiring transport timer должен
-быть остановлен adapter/runtime coordination; этот шаг принадлежит BW-P2B.
+AUTO policy существующего transport draft не копируется. `/collect` поверх
+совместимого files-first draft создаёт explicit collection, promotion очищает
+transport quiet/sealing/maximum deadlines и привязывает batch к collection key.
+
+Текущая schema-v2 реализация использует ранее зарезервированный
+`InputGroupingMode.IMMEDIATE_TEXT` как внутренний persisted marker. Public
+contracts остаются explicit; именованная structural migration описана в
+[`explicit-control-plane.md`](explicit-control-plane.md) и входит в BW-P5.
 
 ## 3. Exact scope
 
@@ -106,7 +110,7 @@ Client adapters не изменяют JSON/filesystem records напрямую.
 - создаёт пустой explicit collection;
 - повтор с тем же idempotency key возвращает сохранённый результат;
 - повтор с новым key возвращает `already_active`;
-- один совместимый AUTO files-first draft связывается с collection;
+- один совместимый AUTO files-first draft promotion-ится и связывается с collection;
 - несколько совместимых drafts дают explicit conflict.
 
 ### commit
@@ -152,25 +156,29 @@ start, commit и cancel повторно разрешаются по durable col
 
 ## 7. Composition
 
-`IngressServices` теперь включает:
+`IngressServices` включает:
 
 ```text
 collection_store
- draft_control_service
+draft_control_service
 ```
 
-Telegram/Web/CLI wiring использует один и тот же service.
+Telegram/Web/CLI используют один и тот же service. Реализованная shared HTTP и
+Telegram composition описана в
+[`explicit-control-plane.md`](explicit-control-plane.md).
 
-## 8. Текущая граница
+## 8. Реализованная граница
 
-BW-P2A не добавляет Telegram-команды и не изменяет AUTO routing. Следующий slice:
+BW-P2A foundation завершён и расширен BW-P2B:
 
 ```text
 shared HTTP control routes
 → Telegram /collect /send /cancel
 → aliases /batch /done
 → routing новых events в active explicit collection
-→ остановка automatic media-group commit после promotion
+→ suppression automatic media-group/transport commit после promotion
+→ durable /send commit до отдельного AgentCycle run
 ```
 
-Новых `.env` или `mcp.config` keys в BW-P2A нет.
+Новое поведение не добавляет `.env` или `mcp.config` keys. Следующая feature
+граница — BW-P3 presentation generations и safe relocation.
