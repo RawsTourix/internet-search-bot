@@ -76,6 +76,14 @@ last_reviewed: 2026-07-30
 19. Explicit draft не имеет transport quiet/deadline semantics и не auto-commit-ится.
 20. Persisted canonical grouping mode — `explicit_collection`; rollout-era
     `immediate_text` records читаются и переписываются при reconcile.
+21. После `/send` AgentCycle progress направляется в status-сообщение ниже команды;
+    stale/superseded callback targets проходят bounded redirect chain.
+22. Поздний quiet-timer callback explicit media group после `/send` или `/cancel`
+    является silent no-op и не может повторно вызвать AUTO commit.
+23. До появления `CycleInbox` одна exact Telegram session имеет один FIFO admission/run
+    lane, поэтому два AgentCycle одной сессии не выполняются параллельно.
+24. Артефакты завершённого цикла не наследуются новым циклом автоматически:
+    historical exact IDs сначала активируются через `artifact_list(scope="session")`.
 
 ## Положение в архитектуре
 
@@ -112,7 +120,8 @@ v0.4-input-runtime
 - только `/collect`, `/send`, `/cancel`;
 - text-only/files-only/mixed explicit commit;
 - transport auto-commit guard;
-- `/send → commit → run` boundary.
+- `/send → commit → run` boundary;
+- terminal media-group tombstone после `/send`/`/cancel`.
 
 ### BW-P3. Presentation relocation — реализован
 
@@ -124,7 +133,9 @@ v0.4-input-runtime
 - deleted/failed/unknown receipts;
 - stale generation rejection;
 - Telegram transport executor;
-- old handle остаётся неизменным при failed deletion.
+- old handle остаётся неизменным при failed deletion;
+- stale progress targets redirect-ятся в latest writable status;
+- initial status creation имеет bounded Telegram retry.
 
 ### BW-P4. Artifact access scopes — реализован
 
@@ -133,26 +144,30 @@ v0.4-input-runtime
 - opaque scope-bound cursor;
 - exact activation provenance;
 - historical read/search/delivery после activation;
+- отсутствие implicit cross-cycle artifact handoff;
 - filesystem workspace projection объявляет `effective_scope=session`.
 
-### BW-P5. Integration and acceptance — ожидает maintainer live gate
+### BW-P5. Integration and acceptance — ожидает повторный maintainer live gate
 
 - named persisted `EXPLICIT_COLLECTION` migration — реализована;
 - rollout-era JSON/index regression — реализован;
 - CI thematic suites — зелёные;
+- live Telegram прогон 2026-07-30 выявил stale progress target, late album commit,
+  parallel same-session cycles и implicit artifact handoff — исправлено;
 - новый full Windows suite — требуется;
-- Telegram live scenarios `/collect`, `/send`, `/cancel`, relocation — требуются;
+- повторные Telegram scenarios `/collect`, `/send`, `/cancel`, relocation — требуются;
 - multi-client live environment — переносится к появлению Web/CLI adapters.
 
 ## Текущий статус
 
-Кодовые этапы `BW-P1`–`BW-P4` и structural migration реализованы.
+Кодовые этапы `BW-P1`–`BW-P4`, structural migration и live-race hardening
+реализованы.
 
-Последний CI head `c67e822a771a4a90de4bc25295ebd8a29717267d`:
+Последний CI head `6be4d280ff324651ab1f2dfa868f6e0140788539`:
 
 ```text
 compile: success
-artifact suite: 224 tests, OK
+artifact suite: 231 tests, OK
 storage suite: 41 tests, OK
 plans suite: 45 tests, OK
 planning suite: 19 tests, OK
@@ -165,8 +180,9 @@ API suite: 1 test, OK
 622 tests, OK (skipped=4)
 ```
 
-Перед переводом PR из draft требуется новый Windows full run и живые Telegram
-сценарии canonical commands и status relocation.
+Перед переводом PR из draft требуется новый Windows full run и повторный живой
+Telegram gate с canonical commands, status relocation, быстрыми последовательностями
+команд и отменой ещё не завершившего quiet period альбома.
 
 Новый параметр forwarded sequencing slice:
 
@@ -174,6 +190,6 @@ API suite: 1 test, OK
 TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
 ```
 
-Он присутствует в `.env.example`; в `mcp.config` новых keys нет. BW-P2A, BW-P2B,
-BW-P3, BW-P4 и migration не добавляют параметров. Каждый будущий ключ обязан в том
-же patch обновлять example, validation, tests и release notes.
+Он присутствует в `.env.example`; в `mcp.config` новых keys нет. Live-race hardening
+также не добавляет конфигурационных параметров. Каждый будущий ключ обязан в том же
+patch обновлять example, validation, tests и release notes.
