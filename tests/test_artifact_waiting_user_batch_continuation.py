@@ -1,12 +1,16 @@
 import unittest
 from types import SimpleNamespace
 
+from src.mcp.artifact_request_context import (
+    reset_artifact_request_input_batch,
+    set_artifact_request_input_batch,
+)
 from src.mcp.waiting_user_batch_continuation import (
     WaitingUserBatchContinuationMixin,
 )
 
 
-class _BaseClient:
+class _GuardedBaseClient:
     def __init__(self):
         self.pending_cycle = None
         self.observed_batch_id = None
@@ -17,12 +21,17 @@ class _BaseClient:
 
     async def process_query(self, *args, **kwargs):
         active_cycle = kwargs.pop("active_cycle")
-        self._activate_manager_context(
-            active_cycle=active_cycle,
-            state=SimpleNamespace(),
-            session_id=kwargs.get("session_id", "default"),
-            progress_callback=None,
-        )
+        input_batch = kwargs.pop("input_batch", None)
+        token = set_artifact_request_input_batch(input_batch)
+        try:
+            self._activate_manager_context(
+                active_cycle=active_cycle,
+                state=SimpleNamespace(),
+                session_id=kwargs.get("session_id", "default"),
+                progress_callback=None,
+            )
+        finally:
+            reset_artifact_request_input_batch(token)
         return active_cycle
 
     def _activate_manager_context(
@@ -33,6 +42,21 @@ class _BaseClient:
         session_id,
         progress_callback,
     ):
+        from src.mcp.artifact_request_context import (
+            get_artifact_request_input_batch,
+        )
+
+        input_batch = get_artifact_request_input_batch()
+        if input_batch is not None:
+            existing = active_cycle.original_input_batch_id
+            if existing is not None and existing != input_batch.input_batch_id:
+                raise RuntimeError(
+                    "Additional committed batches require CycleInbox runtime"
+                )
+            active_cycle.original_input_batch_id = input_batch.input_batch_id
+            for artifact_id in input_batch.artifact_refs:
+                if artifact_id not in active_cycle.artifact_refs:
+                    active_cycle.artifact_refs.append(artifact_id)
         self.observed_batch_id = active_cycle.original_input_batch_id
         return SimpleNamespace(active_cycle=active_cycle)
 
@@ -41,16 +65,17 @@ class _BaseClient:
         trace.append({"type": event_type, **data})
 
 
-class _Client(WaitingUserBatchContinuationMixin, _BaseClient):
+class _Client(WaitingUserBatchContinuationMixin, _GuardedBaseClient):
     pass
 
 
 class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_waiting_cycle_accepts_new_committed_batch(self):
+    async def test_waiting_cycle_preserves_old_refs_and_accepts_new_batch(self):
         client = _Client()
         client.pending_cycle = SimpleNamespace(status="waiting_user")
         active_cycle = SimpleNamespace(
             original_input_batch_id="ibat-old",
+            artifact_refs=["art-old"],
             cycle_trace=client.trace,
         )
         input_batch = SimpleNamespace(
@@ -68,6 +93,7 @@ class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(result, active_cycle)
         self.assertEqual(client.observed_batch_id, "ibat-new")
+        self.assertEqual(active_cycle.artifact_refs, ["art-old", "art-new"])
         self.assertEqual(
             client.trace[-1],
             {
@@ -83,6 +109,7 @@ class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
         client = _Client()
         active_cycle = SimpleNamespace(
             original_input_batch_id="ibat-old",
+            artifact_refs=[],
             cycle_trace=client.trace,
         )
         input_batch = SimpleNamespace(
@@ -91,14 +118,15 @@ class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
             text_parts=[],
         )
 
-        await client.process_query(
-            "payload",
-            session_id="session-1",
-            input_batch=input_batch,
-            active_cycle=active_cycle,
-        )
+        with self.assertRaisesRegex(RuntimeError, "CycleInbox runtime"):
+            await client.process_query(
+                "payload",
+                session_id="session-1",
+                input_batch=input_batch,
+                active_cycle=active_cycle,
+            )
 
-        self.assertEqual(client.observed_batch_id, "ibat-old")
+        self.assertEqual(active_cycle.original_input_batch_id, "ibat-old")
         self.assertEqual(client.trace, [])
 
 
