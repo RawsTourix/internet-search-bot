@@ -117,7 +117,7 @@ _route_forwarded_text_through_text_handler()
 
 
 # Admission order is owned once, before python-telegram-bot creates a task for
-# the update.  This is a real per-session FIFO queue, not several handler locks
+# the update. This is a real per-session FIFO queue, not several handler locks
 # whose acquisition order depends on event-loop scheduling.
 session_dispatcher = TelegramSessionDispatcher()
 _base_process_update = getattr(
@@ -140,7 +140,7 @@ server.application.process_update = _queued_process_update
 
 
 # Media-group completion is an internal callback rather than a Telegram update,
-# but it belongs to the same session lane.  A late callback therefore cannot
+# but it belongs to the same session lane. A late callback therefore cannot
 # overtake /send or /cancel; the explicit-batch tombstone remains the final
 # safety check after it reaches its turn.
 _base_finish_group = getattr(
@@ -182,6 +182,32 @@ async def _remember_presentation_handle(submission, status_message) -> None:
     )
 
 
+async def _remember_auto_run_presentation(
+    *,
+    update,
+    submission,
+    status_message,
+) -> None:
+    """Bind post-ingress AUTO status to the one exact committed `/run`."""
+
+    if (
+        str(submission.get("status") or "") != "committed"
+        or bool(submission.get("duplicate"))
+    ):
+        return
+    batch_id = str(submission.get("input_batch_id") or "").strip()
+    if not batch_id:
+        return
+    await artifact_gateway.remember_run_presentation(
+        batch_id,
+        progress_metadata=server._progress_metadata(
+            update,
+            status_message,
+            request_id=batch_id,
+        ),
+    )
+
+
 async def _apply_input_ack_policy(*, update, submission, session_id):
     status_message = await apply_relocating_input_ack_policy(
         base_apply=_base_apply_input_ack_policy,
@@ -191,6 +217,11 @@ async def _apply_input_ack_policy(*, update, submission, session_id):
         session_id=session_id,
     )
     await _remember_presentation_handle(submission, status_message)
+    await _remember_auto_run_presentation(
+        update=update,
+        submission=submission,
+        status_message=status_message,
+    )
     return status_message
 
 
@@ -199,6 +230,8 @@ server.apply_input_ack_policy = _apply_input_ack_policy
 
 # Media/standalone paths bind presentations directly rather than through the
 # acknowledgement dispatcher, so keep the same latest-handle cache there too.
+# Their envelopes already contain response metadata before ingress, so they do
+# not need the post-ingress AUTO one-shot binding above.
 _base_bind_input_presentation_status = getattr(
     server,
     "_v04_base_bind_input_presentation_status",
