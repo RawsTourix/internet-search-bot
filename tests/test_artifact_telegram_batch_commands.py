@@ -1,10 +1,17 @@
+import os
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from telegram.ext import ApplicationHandlerStop
+os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
+os.environ.setdefault("WEBHOOK_DOMAIN", "https://example.test")
+os.environ.setdefault("WEBHOOK_SECRET", "test-secret")
+os.environ.setdefault("TELEGRAM_API_KEY", "telegram-test-key")
+os.environ.setdefault("GATEWAY_URL", "http://gateway.test")
 
-from src.servers.telegram import batch_commands
+from telegram.ext import ApplicationHandlerStop  # noqa: E402
+
+from src.servers.telegram import batch_commands  # noqa: E402
 
 
 class TelegramBatchCommandTests(unittest.IsolatedAsyncioTestCase):
