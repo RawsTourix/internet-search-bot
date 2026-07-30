@@ -50,10 +50,15 @@ AUTO policy существующего transport draft не копируется
 совместимого files-first draft создаёт explicit collection, promotion очищает
 transport quiet/sealing/maximum deadlines и привязывает batch к collection key.
 
-Текущая schema-v2 реализация использует ранее зарезервированный
-`InputGroupingMode.IMMEDIATE_TEXT` как внутренний persisted marker. Public
-contracts остаются explicit; именованная structural migration описана в
-[`explicit-control-plane.md`](explicit-control-plane.md) и входит в BW-P5.
+Canonical persisted grouping mode:
+
+```text
+InputGroupingMode.EXPLICIT_COLLECTION = "explicit_collection"
+```
+
+Rollout-era records с `grouping_mode="immediate_text"` остаются читаемыми и при
+reconcile атомарно переписываются вместе с group index. Batch ID, collection ID,
+source events и содержимое не изменяются.
 
 ## 3. Exact scope
 
@@ -163,22 +168,22 @@ collection_store
 draft_control_service
 ```
 
-Telegram/Web/CLI используют один и тот же service. Реализованная shared HTTP и
-Telegram composition описана в
+Telegram и будущие Web/CLI adapters используют один и тот же service. Shared HTTP
+и Telegram composition описана в
 [`explicit-control-plane.md`](explicit-control-plane.md).
 
 ## 8. Реализованная граница
 
-BW-P2A foundation завершён и расширен BW-P2B:
-
 ```text
 shared HTTP control routes
 → Telegram /collect /send /cancel
-→ aliases /batch /done
 → routing новых events в active explicit collection
 → suppression automatic media-group/transport commit после promotion
 → durable /send commit до отдельного AgentCycle run
+→ named persisted EXPLICIT_COLLECTION migration
 ```
 
-Новое поведение не добавляет `.env` или `mcp.config` keys. Следующая feature
-граница — BW-P3 presentation generations и safe relocation.
+Дублирующие `/batch` и `/done` не регистрируются.
+
+Новое поведение не добавляет `.env` или `mcp.config` keys. Presentation relocation
+и scoped artifact activation реализованы следующими BW-P3/BW-P4 slices.
