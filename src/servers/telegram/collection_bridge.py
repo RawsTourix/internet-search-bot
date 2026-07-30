@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import OrderedDict
 from typing import Any
 
 from .scoped_artifact_bridge import InstanceScopedTelegramArtifactGatewayClient
@@ -17,6 +18,75 @@ class ExplicitCollectionTelegramGatewayClient(
         super().__init__(**values)
         self._explicit_batch_lock = asyncio.Lock()
         self._explicit_batches: dict[str, dict[str, Any]] = {}
+        # A media-group quiet timer may fire after /send or /cancel has already
+        # made the explicit collection terminal.  Keep a bounded tombstone so
+        # that the late transport callback becomes a no-op instead of falling
+        # through to the ordinary AUTO commit endpoint and producing HTTP 409.
+        self._terminal_explicit_batches: OrderedDict[
+            str,
+            dict[str, Any],
+        ] = OrderedDict()
+        self._maximum_terminal_explicit_batches = 512
+
+    @staticmethod
+    def _merge_presentation_ref(
+        current: dict[str, Any] | None,
+        incoming: dict[str, Any] | None,
+        *,
+        client_message_id: str | None = None,
+    ) -> dict[str, Any]:
+        merged = dict(current or {})
+        for key, value in dict(incoming or {}).items():
+            if value is not None:
+                merged[key] = value
+        if client_message_id is not None:
+            merged["client_message_id"] = str(client_message_id)
+            merged["active_client_message_id"] = str(client_message_id)
+            generation = (
+                merged.get("relocation_generation")
+                or merged.get("presentation_generation")
+                or 1
+            )
+            merged["presentation_generation"] = max(1, int(generation))
+        return merged
+
+    def _remember_terminal_locked(
+        self,
+        input_batch_id: str,
+        *,
+        action: str,
+        explicit: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        state = {
+            "action": str(action),
+            "collection_id": (explicit or {}).get("collection_id"),
+            "file_count": int((explicit or {}).get("file_count") or 0),
+            "text_part_count": int(
+                (explicit or {}).get("text_part_count") or 0
+            ),
+            "presentation_ref": dict(
+                (explicit or {}).get("presentation_ref") or {}
+            ),
+        }
+        self._terminal_explicit_batches[input_batch_id] = state
+        self._terminal_explicit_batches.move_to_end(input_batch_id)
+        while (
+            len(self._terminal_explicit_batches)
+            > self._maximum_terminal_explicit_batches
+        ):
+            self._terminal_explicit_batches.popitem(last=False)
+        return state
+
+    @staticmethod
+    def _current_message_id(state: dict[str, Any] | None) -> str | None:
+        ref = dict((state or {}).get("presentation_ref") or {})
+        value = ref.get("active_client_message_id") or ref.get(
+            "client_message_id"
+        )
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
     async def submit_envelope(
         self,
@@ -38,12 +108,46 @@ class ExplicitCollectionTelegramGatewayClient(
             and params.get("auto_commit_allowed") is False
         ):
             async with self._explicit_batch_lock:
-                self._explicit_batches[batch_id] = {
-                    "collection_id": params.get("collection_id"),
-                    "file_count": int(params.get("file_count") or 0),
-                    "text_part_count": int(params.get("text_part_count") or 0),
-                }
+                if batch_id not in self._terminal_explicit_batches:
+                    current = dict(self._explicit_batches.get(batch_id) or {})
+                    current.update({
+                        "collection_id": params.get("collection_id"),
+                        "file_count": int(params.get("file_count") or 0),
+                        "text_part_count": int(
+                            params.get("text_part_count") or 0
+                        ),
+                    })
+                    current["presentation_ref"] = self._merge_presentation_ref(
+                        current.get("presentation_ref"),
+                        payload.get("presentation_ref"),
+                    )
+                    self._explicit_batches[batch_id] = current
         return payload
+
+    async def remember_input_presentation_handle(
+        self,
+        submission: dict[str, Any],
+        *,
+        client_message_id: str,
+    ) -> None:
+        """Remember the latest Telegram handle for the active explicit draft."""
+
+        batch_id = str(submission.get("input_batch_id") or "").strip()
+        if not batch_id:
+            return
+        async with self._explicit_batch_lock:
+            if batch_id in self._terminal_explicit_batches:
+                return
+            current = self._explicit_batches.get(batch_id)
+            if current is None:
+                return
+            current = dict(current)
+            current["presentation_ref"] = self._merge_presentation_ref(
+                current.get("presentation_ref"),
+                submission.get("presentation_ref"),
+                client_message_id=str(client_message_id),
+            )
+            self._explicit_batches[batch_id] = current
 
     async def commit_and_run(
         self,
@@ -53,7 +157,25 @@ class ExplicitCollectionTelegramGatewayClient(
         progress_locale: str,
     ) -> dict[str, Any]:
         async with self._explicit_batch_lock:
+            terminal = dict(
+                self._terminal_explicit_batches.get(input_batch_id) or {}
+            )
             explicit = dict(self._explicit_batches.get(input_batch_id) or {})
+        if terminal:
+            await self._close_group_for_batch(input_batch_id)
+            return {
+                "status": "suppressed",
+                "input_batch_id": input_batch_id,
+                "duplicate": False,
+                "run_skipped_duplicate": False,
+                "response": "",
+                "metadata": {
+                    "input_collection_terminal_suppressed": True,
+                    "terminal_action": terminal.get("action"),
+                    "collection_id": terminal.get("collection_id"),
+                    "progress_locale": progress_locale,
+                },
+            }
         if explicit:
             await self._close_group_for_batch(input_batch_id)
             return {
@@ -136,7 +258,17 @@ class ExplicitCollectionTelegramGatewayClient(
         batch_id = str(payload.get("input_batch_id") or "").strip()
         if payload.get("status") == "committed" and batch_id:
             async with self._explicit_batch_lock:
-                self._explicit_batches.pop(batch_id, None)
+                explicit = self._explicit_batches.pop(batch_id, None)
+                terminal = self._remember_terminal_locked(
+                    batch_id,
+                    action="committed",
+                    explicit=explicit,
+                )
+            previous_message_id = self._current_message_id(terminal)
+            if previous_message_id is not None:
+                payload["_telegram_previous_status_message_id"] = (
+                    previous_message_id
+                )
             await self._close_group_for_batch(batch_id)
         return payload
 
@@ -160,7 +292,17 @@ class ExplicitCollectionTelegramGatewayClient(
         batch_id = str(payload.get("input_batch_id") or "").strip()
         if batch_id:
             async with self._explicit_batch_lock:
-                self._explicit_batches.pop(batch_id, None)
+                explicit = self._explicit_batches.pop(batch_id, None)
+                terminal = self._remember_terminal_locked(
+                    batch_id,
+                    action="cancelled",
+                    explicit=explicit,
+                )
+            previous_message_id = self._current_message_id(terminal)
+            if previous_message_id is not None:
+                payload["_telegram_previous_status_message_id"] = (
+                    previous_message_id
+                )
             await self._close_group_for_batch(batch_id)
         return payload
 
@@ -191,6 +333,31 @@ class ExplicitCollectionTelegramGatewayClient(
             payload = response.json()
         if not isinstance(payload, dict):
             raise RuntimeError("Gateway presentation relocation response is invalid")
+
+        batch_id = str(payload.get("input_batch_id") or "").strip()
+        if batch_id:
+            updated_ref = self._merge_presentation_ref(
+                presentation_ref,
+                {
+                    "presentation_id": presentation_id,
+                    "presentation_token": token,
+                    "client_message_id": payload.get("client_message_id"),
+                    "active_client_message_id": payload.get(
+                        "client_message_id"
+                    ),
+                    "presentation_generation": payload.get(
+                        "presentation_generation"
+                    ),
+                    "state": payload.get("state"),
+                },
+                client_message_id=str(client_message_id),
+            )
+            async with self._explicit_batch_lock:
+                current = self._explicit_batches.get(batch_id)
+                if current is not None:
+                    current = dict(current)
+                    current["presentation_ref"] = updated_ref
+                    self._explicit_batches[batch_id] = current
         return payload
 
     async def record_input_presentation_deletion(
