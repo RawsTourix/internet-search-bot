@@ -3,7 +3,7 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # Текущий архитектурный baseline
@@ -48,7 +48,8 @@ boundary реализованы и покрыты regression suites.
 Кодовый update реализован. Он завершает client-facing workflow до admission в
 AgentCycle:
 
-- AUTO text-only input запускается без artificial delay;
+- AUTO text-only input запускается без artificial delay и получает user-facing
+  initial status `Сообщение принято. Обрабатываю…`;
 - files-first открывает durable draft;
 - explicit `/collect → /send | /cancel` поддерживает text-first/files-first/mixed;
 - `/batch` и `/done` отсутствуют как дублирующие aliases;
@@ -66,37 +67,56 @@ AgentCycle:
   one-shot binding `input_batch_id → run progress metadata`, потребляемый exact
   `/run` один раз;
 - durable `InputBatch.response_route` не мутируется ради UI presentation;
+- receipt-driven finalization переводит tracked status из `result_ready` в
+  terminal delivery state; подтверждённый `delivered` становится
+  `✅ Задача завершена.`;
+- отдельное сообщение `Готово.` управляется
+  `TELEGRAM_FINAL_STATUS_MODE=always|artefacts_only|never`, default —
+  `artefacts_only`;
 - obsolete progress redirect registry удалён;
 - exact Telegram conversation/thread использует один FIFO dispatcher на входе
   `Application.process_update`, а разные sessions остаются параллельными;
-- успешный новый `/collect` является fresh-task boundary и не продолжает старый
-  `WAITING_USER` cycle;
+- `/collect` упаковывает пользовательский ввод и не является reset-командой;
+- committed package продолжает suspended `WAITING_USER` cycle, сохраняя его
+  messages, working memory и artifact refs;
+- additions во время реально выполняющегося cycle всё ещё требуют будущий
+  `CycleInbox`;
 - late album callback после `/send`/`/cancel` подавляется terminal tombstone;
-- `artifact_list(scope=current|session|workspace)` активирует exact historical
-  versions в bounded current-cycle manifest;
-- historical read/search/delivery разрешены после explicit activation;
+- последний bounded набор artifact refs завершённого cycle наследуется следующим
+  cycle той же session;
+- session handoff не пересекает session boundary и очищается вместе с session при
+  `/reset`;
+- более старая история доступна через
+  `artifact_list(scope="session|workspace")` и explicit activation;
 - output grouping и native Telegram multipart delivery сохраняют порядок.
 
-Thematic CI head `1ce84a02742bd94624b6c7b32d966a3e87c5b14f`:
+Thematic CI закрывающего PR проверяет:
 
 ```text
-compile: success
-artifact suite: 242 tests, OK
-storage suite: 41 tests, OK
-plans suite: 45 tests, OK
-planning suite: 19 tests, OK
-API suite: 1 test, OK
+compile
+artifact suite
+storage suite
+plans suite
+planning suite
+API suite
 ```
 
-Перед переводом PR из draft остаются:
+Точный последний head и результаты run фиксируются в GitHub Actions и описании PR,
+чтобы этот архитектурный baseline не устаревал после каждого документационного
+коммита.
+
+Перед переводом PR из draft остаются release/live gates:
 
 - новый полный Windows suite;
-- повторный live Telegram `/collect`, `/send`, `/cancel`;
+- ordinary AUTO text: правильный initial status, `result_ready → cycle_done` и
+  отсутствие отдельного `Готово.` для text-only ответа при default mode;
+- files-only/text-only/mixed `/collect → /send`;
 - подтверждение сохранения collection snapshot;
-- подтверждение execution progress под `/send`;
-- подтверждение progress обычного committed AUTO text;
+- WAITING_USER continuation в обоих направлениях: новый instruction к старому
+  файлу и новый файл к старому instruction;
+- повторная работа с файлом в следующем независимом cycle той же session;
+- `/reset`, после которого старый bounded artifact handoff больше не наследуется;
 - rapid-command/FIFO scenario;
-- fresh-task boundary после прежнего `WAITING_USER`;
 - отмена до завершения album quiet period;
 - финальный acceptance audit.
 
