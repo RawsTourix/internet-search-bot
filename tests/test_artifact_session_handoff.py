@@ -66,7 +66,7 @@ class ArtifactSessionHandoffTests(unittest.IsolatedAsyncioTestCase):
         await self.client.cleanup()
         self.temporary.cleanup()
 
-    async def test_previous_cycle_artifact_requires_session_catalog_activation(self):
+    async def test_previous_cycle_artifact_is_available_in_same_session(self):
         first_cycle = cycle("cycle-1", "session-1")
         first_state = SessionState()
         self.client._activate_manager_context(
@@ -102,21 +102,11 @@ class ArtifactSessionHandoffTests(unittest.IsolatedAsyncioTestCase):
             progress_callback=None,
         )
 
-        self.assertNotIn(artifact_id, second_cycle.artifact_refs)
-        direct = await self.client._call_registered_tool(
-            "artifact_read_text",
-            {"artifact_ids": [artifact_id]},
-        )
-        direct_payload = json.loads(direct.content[0].text)
-        self.assertNotEqual(direct_payload["status"], "ok")
-
-        catalog = await self.client._call_registered_tool(
-            "artifact_list",
-            {"scope": "session", "limit": 10},
-        )
-        catalog_payload = json.loads(catalog.content[0].text)
-        self.assertIn(artifact_id, catalog_payload["activated_artifact_ids"])
         self.assertIn(artifact_id, second_cycle.artifact_refs)
+        self.assertEqual(
+            second_cycle.cycle_trace[-1]["type"],
+            "artifact_authority_inherited",
+        )
 
         result = await self.client._call_registered_tool(
             "artifact_read_text",
