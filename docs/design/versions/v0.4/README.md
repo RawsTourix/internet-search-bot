@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -25,7 +25,7 @@ last_reviewed: 2026-07-30
 | 4 | [`v0.4-dag-planning`](v0.4-dag-planning.md) | implemented | Optional runtime-owned DAG без scheduler |
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25`/`AF-26` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
-| 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented; acceptance pending | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и scoped artifact history |
+| 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented; acceptance pending | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
 | 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
 
@@ -41,7 +41,7 @@ Robustness tests выявили follow-up hardening:
 
 `v0.4-batch-workflows` реализует:
 
-- text-only AUTO input без artificial delay;
+- text-only AUTO input без artificial delay и с user-facing initial status;
 - file-first AUTO draft и explicit text/files/mixed collection;
 - только `/collect`, `/send`, `/cancel`;
 - authenticated shared control plane;
@@ -49,28 +49,27 @@ Robustness tests выявили follow-up hardening:
 - active-collection relocation через presentation generations;
 - persistent terminal collection snapshot после `/send`/`/cancel`;
 - отдельный execution status под `/send` с run-scoped progress overlay;
+- receipt-driven `result_ready → terminal delivery status`;
+- настраиваемое отдельное `Готово.` через
+  `TELEGRAM_FINAL_STATUS_MODE=always|artefacts_only|never`;
 - FIFO admission dispatcher на exact Telegram conversation/thread;
-- fresh-task boundary при успешном новом `/collect`;
+- continuation suspended `WAITING_USER` cycle через новый committed package;
 - stable semantic OutputPart grouping и Telegram multipart mapping;
-- bounded current artifact manifest;
-- `artifact_list(scope=current|session|workspace)` и exact history activation.
+- bounded handoff последнего набора artifact refs между последовательными cycles
+  одной session;
+- очистку bounded handoff вместе с session при `/reset`;
+- `artifact_list(scope=current|session|workspace)` и exact activation более старой
+  истории за пределами текущего handoff.
 
-Thematic CI head `205924ee85f9696c068eabaa19d673a616d7b88d`:
-
-```text
-compile: success
-artifact suite: 238 tests, OK
-storage suite: 41 tests, OK
-plans suite: 45 tests, OK
-planning suite: 19 tests, OK
-API suite: 1 test, OK
-```
+Thematic PR CI проверяет compile и отдельные artifact/storage/plans/planning/API
+suites. Точный последний head и результаты run фиксируются в GitHub Actions и
+описании PR, а не дублируются здесь после каждого закрывающего коммита.
 
 Перед закрытием acceptance остаются новый full Windows run и повторные живые
-Telegram scenarios: canonical controls, preservation collection snapshot, progress
-под `/send`, rapid FIFO sequence, fresh-task boundary и cancellation до окончания
-album quiet period. Статус перед release всегда проверяется по коду, тестам и live
-evidence.
+Telegram scenarios: ordinary AUTO text, canonical controls, preservation collection
+snapshot, WAITING_USER continuation, same-session file handoff, `/reset`, rapid FIFO
+sequence и cancellation до окончания album quiet period. Статус перед release всегда
+проверяется по коду, тестам и live evidence.
 
 ## Связующие документы версии
 
