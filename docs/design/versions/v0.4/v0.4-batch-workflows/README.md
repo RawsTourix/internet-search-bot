@@ -79,15 +79,17 @@ checkpoints принадлежат следующему
 17. Session handoff не пересекает session boundary. Более старая история за
     пределами bounded handoff остаётся доступна через
     `artifact_list(scope="session")`.
-18. Output grouping сохраняет `OutputPart.index`; Telegram media использует
+18. Полная очистка session удаляет её dialog memory, runtime state и bounded
+    artifact handoff; состояние других sessions не затрагивается.
+19. Output grouping сохраняет `OutputPart.index`; Telegram media использует
     SDK-owned `attach://...` mapping.
-19. Durable commit завершается до AgentCycle; отмена run не откатывает batch.
-20. Forwarding — provenance, не attachment type.
-21. Explicit draft не имеет transport quiet/deadline auto-commit semantics.
-22. Persisted canonical grouping mode — `explicit_collection`; rollout-era
+20. Durable commit завершается до AgentCycle; отмена run не откатывает batch.
+21. Forwarding — provenance, не attachment type.
+22. Explicit draft не имеет transport quiet/deadline auto-commit semantics.
+23. Persisted canonical grouping mode — `explicit_collection`; rollout-era
     `immediate_text` records мигрируют при reconcile.
-23. Поздний album callback после `/send`/`/cancel` является silent no-op.
-24. Exact Telegram session использует один FIFO dispatcher; разные sessions
+24. Поздний album callback после `/send`/`/cancel` является silent no-op.
+25. Exact Telegram session использует один FIFO dispatcher; разные sessions
     остаются параллельными.
 
 ## Этапы
@@ -110,8 +112,9 @@ finalization.
 
 ### BW-P4 — реализован
 
-Bounded same-session handoff, `artifact_list(scope=current|session|workspace)`,
-activation provenance, scope-bound cursor и historical read/search/delivery.
+Bounded same-session handoff, session reset cleanup,
+`artifact_list(scope=current|session|workspace)`, activation provenance,
+scope-bound cursor и historical read/search/delivery.
 
 ### BW-P5 — live acceptance
 
@@ -125,6 +128,7 @@ activation provenance, scope-bound cursor и historical read/search/delivery.
 - ошибочный fresh-task boundary при `/collect`;
 - отсутствие continuation нового committed package в suspended `WAITING_USER`;
 - потерю файлов между последовательными циклами одной session;
+- сохранение bounded artifact handoff после `/reset`;
 - отдельное `Готово.` после каждого text-only ответа;
 - отсутствие `cycle_done` после подтверждённой доставки;
 - transport-level acknowledgement вместо user-facing text acknowledgement.
@@ -144,6 +148,7 @@ activation provenance, scope-bound cursor и historical read/search/delivery.
 - `/collect → package → /send` как continuation после `WAITING_USER`;
 - новый cycle той же session продолжает работу с предыдущим файлом без re-upload;
 - другая session не получает artifact authority;
+- `/reset` очищает bounded handoff текущей session и не затрагивает другие sessions;
 - rapid FIFO scenario;
 - `/cancel` до завершения album quiet period без позднего commit/409.
 
