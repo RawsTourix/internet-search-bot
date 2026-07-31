@@ -59,6 +59,12 @@ class ArtifactDeliveryMixin:
                 artifact_services.delivery_service,
             )
 
+    def clear_session(self, session_id: str) -> None:
+        """Clear artifact handoff state and the inherited session state."""
+
+        self._session_artifact_handoffs.pop(session_id, None)
+        super().clear_session(session_id)
+
     def _build_manager_tools(self) -> dict[str, ManagerToolSpec]:
         tools = super()._build_manager_tools()
         if self.artifact_delivery_tool_controller is None:
