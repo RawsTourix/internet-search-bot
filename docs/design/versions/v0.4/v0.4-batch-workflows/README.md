@@ -3,7 +3,7 @@ id: design.v0.4.batch-workflows
 version: v0.4
 spec_status: accepted
 implementation_status: implemented
-last_reviewed: 2026-07-30
+last_reviewed: 2026-07-31
 ---
 
 # v0.4-batch-workflows
@@ -20,7 +20,7 @@ artifact workspace:
 - отдельные collection snapshot и AgentCycle run status;
 - native Telegram document groups;
 - stable `OutputPart` grouping;
-- bounded artifact manifest и scoped history catalog;
+- bounded current/session artifact authority;
 - durable commit до in-process AgentCycle;
 - cancellation-safe Gateway/MCP shutdown;
 - aggregate progress projection.
@@ -47,39 +47,47 @@ checkpoints принадлежат следующему
 ## Главные инварианты
 
 1. Обычный text-only AUTO input не ждёт будущих файлов.
-2. `text → files` автоматически не объединяется; обратный порядок выражается
+2. Его initial status — `Сообщение принято. Обрабатываю…`, а не transport-level
+   `Входной пакет принят.`.
+3. `text → files` автоматически не объединяется; обратный порядок выражается
    явным `/collect`.
-3. `/send` коммитит любой непустой explicit draft: text-only, files-only или mixed.
-4. `/cancel` не запускает AgentCycle и не удаляет audit evidence.
-5. На exact principal/client-instance/conversation/thread scope существует не
+4. `/send` коммитит любой непустой explicit draft: text-only, files-only или mixed.
+5. `/cancel` не запускает AgentCycle и не удаляет audit evidence.
+6. На exact principal/client-instance/conversation/thread scope существует не
    более одной active collection.
-6. UI содержит только `/collect`, `/send`, `/cancel`.
-7. Collection snapshot и run status — разные presentation roles.
-8. После `/send` collection snapshot terminalize-ится и остаётся в истории.
-9. `/run` получает execution-scoped progress metadata; durable
-   `InputBatch.response_route` не мутируется.
-10. `result_ready` остаётся промежуточным событием. После подтверждённого
-    `delivered` receipt run status переходит в `cycle_done`.
-11. `/collect` является способом упаковать пользовательский ввод, а не командой
+7. UI содержит только `/collect`, `/send`, `/cancel`.
+8. Collection snapshot и run status — разные presentation roles.
+9. После `/send` collection snapshot terminalize-ится и остаётся в истории.
+10. `/run` получает execution-scoped progress metadata; durable
+    `InputBatch.response_route` не мутируется.
+11. `result_ready` остаётся промежуточным событием. После сохранённого terminal
+    receipt tracked run status редактируется напрямую: `delivered → cycle_done`,
+    остальные состояния получают соответствующий delivery status.
+12. Отдельное сообщение `Готово.` не заменяет tracked status и управляется
+    `TELEGRAM_FINAL_STATUS_MODE=always|artefacts_only|never`; default —
+    `artefacts_only`.
+13. `/collect` является способом упаковать пользовательский ввод, а не командой
     очистки памяти.
-12. Если session содержит suspended `WAITING_USER` cycle, committed package
-    продолжает тот же cycle, сохраняет его messages/working memory/artifact refs
-    и добавляет refs нового InputBatch.
-13. Дополнение разрешено только для suspended `WAITING_USER`; active running cycle
+14. Если session содержит suspended `WAITING_USER` cycle, committed package
+    продолжает тот же cycle, сохраняет messages/working memory/artifact refs и
+    добавляет refs нового InputBatch.
+15. Дополнение разрешено только для suspended `WAITING_USER`; active running cycle
     всё ещё требует будущий `CycleInbox`.
-14. Артефакты независимого завершённого цикла не добавляются в новый cycle
-    автоматически; history активируется через `artifact_list(scope="session")`.
-15. Изоляция истории не применяется внутри continuation одного `WAITING_USER`
-    cycle: его существующие artifact refs являются текущим рабочим состоянием.
-16. Output grouping сохраняет `OutputPart.index`; Telegram media использует
+16. Последний bounded набор artifact refs завершённого цикла наследуется следующим
+    циклом той же session, чтобы пользователь мог продолжать работу с присланным
+    или созданным файлом без повторной загрузки.
+17. Session handoff не пересекает session boundary. Более старая история за
+    пределами bounded handoff остаётся доступна через
+    `artifact_list(scope="session")`.
+18. Output grouping сохраняет `OutputPart.index`; Telegram media использует
     SDK-owned `attach://...` mapping.
-17. Durable commit завершается до AgentCycle; отмена run не откатывает batch.
-18. Forwarding — provenance, не attachment type.
-19. Explicit draft не имеет transport quiet/deadline auto-commit semantics.
-20. Persisted canonical grouping mode — `explicit_collection`; rollout-era
+19. Durable commit завершается до AgentCycle; отмена run не откатывает batch.
+20. Forwarding — provenance, не attachment type.
+21. Explicit draft не имеет transport quiet/deadline auto-commit semantics.
+22. Persisted canonical grouping mode — `explicit_collection`; rollout-era
     `immediate_text` records мигрируют при reconcile.
-21. Поздний album callback после `/send`/`/cancel` является silent no-op.
-22. Exact Telegram session использует один FIFO dispatcher; разные sessions
+23. Поздний album callback после `/send`/`/cancel` является silent no-op.
+24. Exact Telegram session использует один FIFO dispatcher; разные sessions
     остаются параллельными.
 
 ## Этапы
@@ -97,12 +105,13 @@ text/files/mixed commit, manual commit guard и terminal album tombstone.
 ### BW-P3 — реализован
 
 Presentation generations для активного collection, persistent terminal snapshot,
-отдельный run status и execution-scoped progress overlay.
+отдельный run status, execution-scoped progress overlay и receipt-driven status
+finalization.
 
 ### BW-P4 — реализован
 
-`artifact_list(scope=current|session|workspace)`, bounded activation, provenance,
-scope-bound cursor и historical read/search/delivery после activation.
+Bounded same-session handoff, `artifact_list(scope=current|session|workspace)`,
+activation provenance, scope-bound cursor и historical read/search/delivery.
 
 ### BW-P5 — live acceptance
 
@@ -115,25 +124,32 @@ scope-bound cursor и historical read/search/delivery после activation.
 - отсутствие run callback;
 - ошибочный fresh-task boundary при `/collect`;
 - отсутствие continuation нового committed package в suspended `WAITING_USER`;
-- отсутствие `cycle_done` после подтверждённой доставки.
+- потерю файлов между последовательными циклами одной session;
+- отдельное `Готово.` после каждого text-only ответа;
+- отсутствие `cycle_done` после подтверждённой доставки;
+- transport-level acknowledgement вместо user-facing text acknowledgement.
 
 ## Acceptance gates
 
 Перед переводом PR из draft требуются:
 
 - новый полный Windows suite;
+- ordinary AUTO text с initial status `Сообщение принято. Обрабатываю…`;
+- text-only delivery: `result_ready → cycle_done`, без отдельного `Готово.` при
+  default mode;
+- artifact delivery: tracked `cycle_done` и отдельное `Готово.` после файлов при
+  default mode;
 - text-only/files-only/mixed `/collect → /send`;
 - сохранение terminal collection snapshot;
-- progress status непосредственно под `/send`;
-- `result_ready → cycle_done` после delivered receipt;
 - `/collect → package → /send` как continuation после `WAITING_USER`;
+- новый cycle той же session продолжает работу с предыдущим файлом без re-upload;
+- другая session не получает artifact authority;
 - rapid FIFO scenario;
-- `/cancel` до завершения album quiet period без позднего commit/409;
-- проверка, что independent historical artifacts требуют catalog activation.
+- `/cancel` до завершения album quiet period без позднего commit/409.
 
-Новых параметров `.env` или `mcp.config` последние runtime-патчи не добавляют.
-Ранее добавленный параметр уже присутствует в `.env.example`:
+Параметры Telegram UX в `.env.example`:
 
 ```env
 TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
+TELEGRAM_FINAL_STATUS_MODE="artefacts_only"
 ```
