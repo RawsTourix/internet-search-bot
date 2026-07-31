@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from contextlib import asynccontextmanager
+from contextvars import ContextVar
+from typing import Any
 
 import httpx
 from telegram import BotCommand
@@ -10,6 +12,7 @@ from telegram.constants import ParseMode
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import CommandHandler, MessageHandler, filters
 
+from ...agent.progress_messages import progress_text
 from . import telegram_server as server
 from .batch_commands import input_collection_command_handler
 from .config import (
@@ -17,6 +20,7 @@ from .config import (
     TELEGRAM_API_KEY,
     TELEGRAM_BOT_INSTANCE_ID,
     TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES,
+    TELEGRAM_FINAL_STATUS_MODE,
     TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS,
     TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS,
     TELEGRAM_READY_OUTBOX_BATCH_LIMIT,
@@ -28,6 +32,22 @@ from .ready_outbox import TelegramReadyOutboxWorker
 from .run_progress_bridge import RunScopedProgressTelegramGatewayClient
 from .runtime_state import TelegramSessionDispatcher
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
+
+
+_ARTIFACT_OUTPUT_TYPES = frozenset({
+    "artifact_output",
+    "image_output",
+    "audio_output",
+    "voice_output",
+    "video_output",
+    "video_note_output",
+    "animation_output",
+    "sticker_output",
+})
+_output_completion_context: ContextVar[dict[str, Any] | None] = ContextVar(
+    "telegram_output_completion_context",
+    default=None,
+)
 
 
 # One exact client-instance authority is shared by the ordinary synchronous
@@ -162,8 +182,8 @@ server._finish_group = _queued_finish_group
 
 
 # Preserve the original transport-neutral acknowledgement executor across test
-# re-imports. The wrapper only intercepts the explicit RELOCATE policy used
-# while a collection is still active. Run progress never uses this path.
+# re-imports. The wrapper intercepts explicit RELOCATE and the ordinary atomic
+# text acknowledgement; run progress never uses this path.
 _base_apply_input_ack_policy = getattr(
     server,
     "_v04_base_apply_input_ack_policy",
@@ -180,6 +200,27 @@ async def _remember_presentation_handle(submission, status_message) -> None:
         submission,
         client_message_id=str(message_id),
     )
+
+
+def _is_committed_text_only_submission(submission: dict[str, Any]) -> bool:
+    event = dict(submission.get("presentation_event") or {})
+    params = dict(event.get("params") or {})
+    return (
+        str(submission.get("status") or "") == "committed"
+        and not bool(submission.get("duplicate"))
+        and int(params.get("file_count") or 0) == 0
+        and int(params.get("text_part_count") or 0) > 0
+    )
+
+
+def _message_received_text(update, submission: dict[str, Any]) -> str:
+    event = dict(submission.get("presentation_event") or {})
+    locale = str(
+        event.get("locale") or server.detect_progress_locale(update) or "ru"
+    ).lower()
+    if locale.startswith("en"):
+        return "Message received. Processing…"
+    return "Сообщение принято. Обрабатываю…"
 
 
 async def _remember_auto_run_presentation(
@@ -209,13 +250,24 @@ async def _remember_auto_run_presentation(
 
 
 async def _apply_input_ack_policy(*, update, submission, session_id):
-    status_message = await apply_relocating_input_ack_policy(
-        base_apply=_base_apply_input_ack_policy,
-        server=server,
-        update=update,
-        submission=submission,
-        session_id=session_id,
-    )
+    if _is_committed_text_only_submission(submission):
+        status_message = await server.send_initial_status_message(
+            update,
+            _message_received_text(update, submission),
+        )
+        await _base_bind_input_presentation_status(
+            submission=submission,
+            status_message=status_message,
+            session_id=session_id,
+        )
+    else:
+        status_message = await apply_relocating_input_ack_policy(
+            base_apply=_base_apply_input_ack_policy,
+            server=server,
+            update=update,
+            submission=submission,
+            session_id=session_id,
+        )
     await _remember_presentation_handle(submission, status_message)
     await _remember_auto_run_presentation(
         update=update,
@@ -328,7 +380,7 @@ async def _edit_known_status(update, status_message, text: str):
     return status_message
 
 
-async def _finish_status_or_send_reply(
+async def _finish_status_or_send_reply_core(
     *,
     update,
     status_message,
@@ -379,6 +431,115 @@ async def _finish_status_or_send_reply(
         return await _terminal_reply_sender()(update, raw)
 
 
+def _completion_message_enabled(*, has_artifacts: bool) -> bool:
+    return (
+        TELEGRAM_FINAL_STATUS_MODE == "always"
+        or (
+            TELEGRAM_FINAL_STATUS_MODE == "artefacts_only"
+            and has_artifacts
+        )
+    )
+
+
+def _terminal_delivery_text(state: str, *, locale: str) -> str:
+    if state == "delivered":
+        return progress_text("cycle_done", locale_name=locale)
+    key = {
+        "partially_delivered": "output.delivery_incomplete",
+        "failed": "output_batch.failed",
+        "unknown": "output.delivery_unknown",
+    }.get(state, "output.delivery_unknown")
+    return server._localized(key, locale=locale)
+
+
+async def _finish_status_or_send_reply(
+    *,
+    update,
+    status_message,
+    text: str,
+    force_reply_if_long: bool = False,
+    delivery_mode: str | None = None,
+):
+    completion = _output_completion_context.get()
+    if completion is not None:
+        take_state = getattr(
+            server.artifact_gateway,
+            "take_completed_output_state",
+            None,
+        )
+        if callable(take_state):
+            terminal_state = await take_state(
+                str(completion["output_batch_id"])
+            )
+            if terminal_state:
+                locale = str(completion["locale"])
+                result = await _finish_status_or_send_reply_core(
+                    update=update,
+                    status_message=status_message,
+                    text=_terminal_delivery_text(
+                        terminal_state,
+                        locale=locale,
+                    ),
+                    delivery_mode="edit_status",
+                )
+                if (
+                    terminal_state == "delivered"
+                    and _completion_message_enabled(
+                        has_artifacts=bool(completion["has_artifacts"])
+                    )
+                ):
+                    await _terminal_reply_sender()(
+                        update,
+                        server._localized("output.done", locale=locale),
+                    )
+                server.logger.info(
+                    "telegram_run_status_finalized output_batch_id=%s "
+                    "state=%s completion_message=%s",
+                    completion["output_batch_id"],
+                    terminal_state,
+                    (
+                        terminal_state == "delivered"
+                        and _completion_message_enabled(
+                            has_artifacts=bool(completion["has_artifacts"])
+                        )
+                    ),
+                )
+                return result
+
+    return await _finish_status_or_send_reply_core(
+        update=update,
+        status_message=status_message,
+        text=text,
+        force_reply_if_long=force_reply_if_long,
+        delivery_mode=delivery_mode,
+    )
+
+
+def _build_output_completion_context(
+    values: dict[str, Any],
+    metadata: dict[str, Any],
+) -> dict[str, Any] | None:
+    if not bool(values.get("success")) or server.is_agent_error(metadata):
+        return None
+    output_batch = dict(metadata.get("output_batch") or {})
+    output_batch_id = str(output_batch.get("output_batch_id") or "").strip()
+    if not output_batch_id:
+        return None
+    parts = list(output_batch.get("parts") or [])
+    has_artifacts = any(
+        isinstance(part, dict)
+        and str(part.get("type") or "") in _ARTIFACT_OUTPUT_TYPES
+        for part in parts
+    )
+    return {
+        "output_batch_id": output_batch_id,
+        "has_artifacts": has_artifacts,
+        "locale": server.normalize_locale(
+            metadata.get("progress_locale") or "ru"
+        ),
+    }
+
+
 async def _deliver_agent_result(**values):
     """Handle explicit collection status and rare synchronous/outbox races."""
 
@@ -410,23 +571,33 @@ async def _deliver_agent_result(**values):
             delivery_mode="edit_status",
         )
 
+    completion = _build_output_completion_context(values, metadata)
+    token = (
+        _output_completion_context.set(completion)
+        if completion is not None
+        else None
+    )
     try:
-        return await _base_deliver_agent_result(**values)
-    except httpx.HTTPStatusError as error:
-        request = error.request
-        if (
-            error.response.status_code == 409
-            and request.method == "POST"
-            and request.url.path.endswith("/claim")
-            and "/internal/output-outbox/" in request.url.path
-        ):
-            output_batch = metadata.get("output_batch") or {}
-            server.logger.info(
-                "telegram_output_claim_already_owned output_batch_id=%s",
-                output_batch.get("output_batch_id"),
-            )
-            return None
-        raise
+        try:
+            return await _base_deliver_agent_result(**values)
+        except httpx.HTTPStatusError as error:
+            request = error.request
+            if (
+                error.response.status_code == 409
+                and request.method == "POST"
+                and request.url.path.endswith("/claim")
+                and "/internal/output-outbox/" in request.url.path
+            ):
+                output_batch = metadata.get("output_batch") or {}
+                server.logger.info(
+                    "telegram_output_claim_already_owned output_batch_id=%s",
+                    output_batch.get("output_batch_id"),
+                )
+                return None
+            raise
+    finally:
+        if token is not None:
+            _output_completion_context.reset(token)
 
 
 server.finish_status_or_send_reply = _finish_status_or_send_reply
