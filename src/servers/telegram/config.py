@@ -132,3 +132,24 @@ TELEGRAM_FINAL_DELIVERY_MODE = os.getenv(
     "TELEGRAM_FINAL_DELIVERY_MODE",
     "send_new",
 )
+
+# Controls the optional standalone completion message ("Готово.") after a
+# confirmed OutputBatch receipt. The tracked run-status message is finalized
+# independently for every terminal delivery state.
+TELEGRAM_FINAL_STATUS_MODE = os.getenv(
+    "TELEGRAM_FINAL_STATUS_MODE",
+    "artefacts_only",
+).strip().lower()
+# Accept the project-wide American spelling as an alias while keeping the
+# public values requested for this transport setting stable.
+if TELEGRAM_FINAL_STATUS_MODE == "artifacts_only":
+    TELEGRAM_FINAL_STATUS_MODE = "artefacts_only"
+if TELEGRAM_FINAL_STATUS_MODE not in {
+    "always",
+    "artefacts_only",
+    "never",
+}:
+    raise ValueError(
+        "TELEGRAM_FINAL_STATUS_MODE must be one of: "
+        "always, artefacts_only, never"
+    )
