@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from .delivery import (
     ArtifactDeliveryRecord,
     ArtifactDeliveryService,
@@ -23,6 +25,163 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
     exact artifact version. DELIVERING and UNKNOWN heads are never silently
     replaced because their bytes may already have reached the client.
     """
+
+    def __init__(
+        self,
+        storage_config,
+        *,
+        trace_service=None,
+    ) -> None:
+        super().__init__(storage_config)
+        self.trace_service = trace_service
+
+    async def select(self, record: ArtifactDeliveryRecord) -> ArtifactDeliveryRecord:
+        selected = await super().select(record)
+        await self._trace_records(
+            [selected],
+            event_type="artifact_delivery_selected",
+            status="succeeded",
+        )
+        return selected
+
+    async def select_many(
+        self,
+        records: list[ArtifactDeliveryRecord],
+    ) -> list[ArtifactDeliveryRecord]:
+        selected = await super().select_many(records)
+        await self._trace_records(
+            selected,
+            event_type="artifact_delivery_selected",
+            status="succeeded",
+        )
+        return selected
+
+    async def transition(
+        self,
+        delivery_id: str,
+        *,
+        target: ArtifactDeliveryState,
+        allowed_from: set[ArtifactDeliveryState],
+        error: str | None = None,
+        receipt: dict[str, Any] | None = None,
+    ) -> ArtifactDeliveryRecord:
+        record = await super().transition(
+            delivery_id,
+            target=target,
+            allowed_from=allowed_from,
+            error=error,
+            receipt=receipt,
+        )
+        await self._trace_records(
+            [record],
+            event_type=self._transition_event_type(target),
+            status=self._transition_status(target),
+            error=error,
+        )
+        return record
+
+    async def transition_many(
+        self,
+        delivery_ids: list[str],
+        *,
+        target: ArtifactDeliveryState,
+        allowed_from: set[ArtifactDeliveryState],
+        receipt_by_delivery_id: dict[str, dict[str, Any]] | None = None,
+        error: str | None = None,
+    ) -> list[ArtifactDeliveryRecord]:
+        records = await super().transition_many(
+            delivery_ids,
+            target=target,
+            allowed_from=allowed_from,
+            receipt_by_delivery_id=receipt_by_delivery_id,
+            error=error,
+        )
+        await self._trace_records(
+            records,
+            event_type=self._transition_event_type(target),
+            status=self._transition_status(target),
+            error=error,
+        )
+        return records
+
+    async def cancel_many(
+        self,
+        delivery_ids: list[str],
+    ) -> list[ArtifactDeliveryRecord]:
+        records = await super().cancel_many(delivery_ids)
+        await self._trace_records(
+            records,
+            event_type="artifact_delivery_cancelled",
+            status="succeeded",
+        )
+        return records
+
+    async def _trace_records(
+        self,
+        records: list[ArtifactDeliveryRecord],
+        *,
+        event_type: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        if self.trace_service is None:
+            return
+        for record in records:
+            await self.trace_service.record(
+                session_id=record.session_id,
+                cycle_id=record.cycle_id,
+                event_type=event_type,
+                stage="delivery",
+                status=status,
+                direction="outbound",
+                correlation={"delivery_id": record.delivery_id},
+                transport={"client_type": record.client_type},
+                artifact={
+                    "artifact_id": record.artifact_id,
+                    "artifact_lineage_id": record.artifact_lineage_id,
+                    "content_id": record.content_id,
+                    "filename": record.filename,
+                    "format_id": record.format_id,
+                    "mime_type": record.mime_type,
+                    "size_bytes": record.size_bytes,
+                    "content_hash": record.content_hash,
+                },
+                metrics={
+                    "attempt_count": record.attempt_count,
+                    "selection_index": record.selection_index,
+                },
+                error=(
+                    {
+                        "error_type": "ArtifactDeliveryError",
+                        "message": error,
+                    }
+                    if error
+                    else None
+                ),
+                data={"state": record.state.value},
+            )
+
+    @staticmethod
+    def _transition_event_type(target: ArtifactDeliveryState) -> str:
+        return {
+            ArtifactDeliveryState.SELECTED: "artifact_delivery_selected",
+            ArtifactDeliveryState.DELIVERING: "artifact_delivery_started",
+            ArtifactDeliveryState.DELIVERED: "artifact_delivery_succeeded",
+            ArtifactDeliveryState.FAILED: "artifact_delivery_failed",
+            ArtifactDeliveryState.UNKNOWN: "artifact_delivery_unknown",
+            ArtifactDeliveryState.CANCELLED: "artifact_delivery_cancelled",
+        }[target]
+
+    @staticmethod
+    def _transition_status(target: ArtifactDeliveryState) -> str:
+        return {
+            ArtifactDeliveryState.SELECTED: "succeeded",
+            ArtifactDeliveryState.DELIVERING: "started",
+            ArtifactDeliveryState.DELIVERED: "succeeded",
+            ArtifactDeliveryState.FAILED: "failed",
+            ArtifactDeliveryState.UNKNOWN: "unknown",
+            ArtifactDeliveryState.CANCELLED: "succeeded",
+        }[target]
 
     def _select_many_sync(
         self,
