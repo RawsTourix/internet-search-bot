@@ -3,7 +3,7 @@ id: design.glossary
 version: cross-version
 spec_status: accepted
 implementation_status: not-applicable
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Глоссарий
@@ -121,7 +121,49 @@ skill не выдаёт разрешение; effective capabilities вычис�
 ## Scope
 
 Область видимости registry/resource: `builtin`, `instance`, `user`, `session`.
-User scope полноценно enforced после v0.8.
+Scope определяет visibility/precedence, но не заменяет permission. User scope
+полноценно enforced после v0.8.
+
+## Builtin MCP service
+
+Отдельный MCP-сервис, поставляемый и тестируемый как системная capability и
+зарегистрированный со scope `builtin`. `Builtin` не означает in-process,
+обязательную доступность или обход authorization policy.
+
+## MCP registry / Registry revision
+
+MCP registry хранит definitions, scopes, visibility и exact server/tool bindings.
+Registry revision — immutable идентификатор snapshot, изменяющийся при
+add/remove, enable/disable, generation/tool-list или trusted metadata change.
+
+## Tool execution semantics
+
+Trusted metadata вызова: side-effect class, retry policy, timeout, normalized
+outcome, presentation и remote-resource behavior. Она принадлежит registry/policy,
+а не произвольному tool output.
+
+## Tool outcome `unknown`
+
+Результат, при котором external operation могла завершиться, но runtime не
+получил достоверного подтверждения. Mutating operation с `unknown` не повторяется
+автоматически.
+
+## Trusted presentation profile
+
+Одобренное со стороны агента описание semantic progress presentation для
+конкретного tool binding. Server-supplied текст не становится trusted profile.
+
+## Remote resource handle
+
+Opaque идентификатор stateful ресурса внешнего сервиса. Agent Runtime хранит
+server/resource/owner coordinates и cleanup policy, но не внутреннее состояние
+ресурса.
+
+## Lifecycle owner
+
+Runtime boundary, к которой привязан remote resource: `tool_call`, `cycle`,
+`run`, `task_run`, `session` или explicit owner. Завершение owner запускает
+policy-controlled best-effort cleanup request.
 
 ## `messages_for_llm`
 
