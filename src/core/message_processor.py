@@ -1,6 +1,7 @@
 import logging
 import os
-from datetime import datetime
+from collections import Counter
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from typing import Any, Dict
 
@@ -237,7 +238,7 @@ class MessageProcessor:
                 "Я интеллектуальный помощник с доступом к инструментам."
             )
         if command == "/status":
-            return await self._get_status_text()
+            return await self._get_status_text(message)
         if command == "/help":
             return self._get_help_text()
         if command == "/reset":
@@ -262,22 +263,166 @@ class MessageProcessor:
         return """
 Доступные команды:
 /start - приветствие
-/status - статус системы
+/status - статус системы и текущей сессии
 /reset - очистка памяти
 /help - справка
 
 Вы можете отправлять текст и файлы для обработки.
         """.strip()
 
-    async def _get_status_text(self) -> str:
+    async def _get_status_text(self, message: UnifiedMessage) -> str:
         uptime = datetime.now() - self.stats["start_time"]
-        return f"""
-Статус Gateway:
-• Время работы: {uptime}
-• Всего сообщений: {self.stats['total_messages']}
-• Ошибок: {self.stats['errors']}
-• Telegram: {self.stats['messages_by_client']['telegram']}
-        """.strip()
+        session_id = self._build_session_id(message)
+        now = datetime.now(timezone.utc)
+        lines = [
+            "Статус Gateway:",
+            f"• Время работы: {str(uptime).split('.')[0]}",
+            f"• Всего сообщений: {self.stats['total_messages']}",
+            f"• Ошибок: {self.stats['errors']}",
+            f"• Telegram: {self.stats['messages_by_client']['telegram']}",
+            "",
+            "Текущая сессия:",
+            f"• ID: {session_id}",
+        ]
+
+        state = getattr(API.mcp_client, "session_states", {}).get(session_id)
+        memory = getattr(API.mcp_client, "sessions", {}).get(session_id)
+        if state is None:
+            lines.append("• Runtime: idle (состояние ещё не создано)")
+        else:
+            status_value = getattr(state.status, "value", state.status)
+            lines.append(f"• Runtime: {status_value}")
+            lines.append(
+                "• Ожидание пользователя: "
+                + ("да" if state.awaiting_user_input else "нет")
+            )
+            lines.append(f"• Итераций последнего цикла: {state.iterations}")
+            if state.last_error:
+                lines.append(f"• Последняя ошибка: {state.last_error}")
+        if memory is not None:
+            lines.append(f"• Диалоговых ходов в памяти: {len(memory.dialog_turns)}")
+            pending = getattr(memory, "pending_cycle", None)
+            if pending is not None:
+                lines.append(f"• Pending cycle: {pending.cycle_id}")
+
+        collection_lines: list[str] = []
+        collection_store = getattr(API.ingress_services, "collection_store", None)
+        control_service = getattr(
+            API.ingress_services,
+            "draft_control_service",
+            None,
+        )
+        if collection_store is not None and hasattr(collection_store, "list_active"):
+            try:
+                active = [
+                    item
+                    for item in await collection_store.list_active()
+                    if item.scope.session_id == session_id
+                ]
+                reconciled = []
+                for item in active:
+                    current = (
+                        await control_service.reconcile_collection(item)
+                        if control_service is not None
+                        else item
+                    )
+                    if current.is_active:
+                        reconciled.append(current)
+                if not reconciled:
+                    collection_lines.append("• Сбор пакета: не активен")
+                else:
+                    collection = reconciled[0]
+                    snapshot = await control_service.inspect(collection.scope)
+                    opened = now - collection.opened_at
+                    idle = now - collection.updated_at
+                    collection_lines.extend([
+                        f"• Сбор пакета: {collection.state.value}",
+                        f"• Collection: {collection.collection_id}",
+                        f"• InputBatch: {collection.bound_input_batch_id or 'не создан'}",
+                        f"• Файлы: {snapshot.file_count}",
+                        f"• Сообщения: {snapshot.text_part_count}",
+                        f"• Возраст: {self._format_duration(opened.total_seconds())}",
+                        f"• Без активности: {self._format_duration(idle.total_seconds())}",
+                    ])
+            except Exception as error:
+                collection_lines.append(
+                    f"• Сбор пакета: диагностика недоступна ({type(error).__name__})"
+                )
+        else:
+            collection_lines.append("• Сбор пакета: control plane недоступен")
+        lines.extend(["", "Входные пакеты:", *collection_lines])
+
+        try:
+            drafts = await API.ingress_services.batch_store.list_open_drafts(
+                session_id=session_id
+            )
+            states = Counter(item.state.value for item in drafts)
+            summary = ", ".join(
+                f"{key}={value}" for key, value in sorted(states.items())
+            ) or "нет"
+            lines.append(f"• Открытых drafts: {len(drafts)} ({summary})")
+        except Exception as error:
+            lines.append(
+                f"• Открытые drafts: недоступно ({type(error).__name__})"
+            )
+
+        try:
+            presentations = await API.ingress_services.presentation_store.list_recoverable()
+            session_presentations = [
+                item for item in presentations
+                if getattr(item, "session_id", None) == session_id
+            ]
+            lines.append(
+                "• Recoverable presentations: "
+                f"{len(session_presentations)} в сессии / {len(presentations)} всего"
+            )
+        except Exception as error:
+            lines.append(
+                f"• Recoverable presentations: недоступно ({type(error).__name__})"
+            )
+
+        try:
+            outputs = await API.output_store.list_recoverable()
+            session_outputs = [
+                item for item in outputs
+                if getattr(item, "session_id", None) == session_id
+            ]
+            output_states = Counter(item.state.value for item in session_outputs)
+            output_summary = ", ".join(
+                f"{key}={value}"
+                for key, value in sorted(output_states.items())
+            ) or "нет"
+            lines.append(
+                f"• Recoverable outputs: {len(session_outputs)} ({output_summary})"
+            )
+        except Exception as error:
+            lines.append(
+                f"• Recoverable outputs: недоступно ({type(error).__name__})"
+            )
+
+        trace_enabled = bool(
+            getattr(API.artifact_config, "trace_enabled", False)
+        )
+        lines.extend([
+            "",
+            "Артефакты:",
+            "• Lifecycle trace: " + ("включён" if trace_enabled else "выключен"),
+            "",
+            "Примечание: Telegram session привязана к chat/thread и сохраняет "
+            "тот же ID после перезапуска процесса.",
+        ])
+        return "\n".join(lines)
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        total = max(0, int(seconds))
+        hours, remainder = divmod(total, 3600)
+        minutes, secs = divmod(remainder, 60)
+        if hours:
+            return f"{hours}ч {minutes}м {secs}с"
+        if minutes:
+            return f"{minutes}м {secs}с"
+        return f"{secs}с"
 
     async def get_stats(self) -> Dict[str, Any]:
         uptime = datetime.now() - self.stats["start_time"]
