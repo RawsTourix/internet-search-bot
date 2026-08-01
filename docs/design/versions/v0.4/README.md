@@ -3,14 +3,14 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-01
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
 
 `v0.4` создаёт agent workspace с внешним хранением полного content,
-управляемым LLM-контекстом, optional DAG, атомарным input, доставкой артефактов
-и устойчивым модульным runtime.
+управляемым LLM-контекстом, optional DAG, атомарным input, доставкой артефактов,
+устойчивым модульным runtime и локальным MCP capability registry foundation.
 
 Основная рабочая единица документации — именованное обновление. Крупное
 обновление может быть папкой с собственным README и внутренними разделами.
@@ -28,6 +28,7 @@ last_reviewed: 2026-07-31
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented; acceptance pending | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
 | 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
+| 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics и remote-resource lifecycle integration |
 
 `AF-24` порядка `grouping → durable InputBatchDraft → streaming` реализован и
 подтверждён live Telegram workflow.
@@ -78,6 +79,7 @@ sequence и cancellation до окончания album quiet period. Стату�
 | [`overview.md`](overview.md) | Цель и граница v0.4 |
 | [`v0.4-unified-input-artifact-architecture.md`](v0.4-unified-input-artifact-architecture.md) | Сквозная связь ingress, input batches, artifacts и runtime |
 | [`v0.4-release-plan.md`](v0.4-release-plan.md) | Порядок реализации и общие acceptance criteria |
+| [`../../contracts/builtin-mcp-service-contract.md`](../../contracts/builtin-mcp-service-contract.md) | Cross-version contract встроенных MCP-сервисов |
 
 ## Зависимости обновлений
 
@@ -91,6 +93,7 @@ v0.4-storage-foundation
         └── v0.4-batch-workflows
             └── v0.4-input-runtime
                 └── v0.4-runtime-modularization
+                    └── v0.4-mcp-registry-foundation
 ```
 
 ## Как читать
@@ -101,7 +104,11 @@ v0.4-storage-foundation
 - Текущий Telegram FIFO dispatcher является in-process acceptance boundary, а не
   заменой `CycleInbox`.
 - `v0.4-input-runtime` отвечает за `CycleInbox` и safe checkpoints.
-- `v0.4-runtime-modularization` меняет ownership, а не product semantics.
+- `v0.4-runtime-modularization` меняет ownership и вводит generic ports, а не
+  product semantics.
+- `v0.4-mcp-registry-foundation` применяет эти ports к scopes, trusted MCP
+  metadata и remote-resource lifecycle; он не реализует конкретный MCP-сервис.
 
-PostgreSQL/RAG начинаются в [`../v0.5/README.md`](../v0.5/README.md), workers и
-distributed orchestration — в [`../v0.6/README.md`](../v0.6/README.md).
+PostgreSQL/RAG начинаются в [`../v0.5/README.md`](../v0.5/README.md), workers,
+distributed orchestration и distributed registry — в
+[`../v0.6/README.md`](../v0.6/README.md).
