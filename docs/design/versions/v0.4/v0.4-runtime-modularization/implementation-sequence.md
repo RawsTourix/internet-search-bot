@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-runtime-modularization
 spec_status: accepted
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Последовательность модульного рефакторинга runtime
@@ -101,10 +101,11 @@ accounting использует то же prompt-bearing representation, что 
 - reconnect locks;
 - tool bindings и registry revision;
 - transport timeouts/recovery;
-- normalized tool execution result.
+- normalized transport execution result.
 
 Agent runtime видит `ToolCatalog`/`ToolExecutor`, а не внутренние connection
-objects.
+objects. MCP runtime не владеет `AgentCycle`, conversation или remote-resource
+ownership.
 
 ## 6. Tool registry и dispatcher
 
@@ -118,11 +119,19 @@ ToolProvider
 ToolRegistry
 ToolDispatcher
 ToolPolicy
+ToolExecutionSemantics
+ToolOutcome
+ToolPresentationProfile
 ```
 
 Manager tools, MCP tools, artifact tools и planning tools регистрируются как
 providers. Dispatcher отвечает за единый invocation envelope, trust marking,
 progress metadata, result handling и error normalization.
+
+На этом этапе достаточно generic contracts и compatibility defaults. Concrete
+MCP scopes, approved binding profiles, side-effect-aware retry registry и remote
+resource integration реализуются следующим update
+[`v0.4-mcp-registry-foundation`](../v0.4-mcp-registry-foundation/README.md).
 
 ## 7. Context management
 
@@ -154,7 +163,8 @@ Local implementation сохраняет callback/list/file compatibility. В v0.
 появится PostgreSQL adapter, в v0.6 — event-bus transport.
 
 Canonical event создаёт runtime; client-specific coalescing/rendering находится
-в delivery adapter.
+в delivery adapter. Event envelope должен позволять Dispatcher добавить
+semantic operation/binding metadata без surface-specific текста.
 
 ## 9. Finalization pipeline
 
@@ -205,6 +215,11 @@ ToolProvider
 Порядок вызова extension points явный, deterministic и покрыт tests. Mixin может
 временно оставаться compatibility adapter, но не получает новую
 ответственность.
+
+`LifecycleHook` получает typed lifecycle context, cancellation/deadline budget и
+доступ только к объявленным ports. Конкретный registry remote handles и cleanup
+policy остаются задачей следующего update, но не должны требовать нового
+subclass или возврата lifecycle logic в `MCPClient`.
 
 ## 12. AgentRuntime
 
@@ -266,6 +281,9 @@ MCP ownership, tool dispatcher и AgentRuntime migration требуют
 последовательной интеграции. Finalization extraction выполняется после
 стабилизации extension contracts.
 
+`v0.4-mcp-registry-foundation` не начинается до стабилизации generic Dispatcher,
+MCP runtime и lifecycle hook contracts.
+
 ## Acceptance criteria
 
 ```text
@@ -280,8 +298,12 @@ same scenario before/after refactor
 
 - основной AgentRuntime не импортирует FastAPI/Telegram/SQLAlchemy/Redis/Docker;
 - MCP runtime самостоятельно владеет connection state;
+- все production tool calls могут быть направлены через `ToolDispatcher`;
+- lifecycle hooks не требуют subclass центрального runtime;
 - planning/artifacts подключены без нового subclass agent loop;
 - no import-time application startup;
 - filesystem/local mode проходит полный regression suite;
 - PostgreSQL adapter может быть добавлен за ports без изменения run loop;
-- worker entrypoint v0.6 сможет создать тот же ApplicationContainer.
+- worker entrypoint v0.6 сможет создать тот же ApplicationContainer;
+- следующий MCP registry update может добавить scopes, profiles и remote handles
+  без изменения публичного agent loop.
