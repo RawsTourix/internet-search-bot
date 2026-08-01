@@ -20,7 +20,9 @@ last_reviewed: 2026-08-01
 До изменения registry/dispatch закрепить scenarios:
 
 - legacy `mcp.config` loading;
-- executable и Streamable HTTP servers;
+- Streamable HTTP servers;
+- stdio/executable servers как поддерживаемый MCP transport;
+- существующие builtin stdio/executable entries как migration baseline;
 - optional/startup-required behavior;
 - list servers/tools/schema;
 - call success, error, timeout и reconnect;
@@ -79,6 +81,17 @@ Scopes:
 builtin | instance | user | session
 ```
 
+Transport задаётся отдельно от scope. Runtime поддерживает Streamable HTTP и
+stdio/executable, но validation новых definitions применяет правило:
+
+```text
+builtin → Streamable HTTP
+```
+
+Существующие builtin stdio/executable definitions помечаются как migration
+compatibility, а не как новый допустимый шаблон. User definitions могут
+использовать stdio/executable.
+
 Legacy config migration должна быть явной и обратимо диагностируемой. До v0.8
 `user` остаётся owner-ready schema без ложного account-isolation claim.
 
@@ -109,6 +122,7 @@ MCPToolBinding
 
 ```text
 MCPServerManager
+→ Streamable HTTP и stdio/executable adapters
 → connection/generation/recovery
 
 MCPRegistry
@@ -125,7 +139,7 @@ Compatibility methods старого `MCPClient` делегируют новым
 Перенести retry decision из общего transport fallback в Dispatcher policy.
 
 - `safe` — bounded retry допустим;
-- `idempotent` — retry требует declared idempotency contract/key;
+- `idempotent` — retry требует declared idempotency semantics/key;
 - `never_automatic` — response loss возвращает `unknown`.
 
 Для `unknown` trace сохраняет original call identity, binding, arguments hash,
@@ -182,7 +196,20 @@ Cleanup:
 - enabled/startup-required;
 - secret reference;
 - approved metadata/profile reference;
-- compatibility version.
+- schema/integration compatibility metadata.
+
+Не вводить заранее свободно придуманное обязательное поле вроде
+`contract: web-search.v1`. Конкретные versioning fields определяются вместе с
+validated `MCPServerDefinition` и существующими tool schemas.
+
+На этом этапе используется `ConfigProvider`, созданный в modularization:
+
+```text
+agent.config snapshot
+→ MCP definition diff
+→ registry revision update
+→ controlled connect/disconnect/reconnect
+```
 
 Не помещать secrets или full trusted descriptors в LLM-visible listing.
 Добавить configuration audit и migration tests.
@@ -190,8 +217,25 @@ Cleanup:
 ## 11. Builtin definitions
 
 Системные definitions хранятся versioned и тестируются вместе с агентом.
+
+Новая builtin definition:
+
+```text
+scope=builtin
+transport=Streamable HTTP
+```
+
 Подключение конкретного builtin MCP-сервиса является отдельным предметным
 изменением и не входит автоматически в этот update.
+
+Существующие builtin stdio/executable servers мигрируют по одному:
+
+```text
+characterization parity
+→ отдельный Streamable HTTP service или удаление
+→ переключение builtin definition
+→ удаление legacy executable entry и его private env parameters
+```
 
 Builtin outage должна давать controlled degraded capability. Optional server не
 блокирует запуск всего приложения.
@@ -203,8 +247,11 @@ Builtin outage должна давать controlled degraded capability. Optiona
 - удалить duplicate registry state из compatibility facade;
 - запретить direct MCP call в обход Dispatcher для production agent loop;
 - удалить generic retry, который игнорирует tool semantics;
+- удалить legacy builtin executable definitions после их migration/removal;
 - зафиксировать architecture tests;
 - обновить canonical owners и configuration documentation.
+
+Поддержка stdio/executable transport для user MCP при этом сохраняется.
 
 ## Допустимая параллельность
 
@@ -231,9 +278,12 @@ MCP runtime events
 - revision/generation invalidation;
 - stale binding rejection;
 - legacy configuration parity;
+- new builtin definition rejects stdio/executable;
+- user stdio/executable definition remains supported;
+- Streamable HTTP builtin connect/reconnect/degraded mode;
 - generic и semantic presentation;
 - safe retry budget;
-- idempotent retry contract;
+- idempotent retry semantics;
 - mutating `unknown` without duplicate call;
 - handle owner isolation;
 - cleanup success/failure/timeout;
@@ -254,6 +304,14 @@ existing local scenarios before/after migration
 all production MCP calls
 → ToolDispatcher policy
 → structured progress/outcome/trace
+```
+
+```text
+new builtin MCP integration
+→ Streamable HTTP
+
+user MCP integration
+→ Streamable HTTP or stdio/executable according to definition
 ```
 
 ```text
