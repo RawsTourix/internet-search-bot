@@ -13,10 +13,20 @@ class ArtifactLifecycleTraceMixin:
     async def _record_artifact_outcome(self, outcome, context) -> None:
         await super()._record_artifact_outcome(outcome, context)
         trace_service = getattr(self, "artifact_trace_service", None)
-        if trace_service is None or outcome.event_type is None:
+        if trace_service is None:
             return
 
         payload = dict(outcome.payload or {})
+        event_type = outcome.event_type
+        if event_type is None:
+            # artifact_search_text historically has no user-progress event. Its
+            # structured composite type is nevertheless an authoritative and
+            # safe signal for the diagnostic lifecycle trace.
+            if payload.get("type") == "artifact_batch_search":
+                event_type = "artifact_search_completed"
+            else:
+                return
+
         artifact = payload.get("artifact")
         artifact_projection = (
             self._artifact_trace_projection(artifact)
@@ -49,7 +59,7 @@ class ArtifactLifecycleTraceMixin:
         if payload.get("source_candidate_id") is not None:
             correlation["candidate_id"] = payload["source_candidate_id"]
 
-        if outcome.event_type in {
+        if event_type in {
             "artifact_read_completed",
             "artifact_search_completed",
         }:
@@ -79,7 +89,7 @@ class ArtifactLifecycleTraceMixin:
                 ),
                 "failed_count": int(payload.get("failed_count") or 0),
             })
-            if outcome.event_type == "artifact_read_completed":
+            if event_type == "artifact_read_completed":
                 data["complete_artifact_ids"] = list(dict.fromkeys(
                     str(item.get("requested_artifact_id"))
                     for item in items
@@ -107,7 +117,7 @@ class ArtifactLifecycleTraceMixin:
         await trace_service.record(
             session_id=context.session_id,
             cycle_id=context.cycle_id,
-            event_type=str(outcome.event_type),
+            event_type=str(event_type),
             stage="artifact_runtime",
             status=status,
             direction="internal",
