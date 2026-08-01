@@ -66,6 +66,11 @@ class FileSystemInputCollectionStore(_AtomicJsonStore):
     ) -> InputCollectionRecord | None:
         return await asyncio.to_thread(self._get_active_sync, scope)
 
+    async def touch(self, collection_id: str) -> InputCollectionRecord:
+        """Refresh durable activity for one still-active collection."""
+
+        return await asyncio.to_thread(self._touch_sync, collection_id)
+
     async def bind(
         self,
         collection_id: str,
@@ -184,6 +189,18 @@ class FileSystemInputCollectionStore(_AtomicJsonStore):
             raise ArtifactIntegrityError("Input collection authority mismatch")
         return record
 
+    def _touch_sync(self, collection_id: str) -> InputCollectionRecord:
+        with self._lock:
+            current = self._load_record_sync(collection_id)
+            if not current.is_active:
+                return current
+            updated = current.model_copy(update={"updated_at": utc_now()})
+            updated = InputCollectionRecord.model_validate(
+                updated.model_dump(mode="python")
+            )
+            self._write_record_sync(updated)
+            return updated
+
     def _bind_sync(
         self,
         collection_id: str,
@@ -197,7 +214,12 @@ class FileSystemInputCollectionStore(_AtomicJsonStore):
                 )
             if current.bound_input_batch_id is not None:
                 if current.bound_input_batch_id == input_batch_id:
-                    return current
+                    updated = current.model_copy(update={"updated_at": utc_now()})
+                    updated = InputCollectionRecord.model_validate(
+                        updated.model_dump(mode="python")
+                    )
+                    self._write_record_sync(updated)
+                    return updated
                 raise InputDraftControlConflictError(
                     "Input collection is already bound to another batch"
                 )
