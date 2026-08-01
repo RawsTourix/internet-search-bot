@@ -45,6 +45,7 @@ async def apply_relocating_input_ack_policy(
 
     return await relocate_precreated_input_presentation(
         server=server,
+        gateway=server.artifact_gateway,
         submission=submission,
         session_id=session_id,
         status_message=new_status,
@@ -56,6 +57,7 @@ async def apply_relocating_input_ack_policy(
 async def relocate_precreated_input_presentation(
     *,
     server,
+    gateway,
     submission: dict[str, Any],
     session_id: str,
     status_message,
@@ -88,7 +90,7 @@ async def relocate_precreated_input_presentation(
 
     resolved_chat_id = _resolve_chat_id(status_message, fallback=chat_id)
     try:
-        await server.artifact_gateway.relocate_input_presentation(
+        await gateway.relocate_input_presentation(
             ref,
             session_id=session_id,
             client_message_id=str(new_message_id_int),
@@ -122,8 +124,12 @@ async def relocate_precreated_input_presentation(
 
     register_redirect = getattr(server, "register_progress_redirect", None)
     if callable(register_redirect) and resolved_chat_id is not None:
+        try:
+            numeric_chat_id = int(resolved_chat_id)
+        except (TypeError, ValueError):
+            numeric_chat_id = resolved_chat_id
         register_redirect(
-            chat_id=int(resolved_chat_id),
+            chat_id=numeric_chat_id,
             old_message_id=old_message_id_int,
             new_message_id=new_message_id_int,
         )
@@ -173,7 +179,7 @@ async def relocate_precreated_input_presentation(
             )
 
     try:
-        await server.artifact_gateway.record_input_presentation_deletion(
+        await gateway.record_input_presentation_deletion(
             ref,
             session_id=session_id,
             generation=generation,
