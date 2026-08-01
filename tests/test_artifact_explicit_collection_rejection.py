@@ -3,11 +3,7 @@ import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-from src.artifacts import (
-    ArtifactConfigType,
-    ArtifactLimitError,
-    create_artifact_services,
-)
+from src.artifacts import ArtifactConfigType, create_artifact_services
 from src.core.models import ClientType
 from src.ingress import (
     ClientAttachmentLocator,
@@ -17,6 +13,7 @@ from src.ingress import (
     ClientSenderRef,
     IngressAttachmentSlot,
     IngressConfigType,
+    IngressConflictError,
     InputDraftControlStatus,
     InputDraftScope,
     create_ingress_services,
@@ -126,7 +123,10 @@ class ExplicitCollectionRejectionTests(unittest.IsolatedAsyncioTestCase):
         second = await self._submit(2)
         self.assertEqual(first.input_batch_id, second.input_batch_id)
 
-        with self.assertRaises(ArtifactLimitError):
+        with self.assertRaisesRegex(
+            IngressConflictError,
+            "attachment limit exceeded",
+        ):
             await self._submit(3)
 
         inspected = await self.ingress.draft_control_service.inspect(self.scope)
