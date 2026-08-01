@@ -164,6 +164,8 @@ class ArtifactTracingTests(unittest.IsolatedAsyncioTestCase):
         )
 
         selected = await delivery_store.select(record)
+        repeated_selection = await delivery_store.select(record)
+        self.assertEqual(repeated_selection.delivery_id, selected.delivery_id)
         delivering = await delivery_store.transition(
             selected.delivery_id,
             target=ArtifactDeliveryState.DELIVERING,
@@ -175,8 +177,14 @@ class ArtifactTracingTests(unittest.IsolatedAsyncioTestCase):
             allowed_from={ArtifactDeliveryState.DELIVERING},
             receipt={"transport": "telegram", "message_id": 77},
         )
+        repeated_delivery = await delivery_store.transition(
+            delivered.delivery_id,
+            target=ArtifactDeliveryState.DELIVERED,
+            allowed_from={ArtifactDeliveryState.DELIVERING},
+            receipt={"transport": "telegram", "message_id": 77},
+        )
 
-        self.assertEqual(delivered.state, ArtifactDeliveryState.DELIVERED)
+        self.assertEqual(repeated_delivery.state, ArtifactDeliveryState.DELIVERED)
         events = await trace_store.list_session(
             "telegram:conversation:delivery"
         )
