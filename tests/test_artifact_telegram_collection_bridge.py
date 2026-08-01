@@ -41,6 +41,22 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
             ),
         )
 
+    def _group_envelope(self, suffix: str) -> ClientInputEnvelope:
+        envelope = self._envelope()
+        return envelope.model_copy(update={
+            "idempotency_key": f"telegram:bot-1:update:group-{suffix}",
+            "source_update_id": f"group-update-{suffix}",
+            "source_message_id": f"group-message-{suffix}",
+            "source_group_id": f"album-{suffix}",
+            "text_parts": [
+                IngressTextPart(
+                    part_id=f"group-text-part-{suffix}",
+                    kind="caption",
+                    text=f"album caption {suffix}",
+                )
+            ],
+        })
+
     @staticmethod
     def _explicit_submission() -> dict:
         return {
@@ -109,6 +125,123 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending["status"], "collecting")
         self.assertTrue(pending["metadata"]["input_collection_pending"])
         self.assertEqual(pending["metadata"]["text_part_count"], 1)
+
+    async def test_multiple_groups_release_one_callback_at_a_time(self):
+        requests = []
+        submission_payload = self._explicit_submission()
+        batch_id = submission_payload["input_batch_id"]
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.url.path)
+            if request.url.path == "/ingress/events":
+                return httpx.Response(
+                    202,
+                    request=request,
+                    json=submission_payload,
+                )
+            raise AssertionError(f"unexpected HTTP call: {request.url.path}")
+
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(handler),
+        )
+        for suffix in ("1", "2", "3"):
+            await bridge.submit_envelope(
+                self._group_envelope(suffix),
+                progress_locale="ru",
+            )
+
+        self.assertEqual(
+            len(bridge._input_batch_groups[batch_id]),
+            3,
+        )
+        self.assertEqual(len(bridge._input_groups), 3)
+
+        for remaining in (2, 1, 0):
+            pending = await bridge.commit_and_run(
+                batch_id,
+                session_id="telegram:conversation:chat-1",
+                progress_locale="ru",
+            )
+            self.assertEqual(pending["status"], "collecting")
+            self.assertEqual(
+                len(bridge._input_batch_groups.get(batch_id, set())),
+                remaining,
+            )
+            self.assertEqual(len(bridge._input_groups), remaining)
+
+        self.assertEqual(
+            requests,
+            ["/ingress/events", "/ingress/events", "/ingress/events"],
+        )
+
+    async def test_send_closes_every_group_for_explicit_batch(self):
+        requests = []
+        submission_payload = self._explicit_submission()
+        batch_id = submission_payload["input_batch_id"]
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(request.url.path)
+            if request.url.path == "/ingress/events":
+                return httpx.Response(
+                    202,
+                    request=request,
+                    json=submission_payload,
+                )
+            if request.url.path == "/internal/input-collections/send":
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "action": "send",
+                        "status": "committed",
+                        "duplicate": False,
+                        "collection": None,
+                        "input_batch_id": batch_id,
+                        "draft_state": "committed",
+                        "file_count": 21,
+                        "text_part_count": 2,
+                        "semantic_part_count": 0,
+                        "committed_batch": {"input_batch_id": batch_id},
+                        "error_code": None,
+                    },
+                )
+            raise AssertionError(f"unexpected HTTP call: {request.url.path}")
+
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(handler),
+        )
+        for suffix in ("1", "2", "3"):
+            await bridge.submit_envelope(
+                self._group_envelope(suffix),
+                progress_locale="ru",
+            )
+
+        committed = await bridge.send_collection(
+            session_id="telegram:conversation:chat-1",
+            chat_id="chat-1",
+            thread_id=None,
+            principal_id="user-1",
+            idempotency_key="send-multi-group",
+        )
+
+        self.assertEqual(committed["status"], "committed")
+        self.assertNotIn(batch_id, bridge._input_batch_groups)
+        self.assertEqual(bridge._input_groups, {})
+        self.assertEqual(
+            requests,
+            [
+                "/ingress/events",
+                "/ingress/events",
+                "/ingress/events",
+                "/internal/input-collections/send",
+            ],
+        )
 
     async def test_send_redirects_current_status_and_suppresses_late_group(self):
         requests = []
