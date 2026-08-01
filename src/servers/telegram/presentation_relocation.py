@@ -63,6 +63,7 @@ async def relocate_precreated_input_presentation(
     status_message,
     chat_id: int | str | None = None,
     cleanup_unbound: bool = False,
+    raise_on_bind_failure: bool = False,
 ):
     """Bind one already-created status as the next presentation generation."""
 
@@ -117,6 +118,8 @@ async def relocate_precreated_input_presentation(
                     new_message_id_int,
                 )
             return SimpleNamespace(message_id=old_message_id_int)
+        if raise_on_bind_failure:
+            raise
         # A pre-created media status may already be visible and tracked by its
         # handler. Keep it visible on failure rather than deleting the caller's
         # only local handle; the old durable generation remains authoritative.
