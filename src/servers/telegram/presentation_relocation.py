@@ -25,41 +25,73 @@ async def apply_relocating_input_ack_policy(
             session_id=session_id,
         )
 
+    text = server._presentation_text(submission)
+    new_status = await server.send_initial_status_message(update, text)
+    if new_status is None:
+        ref = dict(submission.get("presentation_ref") or {})
+        old_message_id = ref.get("previous_client_message_id") or ref.get(
+            "client_message_id"
+        )
+        server.logger.warning(
+            "telegram_presentation_relocation_create_failed presentation_id=%s "
+            "generation=%s",
+            ref.get("presentation_id"),
+            int(ref.get("presentation_generation") or 0) + 1,
+        )
+        try:
+            return SimpleNamespace(message_id=int(old_message_id))
+        except (TypeError, ValueError):
+            return None
+
+    return await relocate_precreated_input_presentation(
+        server=server,
+        submission=submission,
+        session_id=session_id,
+        status_message=new_status,
+        chat_id=update.effective_chat.id,
+        cleanup_unbound=True,
+    )
+
+
+async def relocate_precreated_input_presentation(
+    *,
+    server,
+    submission: dict[str, Any],
+    session_id: str,
+    status_message,
+    chat_id: int | str | None = None,
+    cleanup_unbound: bool = False,
+):
+    """Bind one already-created status as the next presentation generation."""
+
+    if str(submission.get("ack_policy") or "silent") != "relocate":
+        return status_message
+
     ref = dict(submission.get("presentation_ref") or {})
     old_message_id = ref.get("previous_client_message_id") or ref.get(
         "client_message_id"
     )
+    new_message_id = getattr(status_message, "message_id", None)
     try:
         old_message_id_int = int(old_message_id)
+        new_message_id_int = int(new_message_id)
         generation = int(ref.get("presentation_generation") or 0)
     except (TypeError, ValueError):
         server.logger.error(
             "telegram_presentation_relocation_invalid_reference presentation_id=%s",
             ref.get("presentation_id"),
         )
-        return await base_apply(
-            update=update,
-            submission=submission,
-            session_id=session_id,
-        )
+        return status_message
 
-    text = server._presentation_text(submission)
-    new_status = await server.send_initial_status_message(update, text)
-    if new_status is None:
-        server.logger.warning(
-            "telegram_presentation_relocation_create_failed presentation_id=%s "
-            "generation=%s",
-            ref.get("presentation_id"),
-            generation + 1,
-        )
-        return SimpleNamespace(message_id=old_message_id_int)
+    if old_message_id_int == new_message_id_int:
+        return status_message
 
-    new_message_id = int(new_status.message_id)
+    resolved_chat_id = _resolve_chat_id(status_message, fallback=chat_id)
     try:
         await server.artifact_gateway.relocate_input_presentation(
             ref,
             session_id=session_id,
-            client_message_id=str(new_message_id),
+            client_message_id=str(new_message_id_int),
         )
     except Exception as error:
         server.logger.exception(
@@ -67,75 +99,78 @@ async def apply_relocating_input_ack_policy(
             "old_message_id=%s new_message_id=%s error_type=%s",
             ref.get("presentation_id"),
             old_message_id_int,
-            new_message_id,
+            new_message_id_int,
             type(error).__name__,
         )
-        # The new message is not authoritative without the durable bind. Remove
-        # it when possible, but never touch the still-active old handle.
-        try:
-            await server.application.bot.delete_message(
-                chat_id=update.effective_chat.id,
-                message_id=new_message_id,
-            )
-        except Exception:
-            server.logger.warning(
-                "telegram_unbound_relocation_message_cleanup_failed "
-                "message_id=%s",
-                new_message_id,
-            )
-        return SimpleNamespace(message_id=old_message_id_int)
+        if cleanup_unbound and resolved_chat_id is not None:
+            try:
+                await server.application.bot.delete_message(
+                    chat_id=resolved_chat_id,
+                    message_id=new_message_id_int,
+                )
+            except Exception:
+                server.logger.warning(
+                    "telegram_unbound_relocation_message_cleanup_failed "
+                    "message_id=%s",
+                    new_message_id_int,
+                )
+            return SimpleNamespace(message_id=old_message_id_int)
+        # A pre-created media status may already be visible and tracked by its
+        # handler. Keep it visible on failure rather than deleting the caller's
+        # only local handle; the old durable generation remains authoritative.
+        return status_message
 
-    # Immutable committed batches may still contain an older progress target.
-    # Redirect it before deleting the superseded handle, so every future event
-    # reaches the new writable generation instead of raising "message not found".
     register_redirect = getattr(server, "register_progress_redirect", None)
-    if callable(register_redirect):
+    if callable(register_redirect) and resolved_chat_id is not None:
         register_redirect(
-            chat_id=int(update.effective_chat.id),
+            chat_id=int(resolved_chat_id),
             old_message_id=old_message_id_int,
-            new_message_id=new_message_id,
+            new_message_id=new_message_id_int,
         )
 
-    await server.stop_progress_edits(
-        chat_id=update.effective_chat.id,
-        message_id=old_message_id_int,
-    )
-
-    deletion_state = "deleted"
-    try:
-        await server.application.bot.delete_message(
-            chat_id=update.effective_chat.id,
+    if resolved_chat_id is not None:
+        await server.stop_progress_edits(
+            chat_id=resolved_chat_id,
             message_id=old_message_id_int,
         )
-    except BadRequest as error:
-        # BadRequest is a NetworkError subclass in python-telegram-bot, so it
-        # must be classified before the broader transport exception.
-        deletion_state = "failed"
-        server.logger.warning(
-            "telegram_presentation_old_handle_delete_failed "
-            "presentation_id=%s message_id=%s error=%s",
-            ref.get("presentation_id"),
-            old_message_id_int,
-            error,
-        )
-    except (TimedOut, NetworkError) as error:
-        deletion_state = "unknown"
-        server.logger.warning(
-            "telegram_presentation_old_handle_delete_unknown "
-            "presentation_id=%s message_id=%s error_type=%s",
-            ref.get("presentation_id"),
-            old_message_id_int,
-            type(error).__name__,
-        )
-    except Exception as error:
-        deletion_state = "failed"
-        server.logger.warning(
-            "telegram_presentation_old_handle_delete_failed "
-            "presentation_id=%s message_id=%s error_type=%s",
-            ref.get("presentation_id"),
-            old_message_id_int,
-            type(error).__name__,
-        )
+
+    deletion_state = "unknown"
+    if resolved_chat_id is not None:
+        deletion_state = "deleted"
+        try:
+            await server.application.bot.delete_message(
+                chat_id=resolved_chat_id,
+                message_id=old_message_id_int,
+            )
+        except BadRequest as error:
+            # BadRequest is a NetworkError subclass in python-telegram-bot, so it
+            # must be classified before the broader transport exception.
+            deletion_state = "failed"
+            server.logger.warning(
+                "telegram_presentation_old_handle_delete_failed "
+                "presentation_id=%s message_id=%s error=%s",
+                ref.get("presentation_id"),
+                old_message_id_int,
+                error,
+            )
+        except (TimedOut, NetworkError) as error:
+            deletion_state = "unknown"
+            server.logger.warning(
+                "telegram_presentation_old_handle_delete_unknown "
+                "presentation_id=%s message_id=%s error_type=%s",
+                ref.get("presentation_id"),
+                old_message_id_int,
+                type(error).__name__,
+            )
+        except Exception as error:
+            deletion_state = "failed"
+            server.logger.warning(
+                "telegram_presentation_old_handle_delete_failed "
+                "presentation_id=%s message_id=%s error_type=%s",
+                ref.get("presentation_id"),
+                old_message_id_int,
+                type(error).__name__,
+            )
 
     try:
         await server.artifact_gateway.record_input_presentation_deletion(
@@ -162,7 +197,17 @@ async def apply_relocating_input_ack_policy(
         ref.get("presentation_id"),
         generation + 1,
         old_message_id_int,
-        new_message_id,
+        new_message_id_int,
         deletion_state,
     )
-    return new_status
+    return status_message
+
+
+def _resolve_chat_id(status_message, *, fallback: int | str | None):
+    if fallback is not None:
+        return fallback
+    direct = getattr(status_message, "chat_id", None)
+    if direct is not None:
+        return direct
+    chat = getattr(status_message, "chat", None)
+    return getattr(chat, "id", None) if chat is not None else None
