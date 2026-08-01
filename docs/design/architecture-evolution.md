@@ -41,13 +41,18 @@ contracts.
   ответственности.
 - После `v0.4-input-runtime` центральный orchestration core декомпозируется без
   изменения пользовательского поведения.
+- `ConfigProvider` становится единственным owner чтения и валидации
+  `agent.config`, публикует immutable revisioned snapshots и позволяет применять
+  поддерживаемые изменения без обязательного restart Gateway.
 - `AgentRuntime` становится владельцем agent loop, а MCP — одним из tool
   backends.
 - Local/config-backed MCP registry получает scopes
   `builtin|instance|user|session`, trusted tool metadata и remote-resource
   lifecycle contracts.
-- Внутренняя реализация отдельного builtin MCP-сервиса остаётся за network/service
-  boundary и не импортируется в AgentRuntime.
+- Новые builtin MCP integrations работают через Streamable HTTP и остаются за
+  network/service boundary.
+- stdio/executable остаётся поддерживаемым MCP transport для user integrations;
+  legacy являются только существующие builtin stdio/executable servers.
 
 ### v0.5 — durable persistence
 
@@ -68,6 +73,8 @@ contracts.
   budgets и safe fork/join.
 - MCP registry foundation v0.4 становится PostgreSQL-backed, worker-visible и
   ownership-ready; scopes не проектируются заново.
+- ConfigProvider snapshot/revision contract расширяется на multi-process
+  propagation, а не заменяется новым способом конфигурации.
 
 ### v0.7 — extension platform
 
@@ -117,8 +124,15 @@ contracts.
 создавать микросервис.
 
 Builtin MCP service может быть отдельным deployable component уже при наличии
-самостоятельного lifecycle/failure domain. Это не делает его внутреннюю
-реализацию частью agent repository: интеграция определяется
+самостоятельного lifecycle/failure domain. Новые builtin integrations используют
+Streamable HTTP; внутренняя реализация сервиса не является частью Agent Runtime и
+определяется собственным deployment/repository.
+
+Существующий builtin stdio/executable server может быть migration source для
+такого сервиса, но поддержка stdio transport в MCP runtime сохраняется для user
+MCP definitions.
+
+Общий integration contract:
 [`contracts/builtin-mcp-service-contract.md`](contracts/builtin-mcp-service-contract.md).
 
 ## Рекомендуемый порядок физических границ
@@ -126,7 +140,8 @@ Builtin MCP service может быть отдельным deployable component 
 ```text
 v0.4–v0.5:
 один application process в local mode + PostgreSQL
-optional external builtin MCP services через стабильный contract
+optional external builtin MCP services через Streamable HTTP
+user MCP servers через Streamable HTTP или stdio/executable
 
 v0.6:
 Gateway
@@ -155,6 +170,8 @@ MCP Tool Runtime, Memory/Workspace Service и Notification/Delivery Service
 - Process boundary использует тот же contract, который ранее прошёл проверку в
   in-process implementation либо отдельном integration contract.
 - MCP transport lifecycle не является lifecycle remote resource.
+- MCP transport type не является scope или trust level.
+- Configuration reload не публикует частично validated state.
 - Local и self-hosted deployment остаются first-class.
 - Execution environment не получает неограниченный доступ к control plane.
 - Переход на следующую версию не должен требовать переписывания завершённого
