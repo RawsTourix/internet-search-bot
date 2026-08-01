@@ -43,8 +43,9 @@ class InstanceScopedTelegramArtifactGatewayClient(
 
     This is transport sequencing, not semantic guessing: ordinary text never
     waits, while forwarded text may briefly wait for an earlier forwarded album
-    update from the same bot/chat/thread. More than one active album remains an
-    explicit ambiguity error.
+    update from the same bot/chat/thread. Multiple active groups are accepted
+    only when they already resolve to one exact InputBatch; in that case the
+    newest group is the transport-local sequencing target.
     """
 
     def __init__(
@@ -86,7 +87,7 @@ class InstanceScopedTelegramArtifactGatewayClient(
         self._input_group_lock = asyncio.Lock()
         self._input_group_condition = asyncio.Condition(self._input_group_lock)
         self._input_groups: dict[str, _ActiveInputGroup] = {}
-        self._input_batch_groups: dict[str, str] = {}
+        self._input_batch_groups: dict[str, set[str]] = {}
 
     async def submit_envelope(
         self,
@@ -147,9 +148,11 @@ class InstanceScopedTelegramArtifactGatewayClient(
             async with self._input_group_condition:
                 current = self._input_groups.get(group_key)
                 if current is not None:
-                    current.input_batch_id = batch_id
+                    self._associate_input_group_locked(
+                        current,
+                        input_batch_id=batch_id,
+                    )
                     current.last_activity = time.monotonic()
-                    self._input_batch_groups[batch_id] = group_key
                     self._input_group_condition.notify_all()
         return payload
 
@@ -344,6 +347,36 @@ class InstanceScopedTelegramArtifactGatewayClient(
                     if item.scope_key == scope_key
                 ]
                 if len(candidates) > 1:
+                    batch_ids = {
+                        item.input_batch_id
+                        for item in candidates
+                        if item.input_batch_id is not None
+                    }
+                    if (
+                        len(batch_ids) == 1
+                        and all(
+                            item.input_batch_id is not None
+                            for item in candidates
+                        )
+                    ):
+                        newest = max(
+                            candidates,
+                            key=lambda item: (
+                                item.last_activity,
+                                item.group_key,
+                            ),
+                        )
+                        logger.info(
+                            "telegram_text_resolved_to_newest_same_batch_group "
+                            "scope_key=%s input_batch_id=%s group_count=%s "
+                            "selected_group_key=%s source_message_id=%s",
+                            scope_key,
+                            newest.input_batch_id,
+                            len(candidates),
+                            newest.group_key,
+                            getattr(envelope, "source_message_id", None),
+                        )
+                        return newest
                     raise TelegramArtifactBridgeError(
                         "Text input matches multiple active Telegram media groups"
                     )
@@ -382,15 +415,70 @@ class InstanceScopedTelegramArtifactGatewayClient(
                     )
                     return None
 
+    def _associate_input_group_locked(
+        self,
+        group: _ActiveInputGroup,
+        *,
+        input_batch_id: str,
+    ) -> None:
+        previous_batch_id = group.input_batch_id
+        if previous_batch_id and previous_batch_id != input_batch_id:
+            previous_groups = self._input_batch_groups.get(previous_batch_id)
+            if previous_groups is not None:
+                previous_groups.discard(group.group_key)
+                if not previous_groups:
+                    self._input_batch_groups.pop(previous_batch_id, None)
+        group.input_batch_id = input_batch_id
+        self._input_batch_groups.setdefault(input_batch_id, set()).add(
+            group.group_key
+        )
+
     async def _close_group_for_batch(self, input_batch_id: str) -> None:
         normalized = input_batch_id.strip()
         if not normalized:
             return
         async with self._input_group_condition:
-            group_key = self._input_batch_groups.pop(normalized, None)
-            if group_key is not None:
+            group_keys = self._input_batch_groups.pop(normalized, set())
+            for group_key in group_keys:
                 self._input_groups.pop(group_key, None)
+            if group_keys:
                 self._input_group_condition.notify_all()
+
+    async def _close_one_group_for_batch(self, input_batch_id: str) -> None:
+        """Release one quiet-callback group without closing sibling albums."""
+
+        normalized = input_batch_id.strip()
+        if not normalized:
+            return
+        async with self._input_group_condition:
+            group_keys = self._input_batch_groups.get(normalized)
+            if not group_keys:
+                return
+            existing = [
+                self._input_groups[group_key]
+                for group_key in group_keys
+                if group_key in self._input_groups
+            ]
+            if existing:
+                selected = min(
+                    existing,
+                    key=lambda item: (
+                        item.last_activity,
+                        item.group_key,
+                    ),
+                ).group_key
+            else:
+                selected = min(group_keys)
+            group_keys.discard(selected)
+            self._input_groups.pop(selected, None)
+            if not group_keys:
+                self._input_batch_groups.pop(normalized, None)
+            self._input_group_condition.notify_all()
+
+    async def close_input_group(self, group_key: str) -> None:
+        """Release one exact transport group after its callback reaches FIFO."""
+
+        await self._close_input_group(group_key)
 
     async def _close_input_group(self, group_key: str | None) -> None:
         if not group_key:
@@ -398,7 +486,14 @@ class InstanceScopedTelegramArtifactGatewayClient(
         async with self._input_group_condition:
             current = self._input_groups.pop(group_key, None)
             if current is not None and current.input_batch_id:
-                self._input_batch_groups.pop(current.input_batch_id, None)
+                groups = self._input_batch_groups.get(current.input_batch_id)
+                if groups is not None:
+                    groups.discard(group_key)
+                    if not groups:
+                        self._input_batch_groups.pop(
+                            current.input_batch_id,
+                            None,
+                        )
             self._input_group_condition.notify_all()
 
     def _purge_expired_input_groups(self, now: float) -> None:
@@ -410,7 +505,11 @@ class InstanceScopedTelegramArtifactGatewayClient(
         for key in expired:
             item = self._input_groups.pop(key)
             if item.input_batch_id:
-                self._input_batch_groups.pop(item.input_batch_id, None)
+                groups = self._input_batch_groups.get(item.input_batch_id)
+                if groups is not None:
+                    groups.discard(key)
+                    if not groups:
+                        self._input_batch_groups.pop(item.input_batch_id, None)
 
     def _input_scope_key(self, envelope) -> str | None:
         conversation = getattr(envelope, "conversation", None)
