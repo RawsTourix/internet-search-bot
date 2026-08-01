@@ -3,7 +3,7 @@ id: design.index
 version: cross-version
 spec_status: accepted
 implementation_status: not-applicable
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Архитектура ИИ-агента
@@ -25,6 +25,8 @@ last_reviewed: 2026-07-27
 4. [`architecture-evolution.md`](architecture-evolution.md) — путь от модульного
    runtime к distributed execution plane.
 5. README интересующей версии.
+6. Применимый документ в [`contracts/`](contracts/README.md), если задача
+   затрагивает внешний сервис или protocol boundary.
 
 Не начинайте анализ с roadmap или history: эти документы дают хронологический
 контекст, но не заменяют тематические спецификации.
@@ -75,6 +77,7 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
 | [`release-gates.md`](release-gates.md) | Универсальные и version-specific критерии завершения |
 | [`glossary.md`](glossary.md) | Канонические значения основных терминов |
 | [`roadmap.md`](roadmap.md) | Хронологическая сводка; не источник детальных контрактов |
+| [`contracts/`](contracts/README.md) | Сквозные интеграционные контракты агента с внешними компонентами |
 | [`decisions/`](decisions/README.md) | Правила ведения ADR |
 
 ## Рекомендуемые наборы контекста
@@ -86,6 +89,7 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
 | DAG planning | `v0.4/README.md` → storage → DAG planning |
 | Файлы, input и delivery | `v0.4/README.md` → unified input/artifact → file artifacts → semantic interaction → output delivery → input runtime |
 | Рефакторинг runtime | `v0.4/README.md` → `v0.4-runtime-modularization/` → dependency rules |
+| Builtin MCP-сервисы | `contracts/builtin-mcp-service-contract.md` → `v0.4-mcp-registry-foundation/` → dependency rules |
 | PostgreSQL и RAG | `v0.5/README.md` → architecture overview → implementation plan |
 | Distributed runtime | `v0.6/README.md` → v0.5 persistence → implementation plan |
 | Skills | `v0.7/README.md` → v0.6 task runtime → implementation plan |
@@ -101,15 +105,17 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
    тематический файл.
 3. README версии определяет порядок чтения и область действия, но не
    переопределяет подробные контракты тематического файла.
-4. `roadmap.md` описывает последовательность развития и не является второй
+4. `contracts/` владеет cross-version требованиями интеграционной границы, а
+   version-specific документ — реализацией стороны агента.
+5. `roadmap.md` описывает последовательность развития и не является второй
    спецификацией.
-5. ADR объясняет причину решения. После принятия решения актуальное состояние
+6. ADR объясняет причину решения. После принятия решения актуальное состояние
    интегрируется в канонический тематический файл.
-6. Документы со статусом `historical` или `superseded` не участвуют в обычном
+7. Документы со статусом `historical` или `superseded` не участвуют в обычном
    архитектурном анализе.
-7. Более новый файл не уточняет предыдущий неявно. Изменение ограничивается
+8. Более новый файл не уточняет предыдущий неявно. Изменение ограничивается
    версией либо оформляется явным `supersedes`.
-8. При конфликте сначала применяется версия из `current.md`, затем
+9. При конфликте сначала применяется версия из `current.md`, затем
    канонический тематический документ этой версии. Конфликт между двумя
    каноническими файлами считается дефектом документации.
 
@@ -143,7 +149,7 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
   dependencies и допустимая параллельность задаются implementation plan.
 - Fenced blocks применяются для кода, схем и форматозависимых flow, а не как
   замена обычным Markdown-спискам.
-- Каждый новый документ должен быть достижим из README своей версии или из
-  таблицы сквозных документов.
+- Каждый новый документ должен быть достижим из README своей версии, из
+  `contracts/README.md` или из таблицы сквозных документов.
 - Каждая основная версия заканчивается stabilization/hardening update и
   проверяется по [`release-gates.md`](release-gates.md).
