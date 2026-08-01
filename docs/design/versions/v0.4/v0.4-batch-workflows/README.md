@@ -3,7 +3,7 @@ id: design.v0.4.batch-workflows
 version: v0.4
 spec_status: accepted
 implementation_status: implemented
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-01
 ---
 
 # v0.4-batch-workflows
@@ -17,13 +17,16 @@ artifact workspace:
 
 - AUTO text input без artificial delay;
 - explicit `/collect → /send | /cancel` для text/files/mixed package;
+- несколько Telegram media groups внутри одного explicit package;
+- один authoritative collection presentation;
 - отдельные collection snapshot и AgentCycle run status;
 - native Telegram document groups;
 - stable `OutputPart` grouping;
 - bounded current/session artifact authority;
 - durable commit до in-process AgentCycle;
 - cancellation-safe Gateway/MCP shutdown;
-- aggregate progress projection.
+- aggregate progress projection;
+- per-session artifact lifecycle traces.
 
 `CycleInbox`, additions во время реально выполняющегося AgentCycle и durable
 checkpoints принадлежат следующему
@@ -43,6 +46,7 @@ checkpoints принадлежат следующему
 | `BW-14` | [`progress-events.md`](progress-events.md) |
 | `BW-15` | [`draft-control-foundation.md`](draft-control-foundation.md) |
 | `BW-16` | [`explicit-control-plane.md`](explicit-control-plane.md) |
+| `BW-17` | [`artifact-tracing.md`](artifact-tracing.md) |
 
 ## Главные инварианты
 
@@ -91,6 +95,18 @@ checkpoints принадлежат следующему
 24. Поздний album callback после `/send`/`/cancel` является silent no-op.
 25. Exact Telegram session использует один FIFO dispatcher; разные sessions
     остаются параллельными.
+26. Несколько media groups могут принадлежать одному exact explicit InputBatch;
+    quiet callback освобождает только собственную группу, `/send` и `/cancel` —
+    все группы package.
+27. У active collection существует один authoritative Telegram presentation.
+    Новое поколение получает durable bind до удаления superseded message.
+28. Счётчики package берутся из durable draft. Presentation timing не является
+    источником `file_count` или `text_part_count`.
+29. Artifact trace является best-effort observability projection. Его ошибка не
+    откатывает ingress, mutation или delivery; authoritative stores остаются
+    источниками истины.
+30. Built-in manager tools вызываются напрямую. `mcp_call_tool` маршрутизирует
+    только внешние MCP tools, найденные через `mcp_list_tools`.
 
 ## Этапы
 
@@ -131,7 +147,17 @@ scope-bound cursor и historical read/search/delivery.
 - сохранение bounded artifact handoff после `/reset`;
 - отдельное `Готово.` после каждого text-only ответа;
 - отсутствие `cycle_done` после подтверждённой доставки;
-- transport-level acknowledgement вместо user-facing text acknowledgement.
+- transport-level acknowledgement вместо user-facing text acknowledgement;
+- перезапись media-group mapping при нескольких albums в одном `/collect`;
+- несколько stale collection presentations;
+- неоднозначный routing встроенных artifact tools через `mcp_call_tool`;
+- отсутствие сквозного session-level журнала ingress/authority/delivery.
+
+### BW-P6 — artifact tracing foundation
+
+Реализованы transport-neutral event models, JSONL store с session hashing и
+rotation, best-effort trace service, ingress/delivery integration и события
+межцикловой artifact authority.
 
 ## Acceptance gates
 
@@ -144,17 +170,33 @@ scope-bound cursor и historical read/search/delivery.
 - artifact delivery: tracked `cycle_done` и отдельное `Готово.` после файлов при
   default mode;
 - text-only/files-only/mixed `/collect → /send`;
+- live package `7 + 7 + 7 + 1 files + 2 messages` коммитится как `22/2`;
+- после каждого collection update остаётся один актуальный presentation;
+- `/send` terminalize-ит последний presentation без stale `Пакет собирается`;
 - сохранение terminal collection snapshot;
 - `/collect → package → /send` как continuation после `WAITING_USER`;
-- новый cycle той же session продолжает работу с предыдущим файлом без re-upload;
+- новый cycle той же session продолжает работу с предыдущим input/created file
+  без re-upload;
 - другая session не получает artifact authority;
 - `/reset` очищает bounded handoff текущей session и не затрагивает другие sessions;
 - rapid FIFO scenario;
-- `/cancel` до завершения album quiet period без позднего commit/409.
+- `/cancel` до завершения album quiet period без позднего commit/409;
+- artifact JSONL содержит ingress counts, handoff saved/applied и delivery
+  transitions без file content, credentials и local paths.
 
 Параметры Telegram UX в `.env.example`:
 
 ```env
 TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS="1.5"
 TELEGRAM_FINAL_STATUS_MODE="artefacts_only"
+```
+
+Параметры artifact tracing задаются в `artifacts` config:
+
+```json
+{
+  "trace_enabled": true,
+  "trace_max_file_bytes": 8388608,
+  "trace_max_string_chars": 2000
+}
 ```
