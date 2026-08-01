@@ -4,7 +4,7 @@ version: v0.6
 document_role: implementation-plan
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Пошаговый план v0.6
@@ -26,6 +26,10 @@ request
 `CycleInbox` сохраняет v0.4 admission/safe-checkpoint semantics. Новые inputs во
 время active run дополнительно получают intervention semantics.
 
+Local/config-backed MCP scopes и registry contracts уже подготовлены в
+`v0.4-mcp-registry-foundation`. v0.6 переносит их в durable multi-process
+runtime, а не создаёт вторую несовместимую scope-модель.
+
 ## Реестр updates
 
 | Порядок | Update | Главный результат |
@@ -38,7 +42,7 @@ request
 | 6 | `v0.6.6-event-bus-and-delivery` | Durable progress transport и delivery boundary |
 | 7 | `v0.6.7-background-workers` | Extraction, embeddings, conversion и cleanup workers |
 | 8 | `v0.6.8-object-storage-and-payload-runtime` | Multi-process payload transport и signed access |
-| 9 | `v0.6.9-capability-registry-scopes` | MCP scopes builtin/instance/user/session |
+| 9 | `v0.6.9-distributed-capability-registry` | Durable registry, worker-visible revisions и ownership-ready scopes |
 | 10 | `v0.6.10-service-boundary-stabilization` | Проверка process/service boundaries и v0.7 readiness |
 
 ## v0.6.1-job-runtime-foundation
@@ -237,9 +241,9 @@ resource/deadline policy и idempotent durable commit.
 
 Object storage не заменяет PostgreSQL metadata/ownership/transactions.
 
-## v0.6.9-capability-registry-scopes
+## v0.6.9-distributed-capability-registry
 
-MCP server/tool registry получает scopes:
+Update развивает local/config-backed registry v0.4:
 
 ```text
 builtin
@@ -248,15 +252,35 @@ user
 session
 ```
 
-Требования:
+Scopes, trusted tool descriptors, retry/outcome semantics и opaque remote handle
+contract не переопределяются. Добавляются distributed guarantees:
 
-- immutable registry snapshot/revision;
-- deterministic precedence;
-- enable/disable и hot change generation;
+- PostgreSQL-backed canonical server/tool definitions и ownership-ready metadata;
+- immutable durable registry snapshot/revision;
+- deterministic precedence, совместимый с v0.4;
+- worker-visible revision publication и invalidation;
+- enable/disable/hot change generation между процессами;
 - discovery result хранит binding coordinates/revision;
-- call повторно проверяет snapshot freshness;
+- call повторно проверяет snapshot freshness на executing worker;
+- reconnect/server generation не рассинхронизирует registry replicas;
+- active run/task сохраняет применённый registry snapshot либо controlled
+  rediscovery policy;
+- remote-resource ownership может быть durable там, где ресурс переживает
+  process boundary;
+- startup/reconciliation восстанавливает unresolved cleanup intent;
 - `user` scope хранится ownership-ready, но полноценно enforced только в v0.8;
 - scope model совместима с SkillRegistry v0.7.
+
+Redis может ускорять invalidation/event delivery, но не является единственным
+source of truth registry state.
+
+### Acceptance
+
+- два agent workers видят одну committed revision;
+- stale worker не вызывает binding после disable/rebind;
+- restart восстанавливает definitions и unresolved lifecycle metadata;
+- hot change не меняет уже committed task snapshot молча;
+- local single-process adapter проходит тот же registry contract suite.
 
 ## v0.6.10-service-boundary-stabilization
 
@@ -291,7 +315,7 @@ MCP Tool Runtime, Workspace Service и Notification Service выделяются
 ### Gate v0.7–v0.9
 
 - skills могут прикрепляться к TaskContextManifest;
-- capability registry имеет stable scopes/revisions;
+- capability registry имеет stable distributed scopes/revisions;
 - execution operation уже представима через port/job, но full sandbox не входит
   в v0.6;
 - Sandbox Manager сможет стать отдельной security boundary в v0.9;
@@ -299,6 +323,7 @@ MCP Tool Runtime, Workspace Service и Notification Service выделяются
 
 ## Non-goals v0.6
 
+- повторное проектирование local MCP scope model;
 - полноценная authentication/authorization UI;
 - untrusted user-code sandbox platform;
 - per-user permanent containers;
