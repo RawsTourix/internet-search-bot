@@ -36,24 +36,27 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
         self.trace_service = trace_service
 
     async def select(self, record: ArtifactDeliveryRecord) -> ArtifactDeliveryRecord:
-        selected = await super().select(record)
-        await self._trace_records(
-            [selected],
-            event_type="artifact_delivery_selected",
-            status="succeeded",
+        before = await self.list_cycle(
+            session_id=record.session_id,
+            cycle_id=record.cycle_id,
         )
+        selected = await super().select(record)
+        await self._trace_selection_delta(before, [selected])
         return selected
 
     async def select_many(
         self,
         records: list[ArtifactDeliveryRecord],
     ) -> list[ArtifactDeliveryRecord]:
-        selected = await super().select_many(records)
-        await self._trace_records(
-            selected,
-            event_type="artifact_delivery_selected",
-            status="succeeded",
+        if not records:
+            return []
+        first = records[0]
+        before = await self.list_cycle(
+            session_id=first.session_id,
+            cycle_id=first.cycle_id,
         )
+        selected = await super().select_many(records)
+        await self._trace_selection_delta(before, selected)
         return selected
 
     async def transition(
@@ -65,6 +68,7 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
         error: str | None = None,
         receipt: dict[str, Any] | None = None,
     ) -> ArtifactDeliveryRecord:
+        before = await self.get(delivery_id)
         record = await super().transition(
             delivery_id,
             target=target,
@@ -72,12 +76,13 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
             error=error,
             receipt=receipt,
         )
-        await self._trace_records(
-            [record],
-            event_type=self._transition_event_type(target),
-            status=self._transition_status(target),
-            error=error,
-        )
+        if before.state != record.state:
+            await self._trace_records(
+                [record],
+                event_type=self._transition_event_type(target),
+                status=self._transition_status(target),
+                error=error,
+            )
         return record
 
     async def transition_many(
@@ -89,6 +94,11 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
         receipt_by_delivery_id: dict[str, dict[str, Any]] | None = None,
         error: str | None = None,
     ) -> list[ArtifactDeliveryRecord]:
+        unique_ids = list(dict.fromkeys(delivery_ids))
+        before = {
+            delivery_id: await self.get(delivery_id)
+            for delivery_id in unique_ids
+        }
         records = await super().transition_many(
             delivery_ids,
             target=target,
@@ -96,8 +106,13 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
             receipt_by_delivery_id=receipt_by_delivery_id,
             error=error,
         )
+        changed = [
+            record
+            for record in records
+            if before[record.delivery_id].state != record.state
+        ]
         await self._trace_records(
-            records,
+            changed,
             event_type=self._transition_event_type(target),
             status=self._transition_status(target),
             error=error,
@@ -108,13 +123,54 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
         self,
         delivery_ids: list[str],
     ) -> list[ArtifactDeliveryRecord]:
+        unique_ids = list(dict.fromkeys(delivery_ids))
+        before = {
+            delivery_id: await self.get(delivery_id)
+            for delivery_id in unique_ids
+        }
         records = await super().cancel_many(delivery_ids)
+        changed = [
+            record
+            for record in records
+            if before[record.delivery_id].state != record.state
+        ]
         await self._trace_records(
-            records,
+            changed,
             event_type="artifact_delivery_cancelled",
             status="succeeded",
         )
         return records
+
+    async def _trace_selection_delta(
+        self,
+        before: list[ArtifactDeliveryRecord],
+        selected: list[ArtifactDeliveryRecord],
+    ) -> None:
+        """Trace new selections and superseded heads, not idempotent lookups."""
+
+        before_by_id = {item.delivery_id: item for item in before}
+        new_records = [
+            item for item in selected if item.delivery_id not in before_by_id
+        ]
+        await self._trace_records(
+            new_records,
+            event_type="artifact_delivery_selected",
+            status="succeeded",
+        )
+
+        superseded: list[ArtifactDeliveryRecord] = []
+        for delivery_id, previous in before_by_id.items():
+            current = await self.get(delivery_id)
+            if (
+                previous.state != current.state
+                and current.state == ArtifactDeliveryState.CANCELLED
+            ):
+                superseded.append(current)
+        await self._trace_records(
+            superseded,
+            event_type="artifact_delivery_cancelled",
+            status="succeeded",
+        )
 
     async def _trace_records(
         self,
