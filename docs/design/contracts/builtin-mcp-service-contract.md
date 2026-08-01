@@ -34,10 +34,39 @@ Agent Runtime
 - поставляются или явно поддерживаются проектом;
 - подключаются через MCP registry со scope `builtin`;
 - имеют versioned tool schemas и trusted metadata со стороны агента;
-- могут работать как отдельные процессы или deployable services;
+- работают как отдельные deployable services за network boundary;
 - могут быть optional и временно недоступными;
 - при необходимости создают stateful remote resources и возвращают opaque
   handles.
+
+## Transport policy
+
+MCP runtime поддерживает несколько transport adapters, включая:
+
+```text
+Streamable HTTP
+stdio/executable
+```
+
+Поддержка stdio/executable не считается legacy-функцией MCP runtime.
+
+Для scope `builtin` действует отдельное архитектурное правило:
+
+```text
+новая builtin integration
+→ Streamable HTTP
+```
+
+Существующие builtin MCP-серверы, запускаемые через stdio/executable, являются
+legacy именно как builtin integrations. Они поддерживаются на время миграции и
+постепенно:
+
+- удаляются, если больше не нужны;
+- либо выделяются в отдельные MCP-сервисы со Streamable HTTP boundary.
+
+Для user MCP-серверов stdio/executable остаётся штатным поддерживаемым
+транспортом наряду со Streamable HTTP. Выбор транспорта сам по себе не задаёт
+scope, trust, permissions или retry semantics.
 
 ## Граница ответственности
 
@@ -67,7 +96,7 @@ Agent Runtime
 - идемпотентный cleanup, если сервис создаёт remote resources;
 - окончательную серверную очистку и expiration независимо от Agent Runtime;
 - корректное поведение после reconnect клиента;
-- совместимость declared contract и versioned schemas;
+- совместимость declared integration metadata и versioned schemas;
 - отсутствие зависимости application state от lifetime одного MCP-соединения.
 
 Агент не знает внутреннее устройство remote resource и не становится его
@@ -108,7 +137,7 @@ result handling policy
 presentation profile
 remote-resource behavior
 required permissions and budgets
-contract/schema compatibility range
+schema/integration compatibility range
 ```
 
 Metadata берётся из versioned code/configuration агента или другого доверенного
@@ -247,7 +276,7 @@ tool outcome unknown
 remote resource expired
 remote resource lost
 cleanup failed or timed out
-contract/version incompatible
+schema/integration incompatible
 ```
 
 Эти состояния не сводятся к одному универсальному сообщению без structured
@@ -261,14 +290,18 @@ capabilities.
 
 Builtin registration фиксирует:
 
-- service contract version;
+- versioned trusted integration metadata;
 - tool schema/version snapshot;
 - supported compatibility range;
 - registry revision;
 - server generation/health state.
 
+Это compatibility metadata registry, а не обязательное свободно придуманное
+поле вроде имени предметного «контракта» в пользовательской конфигурации.
+Конкретная модель и названия полей определяются вместе с `MCPServerDefinition`.
+
 Startup/discovery проверяет совместимость до предоставления tool binding модели.
-Backward-incompatible schema change требует новой contract/version boundary или
+Backward-incompatible schema change требует новой version boundary или
 controlled migration. Stale discovery snapshot повторно проверяется перед
 execution.
 
@@ -286,11 +319,11 @@ execution.
 
 ## Acceptance contract
 
-Каждый builtin MCP-service integration должен иметь проверки:
+Каждый новый builtin MCP-service integration должен иметь проверки:
 
 ```text
-connect and discovery
-schema/contract compatibility
+Streamable HTTP connect and discovery
+schema/integration compatibility
 normal tool invocation
 server unavailable and optional degradation
 transport reconnect and server restart
@@ -303,6 +336,9 @@ cleanup timeout and unavailable service
 expired/lost resource
 unknown mutating outcome without blind retry
 ```
+
+Миграция существующего builtin stdio/executable server дополнительно проверяет
+parity доступных tools и observable behavior до удаления старого запуска.
 
 Version-specific implementation и release gates могут усиливать этот набор, но
 не должны ослаблять перечисленные invariants.
