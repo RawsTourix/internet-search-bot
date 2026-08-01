@@ -3,7 +3,7 @@ id: design.v0.6.index
 version: v0.6
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # v0.6 — Distributed runtime
@@ -22,6 +22,11 @@ DIRECT | SINGLE_TASK | PLANNED_TASK | WORKFLOW
 `CycleInbox` остаётся durable delivery/admission boundary. Поверх него новые
 inputs получают intervention semantics относительно active run/workflow.
 
+Локальная scope-модель и config-backed MCP registry foundation создаются в
+[`v0.4-mcp-registry-foundation`](../v0.4/v0.4-mcp-registry-foundation/README.md).
+`v0.6` не вводит scopes заново: он делает registry durable, multi-process и
+ownership-ready.
+
 ## Читать
 
 1. [`distributed-runtime.md`](distributed-runtime.md) — полный архитектурный
@@ -29,6 +34,8 @@ inputs получают intervention semantics относительно active r
    delivery и observability.
 2. [`implementation-plan.md`](implementation-plan.md) — последовательные updates
    и acceptance/preparation gates.
+3. [`../../contracts/builtin-mcp-service-contract.md`](../../contracts/builtin-mcp-service-contract.md)
+   — общий контракт builtin MCP-сервисов.
 
 ## Именованные updates
 
@@ -42,7 +49,7 @@ inputs получают intervention semantics относительно active r
 | 6 | `v0.6.6-event-bus-and-delivery` | Progress bus и Notification/Delivery boundary |
 | 7 | `v0.6.7-background-workers` | Extraction/conversion/summarization/cleanup workers |
 | 8 | `v0.6.8-object-storage-and-payload-runtime` | Multi-process payload transport |
-| 9 | `v0.6.9-capability-registry-scopes` | MCP scopes и registry revisions |
+| 9 | `v0.6.9-distributed-capability-registry` | Durable MCP registry, worker-visible revisions и ownership-ready scopes |
 | 10 | `v0.6.10-service-boundary-stabilization` | Process/service hardening и readiness |
 
 ## Зависимости
@@ -51,6 +58,7 @@ inputs получают intervention semantics относительно active r
 
 - [`../v0.5/README.md`](../v0.5/README.md);
 - [`../v0.4/v0.4-runtime-modularization/README.md`](../v0.4/v0.4-runtime-modularization/README.md);
+- [`../v0.4/v0.4-mcp-registry-foundation/README.md`](../v0.4/v0.4-mcp-registry-foundation/README.md);
 - [`../v0.4/v0.4-dag-planning.md`](../v0.4/v0.4-dag-planning.md);
 - [`../v0.4/v0.4-input-runtime.md`](../v0.4/v0.4-input-runtime.md);
 - [`../v0.4/v0.4-file-artifacts-advanced/output-delivery.md`](../v0.4/v0.4-file-artifacts-advanced/output-delivery.md).
