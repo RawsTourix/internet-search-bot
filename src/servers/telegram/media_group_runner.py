@@ -43,7 +43,7 @@ class MediaGroupLifetimeExceeded(RuntimeError):
 
 
 class LifetimeMediaGroupActivityCoordinator(MediaGroupActivityCoordinator):
-    """Track the first member time and suppress late terminal callbacks."""
+    """Track the first member time and retain bounded closed-group tombstones."""
 
     def __init__(self, *, tombstone_ttl_seconds: float = 600.0) -> None:
         super().__init__()
@@ -51,6 +51,11 @@ class LifetimeMediaGroupActivityCoordinator(MediaGroupActivityCoordinator):
         self._opened_at: dict[str, float] = {}
         self._closed_at: dict[str, float] = {}
         self._tombstone_ttl_seconds = max(1.0, tombstone_ttl_seconds)
+
+    async def is_closed(self, key: str) -> bool:
+        async with self._lifetime_lock:
+            self._prune_tombstones_locked()
+            return key in self._closed_at
 
     async def member_started(self, key: str, *, filename: str | None = None) -> None:
         async with self._lifetime_lock:
@@ -139,6 +144,11 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
         self._activity = coordinator
         self.maximum_lifetime_seconds = maximum_lifetime_seconds
 
+    async def is_closed(self, key: str) -> bool:
+        """Return whether this exact Telegram album already reached a terminal callback."""
+
+        return await self._activity.is_closed(key)
+
     async def schedule(
         self,
         key: str,
@@ -148,6 +158,8 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
         timeout_callback: Callable[[], Awaitable[None]] | None = None,
         reset: bool = True,
     ) -> bool:
+        if await self._activity.is_closed(key):
+            return False
         async with self._lock:
             if key in self._running:
                 return False
@@ -209,6 +221,10 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
             callback_token = _set_current_media_group_callback_key(key)
             try:
                 await callback()
+                # Once the exact callback completes, this Telegram album ID is
+                # terminal regardless of whether it committed, remained pending
+                # in /collect, or was suppressed after /send or /cancel.
+                ignore_late_members = True
             finally:
                 _reset_current_media_group_callback_key(callback_token)
         except asyncio.CancelledError:
