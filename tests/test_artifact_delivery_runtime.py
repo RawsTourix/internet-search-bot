@@ -50,6 +50,8 @@ class _ProjectionHarness(ArtifactDeliveryMixin, _ProjectionBase):
     def __init__(self, artifact_services):
         self.artifact_services = artifact_services
         self.artifact_config = artifact_services.config
+        self.artifact_trace_service = artifact_services.trace_service
+        self._session_artifact_handoffs = {}
 
 
 class ArtifactDeliveryRuntimeTests(unittest.IsolatedAsyncioTestCase):
