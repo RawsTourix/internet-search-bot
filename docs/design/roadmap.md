@@ -3,7 +3,7 @@ id: design.roadmap
 version: cross-version
 spec_status: summary
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Roadmap v0.3 → v0.10
@@ -11,18 +11,18 @@ last_reviewed: 2026-07-27
 > **Роль документа:** хронологическая сводка. Канонический список именованных
 > updates и их порядок определяются README соответствующей версии в
 > [`versions/`](versions/), текущий baseline — в [`current.md`](current.md), а
-> подробные contracts — в тематических спецификациях.
+> подробные contracts — в тематических спецификациях и [`contracts/`](contracts/README.md).
 
 ## Общая траектория
 
 ```text
 v0.3  agent loop baseline
   ↓
-v0.4  workspace, artifacts, input runtime и modularization
+v0.4  workspace, artifacts, input runtime, modularization и MCP registry foundation
   ↓
 v0.5  PostgreSQL, durable state и RAG
   ↓
-v0.6  AgentRun/TaskRun, workers и workflow orchestration
+v0.6  AgentRun/TaskRun, workers, workflow orchestration и distributed registry
   ↓
 v0.7  skills и extension platform
   ↓
@@ -75,6 +75,7 @@ large orchestration class
 + compact runtime projections
 + durable files/input/delivery
 + optional local DAG
++ modular tool runtime and local MCP registry foundation
 ```
 
 Именованные updates:
@@ -86,8 +87,10 @@ v0.4-cycle-compaction
 v0.4-dag-planning
 v0.4-file-artifacts
 v0.4-file-artifacts-advanced
+v0.4-batch-workflows
 v0.4-input-runtime
 v0.4-runtime-modularization
+v0.4-mcp-registry-foundation
 ```
 
 `v0.4-file-artifacts-advanced` завершает semantic input/output, capabilities,
@@ -99,6 +102,15 @@ checkpoints, control inbox и finalization race barrier.
 `v0.4-runtime-modularization` после functional v0.4 декомпозирует
 `mcp_client.py`, вводит `AgentRuntime`, LLM/tool/event/repository ports,
 composition extensions и composition root.
+
+`v0.4-mcp-registry-foundation` добавляет config-backed scopes
+`builtin|instance|user|session`, trusted execution/presentation metadata,
+side-effect-aware retry и lifecycle ownership opaque remote handles. Он
+реализует только сторону агента; внутреннее устройство конкретного MCP-сервиса
+не входит в документацию агента.
+
+Общий contract:
+[`contracts/builtin-mcp-service-contract.md`](contracts/builtin-mcp-service-contract.md).
 
 Канонический реестр: [`versions/v0.4/README.md`](versions/v0.4/README.md).
 
@@ -162,7 +174,7 @@ v0.6.5-interventions-and-cycle-inbox
 v0.6.6-event-bus-and-delivery
 v0.6.7-background-workers
 v0.6.8-object-storage-and-payload-runtime
-v0.6.9-capability-registry-scopes
+v0.6.9-distributed-capability-registry
 v0.6.10-service-boundary-stabilization
 ```
 
@@ -175,6 +187,10 @@ DIRECT | SINGLE_TASK | PLANNED_TASK | WORKFLOW
 Версия вводит durable jobs/leases, `TaskContextManifest`, workflow revisions,
 safe fork/join, user interventions, progress event bus, background workers,
 object storage и первые обоснованные process boundaries.
+
+`v0.6.9` не проектирует scopes заново: он переносит registry foundation v0.4 в
+PostgreSQL-backed multi-process runtime, публикует worker-visible revisions и
+добавляет ownership-aware synchronization/recovery.
 
 Канонический реестр: [`versions/v0.6/README.md`](versions/v0.6/README.md).
 
@@ -196,7 +212,8 @@ v0.7.7-extension-platform-stabilization
 
 Skills выбираются task-scoped, загружаются bounded и подключаются через
 providers/policies/hooks. Required capabilities не являются разрешениями.
-Registry использует scopes `builtin`, `instance`, `user`, `session`.
+Registry использует scopes `builtin`, `instance`, `user`, `session`, введённые
+для MCP registry foundation и расширенные до distributed revisions в v0.6.
 
 Канонический реестр: [`versions/v0.7/README.md`](versions/v0.7/README.md).
 
