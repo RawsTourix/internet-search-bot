@@ -44,15 +44,8 @@ async def apply_relocating_input_ack_policy(
             return None
 
     return await relocate_precreated_input_presentation(
+        server=server,
         gateway=server.artifact_gateway,
-        bot=server.application.bot,
-        logger=server.logger,
-        stop_progress_edits=server.stop_progress_edits,
-        register_progress_redirect=getattr(
-            server,
-            "register_progress_redirect",
-            None,
-        ),
         submission=submission,
         session_id=session_id,
         status_message=new_status,
@@ -63,16 +56,14 @@ async def apply_relocating_input_ack_policy(
 
 async def relocate_precreated_input_presentation(
     *,
+    server,
     gateway,
-    bot,
-    logger,
-    stop_progress_edits: Callable[..., Awaitable[Any]],
     submission: dict[str, Any],
     session_id: str,
     status_message,
-    register_progress_redirect: Callable[..., Any] | None = None,
     chat_id: int | str | None = None,
     cleanup_unbound: bool = False,
+    raise_on_bind_failure: bool = False,
 ):
     """Bind one already-created status as the next presentation generation."""
 
@@ -89,7 +80,7 @@ async def relocate_precreated_input_presentation(
         new_message_id_int = int(new_message_id)
         generation = int(ref.get("presentation_generation") or 0)
     except (TypeError, ValueError):
-        logger.error(
+        server.logger.error(
             "telegram_presentation_relocation_invalid_reference presentation_id=%s",
             ref.get("presentation_id"),
         )
@@ -106,7 +97,7 @@ async def relocate_precreated_input_presentation(
             client_message_id=str(new_message_id_int),
         )
     except Exception as error:
-        logger.exception(
+        server.logger.exception(
             "telegram_presentation_relocation_bind_failed presentation_id=%s "
             "old_message_id=%s new_message_id=%s error_type=%s",
             ref.get("presentation_id"),
@@ -116,32 +107,35 @@ async def relocate_precreated_input_presentation(
         )
         if cleanup_unbound and resolved_chat_id is not None:
             try:
-                await bot.delete_message(
+                await server.application.bot.delete_message(
                     chat_id=resolved_chat_id,
                     message_id=new_message_id_int,
                 )
             except Exception:
-                logger.warning(
+                server.logger.warning(
                     "telegram_unbound_relocation_message_cleanup_failed "
                     "message_id=%s",
                     new_message_id_int,
                 )
             return SimpleNamespace(message_id=old_message_id_int)
+        if raise_on_bind_failure:
+            raise
         return status_message
 
-    if callable(register_progress_redirect) and resolved_chat_id is not None:
+    register_redirect = getattr(server, "register_progress_redirect", None)
+    if callable(register_redirect) and resolved_chat_id is not None:
         try:
             numeric_chat_id = int(resolved_chat_id)
         except (TypeError, ValueError):
             numeric_chat_id = resolved_chat_id
-        register_progress_redirect(
+        register_redirect(
             chat_id=numeric_chat_id,
             old_message_id=old_message_id_int,
             new_message_id=new_message_id_int,
         )
 
     if resolved_chat_id is not None:
-        await stop_progress_edits(
+        await server.stop_progress_edits(
             chat_id=resolved_chat_id,
             message_id=old_message_id_int,
         )
@@ -150,13 +144,13 @@ async def relocate_precreated_input_presentation(
     if resolved_chat_id is not None:
         deletion_state = "deleted"
         try:
-            await bot.delete_message(
+            await server.application.bot.delete_message(
                 chat_id=resolved_chat_id,
                 message_id=old_message_id_int,
             )
         except BadRequest as error:
             deletion_state = "failed"
-            logger.warning(
+            server.logger.warning(
                 "telegram_presentation_old_handle_delete_failed "
                 "presentation_id=%s message_id=%s error=%s",
                 ref.get("presentation_id"),
@@ -165,7 +159,7 @@ async def relocate_precreated_input_presentation(
             )
         except (TimedOut, NetworkError) as error:
             deletion_state = "unknown"
-            logger.warning(
+            server.logger.warning(
                 "telegram_presentation_old_handle_delete_unknown "
                 "presentation_id=%s message_id=%s error_type=%s",
                 ref.get("presentation_id"),
@@ -174,7 +168,7 @@ async def relocate_precreated_input_presentation(
             )
         except Exception as error:
             deletion_state = "failed"
-            logger.warning(
+            server.logger.warning(
                 "telegram_presentation_old_handle_delete_failed "
                 "presentation_id=%s message_id=%s error_type=%s",
                 ref.get("presentation_id"),
@@ -190,7 +184,7 @@ async def relocate_precreated_input_presentation(
             deletion_state=deletion_state,
         )
     except Exception as error:
-        logger.warning(
+        server.logger.warning(
             "telegram_presentation_deletion_receipt_failed "
             "presentation_id=%s generation=%s state=%s error_type=%s",
             ref.get("presentation_id"),
@@ -199,7 +193,7 @@ async def relocate_precreated_input_presentation(
             type(error).__name__,
         )
 
-    logger.info(
+    server.logger.info(
         "telegram_presentation_relocated presentation_id=%s "
         "generation=%s old_message_id=%s new_message_id=%s deletion_state=%s",
         ref.get("presentation_id"),
