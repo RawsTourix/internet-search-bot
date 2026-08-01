@@ -3,7 +3,7 @@ id: design.release-gates
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Общие release gates
@@ -30,7 +30,7 @@ last_reviewed: 2026-07-27
 8. **Observability** — есть structured state/events/metrics для диагностики.
 9. **Local compatibility** — local/self-hosted mode остаётся рабочим.
 10. **Documentation consistency** — current, README, principles, glossary,
-    roadmap и thematic specs не противоречат друг другу.
+    roadmap, contracts и thematic specs не противоречат друг другу.
 11. **Next-version readiness** — определены contracts, которые следующая версия
     должна заменить adapters, а не переписывать.
 
@@ -57,6 +57,17 @@ last_reviewed: 2026-07-27
 - Compatibility facade не становится новым permanent owner архитектуры.
 - Characterization и integration tests закрывают WAITING_USER, compaction,
   planning, artifacts и finalization.
+- MCP registry scopes `builtin|instance|user|session` имеют deterministic local
+  snapshot/revision и precedence.
+- Unknown MCP tools используют generic safe presentation; trusted bindings могут
+  использовать approved semantic profiles.
+- Retry соответствует declared tool semantics; mutating call с потерянным
+  response возвращает `unknown` и не повторяется автоматически.
+- Remote resource handle не зависит от MCP connection object и изолирован по
+  lifecycle owner.
+- Terminal/reset/shutdown cleanup bounded и не превращает готовый `AgentResult`
+  в failure при недоступности optional сервиса.
+- Optional builtin MCP outage не блокирует unrelated Agent Runtime capabilities.
 
 ## Gate v0.5
 
@@ -74,6 +85,12 @@ last_reviewed: 2026-07-27
 - `TaskContextManifest` bounded и provenance-aware.
 - Parallel tasks запускаются только после policy/dependency validation.
 - Final result persisted до terminal `succeeded`.
+- Distributed MCP registry сохраняет v0.4 scope/precedence semantics.
+- Два workers видят одну committed registry revision; stale binding не может
+  исполняться после disable/rebind.
+- Unresolved remote-resource lifecycle metadata восстанавливается после restart.
+- PostgreSQL остаётся source of truth registry state; Redis loss не уничтожает
+  definitions/revisions.
 
 ## Gate v0.7
 
