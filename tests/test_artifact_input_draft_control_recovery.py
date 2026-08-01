@@ -128,7 +128,7 @@ class InputDraftControlRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
 
     async def test_idle_collection_and_bound_draft_are_abandoned_after_restart(self):
-        first_services = self._create_services(idle_timeout_seconds=0.02)
+        first_services = self._create_services(idle_timeout_seconds=0.5)
         first = await first_services.draft_control_service.start_collection(
             self._scope(),
             response_route=self._route(),
@@ -141,8 +141,8 @@ class InputDraftControlRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(submission.state, "collecting")
 
-        await asyncio.sleep(0.04)
-        restarted = self._create_services(idle_timeout_seconds=0.02)
+        await asyncio.sleep(0.6)
+        restarted = self._create_services(idle_timeout_seconds=0.5)
         await restarted.ingress_service.commit_ready_drafts()
 
         inspected = await restarted.draft_control_service.inspect(self._scope())
