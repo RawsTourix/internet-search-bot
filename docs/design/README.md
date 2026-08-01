@@ -89,7 +89,7 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
 | DAG planning | `v0.4/README.md` → storage → DAG planning |
 | Файлы, input и delivery | `v0.4/README.md` → unified input/artifact → file artifacts → semantic interaction → output delivery → input runtime |
 | Рефакторинг runtime | `v0.4/README.md` → `v0.4-runtime-modularization/` → dependency rules |
-| Builtin MCP-сервисы | `contracts/builtin-mcp-service-contract.md` → `v0.4-mcp-registry-foundation/` → dependency rules |
+| Builtin MCP-сервисы | `contracts/builtin-mcp-service-contract.md` → `versions/v0.4/v0.4-mcp-registry-foundation/` → dependency rules |
 | PostgreSQL и RAG | `v0.5/README.md` → architecture overview → implementation plan |
 | Distributed runtime | `v0.6/README.md` → v0.5 persistence → implementation plan |
 | Skills | `v0.7/README.md` → v0.6 task runtime → implementation plan |
