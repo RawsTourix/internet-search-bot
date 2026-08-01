@@ -26,8 +26,11 @@ last_reviewed: 2026-08-01
 разросшийся orchestration core
 → AgentRuntime + ports + ToolDispatcher
 
+конфигурация приложения
+→ ConfigProvider + immutable revisioned snapshots
+
 MCP integrations
-→ scoped registry + trusted metadata + stable service contract
+→ scoped registry + trusted metadata + stable service boundary
 ```
 
 `v0.4` работает без обязательных PostgreSQL, Redis и workers. Новые компоненты
@@ -65,10 +68,14 @@ v0.4-mcp-registry-foundation
 - safe checkpoints, control inbox и per-session coordination;
 - progress/trace events;
 - декомпозиция `MCPClient` в `AgentRuntime` и независимые ports;
+- `ConfigProvider`, `AgentConfigSnapshot` и переход `mcp.config → agent.config`;
 - generic `ToolDispatcher` и extension hooks;
 - local/config-backed MCP registry scopes;
 - trusted presentation/retry/outcome metadata;
-- opaque remote-resource lifecycle ownership.
+- opaque remote-resource lifecycle ownership;
+- Streamable HTTP как целевой transport новых builtin MCP integrations;
+- сохранение stdio/executable как поддерживаемого transport для user MCP и
+  migration существующих builtin registrations.
 
 В `v0.4` не входят:
 
@@ -91,6 +98,9 @@ Raw content не должен бесконтрольно жить
 
 MCP transport connection
 ≠ remote resource lifecycle.
+
+MCP transport type
+≠ scope или trust level.
 ```
 
 ## 4. Разделение ответственности
@@ -98,6 +108,7 @@ MCP transport connection
 Целевая логическая структура:
 
 ```text
+config/
 storage/
 memory/
 artifacts/
@@ -112,6 +123,8 @@ finalization/
 delivery/
 ```
 
+- `ConfigProvider` владеет чтением, полной валидацией и публикацией configuration
+  snapshots.
 - `AgentRuntime` владеет agent loop.
 - `ToolDispatcher` владеет invocation policy, normalized outcomes и canonical
   progress metadata.
@@ -121,9 +134,15 @@ delivery/
 - Client adapters не владеют application/session state.
 - Concrete infrastructure создаётся composition root.
 
-Внешний builtin MCP-сервис остаётся отдельной integration boundary. Агент
-документирует только registry, policy, orchestration и public contract; внутренняя
-реализация сервиса принадлежит его собственному репозиторию.
+Внешний builtin MCP-сервис остаётся отдельной network integration boundary и
+подключается через Streamable HTTP. Агент документирует только registry, policy,
+orchestration и public integration contract; внутренняя реализация сервиса
+принадлежит его собственному репозиторию.
+
+stdio/executable остаётся поддерживаемым MCP transport, прежде всего для user
+MCP-серверов. Legacy являются только существующие builtin stdio/executable
+integrations, которые постепенно удаляются или выделяются в отдельные
+Streamable HTTP services.
 
 Общий contract:
 [`../../contracts/builtin-mcp-service-contract.md`](../../contracts/builtin-mcp-service-contract.md).
@@ -138,4 +157,5 @@ v0.4 local/filesystem contracts
 
 v0.5 заменяет storage/repository implementations, а не agent loop. v0.6
 распределяет уже стабилизированные contracts между processes/workers. Scope model
-MCP registry и remote-resource semantics не проектируются заново.
+MCP registry, configuration snapshot boundary и remote-resource semantics не
+проектируются заново.
