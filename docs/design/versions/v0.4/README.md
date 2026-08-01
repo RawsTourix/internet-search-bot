@@ -27,8 +27,8 @@ last_reviewed: 2026-08-01
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25`/`AF-26` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented; acceptance pending | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
 | 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
-| 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Декомпозиция orchestration core и подготовка ports для v0.5–v0.6 |
-| 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics и remote-resource lifecycle integration |
+| 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | `AgentRuntime`, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
+| 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и transport policy по scope |
 
 `AF-24` порядка `grouping → durable InputBatchDraft → streaming` реализован и
 подтверждён live Telegram workflow.
@@ -104,10 +104,14 @@ v0.4-storage-foundation
 - Текущий Telegram FIFO dispatcher является in-process acceptance boundary, а не
   заменой `CycleInbox`.
 - `v0.4-input-runtime` отвечает за `CycleInbox` и safe checkpoints.
-- `v0.4-runtime-modularization` меняет ownership и вводит generic ports, а не
-  product semantics.
+- `v0.4-runtime-modularization` меняет ownership, вводит generic ports и
+  `ConfigProvider`; `mcp.config` становится compatibility filename, а
+  `agent.config` — canonical configuration.
 - `v0.4-mcp-registry-foundation` применяет эти ports к scopes, trusted MCP
   metadata и remote-resource lifecycle; он не реализует конкретный MCP-сервис.
+- Новые builtin MCP integrations используют Streamable HTTP.
+- stdio/executable остаётся поддерживаемым transport для user MCP; legacy
+  являются только существующие builtin stdio/executable integrations.
 
 PostgreSQL/RAG начинаются в [`../v0.5/README.md`](../v0.5/README.md), workers,
 distributed orchestration и distributed registry — в
