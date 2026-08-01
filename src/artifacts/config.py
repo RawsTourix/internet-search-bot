@@ -54,6 +54,10 @@ class ArtifactConfigType(BaseModel):
     workspace_ttl_seconds: int = Field(default=3_600, ge=1)
     delivery_claim_timeout_seconds: int = Field(default=900, ge=1)
 
+    trace_enabled: bool = True
+    trace_max_file_bytes: int = Field(default=8 * 1024 * 1024, ge=1024)
+    trace_max_string_chars: int = Field(default=2_000, ge=128)
+
     @field_validator("local_workspace_server_names")
     @classmethod
     def normalize_local_workspace_servers(cls, values: list[str]) -> list[str]:
