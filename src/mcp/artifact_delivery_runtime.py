@@ -7,6 +7,7 @@ from .artifact_composite_preview import ArtifactCompositePreviewMixin
 from .artifact_composite_recovery import ArtifactCompositeRecoveryMixin
 from .artifact_delivery_client import ArtifactDeliveryMixin
 from .artifact_delivery_progress import ArtifactDeliveryProgressMixin
+from .artifact_trace_runtime import ArtifactLifecycleTraceMixin
 from .llm_response_recovery import LLMResponseRecoveryMixin
 from .planning_runtime import FinalizingPlanningMCPClient
 from .waiting_user_batch_continuation import WaitingUserBatchContinuationMixin
@@ -20,6 +21,7 @@ class FinalizingArtifactDeliveryPlanningMCPClient(
     ArtifactCompositePreviewMixin,
     ArtifactCompositeCompactionMixin,
     ArtifactDeliveryProgressMixin,
+    ArtifactLifecycleTraceMixin,
     ArtifactDeliveryMixin,
     ArtifactAccessScopeMixin,
     FinalizingPlanningMCPClient,
