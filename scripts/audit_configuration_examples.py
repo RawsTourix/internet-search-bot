@@ -3,7 +3,7 @@
 The project deliberately keeps runtime defaults, but every user-configurable
 parameter must still be visible in one canonical example:
 
-* environment variables read by production source -> ``.env.example``;
+* environment variables read by production code -> ``.env.example``;
 * every field of a root MCP/agent config model -> ``mcp.config.example``.
 
 This module is importable from tests and executable as a small maintenance tool.
@@ -15,7 +15,7 @@ import ast
 import json
 import re
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from pydantic import BaseModel
 
@@ -99,8 +99,8 @@ class _EnvironmentReadVisitor(ast.NodeVisitor):
         ):
             key = self._literal_key(node.args[0] if node.args else None)
         elif isinstance(function, ast.Name) and function.id == "getenv":
-            # Supports ``from os import getenv`` without requiring imports to be
-            # executed. A literal key keeps false positives acceptably narrow.
+            # Supports ``from os import getenv`` without executing imports. A
+            # literal key keeps false positives acceptably narrow.
             key = self._literal_key(node.args[0] if node.args else None)
         if key is not None:
             self.keys.add(key)
@@ -117,10 +117,24 @@ class _EnvironmentReadVisitor(ast.NodeVisitor):
         self.generic_visit(node)
 
 
+def iter_production_python_files(root: Path = REPOSITORY_ROOT) -> Iterable[Path]:
+    """Yield source, maintenance scripts and root Python entrypoints.
+
+    Tests are deliberately excluded because their temporary fixture variables
+    are not public runtime configuration.
+    """
+
+    paths: set[Path] = set(root.glob("*.py"))
+    for directory_name in ("src", "scripts"):
+        directory = root / directory_name
+        if directory.exists():
+            paths.update(directory.rglob("*.py"))
+    return sorted(path for path in paths if "__pycache__" not in path.parts)
+
+
 def discover_environment_reads(root: Path = REPOSITORY_ROOT) -> set[str]:
     keys: set[str] = set()
-    source_root = root / "src"
-    for path in sorted(source_root.rglob("*.py")):
+    for path in iter_production_python_files(root):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         visitor = _EnvironmentReadVisitor()
         visitor.visit(tree)
@@ -200,9 +214,7 @@ def main() -> int:
     config_missing = missing_config_example_fields()
     errors: list[str] = []
     if env_missing:
-        errors.append(
-            ".env.example is missing: " + ", ".join(env_missing)
-        )
+        errors.append(".env.example is missing: " + ", ".join(env_missing))
     if config_missing:
         details = "; ".join(
             f"{section}: {', '.join(fields)}"
