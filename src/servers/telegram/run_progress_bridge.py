@@ -8,6 +8,7 @@ from typing import Any
 
 from .artifact_bridge import TelegramArtifactBridgeError
 from .collection_bridge import ExplicitCollectionTelegramGatewayClient
+from .media_group_runner import get_current_media_group_callback_key
 
 
 class RunScopedProgressTelegramGatewayClient(
@@ -43,6 +44,15 @@ class RunScopedProgressTelegramGatewayClient(
             dict[str, Any],
         ] = OrderedDict()
         self._completed_output_states: OrderedDict[str, str] = OrderedDict()
+
+    async def _close_one_group_for_batch(self, input_batch_id: str) -> None:
+        """Release the exact quiet callback group, independent of callback order."""
+
+        group_key = get_current_media_group_callback_key()
+        if group_key:
+            await self.close_input_group(group_key)
+            return
+        await super()._close_one_group_for_batch(input_batch_id)
 
     async def remember_run_presentation(
         self,
