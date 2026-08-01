@@ -94,7 +94,11 @@ class FileSystemArtifactTraceStore:
         if session_dir.is_symlink() or not session_dir.is_dir():
             raise ArtifactIntegrityError("Invalid artifact trace session directory")
         result: list[ArtifactTraceEvent] = []
-        for path in sorted(session_dir.glob("*.jsonl")):
+        paths = sorted(
+            session_dir.glob("*.jsonl"),
+            key=self._trace_path_sort_key,
+        )
+        for path in paths:
             mode = path.lstat().st_mode
             if path.is_symlink() or not stat.S_ISREG(mode):
                 raise ArtifactIntegrityError("Invalid artifact trace file")
@@ -118,7 +122,6 @@ class FileSystemArtifactTraceStore:
                         "Artifact trace session authority mismatch"
                     )
                 result.append(event)
-        result.sort(key=lambda item: (item.occurred_at, item.event_id))
         return result
 
     def _session_dir(self, session_id: str) -> Path:
@@ -141,9 +144,25 @@ class FileSystemArtifactTraceStore:
             suffix = "" if index == 0 else f".{index:03d}"
             path = session_dir / f"{day}{suffix}.jsonl"
             current_size = path.stat().st_size if path.exists() else 0
-            if current_size + additional_bytes <= self.max_file_bytes:
+            # A single validated event may be larger than the rotation target.
+            # Persist it in an empty part rather than looping forever; the next
+            # event will rotate to a new part normally.
+            if current_size == 0 or (
+                current_size + additional_bytes <= self.max_file_bytes
+            ):
                 return path
             index += 1
+
+    @staticmethod
+    def _trace_path_sort_key(path: Path) -> tuple[str, int]:
+        stem = path.name.removesuffix(".jsonl")
+        day, separator, raw_index = stem.partition(".")
+        if not separator:
+            return day, 0
+        try:
+            return day, int(raw_index)
+        except ValueError:
+            return day, 2**31 - 1
 
     def _write_session_metadata_sync(
         self,
