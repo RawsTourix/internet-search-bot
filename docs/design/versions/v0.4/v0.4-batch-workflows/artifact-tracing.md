@@ -152,11 +152,10 @@ semantic_part_count
 ```text
 artifact_created
 artifact_version_created
-artifact_replaced
-artifact_patched
 artifact_read_completed
 artifact_search_completed
-artifact_candidate_promoted
+artifact_validation_failed
+artifact_version_conflict
 ```
 
 The production client projects already normalized `ArtifactToolOutcome` values
@@ -164,6 +163,11 @@ through a dedicated tracing mixin. It invokes the existing cycle/progress hook
 first and then writes a safe session-level event. Read/search traces contain
 exact IDs and aggregate counts, never returned text, search queries or match
 contents.
+
+Promotion from a candidate uses the same immutable domain events as native
+creation: `artifact_created` for a new lineage and `artifact_version_created`
+for a new version. Replace and patch also produce `artifact_version_created`;
+the operation-specific tool call remains available in `cycle_trace`.
 
 A native tool without a user-facing progress event may still have a diagnostic
 trace event when its structured payload has an unambiguous domain type. This is
