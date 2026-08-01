@@ -3,7 +3,7 @@ id: design.principles
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Главные принципы
@@ -132,3 +132,17 @@ last_reviewed: 2026-07-27
     assumption в v0.10.
 95. Идентификатор принятого или начатого update стабилен и не меняется при
     последующей реорганизации документации.
+96. Scope определяет visibility/precedence registry, но не является разрешением.
+97. Trusted tool execution, presentation и lifecycle metadata берутся из
+    доверенного registry, а не из произвольного tool output.
+98. MCP transport lifecycle и lifecycle remote resource являются независимыми.
+99. Remote resource handle является opaque; Agent Runtime хранит ownership
+    coordinates, но не внутреннее состояние внешнего сервиса.
+100. Lifecycle hooks универсальны, а automatic remote-resource integration
+     разрешается только trusted policy для конкретного binding.
+101. Cleanup со стороны Agent Runtime является bounded best effort; внешний
+     сервис остаётся владельцем окончательной expiration/orphan cleanup.
+102. Mutating tool call с неопределённым transport outcome получает `unknown` и
+     не повторяется автоматически.
+103. Canonical progress создаёт Agent Runtime; внешний MCP-сервис не управляет
+     локализованным пользовательским UI.
