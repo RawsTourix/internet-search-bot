@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -50,10 +51,6 @@ _output_completion_context: ContextVar[dict[str, Any] | None] = ContextVar(
 )
 
 
-# One exact client-instance authority is shared by the ordinary synchronous
-# response path, the recovery outbox worker and delivery-content streaming.
-# Handler functions in telegram_server resolve these module globals at call
-# time, so replacing them here does not duplicate ingress or Telegram state.
 artifact_gateway = RunScopedProgressTelegramGatewayClient(
     gateway_url=GATEWAY_URL,
     api_key=TELEGRAM_API_KEY,
@@ -72,9 +69,6 @@ server.artifact_gateway = artifact_gateway
 server.telegram_output_executor = telegram_output_executor
 
 
-# Initial status creation is part of the public workflow, not an optional
-# cosmetic side effect. A single Telegram timeout must not leave the entire
-# AgentCycle without a visible tracking handle.
 _base_send_initial_status_message = getattr(
     server,
     "_v04_base_send_initial_status_message",
@@ -102,8 +96,6 @@ async def _retrying_initial_status_message(update, text: str):
 server.send_initial_status_message = _retrying_initial_status_message
 
 
-# Explicit controls are handled before the legacy generic command bridge, so
-# command text never becomes an InputBatch text part.
 server.application.add_handler(
     CommandHandler(
         ["collect", "send", "cancel"],
@@ -136,9 +128,53 @@ def _route_forwarded_text_through_text_handler() -> None:
 _route_forwarded_text_through_text_handler()
 
 
-# Admission order is owned once, before python-telegram-bot creates a task for
-# the update. This is a real per-session FIFO queue, not several handler locks
-# whose acquisition order depends on event-loop scheduling.
+# A media-group tombstone is useful only if it stops admission. The base
+# activity coordinator intentionally remains transport-neutral, while this
+# Telegram composition checks the exact album key before creating any visible
+# status message or making an ingress HTTP request.
+_base_attachment_handler = getattr(
+    server,
+    "_v04_base_attachment_handler",
+    server.attachment_handler,
+)
+server._v04_base_attachment_handler = _base_attachment_handler
+
+
+async def _guarded_attachment_handler(update, context):
+    message = update.effective_message
+    media_group_id = getattr(message, "media_group_id", None)
+    if media_group_id is not None:
+        thread_id = getattr(message, "message_thread_id", None)
+        group_key = (
+            f"{TELEGRAM_BOT_INSTANCE_ID}:{update.effective_chat.id}:"
+            f"{thread_id or '-'}:{media_group_id}"
+        )
+        is_closed = getattr(server.media_group_runner, "is_closed", None)
+        if callable(is_closed) and await is_closed(group_key):
+            server.logger.info(
+                "telegram_media_group_late_update_suppressed "
+                "group_key=%s message_id=%s",
+                group_key,
+                getattr(message, "message_id", None),
+            )
+            return None
+    return await _base_attachment_handler(update, context)
+
+
+server.attachment_handler = _guarded_attachment_handler
+for _handlers in server.application.handlers.values():
+    for _handler in _handlers:
+        if not isinstance(_handler, MessageHandler):
+            continue
+        if (
+            _handler.callback is _base_attachment_handler
+            or getattr(_handler.callback, "__name__", "")
+            in {"attachment_handler", "_guarded_attachment_handler"}
+        ):
+            _handler.callback = _guarded_attachment_handler
+            break
+
+
 session_dispatcher = TelegramSessionDispatcher()
 _base_process_update = getattr(
     server.application,
@@ -159,10 +195,6 @@ def _queued_process_update(update):
 server.application.process_update = _queued_process_update
 
 
-# Media-group completion is an internal callback rather than a Telegram update,
-# but it belongs to the same session lane. A late callback therefore cannot
-# overtake /send or /cancel; the explicit-batch tombstone remains the final
-# safety check after it reaches its turn.
 _base_finish_group = getattr(
     server,
     "_v04_base_finish_group",
@@ -181,9 +213,6 @@ async def _queued_finish_group(group):
 server._finish_group = _queued_finish_group
 
 
-# Preserve the original transport-neutral acknowledgement executor across test
-# re-imports. The wrapper intercepts explicit RELOCATE and the ordinary atomic
-# text acknowledgement; run progress never uses this path.
 _base_apply_input_ack_policy = getattr(
     server,
     "_v04_base_apply_input_ack_policy",
@@ -229,8 +258,6 @@ async def _remember_auto_run_presentation(
     submission,
     status_message,
 ) -> None:
-    """Bind post-ingress AUTO status to the one exact committed `/run`."""
-
     if (
         str(submission.get("status") or "") != "committed"
         or bool(submission.get("duplicate"))
@@ -280,10 +307,6 @@ async def _apply_input_ack_policy(*, update, submission, session_id):
 server.apply_input_ack_policy = _apply_input_ack_policy
 
 
-# Media/standalone paths bind presentations directly rather than through the
-# acknowledgement dispatcher, so keep the same latest-handle cache there too.
-# Their envelopes already contain response metadata before ingress, so they do
-# not need the post-ingress AUTO one-shot binding above.
 _base_bind_input_presentation_status = getattr(
     server,
     "_v04_base_bind_input_presentation_status",
@@ -323,8 +346,6 @@ _base_deliver_agent_result = server._deliver_agent_result
 
 
 async def _strict_markdown_reply(update, text: str):
-    """Do not swallow an exhausted Telegram transport retry sequence."""
-
     sent = []
     for markdown_chunk in server.split_markdown_for_telegram(text or ""):
         try:
@@ -343,10 +364,6 @@ async def _strict_markdown_reply(update, text: str):
     return sent
 
 
-# Keep the public low-level seam authoritative for tests and compatibility
-# callers, while allowing tests focused on this composition root to patch the
-# private strict implementation directly. The selector below supports either
-# patch point without changing runtime behavior.
 _installed_strict_markdown_reply = _strict_markdown_reply
 server.send_telegram_markdown_reply = _installed_strict_markdown_reply
 
@@ -388,8 +405,6 @@ async def _finish_status_or_send_reply_core(
     force_reply_if_long: bool = False,
     delivery_mode: str | None = None,
 ):
-    """Deliver terminal text without repeating an ambiguous send-new action."""
-
     mode = (
         delivery_mode or server.TELEGRAM_FINAL_DELIVERY_MODE
     ).lower().strip()
@@ -540,9 +555,34 @@ def _build_output_completion_context(
     }
 
 
-async def _deliver_agent_result(**values):
-    """Handle explicit collection status and rare synchronous/outbox races."""
+async def _authoritative_collection_status_message(
+    *,
+    values: dict[str, Any],
+    metadata: dict[str, Any],
+):
+    status_message = values.get("status_message")
+    raw_message_id = metadata.get("presentation_message_id")
+    try:
+        authoritative_id = int(raw_message_id)
+    except (TypeError, ValueError):
+        return status_message
 
+    current_id = getattr(status_message, "message_id", None)
+    if current_id is not None and int(current_id) != authoritative_id:
+        await server.stop_progress_edits(
+            chat_id=values["update"].effective_chat.id,
+            message_id=int(current_id),
+        )
+        server.logger.info(
+            "telegram_collection_stale_status_redirected "
+            "old_message_id=%s authoritative_message_id=%s",
+            current_id,
+            authoritative_id,
+        )
+    return SimpleNamespace(message_id=authoritative_id)
+
+
+async def _deliver_agent_result(**values):
     metadata = dict(values.get("metadata") or {})
     if metadata.get("input_collection_terminal_suppressed"):
         status_message = values.get("status_message")
@@ -559,9 +599,13 @@ async def _deliver_agent_result(**values):
 
     if metadata.get("input_collection_pending"):
         locale = str(metadata.get("progress_locale") or "ru")
+        status_message = await _authoritative_collection_status_message(
+            values=values,
+            metadata=metadata,
+        )
         return await server.finish_status_or_send_reply(
             update=values["update"],
-            status_message=values.get("status_message"),
+            status_message=status_message,
             text=server._localized(
                 "input_collection.collecting",
                 locale=locale,
@@ -606,10 +650,6 @@ server._deliver_agent_result = _deliver_agent_result
 
 @asynccontextmanager
 async def lifespan(app):
-    # The original lifecycle owns python-telegram-bot and webhook setup. The
-    # outbox worker starts only after that setup has completed and stops before
-    # the bot application is shut down. This composition owns exactly one
-    # worker and one Telegram Application instance per process.
     async with server.lifespan(app):
         await server.application.bot.set_my_commands([
             BotCommand("start", "Приветствие"),
