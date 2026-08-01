@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 from pathlib import Path
+
 from ..artifacts import ArtifactServices
 from ..storage import StorageConfigType
 from ..storage.interfaces import ContentStore
@@ -57,6 +58,9 @@ def create_ingress_services(
         event_store=event_store,
         batch_store=batch_store,
         collection_store=collection_store,
+        idle_timeout_seconds=(
+            ingress_config.explicit_collection_idle_timeout_seconds
+        ),
     )
     registry = build_default_capability_registry(
         interaction.client_capabilities.contract_version
