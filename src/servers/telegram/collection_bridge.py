@@ -20,10 +20,6 @@ class ExplicitCollectionTelegramGatewayClient(
         super().__init__(**values)
         self._explicit_batch_lock = asyncio.Lock()
         self._explicit_batches: dict[str, dict[str, Any]] = {}
-        # A media-group quiet timer may fire after /send or /cancel has already
-        # made the explicit collection terminal. Keep a bounded tombstone so
-        # that the late transport callback becomes a no-op instead of falling
-        # through to the ordinary AUTO commit endpoint and producing HTTP 409.
         self._terminal_explicit_batches: OrderedDict[
             str,
             dict[str, Any],
@@ -89,6 +85,21 @@ class ExplicitCollectionTelegramGatewayClient(
             return None
         normalized = str(value).strip()
         return normalized or None
+
+    async def current_input_presentation_message_id(
+        self,
+        input_batch_id: str,
+    ) -> str | None:
+        """Return the exact current Telegram handle from the local authority cache."""
+
+        normalized = input_batch_id.strip()
+        if not normalized:
+            return None
+        async with self._explicit_batch_lock:
+            state = self._explicit_batches.get(normalized)
+            if state is None:
+                state = self._terminal_explicit_batches.get(normalized)
+            return self._current_message_id(state)
 
     async def submit_envelope(
         self,
@@ -197,9 +208,6 @@ class ExplicitCollectionTelegramGatewayClient(
                 )
                 if str(active_message_id or "") != str(client_message_id):
                     return
-                # relocate_input_presentation already persisted and cached the
-                # exact new generation. Re-merging the stale reservation ref
-                # would reintroduce pending relocation fields.
                 self._explicit_batches[batch_id] = current
                 return
             current["presentation_ref"] = self._merge_presentation_ref(
@@ -233,14 +241,11 @@ class ExplicitCollectionTelegramGatewayClient(
                     "input_collection_terminal_suppressed": True,
                     "terminal_action": terminal.get("action"),
                     "collection_id": terminal.get("collection_id"),
+                    "presentation_message_id": self._current_message_id(terminal),
                     "progress_locale": progress_locale,
                 },
             }
         if explicit:
-            # One quiet callback owns one exact Telegram album. Releasing all
-            # groups here would erase sibling albums that still need their own
-            # sequencing callback. /send and /cancel remain the terminal paths
-            # that close every group associated with the collection batch.
             await self._close_one_group_for_batch(input_batch_id)
             return {
                 "status": "collecting",
@@ -253,6 +258,7 @@ class ExplicitCollectionTelegramGatewayClient(
                     "collection_id": explicit.get("collection_id"),
                     "file_count": explicit.get("file_count", 0),
                     "text_part_count": explicit.get("text_part_count", 0),
+                    "presentation_message_id": self._current_message_id(explicit),
                     "progress_locale": progress_locale,
                 },
             }
