@@ -7,6 +7,7 @@ from telegram.error import BadRequest
 
 from src.servers.telegram.presentation_relocation import (
     apply_relocating_input_ack_policy,
+    relocate_precreated_input_presentation,
 )
 
 
@@ -85,6 +86,32 @@ class TelegramPresentationRelocationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(receipt.kwargs["generation"], 1)
         self.assertEqual(receipt.kwargs["deletion_state"], "deleted")
+
+    async def test_precreated_status_relocates_without_creating_another_message(self):
+        server = self._server()
+        status_message = SimpleNamespace(message_id=250, chat_id=12345)
+
+        result = await relocate_precreated_input_presentation(
+            server=server,
+            gateway=server.artifact_gateway,
+            submission=self._submission(),
+            session_id="telegram:conversation:12345",
+            status_message=status_message,
+            cleanup_unbound=False,
+        )
+
+        self.assertIs(result, status_message)
+        server.send_initial_status_message.assert_not_awaited()
+        server.artifact_gateway.relocate_input_presentation.assert_awaited_once_with(
+            self._submission()["presentation_ref"],
+            session_id="telegram:conversation:12345",
+            client_message_id="250",
+        )
+        server.application.bot.delete_message.assert_awaited_once_with(
+            chat_id=12345,
+            message_id=100,
+        )
+        server.artifact_gateway.record_input_presentation_deletion.assert_awaited_once()
 
     async def test_bind_failure_keeps_old_handle_and_cleans_only_new_message(self):
         server = self._server()
