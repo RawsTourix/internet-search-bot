@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any, Mapping
 
@@ -29,10 +30,34 @@ _SENSITIVE_KEYS = {
     "password",
     "presigned_url",
     "secret",
-    "set-cookie",
+    "set_cookie",
     "token",
     "workspace_path",
 }
+_SENSITIVE_KEY_SUFFIXES = (
+    "_api_key",
+    "_authorization",
+    "_cookie",
+    "_password",
+    "_path",
+    "_secret",
+    "_token",
+    "_url",
+)
+_BEARER_PATTERN = re.compile(
+    r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]+"
+)
+_SECRET_ASSIGNMENT_PATTERN = re.compile(
+    r"(?i)\b(api[_-]?key|token|secret|password|signature|sig)"
+    r"\s*([:=])\s*([^\s,;&]+)"
+)
+_URL_PATTERN = re.compile(r"(?i)\bhttps?://[^\s]+")
+_WINDOWS_PATH_PATTERN = re.compile(
+    r"(?i)(?<![A-Za-z0-9_])[A-Z]:\\[^\r\n\t ]+"
+)
+_POSIX_PATH_PATTERN = re.compile(
+    r"(?<![:A-Za-z0-9_])/(?:[^/\s]+/)+[^/\s]*"
+)
 
 
 class ArtifactTraceService:
@@ -152,10 +177,18 @@ class ArtifactTraceService:
         result: dict[str, Any] = {}
         for raw_key, raw_value in value.items():
             key = str(raw_key)
-            if key.casefold() in _SENSITIVE_KEYS:
+            if self._is_sensitive_key(key):
                 continue
             result[key] = self._sanitize_value(raw_value)
         return result
+
+    @staticmethod
+    def _is_sensitive_key(key: str) -> bool:
+        normalized = key.casefold().replace("-", "_").strip()
+        return (
+            normalized in _SENSITIVE_KEYS
+            or normalized.endswith(_SENSITIVE_KEY_SUFFIXES)
+        )
 
     def _sanitize_value(self, value: Any) -> Any:
         if isinstance(value, Mapping):
@@ -172,6 +205,22 @@ class ArtifactTraceService:
 
     def _sanitize_string(self, value: str) -> str:
         normalized = value.replace("\x00", "").strip()
+        normalized = _BEARER_PATTERN.sub("Bearer [REDACTED]", normalized)
+        normalized = _SECRET_ASSIGNMENT_PATTERN.sub(
+            lambda match: (
+                f"{match.group(1)}{match.group(2)}[REDACTED]"
+            ),
+            normalized,
+        )
+        normalized = _URL_PATTERN.sub("[REDACTED_URL]", normalized)
+        normalized = _WINDOWS_PATH_PATTERN.sub(
+            "[REDACTED_PATH]",
+            normalized,
+        )
+        normalized = _POSIX_PATH_PATTERN.sub(
+            "[REDACTED_PATH]",
+            normalized,
+        )
         if len(normalized) > self.max_string_chars:
             return normalized[: self.max_string_chars - 1] + "…"
         return normalized
