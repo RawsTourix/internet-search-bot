@@ -118,6 +118,21 @@ resources и настройки области работы. Они не рав�
 Явно именованное разрешённое действие или класс доступа. Required capability
 skill не выдаёт разрешение; effective capabilities вычисляет runtime policy.
 
+## ConfigProvider
+
+Единственный application-level owner чтения и полной валидации конфигурации.
+Публикует immutable `AgentConfigSnapshot` с revision. Невалидный reload не
+заменяет последний рабочий snapshot.
+
+## AgentConfigSnapshot / ConfigRevision
+
+Validated immutable представление всей конфигурации агента и идентификатор её
+версии. Один active `AgentCycle` использует одну revision; следующая операция
+может получить более новую.
+
+Канонический filename после modularization — `agent.config`. Старое имя
+`mcp.config` используется только как временный compatibility alias.
+
 ## Scope
 
 Область видимости registry/resource: `builtin`, `instance`, `user`, `session`.
@@ -129,6 +144,18 @@ Scope определяет visibility/precedence, но не заменяет per
 Отдельный MCP-сервис, поставляемый и тестируемый как системная capability и
 зарегистрированный со scope `builtin`. `Builtin` не означает in-process,
 обязательную доступность или обход authorization policy.
+
+Новые builtin integrations используют Streamable HTTP. Существующие builtin
+stdio/executable integrations являются migration legacy.
+
+## MCP transport
+
+Способ соединения MCP runtime с сервером. Поддерживаемые adapters включают
+Streamable HTTP и stdio/executable.
+
+Transport не определяет scope или trust. stdio/executable остаётся штатным
+поддерживаемым transport для user MCP-серверов, даже после удаления legacy
+builtin stdio integrations.
 
 ## MCP registry / Registry revision
 
