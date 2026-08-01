@@ -164,6 +164,7 @@ class ExplicitCollectionTelegramGatewayClient(
             status_message=status_message,
             chat_id=status_message.chat_id,
             cleanup_unbound=False,
+            raise_on_bind_failure=True,
         )
         return {
             "state": "relocated",
@@ -176,7 +177,7 @@ class ExplicitCollectionTelegramGatewayClient(
         *,
         client_message_id: str,
     ) -> None:
-        """Remember the latest Telegram handle for the active explicit draft."""
+        """Remember only a handle confirmed by the durable presentation store."""
 
         batch_id = str(submission.get("input_batch_id") or "").strip()
         if not batch_id:
@@ -188,6 +189,19 @@ class ExplicitCollectionTelegramGatewayClient(
             if current is None:
                 return
             current = dict(current)
+            if str(submission.get("ack_policy") or "") == "relocate":
+                current_ref = dict(current.get("presentation_ref") or {})
+                active_message_id = (
+                    current_ref.get("active_client_message_id")
+                    or current_ref.get("client_message_id")
+                )
+                if str(active_message_id or "") != str(client_message_id):
+                    return
+                # relocate_input_presentation already persisted and cached the
+                # exact new generation. Re-merging the stale reservation ref
+                # would reintroduce pending relocation fields.
+                self._explicit_batches[batch_id] = current
+                return
             current["presentation_ref"] = self._merge_presentation_ref(
                 current.get("presentation_ref"),
                 submission.get("presentation_ref"),
@@ -402,6 +416,8 @@ class ExplicitCollectionTelegramGatewayClient(
                 },
                 client_message_id=str(client_message_id),
             )
+            updated_ref["relocation_generation"] = None
+            updated_ref["previous_client_message_id"] = None
             async with self._explicit_batch_lock:
                 current = self._explicit_batches.get(batch_id)
                 if current is not None:
