@@ -24,6 +24,13 @@ def new_artifact_trace_event_id() -> str:
     return f"aevt_{uuid4().hex}"
 
 
+def _normalize_optional_identifier(value: Any) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip()
+    return normalized or None
+
+
 class ArtifactTraceCorrelation(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
@@ -32,6 +39,18 @@ class ArtifactTraceCorrelation(BaseModel):
     output_batch_id: str | None = None
     delivery_id: str | None = None
     candidate_id: str | None = None
+
+    @field_validator(
+        "ingress_event_id",
+        "input_batch_id",
+        "output_batch_id",
+        "delivery_id",
+        "candidate_id",
+        mode="before",
+    )
+    @classmethod
+    def normalize_identifiers(cls, value: Any) -> str | None:
+        return _normalize_optional_identifier(value)
 
 
 class ArtifactTraceTransport(BaseModel):
@@ -46,6 +65,22 @@ class ArtifactTraceTransport(BaseModel):
     source_group_id: str | None = None
     delivery_mode: str | None = None
     client_message_id: str | None = None
+
+    @field_validator(
+        "client_type",
+        "client_instance_id",
+        "conversation_id",
+        "thread_id",
+        "source_update_id",
+        "source_message_id",
+        "source_group_id",
+        "delivery_mode",
+        "client_message_id",
+        mode="before",
+    )
+    @classmethod
+    def normalize_identifiers(cls, value: Any) -> str | None:
+        return _normalize_optional_identifier(value)
 
 
 class ArtifactTraceArtifact(BaseModel):
