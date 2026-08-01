@@ -3,7 +3,7 @@ id: design.architecture-evolution
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Эволюция архитектуры до v0.10
@@ -43,6 +43,11 @@ contracts.
   изменения пользовательского поведения.
 - `AgentRuntime` становится владельцем agent loop, а MCP — одним из tool
   backends.
+- Local/config-backed MCP registry получает scopes
+  `builtin|instance|user|session`, trusted tool metadata и remote-resource
+  lifecycle contracts.
+- Внутренняя реализация отдельного builtin MCP-сервиса остаётся за network/service
+  boundary и не импортируется в AgentRuntime.
 
 ### v0.5 — durable persistence
 
@@ -61,6 +66,8 @@ contracts.
   процессами одного repository/deployment.
 - Workflow scheduler исполняет committed revisions с leases, idempotency,
   budgets и safe fork/join.
+- MCP registry foundation v0.4 становится PostgreSQL-backed, worker-visible и
+  ownership-ready; scopes не проектируются заново.
 
 ### v0.7 — extension platform
 
@@ -68,6 +75,7 @@ contracts.
 - Runtime extensions используют providers, policies и hooks, а не subclasses
   центрального клиента.
 - Capability requirements skill не являются разрешениями.
+- SkillRegistry переиспользует scope/revision semantics MCP registry.
 
 ### v0.8 — identity и multi-tenancy
 
@@ -108,11 +116,17 @@ contracts.
 Новый Python package, repository или таблица сами по себе не являются причиной
 создавать микросервис.
 
+Builtin MCP service может быть отдельным deployable component уже при наличии
+самостоятельного lifecycle/failure domain. Это не делает его внутреннюю
+реализацию частью agent repository: интеграция определяется
+[`contracts/builtin-mcp-service-contract.md`](contracts/builtin-mcp-service-contract.md).
+
 ## Рекомендуемый порядок физических границ
 
 ```text
 v0.4–v0.5:
 один application process в local mode + PostgreSQL
+optional external builtin MCP services через стабильный contract
 
 v0.6:
 Gateway
@@ -139,7 +153,8 @@ MCP Tool Runtime, Memory/Workspace Service и Notification/Delivery Service
 - Agent/runtime domain не зависит от FastAPI, SQLAlchemy, Redis, Docker или
   Kubernetes напрямую.
 - Process boundary использует тот же contract, который ранее прошёл проверку в
-  in-process implementation.
+  in-process implementation либо отдельном integration contract.
+- MCP transport lifecycle не является lifecycle remote resource.
 - Local и self-hosted deployment остаются first-class.
 - Execution environment не получает неограниченный доступ к control plane.
 - Переход на следующую версию не должен требовать переписывания завершённого
