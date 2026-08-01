@@ -3,7 +3,7 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-31
+last_reviewed: 2026-08-01
 ---
 
 # Текущий архитектурный baseline
@@ -123,24 +123,31 @@ API suite
 Канонический документ:
 [`versions/v0.4/v0.4-batch-workflows/README.md`](versions/v0.4/v0.4-batch-workflows/README.md).
 
-## Следующий функциональный этап
+## Следующие этапы v0.4
 
 ```text
 v0.4-input-runtime
+→ v0.4-runtime-modularization
+→ v0.4-mcp-registry-foundation
 ```
 
-Он добавит durable `CycleInbox`, safe checkpoints, control inbox и finalization races
-для сообщений, поступающих уже во время active AgentCycle. Текущий in-process
-Telegram FIFO dispatcher не подменяет этот runtime и не переживает restart.
+`v0.4-input-runtime` добавит durable `CycleInbox`, safe checkpoints, control inbox
+и finalization races для сообщений, поступающих уже во время active AgentCycle.
+Текущий in-process Telegram FIFO dispatcher не подменяет этот runtime и не
+переживает restart.
 
-После него запланирован:
+`v0.4-runtime-modularization` декомпозирует orchestration core без изменения
+принятых контрактов и вводит `AgentRuntime`, `ToolDispatcher`, независимый MCP
+runtime и composition ports.
 
-```text
-v0.4-runtime-modularization
-```
+`v0.4-mcp-registry-foundation` затем добавит локальный config-backed registry со
+scopes `builtin`, `instance`, `user`, `session`, trusted presentation/retry
+metadata и lifecycle ownership opaque remote handles. Это planned agent-side
+update; конкретные builtin MCP-сервисы и их внутренняя реализация в текущем
+baseline отсутствуют.
 
-Он декомпозирует orchestration core без изменения принятых контрактов и готовит
-ports/repositories/composition root для v0.5 и v0.6.
+Контракт внешней границы:
+[`contracts/builtin-mcp-service-contract.md`](contracts/builtin-mcp-service-contract.md).
 
 Канонический индекс v0.4: [`versions/v0.4/README.md`](versions/v0.4/README.md).
 
@@ -149,7 +156,7 @@ ports/repositories/composition root для v0.5 и v0.6.
 | Версия | Роль |
 |---|---|
 | `v0.5` | PostgreSQL, lazy indexing, embeddings и RAG |
-| `v0.6` | AgentRun/TaskRun, workers, queues и workflow orchestration |
+| `v0.6` | AgentRun/TaskRun, workers, queues, workflow orchestration и distributed registry |
 | `v0.7` | Skills и extension platform |
 | `v0.8` | Identity, authorization и multi-user workspace |
 | `v0.9` | Single-node isolated execution через sandbox backend |
@@ -165,6 +172,9 @@ test или migration evidence.
 3. учитывайте AF-24–AF-26 по их code/live status;
 4. учитывайте `v0.4-batch-workflows` как code-complete, acceptance-pending;
 5. не приписывайте durable active-cycle additions до `v0.4-input-runtime`;
-6. проверяйте затронутый код и tests для точного implementation status;
-7. используйте v0.5–v0.10 только как будущие ограничения;
-8. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`.
+6. не приписывайте `AgentRuntime`/Dispatcher до modularization;
+7. не приписывайте scopes, trusted presentation и remote handle lifecycle до
+   `v0.4-mcp-registry-foundation`;
+8. проверяйте затронутый код и tests для точного implementation status;
+9. используйте v0.5–v0.10 только как будущие ограничения;
+10. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`.
