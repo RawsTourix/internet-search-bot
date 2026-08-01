@@ -1,5 +1,6 @@
 import unittest
 from datetime import datetime, timezone
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -152,10 +153,13 @@ class TelegramCollectionRelocationTests(unittest.IsolatedAsyncioTestCase):
         )
         delete_message = AsyncMock()
         stop_progress = AsyncMock()
+        fake_application = SimpleNamespace(
+            bot=SimpleNamespace(delete_message=delete_message)
+        )
         with (
             patch(
-                "src.servers.telegram.telegram_server.application.bot.delete_message",
-                delete_message,
+                "src.servers.telegram.telegram_server.application",
+                fake_application,
             ),
             patch(
                 "src.servers.telegram.telegram_server.stop_progress_edits",
