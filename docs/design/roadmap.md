@@ -76,6 +76,7 @@ large orchestration class
 + durable files/input/delivery
 + optional local DAG
 + modular tool runtime and local MCP registry foundation
++ revisioned application configuration
 ```
 
 Именованные updates:
@@ -101,13 +102,20 @@ checkpoints, control inbox и finalization race barrier.
 
 `v0.4-runtime-modularization` после functional v0.4 декомпозирует
 `mcp_client.py`, вводит `AgentRuntime`, LLM/tool/event/repository ports,
-composition extensions и composition root.
+composition extensions, composition root и `ConfigProvider`. Канонический
+configuration filename меняется с `mcp.config` на `agent.config`; validated
+immutable snapshots позволяют применять поддерживаемые изменения без
+обязательного restart Gateway.
 
 `v0.4-mcp-registry-foundation` добавляет config-backed scopes
 `builtin|instance|user|session`, trusted execution/presentation metadata,
-side-effect-aware retry и lifecycle ownership opaque remote handles. Он
-реализует только сторону агента; внутреннее устройство конкретного MCP-сервиса
-не входит в документацию агента.
+side-effect-aware retry и lifecycle ownership opaque remote handles. Новые
+builtin MCP integrations используют Streamable HTTP. stdio/executable остаётся
+поддерживаемым MCP transport для user servers; legacy являются только
+существующие builtin stdio/executable integrations.
+
+Registry update реализует только сторону агента; внутреннее устройство
+конкретного MCP-сервиса не входит в документацию агента.
 
 Общий contract:
 [`contracts/builtin-mcp-service-contract.md`](contracts/builtin-mcp-service-contract.md).
@@ -191,6 +199,9 @@ object storage и первые обоснованные process boundaries.
 `v0.6.9` не проектирует scopes заново: он переносит registry foundation v0.4 в
 PostgreSQL-backed multi-process runtime, публикует worker-visible revisions и
 добавляет ownership-aware synchronization/recovery.
+
+ConfigProvider revision contract также расширяется на multi-process propagation,
+а не заменяется новым способом загрузки конфигурации.
 
 Канонический реестр: [`versions/v0.6/README.md`](versions/v0.6/README.md).
 
