@@ -42,6 +42,10 @@ AgentRuntime
 - Agent Runtime регистрирует lifecycle ownership handles и выполняет bounded
   best-effort cleanup через общие lifecycle hooks.
 - MCP transport lifecycle остаётся независимым от lifecycle remote resource.
+- Streamable HTTP и stdio/executable остаются поддерживаемыми adapters MCP
+  runtime.
+- Новые builtin definitions используют Streamable HTTP; существующие builtin
+  stdio/executable registrations мигрируют постепенно.
 - Текущие `mcp.config` и `MCPServerManager` мигрируют без поломки local mode.
 
 ## Граница ответственности
@@ -81,6 +85,32 @@ authorization policy.
 
 До v0.8 `user` не объявляется полноценно изолированным между accounts. Реализация
 должна сохранять owner-ready fields без ложного security claim.
+
+## Transport policy
+
+Transport и scope являются разными характеристиками server definition.
+
+MCP runtime продолжает поддерживать:
+
+```text
+Streamable HTTP
+stdio/executable
+```
+
+Для новых builtin definitions применяется правило:
+
+```text
+scope=builtin
+→ transport=Streamable HTTP
+```
+
+Существующие builtin stdio/executable entries являются migration input. Их
+observable behavior сохраняется на переходном этапе, после чего они удаляются
+или заменяются отдельными Streamable HTTP MCP-сервисами.
+
+Для user MCP-серверов stdio/executable остаётся обычным поддерживаемым
+транспортом. Registry не делает transport источником trust: trusted metadata,
+permissions, retry и presentation определяются scope/policy и approved binding.
 
 ## Registry contracts
 
@@ -124,7 +154,7 @@ result handling
 presentation profile
 remote-resource behavior
 required permissions/budgets
-contract compatibility
+schema/integration compatibility
 ```
 
 Минимальные retry classes:
@@ -147,6 +177,11 @@ unknown
 
 Generic/untrusted MCP tool без approved metadata получает conservative defaults и
 обычное отображение.
+
+Документ не вводит произвольное обязательное поле вида
+`contract: web-search.v1`. Конкретная модель versioned compatibility metadata
+будет определена вместе с `MCPServerDefinition` и не должна дублировать tool
+schemas без необходимости.
 
 ## Presentation profiles
 
@@ -217,7 +252,11 @@ resource не требует уничтожать весь MCP runtime. Agent Ru
   compatibility scope;
 - системные entries переносятся в trusted builtin definitions;
 - startup-required/optional semantics сохраняются;
-- executable и Streamable HTTP transports остаются adapters MCP runtime;
+- Streamable HTTP и stdio/executable остаются adapters MCP runtime;
+- новые builtin registrations создаются только для Streamable HTTP services;
+- старые builtin executable entries сохраняются только до parity migration или
+  удаления соответствующего сервера;
+- user definitions могут использовать stdio/executable;
 - текущий dynamic discovery остаётся доступным;
 - compatibility facade старого `MCPClient` делегирует новым registry/dispatcher
   components до migration всех callers.
@@ -246,6 +285,14 @@ legacy config
 ```text
 builtin/instance/user/session definitions
 → deterministic visible registry snapshot and revision
+```
+
+```text
+new builtin definition
+→ Streamable HTTP binding
+
+user stdio definition
+→ supported local binding with conservative trust defaults
 ```
 
 ```text
