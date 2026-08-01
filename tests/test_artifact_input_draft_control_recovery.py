@@ -175,6 +175,38 @@ class InputDraftControlRecoveryTests(unittest.IsolatedAsyncioTestCase):
             first.collection.collection_id,
         )
 
+    async def test_terminal_bound_draft_closes_collection_during_inspect(self):
+        services = self._create_services()
+        started = await services.draft_control_service.start_collection(
+            self._scope(),
+            response_route=self._route(),
+            locale="ru",
+            idempotency_key="collect-failed",
+        )
+        submission = await services.ingress_service.submit_atomic(
+            self._text_envelope(),
+            session_id=self._scope().session_id,
+        )
+        await services.batch_store.fail(
+            submission.input_batch_id,
+            code="simulated_terminal_failure",
+        )
+
+        inspected = await services.draft_control_service.inspect(self._scope())
+        collection = await services.collection_store.get(
+            started.collection.collection_id
+        )
+
+        self.assertEqual(inspected.status, InputDraftControlStatus.NOT_FOUND)
+        self.assertEqual(collection.state.value, "failed")
+        self.assertEqual(
+            collection.failure_code,
+            "simulated_terminal_failure",
+        )
+        self.assertIsNone(
+            await services.collection_store.get_active(self._scope())
+        )
+
     async def test_terminal_collection_releases_scope_for_new_collection(self):
         services = self._create_services()
         first = await services.draft_control_service.start_collection(
