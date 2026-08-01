@@ -35,15 +35,54 @@ remote resources.
 - Planning, artifacts и будущие skills подключаются композиционно.
 - `ToolDispatcher`, registry и lifecycle hook interfaces готовы к последующему
   MCP registry foundation.
+- `ConfigProvider` владеет validated configuration snapshots и их revision.
+- Канонический конфигурационный файл переименовывается из `mcp.config` в
+  `agent.config`; старое имя временно остаётся compatibility alias.
 - Concrete adapters создаются в composition root.
 - v0.5 может заменить persistence backend без переписывания agent loop.
 - v0.6 может запускать тот же runtime в worker process.
+
+## Configuration boundary
+
+Конфигурацию не загружают отдельно `Gateway`, `MCPClient`, LLM adapter и другие
+services. Единственный owner чтения и валидации — `ConfigProvider`.
+
+```text
+agent.config
+→ ConfigProvider
+→ immutable AgentConfigSnapshot(revision)
+→ composition/runtime consumers
+```
+
+При изменении файла provider:
+
+1. читает полный документ;
+2. валидирует все root sections;
+3. при успехе атомарно публикует новый snapshot/revision;
+4. при ошибке оставляет предыдущий snapshot активным.
+
+Новые операции получают актуальную revision. Один активный `AgentCycle` работает
+с одним snapshot и не меняет LLM/runtime/tool settings посередине выполнения.
+Компонент, которому требуется reconnect или пересоздание adapter, реагирует на
+новую revision через собственную boundary, а не требует перезапуска Gateway как
+универсального механизма применения конфигурации.
+
+На переходном этапе:
+
+```text
+mcp.config
+→ compatibility filename
+
+agent.config
+→ canonical filename после modularization
+```
 
 ## Граница со следующим update
 
 `v0.4-runtime-modularization` создаёт generic contracts и переносит ownership:
 
 ```text
+ConfigProvider / AgentConfigSnapshot / ConfigRevision
 ToolDefinition / ToolRequest / ToolResult
 ToolProvider / ToolRegistry / ToolDispatcher / ToolPolicy
 LifecycleHook
@@ -75,7 +114,9 @@ strangler-refactor дополнительными product semantics.
 - изменение semantics compaction, planning, artifacts, delivery или
   `WAITING_USER`;
 - физическое выделение микросервисов;
-- реализация конкретного builtin MCP-сервиса.
+- реализация конкретного builtin MCP-сервиса;
+- произвольное применение невалидной конфигурации;
+- изменение active AgentCycle посередине выполнения из-за reload файла.
 
 ## Порядок чтения
 
@@ -108,6 +149,15 @@ strangler-refactor дополнительными product semantics.
 → compatibility method удаляется только после migration callers
 ```
 
+Для configuration migration применяется тот же принцип:
+
+```text
+старый mcp.config loader
+→ compatibility adapter к ConfigProvider
+→ agent.config становится canonical
+→ старый filename удаляется после migration entrypoints
+```
+
 Большой одномоментный rewrite `mcp_client.py` запрещён этой спецификацией.
 
 ## Release gate
@@ -116,3 +166,11 @@ strangler-refactor дополнительными product semantics.
 adapters и concrete infrastructure, полный v0.4 regression suite подтверждает
 эквивалентность поведения, а `v0.4-mcp-registry-foundation` может быть реализован
 поверх новых ports без возврата ответственности в compatibility facade.
+
+Дополнительно:
+
+- application использует один validated configuration snapshot source;
+- invalid reload не заменяет последнюю рабочую конфигурацию;
+- изменение поддерживаемых reloadable settings применяется без обязательного
+  restart Gateway;
+- один AgentCycle сохраняет исходную configuration revision до terminal state.
