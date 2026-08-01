@@ -147,6 +147,29 @@ text_part_count
 semantic_part_count
 ```
 
+### Artifact runtime
+
+```text
+artifact_created
+artifact_version_created
+artifact_replaced
+artifact_patched
+artifact_read_completed
+artifact_search_completed
+artifact_candidate_promoted
+```
+
+The production client projects already normalized `ArtifactToolOutcome` values
+through a dedicated tracing mixin. It invokes the existing cycle/progress hook
+first and then writes a safe session-level event. Read/search traces contain
+exact IDs and aggregate counts, never returned text, search queries or match
+contents.
+
+A native tool without a user-facing progress event may still have a diagnostic
+trace event when its structured payload has an unambiguous domain type. This is
+used for `artifact_search_completed` without changing the existing progress
+contract.
+
 ### Session authority
 
 ```text
@@ -174,6 +197,9 @@ artifact_delivery_cancelled
 
 Delivery events are appended only after the delivery store successfully
 persists the corresponding transition. The delivery store remains authoritative.
+Idempotent retries that do not change durable state do not append duplicate
+transition events. Superseding one selected/failed lineage head records both the
+new selection and the durable cancellation of the old head.
 
 ## Redaction and safety
 
@@ -186,9 +212,12 @@ Artifact traces must not contain:
 - absolute local/workspace paths;
 - arbitrary unbounded exception representations.
 
-Sensitive mapping keys are removed recursively. Strings are bounded by
-configuration. Error records contain a safe type, optional code, bounded message
-and optional retryability.
+Sensitive mapping keys are removed recursively. Key matching covers normalized
+secret suffixes such as `_token`, `_api_key`, `_secret`, `_url` and `_path`.
+String values are also scrubbed for Bearer credentials, secret assignments,
+HTTP(S) URLs and absolute Windows/POSIX paths before length bounding. Error
+records contain a safe type, optional code, bounded redacted message and optional
+retryability.
 
 ## Configuration
 
