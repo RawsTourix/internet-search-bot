@@ -22,6 +22,19 @@ from .models import ClientResponseRoute, InputBatchDraftState, utc_now
 
 logger = logging.getLogger("API.Ingress.ExplicitControl")
 
+_OPEN_DRAFT_STATES = {
+    InputBatchDraftState.COLLECTING,
+    InputBatchDraftState.SEALING,
+    InputBatchDraftState.INGESTING,
+    InputBatchDraftState.READY_TO_COMMIT,
+}
+_TERMINAL_COLLECTION_BY_DRAFT = {
+    InputBatchDraftState.COMMITTED: InputCollectionState.COMMITTED,
+    InputBatchDraftState.CANCELLED: InputCollectionState.CANCELLED,
+    InputBatchDraftState.ABANDONED: InputCollectionState.ABANDONED,
+    InputBatchDraftState.FAILED: InputCollectionState.FAILED,
+}
+
 
 class ExplicitInputDraftControlService(InputDraftControlService):
     """Promote, expire and reconcile durable explicit input collections."""
@@ -229,24 +242,7 @@ class ExplicitInputDraftControlService(InputDraftControlService):
     async def reconcile_active_collections(self) -> list[InputCollectionRecord]:
         result: list[InputCollectionRecord] = []
         for collection in await self.collection_store.list_active():
-            current = await self.reconcile_collection(collection)
-            if current.is_active and current.bound_input_batch_id is not None:
-                draft = await self.batch_store.get_draft(
-                    current.bound_input_batch_id
-                )
-                terminal_state = {
-                    InputBatchDraftState.COMMITTED: InputCollectionState.COMMITTED,
-                    InputBatchDraftState.CANCELLED: InputCollectionState.CANCELLED,
-                    InputBatchDraftState.ABANDONED: InputCollectionState.ABANDONED,
-                    InputBatchDraftState.FAILED: InputCollectionState.FAILED,
-                }.get(draft.state)
-                if terminal_state is not None:
-                    current = await self.collection_store.mark_terminal(
-                        current.collection_id,
-                        state=terminal_state,
-                        failure_code=draft.failure_code,
-                    )
-            result.append(current)
+            result.append(await self.reconcile_collection(collection))
         return result
 
     async def reconcile_collection(
@@ -262,12 +258,14 @@ class ExplicitInputDraftControlService(InputDraftControlService):
             draft = await self.batch_store.get_draft(
                 collection.bound_input_batch_id
             )
-            if draft.state in {
-                InputBatchDraftState.COLLECTING,
-                InputBatchDraftState.SEALING,
-                InputBatchDraftState.INGESTING,
-                InputBatchDraftState.READY_TO_COMMIT,
-            } and (
+            terminal = _TERMINAL_COLLECTION_BY_DRAFT.get(draft.state)
+            if terminal is not None:
+                return await self.collection_store.mark_terminal(
+                    collection.collection_id,
+                    state=terminal,
+                    failure_code=draft.failure_code,
+                )
+            if draft.state in _OPEN_DRAFT_STATES and (
                 not is_explicit_collection_draft(draft)
                 or is_legacy_explicit_collection_draft(draft)
             ):
@@ -290,6 +288,14 @@ class ExplicitInputDraftControlService(InputDraftControlService):
                 failure_code="explicit_collection_scope_mismatch",
             )
             raise RuntimeError("Explicit collection draft authority mismatch")
+
+        terminal = _TERMINAL_COLLECTION_BY_DRAFT.get(draft.state)
+        if terminal is not None:
+            return await self.collection_store.mark_terminal(
+                collection.collection_id,
+                state=terminal,
+                failure_code=draft.failure_code,
+            )
         if is_legacy_explicit_collection_draft(draft):
             draft = await self.batch_store.promote_to_explicit_collection(
                 draft.input_batch_id,
@@ -311,32 +317,17 @@ class ExplicitInputDraftControlService(InputDraftControlService):
         batch_id = collection.bound_input_batch_id
         if batch_id is not None:
             draft = await self.batch_store.get_draft(batch_id)
-            if draft.state in {
-                InputBatchDraftState.COLLECTING,
-                InputBatchDraftState.SEALING,
-                InputBatchDraftState.INGESTING,
-                InputBatchDraftState.READY_TO_COMMIT,
-            }:
+            terminal = _TERMINAL_COLLECTION_BY_DRAFT.get(draft.state)
+            if terminal is not None:
+                return await self.collection_store.mark_terminal(
+                    collection.collection_id,
+                    state=terminal,
+                    failure_code=draft.failure_code,
+                )
+            if draft.state in _OPEN_DRAFT_STATES:
                 await self.batch_store.abandon_draft(
                     batch_id,
                     code="explicit_collection_idle_timeout",
-                )
-            elif draft.state == InputBatchDraftState.COMMITTED:
-                return await self.collection_store.mark_terminal(
-                    collection.collection_id,
-                    state=InputCollectionState.COMMITTED,
-                )
-            elif draft.state == InputBatchDraftState.CANCELLED:
-                return await self.collection_store.mark_terminal(
-                    collection.collection_id,
-                    state=InputCollectionState.CANCELLED,
-                    failure_code=draft.failure_code,
-                )
-            elif draft.state == InputBatchDraftState.FAILED:
-                return await self.collection_store.mark_terminal(
-                    collection.collection_id,
-                    state=InputCollectionState.FAILED,
-                    failure_code=draft.failure_code,
                 )
 
         abandoned = await self.collection_store.mark_terminal(
