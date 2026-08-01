@@ -3,7 +3,7 @@ id: design.v0.7.index
 version: v0.7
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # v0.7 — Skills и extension platform
@@ -32,7 +32,11 @@ scopes, capability enforcement и task-scoped integration.
 
 ## Зависимости
 
-- [`../v0.6/README.md`](../v0.6/README.md) — workflow/task orchestration и scopes;
+- [`../v0.4/v0.4-mcp-registry-foundation/README.md`](../v0.4/v0.4-mcp-registry-foundation/README.md)
+  — общая scope-модель `builtin|instance|user|session` и local registry contracts;
+- [`../v0.6/README.md`](../v0.6/README.md) — workflow/task orchestration;
+- [`../v0.6/distributed-capability-registry.md`](../v0.6/distributed-capability-registry.md)
+  — durable/distributed revisions и ownership-ready registry;
 - [`../v0.5/postgresql-and-rag.md`](../v0.5/postgresql-and-rag.md) — retrieval;
 - [`../../dependency-rules.md`](../../dependency-rules.md) — composition и
   dependency direction.
