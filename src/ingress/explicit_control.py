@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from .collection_models import (
     InputCollectionRecord,
     InputCollectionState,
@@ -15,11 +17,25 @@ from .explicit_policy import (
     is_explicit_collection_draft,
     is_legacy_explicit_collection_draft,
 )
-from .models import ClientResponseRoute, InputBatchDraftState
+from .models import ClientResponseRoute, InputBatchDraftState, utc_now
+
+
+logger = logging.getLogger("API.Ingress.ExplicitControl")
 
 
 class ExplicitInputDraftControlService(InputDraftControlService):
-    """Promote and reconcile bound drafts before exposing control results."""
+    """Promote, expire and reconcile durable explicit input collections."""
+
+    def __init__(
+        self,
+        *args,
+        idle_timeout_seconds: float = 3600.0,
+        **kwargs,
+    ) -> None:
+        super().__init__(*args, **kwargs)
+        if idle_timeout_seconds <= 0:
+            raise ValueError("explicit collection idle timeout must be positive")
+        self.idle_timeout_seconds = float(idle_timeout_seconds)
 
     async def start_collection(
         self,
@@ -40,17 +56,19 @@ class ExplicitInputDraftControlService(InputDraftControlService):
         active = await self.collection_store.get_active(scope)
         if active is not None:
             active = await self.reconcile_collection(active)
-            result = await self._result(
-                action=InputDraftControlAction.START,
-                status=InputDraftControlStatus.ALREADY_ACTIVE,
-                collection=active,
-            )
-            return await self._save(
-                scope,
-                InputDraftControlAction.START,
-                idempotency_key,
-                result,
-            )
+            if active.is_active:
+                active = await self.collection_store.touch(active.collection_id)
+                result = await self._result(
+                    action=InputDraftControlAction.START,
+                    status=InputDraftControlStatus.ALREADY_ACTIVE,
+                    collection=active,
+                )
+                return await self._save(
+                    scope,
+                    InputDraftControlAction.START,
+                    idempotency_key,
+                    result,
+                )
 
         compatible = await self._compatible_open_drafts(scope)
         if len(compatible) > 1:
@@ -114,6 +132,14 @@ class ExplicitInputDraftControlService(InputDraftControlService):
                 status=InputDraftControlStatus.NOT_FOUND,
             )
         collection = await self.reconcile_collection(collection)
+        if not collection.is_active:
+            return InputDraftControlResult(
+                action=InputDraftControlAction.INSPECT,
+                status=InputDraftControlStatus.NOT_FOUND,
+                collection=collection,
+                input_batch_id=collection.bound_input_batch_id,
+                error_code=collection.failure_code,
+            )
         return await self._result(
             action=InputDraftControlAction.INSPECT,
             status=InputDraftControlStatus.INSPECTED,
@@ -132,6 +158,15 @@ class ExplicitInputDraftControlService(InputDraftControlService):
                 action=InputDraftControlAction.BIND,
                 status=InputDraftControlStatus.NOT_FOUND,
                 input_batch_id=input_batch_id,
+            )
+        collection = await self.reconcile_collection(collection)
+        if not collection.is_active:
+            return InputDraftControlResult(
+                action=InputDraftControlAction.BIND,
+                status=InputDraftControlStatus.NOT_FOUND,
+                collection=collection,
+                input_batch_id=input_batch_id,
+                error_code=collection.failure_code,
             )
         if (
             collection.bound_input_batch_id is not None
@@ -195,7 +230,7 @@ class ExplicitInputDraftControlService(InputDraftControlService):
         result: list[InputCollectionRecord] = []
         for collection in await self.collection_store.list_active():
             current = await self.reconcile_collection(collection)
-            if current.bound_input_batch_id is not None:
+            if current.is_active and current.bound_input_batch_id is not None:
                 draft = await self.batch_store.get_draft(
                     current.bound_input_batch_id
                 )
@@ -220,6 +255,8 @@ class ExplicitInputDraftControlService(InputDraftControlService):
     ) -> InputCollectionRecord:
         if not collection.is_active:
             return collection
+        if self._is_idle_expired(collection):
+            return await self._abandon_idle_collection(collection)
 
         if collection.bound_input_batch_id is not None:
             draft = await self.batch_store.get_draft(
@@ -262,3 +299,57 @@ class ExplicitInputDraftControlService(InputDraftControlService):
             collection.collection_id,
             draft.input_batch_id,
         )
+
+    def _is_idle_expired(self, collection: InputCollectionRecord) -> bool:
+        idle_seconds = (utc_now() - collection.updated_at).total_seconds()
+        return idle_seconds >= self.idle_timeout_seconds
+
+    async def _abandon_idle_collection(
+        self,
+        collection: InputCollectionRecord,
+    ) -> InputCollectionRecord:
+        batch_id = collection.bound_input_batch_id
+        if batch_id is not None:
+            draft = await self.batch_store.get_draft(batch_id)
+            if draft.state in {
+                InputBatchDraftState.COLLECTING,
+                InputBatchDraftState.SEALING,
+                InputBatchDraftState.INGESTING,
+                InputBatchDraftState.READY_TO_COMMIT,
+            }:
+                await self.batch_store.abandon_draft(
+                    batch_id,
+                    code="explicit_collection_idle_timeout",
+                )
+            elif draft.state == InputBatchDraftState.COMMITTED:
+                return await self.collection_store.mark_terminal(
+                    collection.collection_id,
+                    state=InputCollectionState.COMMITTED,
+                )
+            elif draft.state == InputBatchDraftState.CANCELLED:
+                return await self.collection_store.mark_terminal(
+                    collection.collection_id,
+                    state=InputCollectionState.CANCELLED,
+                    failure_code=draft.failure_code,
+                )
+            elif draft.state == InputBatchDraftState.FAILED:
+                return await self.collection_store.mark_terminal(
+                    collection.collection_id,
+                    state=InputCollectionState.FAILED,
+                    failure_code=draft.failure_code,
+                )
+
+        abandoned = await self.collection_store.mark_terminal(
+            collection.collection_id,
+            state=InputCollectionState.ABANDONED,
+            failure_code="explicit_collection_idle_timeout",
+        )
+        logger.warning(
+            "ingress_explicit_collection_abandoned_idle collection_id=%s "
+            "session_id=%s input_batch_id=%s idle_timeout_seconds=%s",
+            collection.collection_id,
+            collection.scope.session_id,
+            batch_id,
+            self.idle_timeout_seconds,
+        )
+        return abandoned
