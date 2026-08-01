@@ -3,7 +3,7 @@ id: design.v0.4.batch-workflows.explicit-control-plane
 version: v0.4
 spec_status: accepted
 implementation_status: implemented
-last_reviewed: 2026-07-30
+last_reviewed: 2026-08-01
 ---
 
 # BW-16 — Explicit collection control plane
@@ -14,7 +14,7 @@ last_reviewed: 2026-07-30
 /collect
 → active InputCollectionRecord exact scope
 → новые transport events входят в один explicit InputBatchDraft
-→ /send durable-коммитит batch
+→ /send закрывает admission и durable-коммитит batch
 → отдельный /run запускает AgentCycle
 
 /cancel
@@ -28,7 +28,7 @@ last_reviewed: 2026-07-30
 
 ## 2. Две разные presentation-роли
 
-Collection и AgentCycle больше не делят один Telegram status handle.
+Collection и AgentCycle не делят один Telegram status handle.
 
 ```text
 collection snapshot
@@ -42,16 +42,28 @@ run status
 → создаётся непосредственно под /send
 → принадлежит только одному /run invocation
 → принимает cycle/tool/final progress
-→ завершается через обычную terminal delivery policy
+→ завершается через terminal delivery policy
 ```
 
-Это разделение является transport-neutral правилом. Adapter может отображать роли
-по-разному, но не должен превращать collection presentation в execution
-presentation.
+### 2.1. Один authoritative collection presentation
 
-### 2.1. Terminal collection snapshot
+Каждое обновление collection может зарезервировать новое presentation generation.
+Telegram adapter соблюдает порядок:
 
-После `/send` прежнее сообщение состава пакета остаётся в истории и редактируется в:
+```text
+создать новый status
+→ durable bind нового generation
+→ остановить edits superseded status
+→ удалить старое Telegram-сообщение best-effort
+→ сохранить deletion receipt: deleted | failed | unknown
+```
+
+Quiet callback старого альбома не редактирует сохранённый в нём старый handle.
+`ExplicitCollectionTelegramGatewayClient` возвращает exact
+`presentation_message_id`, а adapter перенаправляет pending snapshot на текущий
+authoritative handle.
+
+После `/send` snapshot становится:
 
 ```text
 📦 Пакет передан в обработку.
@@ -69,44 +81,15 @@ presentation.
 Сообщения: M
 ```
 
-Ошибка редактирования этого исторического snapshot не откатывает уже
-authoritative commit/cancel. Удалять snapshot при terminal transition запрещено.
+Ошибка редактирования historical snapshot не откатывает commit/cancel.
 
 ### 2.2. Execution-scoped progress overlay
 
 `CommittedInputBatch.response_route` хранит durable reply provenance исходного
-пакета. Он не обязан указывать на status, созданный позднее командой `/send`.
-
-Поэтому `/run` принимает неперсистентный overlay:
-
-```json
-{
-  "session_id": "telegram:conversation:...",
-  "progress_locale": "ru",
-  "progress_metadata": {
-    "progress_callback_url": "...",
-    "progress_target": {
-      "chat_id": 123,
-      "message_id": 456
-    },
-    "status_message_id": 456,
-    "progress_request_id": "ibat_..."
-  }
-}
-```
-
-Gateway создаёт in-memory copy response route для callback factory. Durable
-`CommittedInputBatch` не изменяется. Значит, correctness больше не зависит от
-redirect chain между старыми presentation generations.
+пакета. Run status создаётся позже, поэтому `/run` получает неперсистентный
+`progress_metadata` overlay. Durable `CommittedInputBatch` не мутируется.
 
 ## 3. Persisted explicit grouping
-
-Public/domain policy:
-
-```text
-assembly_mode = explicit
-commit_policy = explicit
-```
 
 Canonical persisted marker:
 
@@ -114,25 +97,13 @@ Canonical persisted marker:
 InputGroupingMode.EXPLICIT_COLLECTION = "explicit_collection"
 ```
 
-Explicit draft не получает `quiet_deadline`, `sealing_deadline` или
-`maximum_deadline`. Transport debounce/recovery не auto-commit-ит его.
-
-Rollout-era `grouping_mode="immediate_text"` остаётся читаемым. При startup,
-inspect, send, cancel или bind reconciliation store:
-
-```text
-читает legacy draft
-→ освобождает legacy group index
-→ сохраняет тот же draft с explicit_collection
-→ создаёт canonical group index
-```
-
-Batch ID, collection ID, source events, attachment/text parts и state не меняются.
-Regression старого JSON входит в CI.
+Explicit draft не получает transport quiet/deadline auto-commit semantics.
+Rollout-era `grouping_mode="immediate_text"` мигрирует при reconciliation без
+изменения batch ID, collection ID, частей или state.
 
 ## 4. Shared ingress admission
 
-`ExplicitCollectionIngressService` строит exact scope:
+Exact scope:
 
 ```text
 session_id
@@ -145,52 +116,110 @@ principal_id
 
 При active `COLLECTING` collection service:
 
-1. удаляет client-supplied server metadata key;
-2. добавляет authoritative collection ID после server-side lookup;
-3. маршрутизирует event в canonical explicit grouping key;
-4. связывает collection с exact `input_batch_id`;
-5. при failure переводит collection в `FAILED`.
+1. выполняет server-side exact-scope lookup;
+2. reconciles terminal/expired state;
+3. обновляет durable `updated_at`;
+4. добавляет authoritative collection ID;
+5. маршрутизирует event в один explicit grouping key;
+6. связывает collection с exact `input_batch_id`.
 
-Text/file/semantic events входят в один draft. Attachment events сохраняют обычный
+Text/file/semantic events входят в один draft. Attachment events сохраняют
 streaming ingestion pipeline.
 
-Presentation params:
+### 4.1. Rejection одного события не ломает collection
+
+Client/admission rejection относится к конкретному событию:
+
+```text
+attachment/text/byte limit
+invalid event
+conflict
+→ rejected event
+→ ранее сохранённые части остаются
+→ collection остаётся COLLECTING
+→ /send или /cancel продолжают работать
+```
+
+Collection переходит в `FAILED` только когда authoritative ingress result сам
+получил terminal failed state, а не при любом exception вокруг отдельного member.
+Это предотвращает опасный fallback:
+
+```text
+explicit member rejected
+→ collection FAILED
+→ остальные Telegram album members становятся AUTO media_group
+→ unintended auto-run
+```
+
+### 4.2. `/send` — закрытая admission boundary
+
+`mark_commit_requested()` выполняется до commit. После этого состояние
+`COMMIT_REQUESTED` больше не принимает новые события.
+
+Поздний Telegram update:
+
+```text
+COMMIT_REQUESTED / terminal collection
+→ не попадает в AUTO/media_group
+→ не создаёт второй InputBatch
+→ не запускает второй AgentCycle
+```
+
+Если uploads, уже принятые до `/send`, ещё выполняются, commit ждёт их terminal
+state. События, admitted после команды, не добавляются к package.
+
+## 5. Несколько media groups и late-member tombstones
+
+Один explicit InputBatch может включать несколько Telegram albums:
+
+```text
+input_batch_id → set[group_key]
+```
+
+Каждый quiet callback закрывает собственный exact `group_key`, независимо от
+порядка завершения callbacks. `/send` и `/cancel` закрывают все оставшиеся группы.
+
+После terminal callback album ID сохраняется в bounded transport tombstone.
+Telegram adapter проверяет tombstone **до** создания status и HTTP ingress call.
+Поздний member поэтому завершается молча и не может создать AUTO batch.
+
+## 6. Idle expiry и restart recovery
+
+Telegram session определяется chat/thread и остаётся той же после перезапуска
+процесса. Поэтому restart сам по себе не означает новую session и не должен
+физически удалять audit state.
+
+При этом explicit collection не может резервировать scope бесконечно. Настройка:
 
 ```json
 {
-  "assembly_mode": "explicit",
-  "commit_policy": "explicit",
-  "auto_commit_allowed": false,
-  "collection_id": "icol_..."
+  "ingress": {
+    "explicit_collection_idle_timeout_seconds": 3600
+  }
 }
 ```
 
-## 5. Crash-safe promotion и recovery
-
-`ExplicitInputDraftControlService`:
-
-- promotion выполняет до сохранения idempotent action result;
-- очищает transport deadlines;
-- восстанавливает bind после crash;
-- reconciles active collections до generic recovery;
-- сохраняет open explicit draft только при authoritative active collection;
-- orphan draft переводит в `ABANDONED`;
-- terminal draft синхронизирует terminal collection state;
-- legacy explicit marker переписывает в canonical mode.
-
-Explicit draft принимает только:
+Каждое успешно принятое событие и повторный `/collect` обновляют `updated_at`.
+При превышении idle TTL startup/inspect/start reconciliation выполняет:
 
 ```text
-commit_reason = explicit_collection_commit
+active collection
++ bound open draft
+→ draft = ABANDONED(explicit_collection_idle_timeout)
+→ collection = ABANDONED(explicit_collection_idle_timeout)
+→ scope index освобождён
+→ следующий /collect создаёт новый collection
 ```
 
-Transport commit reason получает conflict.
+Файлы и metadata не удаляются немедленно: они остаются audit evidence и
+очищаются общей retention policy.
 
-## 6. Один FIFO admission lane на Telegram session
+`commit_requested_at` восстанавливается и завершается идемпотентно. Unknown
+in-flight attachment не считается stored.
 
-Набор `asyncio.Lock` вокруг отдельных handlers обеспечивает mutual exclusion, но
-не гарантирует порядок уже созданных asyncio tasks. Поэтому serialization
-выполняется один раз на входе `Application.process_update`.
+## 7. Один FIFO admission lane на Telegram session
+
+Serialization выполняется один раз на входе `Application.process_update`:
 
 ```text
 process_update(update)
@@ -202,32 +231,29 @@ process_update(update)
 
 Инварианты:
 
-- порядок admission соответствует порядку вызовов `process_update`;
-- внутри одной session одновременно не выполняются два ingress/run workflow;
-- разные session продолжают работать параллельно;
-- late album completion не обгоняет `/send` или `/cancel`;
-- terminal explicit-batch tombstone остаётся последним safety guard;
-- dispatcher не является durable `CycleInbox` и не переживает process restart.
+- updates одной session admitted последовательно;
+- разные sessions работают параллельно;
+- callback не обгоняет `/send` или `/cancel`;
+- durable collection state и transport tombstone остаются safety guards;
+- dispatcher не является durable `CycleInbox`.
 
-## 7. Fresh task boundary
+## 8. WAITING_USER continuation
 
-Обычное сообщение после `WAITING_USER` по-прежнему продолжает pending AgentCycle.
-Явный `/collect` имеет другую семантику: пользователь открыл новый пакет задачи.
-
-При успешном `STARTED` или `PROMOTED_AUTO_DRAFT`:
+`/collect` является упаковкой пользовательского продолжения, а не reset/new-task
+boundary.
 
 ```text
-pending WAITING_USER cycle
-→ trace: pending_cycle_abandoned
-→ session.pending_cycle = None
-→ будущий /send запускает новый AgentCycle
+suspended WAITING_USER cycle
++ /collect ... /send
+→ продолжить тот же cycle
+→ сохранить messages, working memory и artifact refs
+→ добавить refs/text нового committed InputBatch
 ```
 
-`ALREADY_ACTIVE` не сбрасывает pending cycle повторно. Полноценное добавление новых
-committed batches в активный цикл остаётся обязанностью `v0.4-input-runtime` и
-`CycleInbox`.
+Добавления во время реально выполняющегося AgentCycle принадлежат будущему
+`v0.4-input-runtime` / `CycleInbox`.
 
-## 8. Authenticated HTTP control API
+## 9. Authenticated HTTP API
 
 ```text
 POST /internal/input-collections/start
@@ -237,66 +263,43 @@ POST /internal/input-collections/cancel
 ```
 
 Request fields не предоставляют authority. API key проверяется для requested
-`client_type` и exact `client_instance_id`; start route обязан совпадать с exact
-conversation/thread. Mutations имеют idempotency key.
+transport и exact client instance. Mutations имеют idempotency key. `/send`
+коммитит batch, но не запускает AgentCycle внутри control route.
 
-`/send` durable-коммитит batch, но не запускает AgentCycle внутри control route.
+## 10. `/status` diagnostics
 
-## 9. Telegram adapter
+`/status` показывает не только process counters, но и состояние exact session:
 
-Регистрируются только:
+- stable session ID;
+- runtime status, WAITING_USER, iterations и last error;
+- active collection ID/state/InputBatch/counts;
+- возраст collection и idle duration;
+- количество открытых drafts по states;
+- recoverable input presentations;
+- recoverable output batches;
+- включённость artifact lifecycle trace.
 
-```text
-/collect
-/send
-/cancel
-```
+Каждый diagnostic subsection fail-soft: недоступный store не ломает всю команду.
 
-`/batch` и `/done` отсутствуют. После handler применяется
-`ApplicationHandlerStop`, поэтому command text не становится `InputBatch.text_parts`.
+## 11. Validation contracts
 
-Adapter:
+Regression suites покрывают:
 
-- вызывает shared controls с exact bot/chat/thread/principal scope;
-- принимает explicit state только из authoritative presentation params;
-- подавляет прежний transport `commit_and_run`;
-- `/send` после durable commit отдельно вызывает `run_committed`;
-- передаёт execution-scoped progress metadata exact run status;
-- terminalizes collection snapshot без удаления;
-- `/cancel` не запускает agent.
-
-## 10. Validation
-
-CI head `5d9edb4b1e3eafb7b3ad58deab920e147d5bb8e0`:
-
-```text
-compile: success
-artifact suite: 238 tests, OK
-storage suite: 41 tests, OK
-plans suite: 45 tests, OK
-planning suite: 19 tests, OK
-API suite: 1 test, OK
-```
-
-Новые regressions покрывают:
-
-- execution-scoped progress overlay без мутации durable response route;
-- exact progress target в Telegram `/run` request;
-- persistent terminal collection snapshot;
-- отсутствие snapshot mutation при empty `/send`;
-- FIFO same-session ordering;
-- concurrency разных Telegram sessions;
-- nested same-lane callback без deadlock;
-- fresh `/collect` boundary для `WAITING_USER`;
-- no-op boundary при отсутствии pending cycle;
-- late media-group suppression после `/send` и `/cancel`.
+- stale collection abandonment после restart;
+- сохранение audit records и освобождение exact scope;
+- event rejection на attachment limit без terminal collection failure;
+- `/cancel` после rejection;
+- exact callback group cleanup;
+- late closed-album suppression до ingress/status;
+- authoritative presentation redirect для pending callbacks;
+- multi-group package counts и commit;
+- terminal suppression после `/send` и `/cancel`.
 
 Повторный live Telegram gate остаётся maintainer acceptance step.
 
-## 11. Дальнейшая граница
+## 12. Дальнейшая граница
 
-Presentation relocation внутри ещё активного collection и scoped artifact
-activation реализованы в BW-P3/BW-P4. Durable `CycleInbox`, active-cycle additions
-и restart-safe execution queue остаются следующему `v0.4-input-runtime`.
-
-Новых `.env` или `mcp.config` keys этот refactor не добавляет.
+Durable `CycleInbox`, additions в running cycle и restart-safe execution queue
+остаются следующему `v0.4-input-runtime`. Idle TTL и explicit collection
+reconciliation уже transport-neutral и не требуют изменения этой будущей
+границы.
