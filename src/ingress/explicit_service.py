@@ -51,12 +51,34 @@ class ExplicitCollectionIngressService(ResilientUnifiedArtifactIngressService):
     ) -> InputSubmissionResult:
         scope = self._collection_scope(envelope, session_id=session_id)
         active = await self.collection_store.get_active(scope)
+        if active is not None:
+            active = await self.draft_control_service.reconcile_collection(active)
+            if not active.is_active:
+                active = None
+
+        # COMMIT_REQUESTED is a closed admission boundary. A Telegram update
+        # arriving after /send must not escape into AUTO/media_group mode and
+        # start a second agent cycle. It is rejected against the same explicit
+        # workflow and can be retried only in a newly opened collection.
+        if (
+            active is not None
+            and active.state == InputCollectionState.COMMIT_REQUESTED
+        ):
+            raise IngressConflictError(
+                "Explicit collection no longer accepts new input events"
+            )
+
         collect_into = (
             active
             if active is not None
             and active.state == InputCollectionState.COLLECTING
             else None
         )
+        if collect_into is not None:
+            collect_into = await self.collection_store.touch(
+                collect_into.collection_id
+            )
+
         sanitized = self._with_collection_route(
             envelope,
             collection_id=(
@@ -86,18 +108,22 @@ class ExplicitCollectionIngressService(ResilientUnifiedArtifactIngressService):
                 grouping_mode=effective_mode,
                 grouping_key=effective_key,
             )
-        except Exception:
+        except Exception as error:
+            # A rejected event (limits, conflict, invalid client input) is not a
+            # terminal collection failure. The durable collection and already
+            # stored members remain available for /cancel or a valid /send.
+            # Infrastructure failures are reflected by the draft/result recovery
+            # layer and reconciled from its authoritative state.
             if collect_into is not None:
-                latest = await self.collection_store.get_active(scope)
-                if (
-                    latest is not None
-                    and latest.collection_id == collect_into.collection_id
-                ):
-                    await self.collection_store.mark_terminal(
-                        latest.collection_id,
-                        state=InputCollectionState.FAILED,
-                        failure_code="explicit_collection_ingress_failed",
-                    )
+                logger.warning(
+                    "ingress_explicit_collection_event_rejected "
+                    "collection_id=%s session_id=%s source_message_id=%s "
+                    "error_type=%s",
+                    collect_into.collection_id,
+                    session_id,
+                    envelope.source_message_id,
+                    type(error).__name__,
+                )
             raise
 
         if collect_into is None:
@@ -123,6 +149,10 @@ class ExplicitCollectionIngressService(ResilientUnifiedArtifactIngressService):
         if binding.status == InputDraftControlStatus.CONFLICT:
             raise IngressConflictError(
                 binding.error_code or "Explicit collection bind conflict"
+            )
+        if binding.status == InputDraftControlStatus.NOT_FOUND:
+            raise IngressConflictError(
+                binding.error_code or "Explicit collection is no longer active"
             )
         logger.info(
             "ingress_explicit_collection_bound collection_id=%s "
