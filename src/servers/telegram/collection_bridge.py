@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
+from types import SimpleNamespace
 from typing import Any
 
+from .presentation_relocation import relocate_precreated_input_presentation
 from .scoped_artifact_bridge import InstanceScopedTelegramArtifactGatewayClient
 
 
@@ -123,6 +125,50 @@ class ExplicitCollectionTelegramGatewayClient(
                     )
                     self._explicit_batches[batch_id] = current
         return payload
+
+    async def bind_input_presentation(
+        self,
+        presentation_ref: dict[str, Any] | None,
+        *,
+        session_id: str,
+        client_message_id: str,
+    ) -> dict[str, Any] | None:
+        """Bind an initial handle or execute one reserved relocation generation."""
+
+        ref = dict(presentation_ref or {})
+        relocation_reserved = (
+            ref.get("relocation_generation") is not None
+            or ref.get("previous_client_message_id") is not None
+        )
+        if not relocation_reserved:
+            return await super().bind_input_presentation(
+                ref,
+                session_id=session_id,
+                client_message_id=client_message_id,
+            )
+
+        from . import telegram_server as server
+
+        status_message = SimpleNamespace(
+            message_id=int(client_message_id),
+            chat_id=self._chat_id_from_session(session_id),
+        )
+        await relocate_precreated_input_presentation(
+            server=server,
+            gateway=self,
+            submission={
+                "ack_policy": "relocate",
+                "presentation_ref": ref,
+            },
+            session_id=session_id,
+            status_message=status_message,
+            chat_id=status_message.chat_id,
+            cleanup_unbound=False,
+        )
+        return {
+            "state": "relocated",
+            "client_message_id": str(client_message_id),
+        }
 
     async def remember_input_presentation_handle(
         self,
@@ -425,3 +471,11 @@ class ExplicitCollectionTelegramGatewayClient(
         if not isinstance(payload, dict):
             raise RuntimeError("Gateway input collection response is invalid")
         return payload
+
+    @staticmethod
+    def _chat_id_from_session(session_id: str) -> str | None:
+        prefix = "telegram:conversation:"
+        if not session_id.startswith(prefix):
+            return None
+        value = session_id[len(prefix):].split(":thread:", 1)[0].strip()
+        return value or None
