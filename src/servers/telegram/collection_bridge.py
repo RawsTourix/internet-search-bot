@@ -19,7 +19,7 @@ class ExplicitCollectionTelegramGatewayClient(
         self._explicit_batch_lock = asyncio.Lock()
         self._explicit_batches: dict[str, dict[str, Any]] = {}
         # A media-group quiet timer may fire after /send or /cancel has already
-        # made the explicit collection terminal.  Keep a bounded tombstone so
+        # made the explicit collection terminal. Keep a bounded tombstone so
         # that the late transport callback becomes a no-op instead of falling
         # through to the ordinary AUTO commit endpoint and producing HTTP 409.
         self._terminal_explicit_batches: OrderedDict[
@@ -162,7 +162,7 @@ class ExplicitCollectionTelegramGatewayClient(
             )
             explicit = dict(self._explicit_batches.get(input_batch_id) or {})
         if terminal:
-            await self._close_group_for_batch(input_batch_id)
+            await self._close_one_group_for_batch(input_batch_id)
             return {
                 "status": "suppressed",
                 "input_batch_id": input_batch_id,
@@ -177,7 +177,11 @@ class ExplicitCollectionTelegramGatewayClient(
                 },
             }
         if explicit:
-            await self._close_group_for_batch(input_batch_id)
+            # One quiet callback owns one exact Telegram album. Releasing all
+            # groups here would erase sibling albums that still need their own
+            # sequencing callback. /send and /cancel remain the terminal paths
+            # that close every group associated with the collection batch.
+            await self._close_one_group_for_batch(input_batch_id)
             return {
                 "status": "collecting",
                 "input_batch_id": input_batch_id,
