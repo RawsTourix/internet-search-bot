@@ -3,7 +3,7 @@ id: design.index
 version: cross-version
 spec_status: accepted
 implementation_status: not-applicable
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-02
 ---
 
 # Архитектура ИИ-агента
@@ -22,10 +22,13 @@ last_reviewed: 2026-08-01
 1. [`current.md`](current.md) — что считается текущим baseline.
 2. [`overview.md`](overview.md) — назначение и направление развития системы.
 3. [`principles.md`](principles.md) — каталог архитектурных инвариантов.
-4. [`architecture-evolution.md`](architecture-evolution.md) — путь от модульного
+4. [`runtime-and-deployment-profiles.md`](runtime-and-deployment-profiles.md) —
+   границы AgentRuntime, Service Application, self-hosted/managed hosting и
+   будущего Local Agent Application.
+5. [`architecture-evolution.md`](architecture-evolution.md) — путь от модульного
    runtime к distributed execution plane.
-5. README интересующей версии.
-6. Применимый документ в [`contracts/`](contracts/README.md), если задача
+6. README интересующей версии.
+7. Применимый документ в [`contracts/`](contracts/README.md), если задача
    затрагивает внешний сервис или protocol boundary.
 
 Не начинайте анализ с roadmap или history: эти документы дают хронологический
@@ -72,6 +75,7 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
 | [`current.md`](current.md) | Текущий baseline и граница между существующим и будущим |
 | [`overview.md`](overview.md) | Цели развития архитектуры `v0.3 → v0.10` |
 | [`principles.md`](principles.md) | Каталог инвариантов разных этапов развития |
+| [`runtime-and-deployment-profiles.md`](runtime-and-deployment-profiles.md) | Application profiles, hosting modes, configuration ownership и transport admission |
 | [`architecture-evolution.md`](architecture-evolution.md) | Этапы модульного, сервисного и execution-plane развития |
 | [`dependency-rules.md`](dependency-rules.md) | Допустимое направление imports и ports/adapters |
 | [`release-gates.md`](release-gates.md) | Универсальные и version-specific критерии завершения |
@@ -85,16 +89,17 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
 | Задача | Что читать |
 |---|---|
 | Анализ текущего agent loop | `current.md` → `v0.3/README.md` → memory, pending cycle, progress и MCP runtime |
+| Runtime/deployment profiles | `runtime-and-deployment-profiles.md` → architecture evolution → modularization → нужная version specification |
 | Context management v0.4 | `v0.4/README.md` → storage → result compaction → cycle compaction |
 | DAG planning | `v0.4/README.md` → storage → DAG planning |
 | Файлы, input и delivery | `v0.4/README.md` → unified input/artifact → file artifacts → semantic interaction → output delivery → input runtime |
-| Рефакторинг runtime | `v0.4/README.md` → `v0.4-runtime-modularization/` → dependency rules |
-| Builtin MCP-сервисы | `contracts/builtin-mcp-service-contract.md` → `versions/v0.4/v0.4-mcp-registry-foundation/` → dependency rules |
+| Рефакторинг runtime | `runtime-and-deployment-profiles.md` → `v0.4/README.md` → `v0.4-runtime-modularization/` → dependency rules |
+| Builtin MCP-сервисы | `runtime-and-deployment-profiles.md` → `contracts/builtin-mcp-service-contract.md` → `versions/v0.4/v0.4-mcp-registry-foundation/` → dependency rules |
 | PostgreSQL и RAG | `v0.5/README.md` → architecture overview → implementation plan |
-| Distributed runtime | `v0.6/README.md` → v0.5 persistence → implementation plan |
+| Distributed runtime | `runtime-and-deployment-profiles.md` → `v0.6/README.md` → v0.5 persistence → implementation plan |
 | Skills | `v0.7/README.md` → v0.6 task runtime → implementation plan |
-| Identity и multi-user | `v0.8/README.md` → ownership-ready persistence/runtime/skills |
-| Isolated execution | `v0.9/README.md` → v0.6 TaskRun → v0.7 capabilities → v0.8 authorization |
+| Identity и multi-user | `runtime-and-deployment-profiles.md` → `v0.8/README.md` → ownership-ready persistence/runtime/skills |
+| Isolated execution | `runtime-and-deployment-profiles.md` → `v0.9/README.md` → v0.6 TaskRun → v0.7 capabilities → v0.8 authorization |
 | Distributed runners | `v0.10/README.md` → v0.9 execution contracts и hardening |
 
 ## Правила каноничности
@@ -107,17 +112,20 @@ v<major>.<minor>.<sequence>-<descriptive-slug>
    переопределяет подробные контракты тематического файла.
 4. `contracts/` владеет cross-version требованиями интеграционной границы, а
    version-specific документ — реализацией стороны агента.
-5. `roadmap.md` описывает последовательность развития и не является второй
+5. `runtime-and-deployment-profiles.md` владеет различием application profile,
+   hosting mode, topology и execution backend; version-specific документы
+   применяют эту модель, но не переопределяют её молча.
+6. `roadmap.md` описывает последовательность развития и не является второй
    спецификацией.
-6. ADR объясняет причину решения. После принятия решения актуальное состояние
+7. ADR объясняет причину решения. После принятия решения актуальное состояние
    интегрируется в канонический тематический файл.
-7. Документы со статусом `historical` или `superseded` не участвуют в обычном
+8. Документы со статусом `historical` или `superseded` не участвуют в обычном
    архитектурном анализе.
-8. Более новый файл не уточняет предыдущий неявно. Изменение ограничивается
+9. Более новый файл не уточняет предыдущий неявно. Изменение ограничивается
    версией либо оформляется явным `supersedes`.
-9. При конфликте сначала применяется версия из `current.md`, затем
-   канонический тематический документ этой версии. Конфликт между двумя
-   каноническими файлами считается дефектом документации.
+10. При конфликте сначала применяется версия из `current.md`, затем
+    канонический тематический документ этой версии. Конфликт между двумя
+    каноническими файлами считается дефектом документации.
 
 ## Статусы
 
