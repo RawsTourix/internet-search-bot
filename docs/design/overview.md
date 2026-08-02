@@ -3,7 +3,7 @@ id: design.overview
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-02
 ---
 
 # Дизайн-документ: архитектура ИИ-агента v0.3 → v0.10
@@ -25,21 +25,35 @@ last_reviewed: 2026-07-27
 multi-user режима и изолированного execution plane.
 ```
 
+Текущий продукт развивается как Service Application. Self-hosted и managed
+являются hosting modes этого приложения. Переиспользуемый `AgentRuntime` должен
+оставаться независимым от server shell, чтобы после стабилизации ядра было
+возможно отдельно спроектировать Future Local Agent Application без fork или
+rewrite agent loop.
+
+Каноническая модель:
+[`runtime-and-deployment-profiles.md`](runtime-and-deployment-profiles.md).
+
 ## Этапы развития
 
 - `v0.3` — agent loop baseline, memory/runtime separation, progress, MCP lifecycle
   и final processing;
 - `v0.4` — agent workspace, stores/refs, compaction, artifacts, optional DAG,
-  semantic input/output, `CycleInbox` и modularization runtime;
+  semantic input/output, `CycleInbox`, reusable AgentRuntime, Service Application
+  composition и MCP registry foundation;
 - `v0.5` — PostgreSQL, lazy extraction, pgvector, RAG и durable persistence;
 - `v0.6` — `AgentRun`, `TaskRun`, execution modes, Redis/arq, workers, workflow
   scheduler и service boundaries;
 - `v0.7` — подключаемые skills и extension/capability platform;
 - `v0.8` — accounts, linked identities, conversations, ownership,
-  authorization, quotas и multi-user workspace;
+  authorization, quotas и multi-user Service Application workspace;
 - `v0.9` — single-node sandbox runtime через `ExecutionBackend`;
 - `v0.10` — distributed runner fleet, placement, leases, fencing и remote
   workspace.
+
+Future Local Agent Application не имеет назначенного номера версии. Его
+packaging, permission model и local configuration проектируются отдельно после
+стабилизации AgentRuntime.
 
 ## Сквозная runtime-модель
 
@@ -54,6 +68,9 @@ Account / Principal               начиная с v0.8
 
 Эти сущности не объединяются в универсальную `session`.
 
+Application profile, hosting mode, topology, environment и execution backend
+также остаются разными архитектурными осями.
+
 ## Основные архитектурные линии
 
 Документация описывает:
@@ -64,6 +81,9 @@ Account / Principal               начиная с v0.8
 - exact retrieval и rebuildable RAG indexes;
 - local task DAG и workflow DAG;
 - structured task handoff вместо передачи полного parent trace;
+- reusable AgentRuntime и profile-specific composition roots;
+- operator configuration отдельно от per-user settings;
+- MCP transport support отдельно от application admission policy;
 - composition-based skills и capability enforcement;
 - control plane / execution plane separation;
 - single-node sandbox и последующий distributed execution backend.
@@ -78,4 +98,6 @@ Account / Principal               начиная с v0.8
 описанием текущего поведения без подтверждения кодом и тестами.
 
 Общий путь физической декомпозиции находится в
-[`architecture-evolution.md`](architecture-evolution.md).
+[`architecture-evolution.md`](architecture-evolution.md), а application/hosting
+границы — в
+[`runtime-and-deployment-profiles.md`](runtime-and-deployment-profiles.md).
