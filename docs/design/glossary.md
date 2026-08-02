@@ -3,7 +3,7 @@ id: design.glossary
 version: cross-version
 spec_status: accepted
 implementation_status: not-applicable
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-02
 ---
 
 # Глоссарий
@@ -38,7 +38,71 @@ Workflow — граф крупных tasks одного `AgentRun`. Revision —
 DIRECT | SINGLE_TASK | PLANNED_TASK | WORKFLOW
 ```
 
-Это не `AgentActivity` и не lifecycle status.
+Это не `AgentActivity`, application profile или lifecycle status.
+
+## Application profile
+
+Тип приложения и его composition root:
+
+```text
+Service Application
+Future Local Agent Application
+```
+
+Application profile определяет верхнюю security/capability boundary и не
+переключается произвольным пользовательским config value внутри AgentRuntime.
+
+## Service Application
+
+Текущий server-side application profile. Принимает запросы через Gateway/client
+API, использует server-side stores, MCP services и delivery adapters. Может быть
+self-hosted или managed и иметь single-process, multi-process либо distributed
+topology.
+
+## Future Local Agent Application
+
+Возможный будущий executable/desktop/CLI/IDE application profile на машине
+пользователя. Использует общий AgentRuntime через отдельный composition root и
+получает собственную local configuration, host permissions и approval policy.
+Не равен локально запущенному self-hosted service.
+
+## Hosting mode
+
+Способ владения и эксплуатации Service Application:
+
+```text
+self-hosted
+managed
+```
+
+Hosting mode не является application profile или runtime topology.
+
+## Self-hosted service
+
+Service Application, развёрнутый пользователем, командой или разработчиком на
+собственной машине/сервере. Может работать локально, но не становится Future
+Local Agent Application.
+
+## Managed service
+
+Service Application, развёртывание и infrastructure policy которого контролирует
+оператор сервиса. Может обслуживать множество пользователей.
+
+## Runtime topology
+
+Физическая раскладка Service Application:
+
+```text
+single-process | multi-process | distributed
+```
+
+Topology выбирает adapters/process boundaries, но не меняет agent domain
+contracts.
+
+## Environment
+
+Операционная среда `development|test|production`. Не выдаёт дополнительных
+capabilities и не подменяет application/hosting policy.
 
 ## TaskContextManifest
 
@@ -67,6 +131,15 @@ revise, cancel, replace или defer.
 Port для создания, выполнения, snapshot и teardown изолированного execution
 environment. Возможные adapters: local process, Docker, remote runner.
 
+`LocalProcessExecutionBackend` является execution adapter, а не Future Local
+Agent Application.
+
+## CommandExecutionPort
+
+Нейтральный application port terminal/process manager tools. Service Application
+связывает его с approved sandbox/execution backend. Future Local Agent Application
+сможет связать его с host executor под отдельной permission policy.
+
 ## Sandbox profile
 
 Versioned и server-approved описание execution environment, capabilities,
@@ -77,6 +150,8 @@ resource limits и network policy. LLM выбирает профиль, а не 
 Sandbox instance — конкретное ephemeral environment. Lease — ограниченное право
 определённого worker/runner управлять instance и commit результат текущей
 попытки.
+
+Sandbox instance не является постоянным local-agent environment.
 
 ## Runner
 
@@ -90,13 +165,14 @@ Sandbox instance — конкретное ephemeral environment. Lease — ог�
 
 ## Control plane
 
-Управляющая часть: API, auth, scheduler, durable state, policies, LLM/tool
-gateways и Sandbox Manager.
+Управляющая часть Service Application: API, auth, scheduler, durable state,
+policies, LLM/tool gateways и Sandbox Manager.
 
 ## Execution plane
 
 Ограниченная среда выполнения кода, processes и файловых операций. Не является
-source of truth для durable application state.
+source of truth для durable application state и не равна Future Local Agent
+Application.
 
 ## Principal
 
@@ -120,24 +196,41 @@ skill не выдаёт разрешение; effective capabilities вычис�
 
 ## ConfigProvider
 
-Единственный application-level owner чтения и полной валидации конфигурации.
-Публикует immutable `AgentConfigSnapshot` с revision. Невалидный reload не
-заменяет последний рабочий snapshot.
+Application-level owner чтения и полной валидации operator/root configuration.
+Публикует immutable snapshot с revision. Невалидный reload не заменяет последний
+рабочий snapshot.
+
+Service и Future Local Agent application profiles могут использовать общий
+ConfigProvider contract с разными root snapshot types.
 
 ## AgentConfigSnapshot / ConfigRevision
 
-Validated immutable представление всей конфигурации агента и идентификатор её
-версии. Один active `AgentCycle` использует одну revision; следующая операция
-может получить более новую.
+Validated immutable представление Service Application configuration и
+идентификатор её версии. Один active `AgentCycle` использует одну revision;
+следующая операция может получить более новую.
 
-Канонический filename после modularization — `agent.config`. Старое имя
+Канонический service filename после modularization — `agent.config`. Старое имя
 `mcp.config` используется только как временный compatibility alias.
+
+Future Local Agent root config пока не имеет утверждённого filename/schema.
+
+## Operator configuration
+
+Deployment-wide configuration Service Application: runtime, infrastructure,
+builtin/instance integrations, client adapters, policies и secret references.
+Не является хранилищем per-user settings многопользовательского сервиса.
+
+## User configuration
+
+Owner-scoped MCP definitions, credentials, preferences и grants пользователя.
+В Service Application загружается через application services/repositories, а не
+как редактируемая секция общего `agent.config`.
 
 ## Scope
 
 Область видимости registry/resource: `builtin`, `instance`, `user`, `session`.
-Scope определяет visibility/precedence, но не заменяет permission. User scope
-полноценно enforced после v0.8.
+Scope определяет visibility/precedence, но не заменяет permission или transport
+admission. User scope полноценно enforced после v0.8.
 
 ## Builtin MCP service
 
@@ -145,17 +238,24 @@ Scope определяет visibility/precedence, но не заменяет per
 зарегистрированный со scope `builtin`. `Builtin` не означает in-process,
 обязательную доступность или обход authorization policy.
 
-Новые builtin integrations используют Streamable HTTP. Существующие builtin
-stdio/executable integrations являются migration legacy.
+Новые builtin integrations Service Application используют Streamable HTTP.
+Существующие builtin stdio/executable integrations являются migration legacy.
 
 ## MCP transport
 
-Способ соединения MCP runtime с сервером. Поддерживаемые adapters включают
+Способ соединения MCP runtime с сервером. Поддерживаемые adapters могут включать
 Streamable HTTP и stdio/executable.
 
-Transport не определяет scope или trust. stdio/executable остаётся штатным
-поддерживаемым transport для user MCP-серверов, даже после удаления legacy
-builtin stdio integrations.
+Transport не определяет scope, trust или permission.
+
+## Transport admission policy
+
+Policy application/hosting profile, определяющая, какие сочетания scope и
+transport можно подключать до process spawn/connect.
+
+Service Application запрещает user/session-provided executable MCP в trusted
+control plane. Self-hosted operator может отдельно разрешить instance stdio.
+Future Local Agent Application сможет иметь другую local admission policy.
 
 ## MCP registry / Registry revision
 
@@ -216,6 +316,9 @@ refs и не зависит от физических файловых путе�
 
 Логический пользовательский или агентный файл с identity, lineage и версиями.
 Конкретное состояние представлено `ArtifactVersion`/`ArtifactRef`.
+
+Execution workspace file становится artifact только после declared validation и
+import через artifact contracts.
 
 ## `InputBatch`
 
