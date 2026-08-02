@@ -3,13 +3,32 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-02
 ---
 
 # Текущий архитектурный baseline
 
 Этот файл определяет, какие версии следует применять при анализе текущего
 проекта. Release-решение дополнительно проверяется по коду, tests и live gates.
+
+Application/hosting profiles и будущая граница Local Agent определены в
+[`runtime-and-deployment-profiles.md`](runtime-and-deployment-profiles.md).
+
+## Текущий application profile
+
+Текущий проект является Service Application в single-process self-hosted
+разработке. Telegram и будущие Web/network clients обращаются к server-side
+runtime через Gateway/application boundary.
+
+```text
+application profile = Service Application
+hosting mode = self-hosted
+topology = single-process
+environment = development
+```
+
+Это не Future Local Agent Application. Отдельный local executable profile пока
+не реализован и не используется как описание текущего поведения.
 
 ## Реализованный baseline
 
@@ -137,14 +156,26 @@ v0.4-input-runtime
 переживает restart.
 
 `v0.4-runtime-modularization` декомпозирует orchestration core без изменения
-принятых контрактов и вводит `AgentRuntime`, `ToolDispatcher`, независимый MCP
-runtime и composition ports.
+принятых контрактов, вводит переиспользуемый `AgentRuntime`, `ToolDispatcher`,
+независимый MCP runtime, composition ports, `ConfigProvider` и явный Service
+Application composition root.
+
+Future Local Agent Application этим update не реализуется. Модульные границы
+должны позволить позднее создать отдельный local composition root без fork или
+rewrite agent loop.
 
 `v0.4-mcp-registry-foundation` затем добавит локальный config-backed registry со
 scopes `builtin`, `instance`, `user`, `session`, trusted presentation/retry
-metadata и lifecycle ownership opaque remote handles. Это planned agent-side
-update; конкретные builtin MCP-сервисы и их внутренняя реализация в текущем
-baseline отсутствуют.
+metadata, lifecycle ownership opaque remote handles и profile-aware transport
+admission.
+
+Общий MCP runtime сохраняет Streamable HTTP и stdio/executable adapters. Новые
+builtin definitions Service Application используют Streamable HTTP. Service не
+запускает user/session-provided executable MCP; self-hosted operator-managed
+instance stdio может быть разрешён только явной deployment policy.
+
+Конкретные builtin MCP-сервисы и их внутренняя реализация в текущем baseline
+отсутствуют.
 
 Контракт внешней границы:
 [`contracts/builtin-mcp-service-contract.md`](contracts/builtin-mcp-service-contract.md).
@@ -158,9 +189,13 @@ baseline отсутствуют.
 | `v0.5` | PostgreSQL, lazy indexing, embeddings и RAG |
 | `v0.6` | AgentRun/TaskRun, workers, queues, workflow orchestration и distributed registry |
 | `v0.7` | Skills и extension platform |
-| `v0.8` | Identity, authorization и multi-user workspace |
+| `v0.8` | Identity, authorization и multi-user Service Application workspace |
 | `v0.9` | Single-node isolated execution через sandbox backend |
 | `v0.10` | Distributed execution plane и runner fleet |
+
+Future Local Agent Application пока не имеет назначенного номера версии. Он
+остаётся будущим отдельным application profile поверх стабилизированного
+AgentRuntime.
 
 Будущая версия не должна использоваться как описание текущего поведения без code,
 test или migration evidence.
@@ -172,9 +207,11 @@ test или migration evidence.
 3. учитывайте AF-24–AF-26 по их code/live status;
 4. учитывайте `v0.4-batch-workflows` как code-complete, acceptance-pending;
 5. не приписывайте durable active-cycle additions до `v0.4-input-runtime`;
-6. не приписывайте `AgentRuntime`/Dispatcher до modularization;
-7. не приписывайте scopes, trusted presentation и remote handle lifecycle до
-   `v0.4-mcp-registry-foundation`;
-8. проверяйте затронутый код и tests для точного implementation status;
-9. используйте v0.5–v0.10 только как будущие ограничения;
-10. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`.
+6. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
+7. не приписывайте scopes, trusted presentation, admission и remote handle
+   lifecycle до `v0.4-mcp-registry-foundation`;
+8. не называйте текущий self-hosted Service Application Future Local Agent;
+9. проверяйте затронутый код и tests для точного implementation status;
+10. используйте v0.5–v0.10 только как будущие ограничения;
+11. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`;
+12. не смешивайте sandbox execution backend и Future Local Agent Application.
