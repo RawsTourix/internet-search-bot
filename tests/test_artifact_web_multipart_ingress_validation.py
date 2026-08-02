@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
+import tempfile
+import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
 import httpx
-import pytest
-import pytest_asyncio
 from fastapi import FastAPI, Header, HTTPException
 
 from src.api.artifact_routes import create_artifact_router
@@ -60,162 +60,190 @@ def _slot(slot_id: str, field_name: str, *, size: int = 1) -> dict:
     }
 
 
-@pytest_asyncio.fixture
-async def web_fixture(tmp_path: Path):
-    storage_root = tmp_path / "storage"
-    storage_config = StorageConfigType(root_dir=str(storage_root))
-    storage = create_storage_services(storage_config)
-    artifact_config = ArtifactConfigType(
-        max_artifact_size_bytes=1024 * 1024,
-        max_patchable_text_bytes=1024 * 1024,
-        max_workspace_bytes=2 * 1024 * 1024,
-    )
-    artifacts = create_artifact_services(
-        storage_config=storage_config,
-        artifact_config=artifact_config,
-        content_store=storage.content_store,
-    )
-    ingress = create_ingress_services(
-        storage_config=storage_config,
-        ingress_config=IngressConfigType(
-            max_batch_total_bytes=2 * 1024 * 1024
-        ),
-        content_store=storage.content_store,
-        artifact_services=artifacts,
-    )
-
-    class ForbiddenMessageProcessor:
-        async def process_committed_batch(self, *_args, **_kwargs):
-            raise AssertionError("AgentCycle must not run in multipart tests")
-
-    facade = ArtifactTransportFacade(
-        api=SimpleNamespace(
-            ingress_services=ingress,
+class WebMultipartIngressValidationTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self) -> None:
+        self.temporary = tempfile.TemporaryDirectory()
+        self.storage_root = Path(self.temporary.name) / "storage"
+        storage_config = StorageConfigType(root_dir=str(self.storage_root))
+        storage = create_storage_services(storage_config)
+        artifact_config = ArtifactConfigType(
+            max_artifact_size_bytes=1024 * 1024,
+            max_patchable_text_bytes=1024 * 1024,
+            max_workspace_bytes=2 * 1024 * 1024,
+        )
+        artifacts = create_artifact_services(
+            storage_config=storage_config,
             artifact_config=artifact_config,
-        ),
-        message_processor=ForbiddenMessageProcessor(),
-    )
-
-    async def auth(x_api_key: str | None = Header(default=None)) -> str:
-        if x_api_key != "web-regression-key":
-            raise HTTPException(status_code=403, detail="Invalid API Key")
-        return x_api_key
-
-    app = FastAPI()
-    app.include_router(
-        create_artifact_router(
-            facade=facade,
-            auth_dependency=auth,
+            content_store=storage.content_store,
         )
-    )
-    async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(
-            app=app,
-            raise_app_exceptions=False,
-        ),
-        base_url="http://web-regression",
-    ) as client:
-        yield SimpleNamespace(
-            client=client,
-            ingress=ingress,
-            storage_root=storage_root,
-        )
-
-
-def _durable_files(storage_root: Path) -> list[str]:
-    return sorted(
-        str(path.relative_to(storage_root))
-        for path in storage_root.rglob("*")
-        if path.is_file()
-    )
-
-
-@pytest.mark.asyncio
-async def test_duplicate_slot_upload_field_is_rejected_before_admission(
-    web_fixture,
-):
-    manifest = _manifest(
-        suffix="duplicate-slot-field",
-        slots=[
-            _slot("slot-a", "shared"),
-            _slot("slot-b", "shared"),
-        ],
-    )
-
-    response = await web_fixture.client.post(
-        "/web/input-batches",
-        headers={"X-API-Key": "web-regression-key"},
-        files=[
-            ("manifest", (None, json.dumps(manifest), "application/json")),
-            ("shared", ("sample.bin", b"x", "application/octet-stream")),
-        ],
-    )
-
-    assert response.status_code == 422, response.text
-    assert "multiple attachment slots" in response.json()["detail"]
-    assert _durable_files(web_fixture.storage_root) == []
-
-
-@pytest.mark.asyncio
-async def test_unexpected_plain_field_is_rejected_before_admission(web_fixture):
-    manifest = _manifest(suffix="unexpected-plain")
-
-    response = await web_fixture.client.post(
-        "/web/input-batches",
-        headers={"X-API-Key": "web-regression-key"},
-        files=[
-            ("manifest", (None, json.dumps(manifest), "application/json")),
-        ],
-        data={"unexpected": "must-not-be-ignored"},
-    )
-
-    assert response.status_code == 422, response.text
-    assert "Unexpected multipart form fields" in response.json()["detail"]
-    assert _durable_files(web_fixture.storage_root) == []
-
-
-@pytest.mark.asyncio
-async def test_duplicate_manifest_is_rejected_before_admission(web_fixture):
-    first = _manifest(suffix="duplicate-manifest-a")
-    second = _manifest(suffix="duplicate-manifest-b")
-
-    response = await web_fixture.client.post(
-        "/web/input-batches",
-        headers={"X-API-Key": "web-regression-key"},
-        files=[
-            ("manifest", (None, json.dumps(first), "application/json")),
-            ("manifest", (None, json.dumps(second), "application/json")),
-        ],
-    )
-
-    assert response.status_code == 422, response.text
-    assert "exactly one JSON manifest" in response.json()["detail"]
-    assert _durable_files(web_fixture.storage_root) == []
-
-
-@pytest.mark.asyncio
-async def test_valid_unique_mapping_still_commits(web_fixture):
-    manifest = _manifest(
-        suffix="valid",
-        slots=[_slot("slot-valid", "upload-valid", size=3)],
-    )
-
-    response = await web_fixture.client.post(
-        "/web/input-batches?run=false",
-        headers={"X-API-Key": "web-regression-key"},
-        files=[
-            ("manifest", (None, json.dumps(manifest), "application/json")),
-            (
-                "upload-valid",
-                ("sample.bin", b"abc", "application/octet-stream"),
+        self.ingress = create_ingress_services(
+            storage_config=storage_config,
+            ingress_config=IngressConfigType(
+                max_batch_total_bytes=2 * 1024 * 1024
             ),
-        ],
-    )
+            content_store=storage.content_store,
+            artifact_services=artifacts,
+        )
 
-    assert response.status_code == 201, response.text
-    payload = response.json()
-    assert payload["status"] == "committed"
-    batch = await web_fixture.ingress.batch_store.get_committed(
-        payload["input_batch_id"]
-    )
-    assert len(batch.artifact_refs) == 1
+        class ForbiddenMessageProcessor:
+            async def process_committed_batch(self, *_args, **_kwargs):
+                raise AssertionError(
+                    "AgentCycle must not run in multipart tests"
+                )
+
+        facade = ArtifactTransportFacade(
+            api=SimpleNamespace(
+                ingress_services=self.ingress,
+                artifact_config=artifact_config,
+            ),
+            message_processor=ForbiddenMessageProcessor(),
+        )
+
+        async def auth(x_api_key: str | None = Header(default=None)) -> str:
+            if x_api_key != "web-regression-key":
+                raise HTTPException(status_code=403, detail="Invalid API Key")
+            return x_api_key
+
+        app = FastAPI()
+        app.include_router(
+            create_artifact_router(
+                facade=facade,
+                auth_dependency=auth,
+            )
+        )
+        self.client = httpx.AsyncClient(
+            transport=httpx.ASGITransport(
+                app=app,
+                raise_app_exceptions=False,
+            ),
+            base_url="http://web-regression",
+        )
+
+    async def asyncTearDown(self) -> None:
+        await self.client.aclose()
+        self.temporary.cleanup()
+
+    def _durable_files(self) -> list[str]:
+        return sorted(
+            str(path.relative_to(self.storage_root))
+            for path in self.storage_root.rglob("*")
+            if path.is_file()
+        )
+
+    async def test_duplicate_slot_upload_field_is_rejected_before_admission(
+        self,
+    ) -> None:
+        manifest = _manifest(
+            suffix="duplicate-slot-field",
+            slots=[
+                _slot("slot-a", "shared"),
+                _slot("slot-b", "shared"),
+            ],
+        )
+
+        response = await self.client.post(
+            "/web/input-batches",
+            headers={"X-API-Key": "web-regression-key"},
+            files=[
+                (
+                    "manifest",
+                    (None, json.dumps(manifest), "application/json"),
+                ),
+                (
+                    "shared",
+                    ("sample.bin", b"x", "application/octet-stream"),
+                ),
+            ],
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn(
+            "multiple attachment slots",
+            response.json()["detail"],
+        )
+        self.assertEqual(self._durable_files(), [])
+
+    async def test_unexpected_plain_field_is_rejected_before_admission(
+        self,
+    ) -> None:
+        manifest = _manifest(suffix="unexpected-plain")
+
+        response = await self.client.post(
+            "/web/input-batches",
+            headers={"X-API-Key": "web-regression-key"},
+            files=[
+                (
+                    "manifest",
+                    (None, json.dumps(manifest), "application/json"),
+                ),
+            ],
+            data={"unexpected": "must-not-be-ignored"},
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn(
+            "Unexpected multipart form fields",
+            response.json()["detail"],
+        )
+        self.assertEqual(self._durable_files(), [])
+
+    async def test_duplicate_manifest_is_rejected_before_admission(
+        self,
+    ) -> None:
+        first = _manifest(suffix="duplicate-manifest-a")
+        second = _manifest(suffix="duplicate-manifest-b")
+
+        response = await self.client.post(
+            "/web/input-batches",
+            headers={"X-API-Key": "web-regression-key"},
+            files=[
+                (
+                    "manifest",
+                    (None, json.dumps(first), "application/json"),
+                ),
+                (
+                    "manifest",
+                    (None, json.dumps(second), "application/json"),
+                ),
+            ],
+        )
+
+        self.assertEqual(response.status_code, 422, response.text)
+        self.assertIn(
+            "exactly one JSON manifest",
+            response.json()["detail"],
+        )
+        self.assertEqual(self._durable_files(), [])
+
+    async def test_valid_unique_mapping_still_commits(self) -> None:
+        manifest = _manifest(
+            suffix="valid",
+            slots=[_slot("slot-valid", "upload-valid", size=3)],
+        )
+
+        response = await self.client.post(
+            "/web/input-batches?run=false",
+            headers={"X-API-Key": "web-regression-key"},
+            files=[
+                (
+                    "manifest",
+                    (None, json.dumps(manifest), "application/json"),
+                ),
+                (
+                    "upload-valid",
+                    ("sample.bin", b"abc", "application/octet-stream"),
+                ),
+            ],
+        )
+
+        self.assertEqual(response.status_code, 201, response.text)
+        payload = response.json()
+        self.assertEqual(payload["status"], "committed")
+        batch = await self.ingress.batch_store.get_committed(
+            payload["input_batch_id"]
+        )
+        self.assertEqual(len(batch.artifact_refs), 1)
+
+
+if __name__ == "__main__":
+    unittest.main()
