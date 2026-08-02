@@ -19,12 +19,15 @@
    baseline и активный этап.
 2. Прочитайте [`design/README.md`](design/README.md), чтобы понять иерархию
    документов и правила каноничности.
-3. Откройте README затронутой версии в `design/versions/`.
-4. Если изменение затрагивает внешний сервис, protocol boundary или отдельный
+3. Если изменение затрагивает runtime composition, deployment, configuration,
+   MCP transport admission, identity или execution, прочитайте
+   [`design/runtime-and-deployment-profiles.md`](design/runtime-and-deployment-profiles.md).
+4. Откройте README затронутой версии в `design/versions/`.
+5. Если изменение затрагивает внешний сервис, protocol boundary или отдельный
    deployable component, откройте применимый документ в
    [`design/contracts/`](design/contracts/README.md).
-5. Прочитайте только относящиеся к задаче канонические тематические документы.
-6. При утверждении текущего поведения сверяйтесь с кодом и тестами: planned или
+6. Прочитайте только относящиеся к задаче канонические тематические документы.
+7. При утверждении текущего поведения сверяйтесь с кодом и тестами: planned или
    provisional спецификация не доказывает наличие реализации.
 
 ## Источники истины
@@ -35,6 +38,8 @@
   версии.
 - README версии задаёт реестр именованных обновлений, их порядок и навигацию.
 - Тематический документ владеет подробным контрактом одной архитектурной темы.
+- `design/runtime-and-deployment-profiles.md` владеет различием application
+  profile, hosting mode, topology, configuration ownership и execution backend.
 - `design/contracts/` владеет сквозными интеграционными контрактами на границе
   агента и внешних компонентов.
 - `design/roadmap.md` является хронологической сводкой, а не второй
@@ -72,17 +77,23 @@
 - Не дублируйте подробные контракты в README, roadmap, ADR или этом файле.
 - Каждый новый документ должен быть достижим из README своей версии, из
   `design/contracts/README.md` либо из cross-version индекса.
-- При изменении спецификации обновляйте зависимости, non-goals, migration path,
+- При изменении спецификации обновляйте dependencies, non-goals, migration path,
   acceptance criteria, release gate, ссылки и metadata статуса.
-- Сохраняйте local/self-hosted mode, если соответствующая версия явно не меняет
-  это требование.
+- Сохраняйте self-hosted Service Application как first-class profile, если
+  соответствующая версия явно не меняет это требование.
+- Не называйте локально запущенный self-hosted service Future Local Agent
+  Application.
+- Не приписывайте Future Local Agent Application реализованные config,
+  permissions, packaging или stdio policy, пока они остаются provisional.
 - Сначала стабилизируйте in-process port/contract, затем вводите process, service,
   database, queue, sandbox или remote execution boundary.
 - Предпочитайте композицию, dependency injection и ports/adapters дальнейшему
   углублению наследования и global mutable state.
 
 Архитектурные инварианты находятся в
-[`design/principles.md`](design/principles.md), эволюция системы — в
+[`design/principles.md`](design/principles.md), runtime/deployment profiles — в
+[`design/runtime-and-deployment-profiles.md`](design/runtime-and-deployment-profiles.md),
+эволюция системы — в
 [`design/architecture-evolution.md`](design/architecture-evolution.md), правила
 зависимостей — в [`design/dependency-rules.md`](design/dependency-rules.md), а
 общие критерии завершения — в
@@ -120,9 +131,12 @@ implementation plan.
 - проверьте относительные ссылки;
 - проверьте уникальность `id`, `update` и `sequence` во frontmatter;
 - проверьте отсутствие двух канонических файлов для одной темы;
-- проверьте согласованность README, current, principles, glossary и roadmap;
+- проверьте согласованность README, current, principles, glossary, runtime
+  profiles и roadmap;
 - проверьте, что agent-side docs не содержат внутреннюю реализацию внешнего
   сервиса;
+- проверьте, что application profile, hosting mode, topology и execution backend
+  не используются как синонимы;
 - перечислите изменённые файлы и оставшиеся provisional решения.
 
 Не объявляйте версию или архитектурное свойство завершёнными, пока не проверены
