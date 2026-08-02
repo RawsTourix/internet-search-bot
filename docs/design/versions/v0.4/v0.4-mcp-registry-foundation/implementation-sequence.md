@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-mcp-registry-foundation
 spec_status: accepted
 implementation_status: planned
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-02
 ---
 
 # Последовательность реализации MCP registry foundation
@@ -15,20 +15,26 @@ last_reviewed: 2026-08-01
 уже выделенных `AgentRuntime`, `ToolDispatcher` и MCP runtime contracts, не
 переписывая central agent loop и не добавляя distributed infrastructure.
 
+Application/hosting profiles и transport admission определены в
+[`../../../runtime-and-deployment-profiles.md`](../../../runtime-and-deployment-profiles.md).
+
 ## 1. Characterization baseline
 
 До изменения registry/dispatch закрепить scenarios:
 
 - legacy `mcp.config` loading;
 - Streamable HTTP servers;
-- stdio/executable servers как поддерживаемый MCP transport;
+- stdio/executable servers как поддерживаемый MCP transport adapter;
 - существующие builtin stdio/executable entries как migration baseline;
 - optional/startup-required behavior;
 - list servers/tools/schema;
 - call success, error, timeout и reconnect;
 - manager/MCP progress rendering;
 - `WAITING_USER`, reset и runtime shutdown;
-- no duplicate call after current recovery path.
+- no duplicate call after current recovery path;
+- current single-process self-hosted Service Application behavior;
+- rejection user/session stdio in service admission before spawn;
+- operator-managed instance identity separated from user definition.
 
 Tests проверяют observable behavior, а не private layout.
 
@@ -64,7 +70,7 @@ Renderer сначала ищет approved profile фактического targe
 затем использует generic fallback. Server-supplied message не становится
 localization key или trusted template.
 
-## 4. Scope и server definitions
+## 4. Scope, ownership и server definitions
 
 Ввести:
 
@@ -73,6 +79,7 @@ MCPServerScope
 MCPServerDefinition
 MCPServerIdentity
 MCPServerBinding
+MCPDefinitionOwner
 ```
 
 Scopes:
@@ -81,21 +88,42 @@ Scopes:
 builtin | instance | user | session
 ```
 
+Scope, owner и trust назначаются trusted application boundary:
+
+- `builtin` — project/system definition;
+- `instance` — deployment operator definition;
+- `user` — authenticated/local owner definition;
+- `session` — bounded session/conversation definition.
+
+User payload не может повысить scope до `builtin`/`instance`.
+
+До v0.8 `user` остаётся owner-ready schema без ложного account-isolation claim.
+
+## 5. Transport admission policy
+
 Transport задаётся отдельно от scope. Runtime поддерживает Streamable HTTP и
-stdio/executable, но validation новых definitions применяет правило:
+stdio/executable, а composition root передаёт `MCPTransportAdmissionPolicy`.
+
+Общие rules Service Application:
 
 ```text
-builtin → Streamable HTTP
+new builtin → Streamable HTTP
+managed service user/session stdio → rejected
+self-hosted service user/session stdio → rejected
+self-hosted operator-managed instance stdio → optional explicit policy
 ```
 
-Существующие builtin stdio/executable definitions помечаются как migration
-compatibility, а не как новый допустимый шаблон. User definitions могут
-использовать stdio/executable.
+Существующие builtin stdio/executable definitions помечаются migration
+compatibility, а не как новый допустимый шаблон.
 
-Legacy config migration должна быть явной и обратимо диагностируемой. До v0.8
-`user` остаётся owner-ready schema без ложного account-isolation claim.
+Admission выполняется до process spawn/connect и не создаёт частичный binding.
+Policy decision имеет structured reason и trace event без raw secrets/command
+arguments.
 
-## 5. Immutable registry snapshots
+Future Local Agent Application сможет использовать другую admission policy, но
+не реализуется этим update.
+
+## 6. Immutable registry snapshots
 
 Ввести:
 
@@ -113,17 +141,23 @@ MCPToolBinding
 - discovery сохраняет exact binding coordinates;
 - execution повторно проверяет freshness;
 - stale snapshot приводит к controlled rediscovery/replan, а не к вызову другого
-  одноимённого tool.
+  одноимённого tool;
+- admission result принадлежит exact definition/policy revision;
+- change policy revision invalidates incompatible bindings.
 
-## 6. MCP runtime integration
+## 7. MCP runtime integration
 
 `MCPServerManager` остаётся transport/lifecycle coordinator и публикует registry
-изменения через port, но не владеет AgentCycle или remote-resource ownership.
+изменения через port, но не владеет AgentCycle, application profile или
+remote-resource ownership.
 
 ```text
 MCPServerManager
 → Streamable HTTP и stdio/executable adapters
 → connection/generation/recovery
+
+MCPTransportAdmissionPolicy
+→ pre-connect/pre-spawn decision
 
 MCPRegistry
 → definitions/snapshots/bindings
@@ -134,7 +168,7 @@ ToolDispatcher
 
 Compatibility methods старого `MCPClient` делегируют новым owners.
 
-## 7. Retry и unknown outcome
+## 8. Retry и unknown outcome
 
 Перенести retry decision из общего transport fallback в Dispatcher policy.
 
@@ -146,7 +180,7 @@ Compatibility methods старого `MCPClient` делегируют новым
 attempt и transport failure. Runtime не создаёт новый side effect, маскируя его
 как обычный retry.
 
-## 8. Remote resource registry
+## 9. Remote resource registry
 
 Ввести нейтральные contracts:
 
@@ -161,7 +195,7 @@ Agent-side registry хранит opaque ID и ownership coordinates, но не �
 состояние сервиса. Handle регистрируется только если поведение tool описано
 trusted descriptor.
 
-## 9. Lifecycle hooks и cleanup
+## 10. Lifecycle hooks и cleanup
 
 Расширить общий `LifecycleHook` контекст owner identity и bounded cleanup budget.
 Минимальные events v0.4:
@@ -186,17 +220,19 @@ Cleanup:
 - failure фиксируется как unresolved/lost;
 - не меняет completed AgentResult на failed.
 
-## 10. Configuration migration
+## 11. Configuration migration
 
-Обновить configuration schema и example:
+Обновить service configuration schema и example:
 
 - explicit registry/server ID;
 - scope;
+- definition owner/source;
 - transport settings;
 - enabled/startup-required;
 - secret reference;
 - approved metadata/profile reference;
-- schema/integration compatibility metadata.
+- schema/integration compatibility metadata;
+- admission policy/profile reference только в trusted operator configuration.
 
 Не вводить заранее свободно придуманное обязательное поле вроде
 `contract: web-search.v1`. Конкретные versioning fields определяются вместе с
@@ -206,15 +242,21 @@ validated `MCPServerDefinition` и существующими tool schemas.
 
 ```text
 agent.config snapshot
-→ MCP definition diff
+→ operator-owned builtin/instance definition diff
+→ admission validation
 → registry revision update
 → controlled connect/disconnect/reconnect
 ```
 
+Per-user service definitions не становятся секциями общего `agent.config`.
+До появления durable user repository v0.8 они могут оставаться schema-ready или
+ограниченным compatibility/local source, но не получают права запускать server
+host executable.
+
 Не помещать secrets или full trusted descriptors в LLM-visible listing.
 Добавить configuration audit и migration tests.
 
-## 11. Builtin definitions
+## 12. Builtin definitions
 
 Системные definitions хранятся versioned и тестируются вместе с агентом.
 
@@ -240,7 +282,23 @@ characterization parity
 Builtin outage должна давать controlled degraded capability. Optional server не
 блокирует запуск всего приложения.
 
-## 12. Compatibility cleanup
+## 13. Self-hosted instance stdio boundary
+
+Если первая реализация поддерживает operator-managed instance stdio, нужны:
+
+- definition только из trusted operator source;
+- explicit opt-in deployment policy;
+- exact executable/args/env validation;
+- no user override or scope escalation;
+- safe logging/redaction;
+- process lifecycle/recovery tests;
+- clear warning, что process работает с правами service host;
+- отсутствие silent enablement в managed defaults.
+
+Эта возможность может быть отложена. Runtime transport adapter при этом остаётся
+поддерживаемым и используется legacy migration tests.
+
+## 14. Compatibility cleanup
 
 После migration callers:
 
@@ -248,17 +306,20 @@ Builtin outage должна давать controlled degraded capability. Optiona
 - запретить direct MCP call в обход Dispatcher для production agent loop;
 - удалить generic retry, который игнорирует tool semantics;
 - удалить legacy builtin executable definitions после их migration/removal;
-- зафиксировать architecture tests;
+- удалить legacy private environment parameters;
+- зафиксировать architecture/admission tests;
 - обновить canonical owners и configuration documentation.
 
-Поддержка stdio/executable transport для user MCP при этом сохраняется.
+Поддержка stdio/executable transport adapter сохраняется. Service/user admission
+не расширяется автоматически после cleanup.
 
 ## Допустимая параллельность
 
 После characterization tests параллельно можно проектировать:
 
 - presentation profile contract;
-- scope/server models;
+- scope/server/owner models;
+- transport admission policy;
 - tool execution semantics;
 - remote-resource pure models.
 
@@ -266,6 +327,7 @@ Builtin outage должна давать controlled degraded capability. Optiona
 
 ```text
 MCP runtime events
+→ admission boundary
 → immutable registry
 → Dispatcher policy
 → remote-resource lifecycle hooks
@@ -275,11 +337,15 @@ MCP runtime events
 ## Required tests
 
 - scope precedence и conflicts;
+- owner/source validation;
+- user cannot assign builtin/instance scope;
 - revision/generation invalidation;
 - stale binding rejection;
 - legacy configuration parity;
 - new builtin definition rejects stdio/executable;
-- user stdio/executable definition remains supported;
+- managed service rejects user/session stdio before spawn;
+- self-hosted service rejects user/session stdio before spawn;
+- operator instance stdio requires explicit policy when implemented;
 - Streamable HTTP builtin connect/reconnect/degraded mode;
 - generic и semantic presentation;
 - safe retry budget;
@@ -295,23 +361,32 @@ MCP runtime events
 ## Acceptance gate
 
 ```text
-existing local scenarios before/after migration
-→ equivalent tool availability and AgentResult
+existing self-hosted Service Application scenarios before/after migration
+→ equivalent allowed tool availability and AgentResult
 → no new PostgreSQL/Redis dependency
 ```
 
 ```text
 all production MCP calls
-→ ToolDispatcher policy
+→ admission + ToolDispatcher policy
 → structured progress/outcome/trace
 ```
 
 ```text
 new builtin MCP integration
 → Streamable HTTP
+```
 
-user MCP integration
-→ Streamable HTTP or stdio/executable according to definition
+```text
+service user/session executable definition
+→ rejected before spawn
+```
+
+```text
+operator-managed instance stdio, if supported
+→ explicit self-hosted policy
+→ exact operator ownership
+→ no user escalation
 ```
 
 ```text
@@ -321,5 +396,7 @@ stateful trusted tool
 ```
 
 Полный gate определён в
-[`README.md`](README.md) и
+[`README.md`](README.md),
+[`../../../runtime-and-deployment-profiles.md`](../../../runtime-and-deployment-profiles.md)
+и
 [`../../../contracts/builtin-mcp-service-contract.md`](../../../contracts/builtin-mcp-service-contract.md).
