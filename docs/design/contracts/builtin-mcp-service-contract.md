@@ -3,7 +3,7 @@ id: design.contracts.builtin-mcp-service
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-02
 ---
 
 # Контракт встроенных MCP-сервисов
@@ -27,6 +27,9 @@ Agent Runtime
 Документ не задаёт внутренний стек, хранилище, очереди, workers, способ
 масштабирования или предметную реализацию конкретного MCP-сервиса.
 
+Application/hosting profiles и общая transport admission model определены в
+[`../runtime-and-deployment-profiles.md`](../runtime-and-deployment-profiles.md).
+
 ## Область действия
 
 Контракт применяется к MCP-сервисам, которые:
@@ -41,7 +44,7 @@ Agent Runtime
 
 ## Transport policy
 
-MCP runtime поддерживает несколько transport adapters, включая:
+Общий MCP runtime поддерживает несколько transport adapters, включая:
 
 ```text
 Streamable HTTP
@@ -64,9 +67,31 @@ legacy именно как builtin integrations. Они поддерживают
 - удаляются, если больше не нужны;
 - либо выделяются в отдельные MCP-сервисы со Streamable HTTP boundary.
 
-Для user MCP-серверов stdio/executable остаётся штатным поддерживаемым
-транспортом наряду со Streamable HTTP. Выбор транспорта сам по себе не задаёт
-scope, trust, permissions или retry semantics.
+Transport support не определяет admission. Service Application не запускает
+user/session-provided executable MCP code в trusted control plane. Self-hosted
+operator может отдельно разрешить operator-managed `instance` stdio definition
+через deployment policy. Future Local Agent Application сможет использовать
+stdio под собственной host permission model.
+
+Выбор транспорта сам по себе не задаёт scope, trust, permissions или retry
+semantics.
+
+## Deployment и network boundary
+
+Builtin MCP service является отдельным service workload. Его endpoint не
+считается публичным пользовательским API только потому, что использует HTTP.
+
+Конкретный deployment должен:
+
+- ограничивать network exposure согласно infrastructure policy;
+- проверять service identity/credentials вызывающей стороны;
+- применять quotas, timeouts и abuse protection;
+- не полагаться только на скрытность URL или `Mcp-Session-Id`;
+- не передавать service secrets через LLM context или обычный registry listing.
+
+Точный механизм service authentication — token, short-lived credential, mTLS или
+workload identity — выбирается deployment infrastructure и пока не фиксируется
+этим общим контрактом.
 
 ## Граница ответственности
 
@@ -75,7 +100,7 @@ scope, trust, permissions или retry semantics.
 - регистрацию MCP-сервера и его scope;
 - discovery и binding доступных tools;
 - проверку registry revision/server generation перед вызовом;
-- capability, authorization и budget policy;
+- capability, authorization, admission и budget policy;
 - dispatch, transport timeout и controlled recovery;
 - нормализацию результатов и ошибок;
 - классификацию side effects и retry policy;
@@ -90,6 +115,7 @@ scope, trust, permissions или retry semantics.
 
 - фактическое выполнение операции;
 - валидацию входной schema и opaque handles;
+- аутентификацию/авторизацию service caller согласно deployment contract;
 - внутреннее состояние и изоляцию ресурсов;
 - собственную concurrency, resource и failure policy;
 - структурированные domain/transport-independent outcomes;
@@ -121,6 +147,9 @@ metadata только на основании собственного tool outp
 
 Scope определяет видимость и precedence registry, но сам по себе не выдаёт
 разрешение на вызов tools или доступ к secrets/resources.
+
+Scope `builtin` назначается доверенной operator/runtime boundary. Пользователь не
+получает builtin trust передачей поля в собственном MCP definition.
 
 ## Обязательная metadata инструмента
 
@@ -308,7 +337,7 @@ execution.
 ## Security invariants
 
 - Tool output, webpages, documents и remote progress считаются недоверенными.
-- Builtin scope не отменяет capability/authorization policy.
+- Builtin scope не отменяет capability/authorization/admission policy.
 - Secrets передаются только через scoped configuration/reference, не через LLM
   context или обычный registry listing.
 - Cleanup вызывается только на сервере и operation, закреплённых trusted
@@ -316,6 +345,10 @@ execution.
 - Opaque handle не даёт доступ к чужому resource без owner/policy checks.
 - Transport reconnect не расширяет permissions и не меняет lifecycle owner.
 - Mutating operation с `unknown` outcome не повторяется автоматически.
+- Service Application не выполняет user-provided executable MCP в trusted
+  control plane.
+- HTTP endpoint builtin service защищается service identity и network policy, а
+  не скрытностью адреса.
 
 ## Acceptance contract
 
@@ -324,6 +357,7 @@ execution.
 ```text
 Streamable HTTP connect and discovery
 schema/integration compatibility
+service authentication/authorization failure
 normal tool invocation
 server unavailable and optional degradation
 transport reconnect and server restart
@@ -351,6 +385,8 @@ Version-specific implementation и release gates могут усиливать �
 - внутренние database/queue/cache модели;
 - конкретные web frameworks или MCP SDK;
 - container orchestration и deployment topology;
+- конкретный механизм service authentication;
 - browser/search/document processing implementation;
 - multi-user authorization до соответствующей версии агента;
-- distributed persistence registry до v0.6.
+- distributed persistence registry до v0.6;
+- Future Local Agent Application или его host permission model.
