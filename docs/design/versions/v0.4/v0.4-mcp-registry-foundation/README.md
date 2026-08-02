@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-mcp-registry-foundation
 spec_status: accepted
 implementation_status: planned
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-02
 ---
 
 # v0.4-mcp-registry-foundation
@@ -27,6 +27,9 @@ AgentRuntime
 Общий контракт встроенных MCP-сервисов:
 [`../../../contracts/builtin-mcp-service-contract.md`](../../../contracts/builtin-mcp-service-contract.md).
 
+Application/hosting profiles и transport admission:
+[`../../../runtime-and-deployment-profiles.md`](../../../runtime-and-deployment-profiles.md).
+
 ## Главный результат
 
 - MCP servers получают scopes `builtin`, `instance`, `user`, `session`.
@@ -42,11 +45,15 @@ AgentRuntime
 - Agent Runtime регистрирует lifecycle ownership handles и выполняет bounded
   best-effort cleanup через общие lifecycle hooks.
 - MCP transport lifecycle остаётся независимым от lifecycle remote resource.
-- Streamable HTTP и stdio/executable остаются поддерживаемыми adapters MCP
+- Streamable HTTP и stdio/executable остаются поддерживаемыми adapters общего MCP
   runtime.
+- Transport support отделён от profile-specific admission policy.
 - Новые builtin definitions используют Streamable HTTP; существующие builtin
   stdio/executable registrations мигрируют постепенно.
-- Текущие `mcp.config` и `MCPServerManager` мигрируют без поломки local mode.
+- Service Application не запускает user/session-provided executable MCP code в
+  trusted control plane.
+- Текущие `mcp.config` и `MCPServerManager` мигрируют без поломки self-hosted
+  single-process Service Application.
 
 ## Граница ответственности
 
@@ -59,10 +66,14 @@ AgentRuntime
 - dispatch, retry и normalized outcomes;
 - remote handle ownership metadata;
 - lifecycle hook integration;
+- transport admission policy contracts;
 - compatibility migration.
 
 Он не описывает внутреннюю архитектуру MCP-сервисов, их базы данных, очереди,
 workers, кэш, браузеры, поисковые движки или deployment.
+
+Он также не реализует Future Local Agent Application, local permission broker
+или пользовательский host execution.
 
 ## Scope model
 
@@ -80,24 +91,34 @@ session
   временно подключён к одной conversation/session/run boundary
 ```
 
-Scope определяет visibility и precedence, но не заменяет capability или
-authorization policy.
+Scope определяет visibility и precedence, но не заменяет capability,
+authorization или transport admission policy.
 
 До v0.8 `user` не объявляется полноценно изолированным между accounts. Реализация
 должна сохранять owner-ready fields без ложного security claim.
 
-## Transport policy
+`builtin` и `instance` назначаются доверенной operator/runtime boundary. User
+payload не может объявить себя builtin только передачей поля `scope`.
+
+## Transport support и admission
 
 Transport и scope являются разными характеристиками server definition.
 
-MCP runtime продолжает поддерживать:
+Общий MCP runtime продолжает поддерживать:
 
 ```text
 Streamable HTTP
 stdio/executable
 ```
 
-Для новых builtin definitions применяется правило:
+Поддержка stdio/executable не считается legacy-функцией runtime. Legacy являются
+только существующие builtin registrations, запускаемые через stdio/executable.
+
+Registry validation получает profile/deployment policy от composition root.
+Одна и та же transport implementation не обязана быть разрешена во всех
+application profiles.
+
+### Новые builtin definitions
 
 ```text
 scope=builtin
@@ -108,9 +129,47 @@ scope=builtin
 observable behavior сохраняется на переходном этапе, после чего они удаляются
 или заменяются отдельными Streamable HTTP MCP-сервисами.
 
-Для user MCP-серверов stdio/executable остаётся обычным поддерживаемым
-транспортом. Registry не делает transport источником trust: trusted metadata,
-permissions, retry и presentation определяются scope/policy и approved binding.
+### Managed Service Application
+
+Для managed service применяется conservative admission:
+
+```text
+builtin  → Streamable HTTP
+instance → Streamable HTTP
+user     → Streamable HTTP
+session  → Streamable HTTP
+```
+
+Service не загружает и не запускает executable command, пакет или stdio server,
+предоставленные обычным пользователем.
+
+### Self-hosted Service Application
+
+Для self-hosted service:
+
+```text
+builtin  → Streamable HTTP; builtin stdio только migration legacy
+instance → Streamable HTTP; stdio может быть разрешён explicit operator policy
+user     → Streamable HTTP
+session  → Streamable HTTP
+```
+
+Operator-managed instance stdio является доверенным решением владельца
+конкретного deployment. Оно не превращает stdio в user capability и не позволяет
+обычному service user задавать произвольную executable command.
+
+Точная policy schema operator-managed stdio уточняется при реализации definitions
+и не должна быть неявным default.
+
+### Future Local Agent Application
+
+Будущий local composition root сможет разрешить stdio/executable для локальных
+user/session definitions под отдельными host permission, approval и trust
+policies. Этот профиль не реализуется в v0.4.
+
+Registry не делает transport источником trust: trusted metadata, permissions,
+retry и presentation определяются approved binding, scope, application ceiling и
+runtime policy.
 
 ## Registry contracts
 
@@ -123,6 +182,7 @@ MCPRegistrySnapshot
 MCPServerBinding
 MCPToolBinding
 RegistryRevision
+MCPTransportAdmissionPolicy
 ```
 
 `MCPServerDefinition` хранит только безопасную metadata и reference на secret
@@ -140,6 +200,10 @@ Snapshot:
 Предварительный precedence должен быть deterministic. Конфликт public tool names
 не разрешается случайным порядком загрузки; используется явная namespace/binding
 policy либо controlled conflict.
+
+Transport admission проверяется до connect/spawn и повторно при изменении
+application/deployment policy revision. Rejected definition не создаёт process,
+connection или tool binding.
 
 ## Tool execution metadata
 
@@ -256,7 +320,10 @@ resource не требует уничтожать весь MCP runtime. Agent Ru
 - новые builtin registrations создаются только для Streamable HTTP services;
 - старые builtin executable entries сохраняются только до parity migration или
   удаления соответствующего сервера;
-- user definitions могут использовать stdio/executable;
+- service user/session definitions ограничиваются remote transports admission
+  policy;
+- operator-managed self-hosted instance stdio допускается только через явную
+  policy, если эта возможность реализована;
 - текущий dynamic discovery остаётся доступным;
 - compatibility facade старого `MCPClient` делегирует новым registry/dispatcher
   components до migration всех callers.
@@ -273,13 +340,16 @@ resource не требует уничтожать весь MCP runtime. Agent Ru
 - public marketplace/install flow;
 - автоматическое доверие внешней metadata;
 - общий scheduler или background workers;
-- изменение MCP transport protocol без отдельной необходимости.
+- изменение MCP transport protocol без отдельной необходимости;
+- реализация Future Local Agent Application;
+- host permission UI или local stdio install workflow;
+- запуск user-provided executable code внутри Service Application.
 
 ## Acceptance criteria
 
 ```text
 legacy config
-→ equivalent available MCP servers/tools after migration
+→ equivalent available allowed MCP servers/tools after migration
 ```
 
 ```text
@@ -290,9 +360,17 @@ builtin/instance/user/session definitions
 ```text
 new builtin definition
 → Streamable HTTP binding
+```
 
-user stdio definition
-→ supported local binding with conservative trust defaults
+```text
+managed service + user/session stdio definition
+→ rejected before process spawn or connection
+```
+
+```text
+self-hosted service + operator-approved instance stdio definition
+→ admitted only by explicit deployment policy
+→ remains instance-scoped and operator-owned
 ```
 
 ```text
@@ -341,4 +419,7 @@ optional builtin server unavailable/incompatible
 - `v0.6.9-distributed-capability-registry` переносит registry revisions,
   visibility и ownership-ready metadata в durable multi-process runtime.
 - `v0.7` переиспользует ту же scope-модель для skills.
-- `v0.8` добавляет полноценное principal/account authorization enforcement.
+- `v0.8` добавляет полноценное principal/account authorization enforcement и
+  repositories per-user definitions/settings.
+- Future Local Agent Application при отдельном проектировании переиспользует
+  registry/transport contracts с другим admission policy.
