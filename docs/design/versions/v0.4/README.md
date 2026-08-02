@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-02
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -14,6 +14,9 @@ last_reviewed: 2026-08-01
 
 Основная рабочая единица документации — именованное обновление. Крупное
 обновление может быть папкой с собственным README и внутренними разделами.
+
+Application/hosting profiles определены в
+[`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md).
 
 ## Именованные обновления
 
@@ -27,8 +30,8 @@ last_reviewed: 2026-08-01
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25`/`AF-26` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented; acceptance pending | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
 | 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
-| 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | `AgentRuntime`, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
-| 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и transport policy по scope |
+| 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Reusable `AgentRuntime`, Service Application composition, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
+| 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и profile-aware transport admission |
 
 `AF-24` порядка `grouping → durable InputBatchDraft → streaming` реализован и
 подтверждён live Telegram workflow.
@@ -76,6 +79,7 @@ sequence и cancellation до окончания album quiet period. Стату�
 
 | Документ | Назначение |
 |---|---|
+| [`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md) | Cross-version application profiles, hosting modes, configuration ownership и transport admission |
 | [`overview.md`](overview.md) | Цель и граница v0.4 |
 | [`v0.4-unified-input-artifact-architecture.md`](v0.4-unified-input-artifact-architecture.md) | Сквозная связь ingress, input batches, artifacts и runtime |
 | [`v0.4-release-plan.md`](v0.4-release-plan.md) | Порядок реализации и общие acceptance criteria |
@@ -104,14 +108,19 @@ v0.4-storage-foundation
 - Текущий Telegram FIFO dispatcher является in-process acceptance boundary, а не
   заменой `CycleInbox`.
 - `v0.4-input-runtime` отвечает за `CycleInbox` и safe checkpoints.
-- `v0.4-runtime-modularization` меняет ownership, вводит generic ports и
-  `ConfigProvider`; `mcp.config` становится compatibility filename, а
-  `agent.config` — canonical configuration.
-- `v0.4-mcp-registry-foundation` применяет эти ports к scopes, trusted MCP
-  metadata и remote-resource lifecycle; он не реализует конкретный MCP-сервис.
-- Новые builtin MCP integrations используют Streamable HTTP.
-- stdio/executable остаётся поддерживаемым transport для user MCP; legacy
-  являются только существующие builtin stdio/executable integrations.
+- `v0.4-runtime-modularization` меняет ownership, вводит reusable AgentRuntime,
+  generic ports, явный Service Application composition и `ConfigProvider`;
+  `mcp.config` становится compatibility filename, а `agent.config` — canonical
+  service configuration.
+- `v0.4-runtime-modularization` не реализует Future Local Agent Application, но
+  не должен привязать AgentRuntime к server shell.
+- `v0.4-mcp-registry-foundation` применяет ports к scopes, trusted MCP metadata,
+  profile-aware admission и remote-resource lifecycle; он не реализует
+  конкретный MCP-сервис.
+- Новые builtin MCP integrations Service Application используют Streamable HTTP.
+- stdio/executable остаётся поддерживаемым MCP runtime adapter, но Service
+  Application не запускает user/session-provided executable MCP. Self-hosted
+  operator-managed instance stdio требует явной deployment policy.
 
 PostgreSQL/RAG начинаются в [`../v0.5/README.md`](../v0.5/README.md), workers,
 distributed orchestration и distributed registry — в
