@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -20,6 +21,10 @@ from src.interaction.ids import (
 from src.interaction.output_models import (
     OutputBatchKind,
     OutputBatchState,
+    OutputDeliveryReceipt,
+    OutputDeliveryReceiptState,
+    OutputPartReceipt,
+    OutputPartReceiptState,
     TextOutputPart,
 )
 from src.interaction.output_store import (
@@ -72,9 +77,18 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
                 raise HTTPException(status_code=403, detail="Invalid API Key")
             return x_api_key
 
-        facade = SimpleNamespace(
-            api=SimpleNamespace(output_store=self.store),
+        renderer = SimpleNamespace(
+            plan=lambda batch: SimpleNamespace(
+                model_dump=lambda **_: {
+                    "output_batch_id": batch.output_batch_id,
+                    "operations": [],
+                }
+            )
         )
+        facade = SimpleNamespace(api=SimpleNamespace(
+            output_store=self.store,
+            output_renderer=renderer,
+        ))
         app = FastAPI()
         app.include_router(
             create_output_outbox_router(
@@ -148,6 +162,50 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
             self.other_batch_id,
         )
 
+    def test_exact_instance_can_read_ready_and_terminal_batch_by_id(self):
+        ready = self._get(self.final_batch_id)
+        self.assertEqual(ready.status_code, 200)
+        self.assertEqual(ready.json()["output_batch"]["state"], "ready")
+
+        batch, attempt_id = asyncio.run(
+            self.store.claim_delivery(self.final_batch_id)
+        )
+        now = datetime.now(timezone.utc)
+        receipt = OutputDeliveryReceipt(
+            output_batch_id=batch.output_batch_id,
+            attempt_id=attempt_id,
+            state=OutputDeliveryReceiptState.DELIVERED,
+            part_receipts=tuple(
+                OutputPartReceipt(
+                    part_id=part.part_id,
+                    index=part.index,
+                    required=part.required,
+                    state=OutputPartReceiptState.DELIVERED,
+                    client_message_ids=("web-response-1",),
+                    delivered_at=now,
+                )
+                for part in batch.parts
+            ),
+            started_at=now,
+            completed_at=now,
+        )
+        asyncio.run(self.store.complete(receipt))
+
+        terminal = self._get(self.final_batch_id)
+        self.assertEqual(terminal.status_code, 200)
+        self.assertEqual(terminal.json()["output_batch"]["state"], "delivered")
+
+    def test_get_by_id_enforces_session_and_instance_authority(self):
+        wrong_session = self._get(self.final_batch_id, session_id="session-2")
+        self.assertEqual(wrong_session.status_code, 403)
+        wrong_instance = self._get(
+            self.final_batch_id,
+            client_instance_id="bot-2",
+        )
+        self.assertEqual(wrong_instance.status_code, 403)
+        unknown = self._get("obat_" + "f" * 32)
+        self.assertEqual(unknown.status_code, 404)
+
     def test_direct_claim_rejects_non_final_batch_before_state_change(self):
         response = self.client.post(
             f"/internal/output-outbox/{self.intermediate_batch_id}/claim",
@@ -172,6 +230,23 @@ class OutputOutboxApiAuthorityTests(unittest.TestCase):
                 "minimum_age_seconds": 0,
             },
             headers={"X-API-Key": key},
+        )
+
+    def _get(
+        self,
+        output_batch_id: str,
+        *,
+        session_id: str = "session-1",
+        client_instance_id: str = "bot-1",
+    ):
+        return self.client.get(
+            f"/internal/output-outbox/{output_batch_id}",
+            params={
+                "session_id": session_id,
+                "client_type": "telegram",
+                "client_instance_id": client_instance_id,
+            },
+            headers={"X-API-Key": "telegram-key"},
         )
 
     def _batch(

@@ -141,6 +141,35 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
         )
         return records
 
+    async def trace_output_bindings(
+        self,
+        records: list[ArtifactDeliveryRecord],
+    ) -> None:
+        """Record the point where aggregate output becomes the sole owner."""
+
+        await self._trace_records(
+            records,
+            event_type="artifact_delivery_output_bound",
+            status="observed",
+        )
+
+    async def trace_external_transitions(
+        self,
+        before_states: dict[str, ArtifactDeliveryState],
+        records: list[ArtifactDeliveryRecord],
+    ) -> None:
+        """Trace atomic cross-store transitions applied by output completion."""
+
+        for record in records:
+            if before_states.get(record.delivery_id) == record.state:
+                continue
+            await self._trace_records(
+                [record],
+                event_type=self._transition_event_type(record.state),
+                status=self._transition_status(record.state),
+                error=record.last_error,
+            )
+
     async def _trace_selection_delta(
         self,
         before: list[ArtifactDeliveryRecord],
@@ -190,8 +219,15 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
                 stage="delivery",
                 status=status,
                 direction="outbound",
-                correlation={"delivery_id": record.delivery_id},
-                transport={"client_type": record.client_type},
+                correlation={
+                    "input_batch_id": record.input_batch_id,
+                    "output_batch_id": record.output_batch_id,
+                    "delivery_id": record.delivery_id,
+                },
+                transport={
+                    "client_type": record.client_type,
+                    "client_instance_id": record.client_instance_id,
+                },
                 artifact={
                     "artifact_id": record.artifact_id,
                     "artifact_lineage_id": record.artifact_lineage_id,

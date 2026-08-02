@@ -6,9 +6,15 @@ from pathlib import Path
 from src.artifacts import (
     ArtifactAccessContext,
     ArtifactConfigType,
+    ArtifactDeliveryState,
     ArtifactProvenance,
     ArtifactPurpose,
     create_artifact_services,
+)
+from src.artifacts.errors import ArtifactDeliveryError
+from src.api.artifact_transport import (
+    ArtifactTransportFacade,
+    DeliveryReceiptRequest,
 )
 from src.core.models import AgentResult, AgentStatus, ClientType
 from src.ingress.models import (
@@ -94,8 +100,39 @@ class OutputAssemblyCommitOnceTests(unittest.IsolatedAsyncioTestCase):
                 result=result,
                 input_batch=input_batch,
             )
+            bound = await artifacts.delivery_store.get(selected.delivery_id)
+            self.assertEqual(bound.output_batch_id, batch.output_batch_id)
+            self.assertEqual(bound.input_batch_id, input_batch.input_batch_id)
+            self.assertEqual(
+                bound.client_instance_id,
+                input_batch.capability_snapshot.client_instance_id,
+            )
             artifact_part = next(
                 part for part in batch.parts if isinstance(part, ArtifactOutputPart)
+            )
+            legacy_facade = ArtifactTransportFacade(
+                api=type("Api", (), {"artifact_services": artifacts})(),
+                message_processor=object(),
+            )
+            with self.assertRaisesRegex(
+                ArtifactDeliveryError,
+                "aggregate OutputBatch receipt",
+            ):
+                await legacy_facade.complete_delivery(
+                    selected.delivery_id,
+                    DeliveryReceiptRequest(
+                        session_id="session-1",
+                        client_type=ClientType.TELEGRAM,
+                        receipt={"message_id": "legacy"},
+                    ),
+                )
+            self.assertEqual(
+                (await output_store.get(batch.output_batch_id)).state,
+                OutputBatchState.READY,
+            )
+            self.assertEqual(
+                (await artifacts.delivery_store.get(selected.delivery_id)).state,
+                ArtifactDeliveryState.SELECTED,
             )
             await artifacts.delivery_service.claim(selected.delivery_id)
             _, attempt_id = await output_store.claim_delivery(batch.output_batch_id)
@@ -111,15 +148,45 @@ class OutputAssemblyCommitOnceTests(unittest.IsolatedAsyncioTestCase):
                     client_message_ids=(f"message-{part.index}",),
                     delivered_at=now,
                 ))
-            completed = await completion.complete(OutputDeliveryReceipt(
+            receipt = OutputDeliveryReceipt(
                 output_batch_id=batch.output_batch_id,
                 attempt_id=attempt_id,
                 state=OutputDeliveryReceiptState.DELIVERED,
                 part_receipts=tuple(receipts),
                 started_at=now,
                 completed_at=now,
-            ))
+            )
+            completed = await completion.complete(receipt)
             self.assertEqual(completed.state, OutputBatchState.DELIVERED)
+            delivered_record = await artifacts.delivery_store.get(
+                selected.delivery_id
+            )
+            attempts_after_delivery = delivered_record.attempt_count
+            replayed_receipt = await completion.complete(receipt)
+            self.assertEqual(replayed_receipt.state, OutputBatchState.DELIVERED)
+            self.assertEqual(
+                (await artifacts.delivery_store.get(selected.delivery_id)).attempt_count,
+                attempts_after_delivery,
+            )
+            traces = await artifacts.trace_store.list_session("session-1")
+            terminal = [
+                event
+                for event in traces
+                if event.event_type == "artifact_delivery_succeeded"
+            ]
+            self.assertEqual(len(terminal), 1)
+            self.assertEqual(
+                terminal[0].correlation.output_batch_id,
+                batch.output_batch_id,
+            )
+            self.assertEqual(
+                terminal[0].correlation.input_batch_id,
+                input_batch.input_batch_id,
+            )
+            self.assertEqual(
+                terminal[0].transport.client_instance_id,
+                input_batch.capability_snapshot.client_instance_id,
+            )
 
             replay = await assembler.assemble_final(
                 result=AgentResult(

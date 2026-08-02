@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ..artifacts import ArtifactAccessError, ArtifactDeliveryRef
+from ..artifacts import (
+    ArtifactAccessError,
+    ArtifactDeliveryError,
+    ArtifactDeliveryRef,
+)
 from ..core.models import ClientType, UnifiedResponse
 from ..ingress import (
     ClientInputEnvelope,
@@ -422,6 +426,7 @@ class ArtifactTransportFacade:
         *,
         session_id: str,
         client_type: ClientType,
+        output_batch_id: str | None = None,
     ) -> ArtifactDeliveryRef:
         record = await self.api.artifact_services.delivery_store.get(delivery_id)
         self._authorize_delivery(
@@ -429,6 +434,7 @@ class ArtifactTransportFacade:
             session_id=session_id,
             client_type=client_type,
         )
+        self._authorize_output_owner(record, output_batch_id=output_batch_id)
         return await self.api.artifact_services.delivery_service.claim(delivery_id)
 
     async def open_delivery(
@@ -437,7 +443,15 @@ class ArtifactTransportFacade:
         *,
         session_id: str,
         client_type: ClientType,
+        output_batch_id: str | None = None,
     ) -> AsyncIterator[bytes]:
+        record = await self.api.artifact_services.delivery_store.get(delivery_id)
+        self._authorize_delivery(
+            record,
+            session_id=session_id,
+            client_type=client_type,
+        )
+        self._authorize_output_owner(record, output_batch_id=output_batch_id)
         return self.api.artifact_services.delivery_service.iter_content(
             delivery_id,
             session_id=session_id,
@@ -455,6 +469,7 @@ class ArtifactTransportFacade:
             session_id=request.session_id,
             client_type=request.client_type,
         )
+        self._reject_legacy_completion(record)
         return await self.api.artifact_services.delivery_service.complete(
             delivery_id,
             receipt=request.receipt,
@@ -471,6 +486,7 @@ class ArtifactTransportFacade:
             session_id=request.session_id,
             client_type=request.client_type,
         )
+        self._reject_legacy_completion(record)
         return await self.api.artifact_services.delivery_service.fail(
             delivery_id,
             error=request.error,
@@ -486,6 +502,30 @@ class ArtifactTransportFacade:
         ):
             raise ArtifactAccessError(
                 "Delivery is outside the current client authority"
+            )
+
+    @staticmethod
+    def _authorize_output_owner(
+        record,
+        *,
+        output_batch_id: str | None,
+    ) -> None:
+        if record.output_batch_id is None:
+            if output_batch_id is not None:
+                raise ArtifactDeliveryError(
+                    "Delivery is not owned by the requested OutputBatch"
+                )
+            return
+        if record.output_batch_id != output_batch_id:
+            raise ArtifactDeliveryError(
+                "Output-owned delivery requires exact OutputBatch authority"
+            )
+
+    @staticmethod
+    def _reject_legacy_completion(record) -> None:
+        if record.output_batch_id is not None:
+            raise ArtifactDeliveryError(
+                "Output-owned delivery requires aggregate OutputBatch receipt"
             )
 
 

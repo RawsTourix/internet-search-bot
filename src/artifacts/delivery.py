@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import stat
 import tempfile
@@ -49,6 +50,9 @@ class ArtifactDeliveryRecord(BaseModel):
     delivery_id: str
     session_id: str
     cycle_id: str
+    output_batch_id: str | None = None
+    input_batch_id: str | None = None
+    client_instance_id: str | None = None
 
     artifact_id: str
     artifact_lineage_id: str
@@ -141,6 +145,29 @@ class ArtifactDeliveryRecord(BaseModel):
         normalized = value.strip()
         return normalized[:2_000] or None
 
+    @field_validator(
+        "output_batch_id",
+        "input_batch_id",
+        "client_instance_id",
+    )
+    @classmethod
+    def normalize_optional_authority(cls, value: str | None, info) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError(f"{info.field_name} must not be empty")
+        expected_prefix = {
+            "output_batch_id": "obat",
+            "input_batch_id": "ibat",
+        }.get(info.field_name)
+        if expected_prefix is not None and not re.fullmatch(
+            rf"{expected_prefix}_[0-9a-f]{{32}}",
+            normalized,
+        ):
+            raise ValueError(f"invalid {info.field_name}")
+        return normalized
+
     @model_validator(mode="after")
     def validate_state_timestamps(self) -> "ArtifactDeliveryRecord":
         if self.updated_at < self.created_at:
@@ -196,6 +223,24 @@ class FileSystemArtifactDeliveryStore:
 
     async def get(self, delivery_id: str) -> ArtifactDeliveryRecord:
         return await asyncio.to_thread(self._load_sync, delivery_id)
+
+    async def bind_output_batch(
+        self,
+        delivery_ids: list[str],
+        *,
+        output_batch_id: str,
+        input_batch_id: str,
+        client_instance_id: str,
+    ) -> list[ArtifactDeliveryRecord]:
+        """Atomically bind selected deliveries to one aggregate output owner."""
+
+        return await asyncio.to_thread(
+            self._bind_output_batch_sync,
+            delivery_ids,
+            output_batch_id,
+            input_batch_id,
+            client_instance_id,
+        )
 
     async def list_cycle(
         self,
@@ -404,6 +449,75 @@ class FileSystemArtifactDeliveryStore:
                 for delivery_id, (record, _) in updates.items()
             }
             return [cancelled[delivery_id] for delivery_id in delivery_ids]
+
+    def _bind_output_batch_sync(
+        self,
+        delivery_ids: list[str],
+        output_batch_id: str,
+        input_batch_id: str,
+        client_instance_id: str,
+    ) -> list[ArtifactDeliveryRecord]:
+        if not delivery_ids:
+            return []
+        unique_ids = list(dict.fromkeys(delivery_ids))
+        with self._lock:
+            current_by_id = {
+                delivery_id: self._load_sync(delivery_id)
+                for delivery_id in unique_ids
+            }
+            first = current_by_id[unique_ids[0]]
+            updates: dict[str, tuple[ArtifactDeliveryRecord, bool]] = {}
+            bound = dict(current_by_id)
+            for delivery_id in unique_ids:
+                current = current_by_id[delivery_id]
+                if (
+                    current.session_id != first.session_id
+                    or current.cycle_id != first.cycle_id
+                    or current.client_type != first.client_type
+                ):
+                    raise ArtifactDeliveryError(
+                        "OutputBatch deliveries must share one runtime authority"
+                    )
+                if current.state == ArtifactDeliveryState.CANCELLED:
+                    raise ArtifactDeliveryError(
+                        "Cancelled delivery cannot bind to OutputBatch"
+                    )
+                if current.output_batch_id not in {None, output_batch_id}:
+                    raise ArtifactDeliveryError(
+                        "Delivery is already owned by another OutputBatch"
+                    )
+                if current.input_batch_id not in {None, input_batch_id}:
+                    raise ArtifactDeliveryError(
+                        "Delivery is already bound to another InputBatch"
+                    )
+                if current.client_instance_id not in {None, client_instance_id}:
+                    raise ArtifactDeliveryError(
+                        "Delivery is already bound to another client instance"
+                    )
+                if (
+                    current.output_batch_id == output_batch_id
+                    and current.input_batch_id == input_batch_id
+                    and current.client_instance_id == client_instance_id
+                ):
+                    continue
+                updated = current.model_copy(update={
+                    "output_batch_id": output_batch_id,
+                    "input_batch_id": input_batch_id,
+                    "client_instance_id": client_instance_id,
+                    "updated_at": utc_now(),
+                })
+                updates[delivery_id] = (
+                    ArtifactDeliveryRecord.model_validate(
+                        updated.model_dump(mode="python")
+                    ),
+                    True,
+                )
+            self._commit_batch_sync(updates)
+            bound.update({
+                delivery_id: record
+                for delivery_id, (record, _) in updates.items()
+            })
+            return [bound[delivery_id] for delivery_id in delivery_ids]
 
     def _commit_batch_sync(
         self,

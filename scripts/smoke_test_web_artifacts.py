@@ -3,8 +3,8 @@
 The default mode does not call the LLM: it uploads two files atomically and
 replays the same idempotency key.  ``--run`` additionally executes the committed
 batch through the real agent.  ``--expect-delivery`` downloads every selected
-deliverable, verifies size and SHA-256, saves it locally and posts a completion
-receipt.
+deliverable through the instance-scoped OutputBatch outbox, verifies size and
+SHA-256, saves it locally and posts one terminal aggregate receipt.
 """
 
 from __future__ import annotations
@@ -22,6 +22,8 @@ from typing import Any
 
 import httpx
 
+
+WEB_CLIENT_INSTANCE_ID = "web-artifact-smoke"
 
 DEFAULT_PROMPT = (
     "Прочитай оба приложенных файла. Сверь данные и ответь кратко: "
@@ -167,7 +169,7 @@ def build_manifest(
     manifest = {
         "idempotency_key": idempotency_key,
         "client_type": "web",
-        "client_instance_id": "web-artifact-smoke",
+        "client_instance_id": WEB_CLIENT_INSTANCE_ID,
         "conversation": {
             "conversation_id": conversation_id,
             "thread_id": None,
@@ -217,81 +219,145 @@ def multipart_payload(
     return result
 
 
-def verify_delivery(
+def deliver_output_batch(
     client: httpx.Client,
     *,
-    delivery: dict[str, Any],
+    output_batch: dict[str, Any],
     session_id: str,
     output_dir: Path,
-) -> Path:
-    delivery_id = str(delivery.get("delivery_id") or "")
-    require(delivery_id.startswith("dlv_"), "Invalid or missing delivery_id")
-    params = {"session_id": session_id, "client_type": "web"}
-
-    metadata = response_json(
-        client.get(f"/internal/deliveries/{delivery_id}", params=params),
-        expected={200},
-    )
-    content_response = client.get(
-        f"/internal/deliveries/{delivery_id}/content",
-        params=params,
-    )
-    if content_response.status_code != 200:
-        raise RuntimeError(
-            f"Could not download {delivery_id}: HTTP "
-            f"{content_response.status_code}: {content_response.text[:1000]}"
-        )
-
-    payload = content_response.content
-    expected_size = int(metadata["size_bytes"])
-    expected_hash = str(metadata["content_hash"])
-    actual_hash = "sha256:" + hashlib.sha256(payload).hexdigest()
-
-    if len(payload) != expected_size or actual_hash != expected_hash:
-        client.post(
-            f"/internal/deliveries/{delivery_id}/failed",
-            json={
-                "session_id": session_id,
+) -> list[Path]:
+    output_batch_id = str(output_batch.get("output_batch_id") or "")
+    require(output_batch_id.startswith("obat_"), "Invalid output_batch_id")
+    authority = {
+        "session_id": session_id,
+        "client_type": "web",
+        "client_instance_id": WEB_CLIENT_INSTANCE_ID,
+    }
+    ready = response_json(
+        client.get(
+            "/internal/output-outbox/ready",
+            params={
                 "client_type": "web",
-                "error": "Smoke test detected delivery size or hash mismatch",
-                "ambiguous": False,
-                "receipt": {
-                    "smoke_test": True,
-                    "actual_size_bytes": len(payload),
-                    "actual_content_hash": actual_hash,
-                },
-            },
-        )
-        raise RuntimeError(
-            f"Delivery integrity mismatch for {delivery_id}: "
-            f"size {len(payload)}/{expected_size}, hash "
-            f"{actual_hash}/{expected_hash}"
-        )
-
-    filename = str(metadata.get("filename") or f"{delivery_id}.bin")
-    safe_name = Path(filename).name or f"{delivery_id}.bin"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    target = output_dir / safe_name
-    target.write_bytes(payload)
-
-    completed = response_json(
-        client.post(
-            f"/internal/deliveries/{delivery_id}/complete",
-            json={
-                "session_id": session_id,
-                "client_type": "web",
-                "receipt": {
-                    "smoke_test": True,
-                    "saved_filename": safe_name,
-                    "size_bytes": len(payload),
-                    "content_hash": actual_hash,
-                },
+                "client_instance_id": WEB_CLIENT_INSTANCE_ID,
+                "minimum_age_seconds": 0,
             },
         ),
         expected={200},
     )
-    require(completed.get("state") == "delivered", "Delivery was not completed")
-    return target
+    ready_ids = {
+        item.get("output_batch_id")
+        for item in ready.get("output_batches", [])
+        if isinstance(item, dict)
+    }
+    require(output_batch_id in ready_ids, "OutputBatch is not READY in Web outbox")
+
+    claim_request_id = "oclm_" + uuid.uuid4().hex
+    claim_body = {**authority, "claim_request_id": claim_request_id}
+    claimed = response_json(
+        client.post(
+            f"/internal/output-outbox/{output_batch_id}/claim",
+            json=claim_body,
+        ),
+        expected={200},
+    )
+    replayed_claim = response_json(
+        client.post(
+            f"/internal/output-outbox/{output_batch_id}/claim",
+            json=claim_body,
+        ),
+        expected={200},
+    )
+    attempt_id = str(claimed.get("attempt_id") or "")
+    require(attempt_id, "Claim did not return attempt_id")
+    require(
+        replayed_claim.get("attempt_id") == attempt_id,
+        "Exact claim replay returned another attempt",
+    )
+    claimed_batch = claimed.get("output_batch") or {}
+    require(claimed_batch.get("state") == "delivering", "Claim did not start delivery")
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    saved: list[Path] = []
+    part_receipts: list[dict[str, Any]] = []
+    started_at = datetime.now(timezone.utc).isoformat()
+    for part in claimed_batch.get("parts", []):
+        require(isinstance(part, dict), "OutputBatch part must be an object")
+        receipt: dict[str, Any] = {
+            "part_id": part["part_id"],
+            "index": part["index"],
+            "required": part["required"],
+            "state": "delivered",
+            "client_message_ids": [
+                f"web-smoke:{output_batch_id}:{part['part_id']}"
+            ],
+            "delivered_at": datetime.now(timezone.utc).isoformat(),
+        }
+        delivery_id = part.get("delivery_id")
+        if delivery_id is not None:
+            content_response = client.get(
+                f"/internal/output-outbox/{output_batch_id}/deliveries/"
+                f"{delivery_id}/content",
+                params=authority,
+            )
+            if content_response.status_code != 200:
+                raise RuntimeError(
+                    f"Could not download {delivery_id}: HTTP "
+                    f"{content_response.status_code}: {content_response.text[:1000]}"
+                )
+            payload = content_response.content
+            expected_size = int(part["size_bytes"])
+            expected_hash = content_response.headers.get("X-Content-Hash", "")
+            actual_hash = "sha256:" + hashlib.sha256(payload).hexdigest()
+            require(len(payload) == expected_size, f"Size mismatch for {delivery_id}")
+            require(actual_hash == expected_hash, f"Hash mismatch for {delivery_id}")
+            filename = str(part.get("filename") or f"{delivery_id}.bin")
+            safe_name = Path(filename).name or f"{delivery_id}.bin"
+            target = output_dir / safe_name
+            target.write_bytes(payload)
+            saved.append(target)
+            receipt.update({
+                "delivery_id": delivery_id,
+                "artifact_content_state": "delivered",
+            })
+        part_receipts.append(receipt)
+
+    receipt = {
+        "output_batch_id": output_batch_id,
+        "attempt_id": attempt_id,
+        "state": "delivered",
+        "part_receipts": part_receipts,
+        "started_at": started_at,
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    receipt_body = {**authority, "receipt": receipt}
+    completed = response_json(
+        client.post(
+            f"/internal/output-outbox/{output_batch_id}/receipt",
+            json=receipt_body,
+        ),
+        expected={200},
+    )
+    require(completed.get("state") == "delivered", "OutputBatch did not finish")
+    replayed = response_json(
+        client.post(
+            f"/internal/output-outbox/{output_batch_id}/receipt",
+            json=receipt_body,
+        ),
+        expected={200},
+    )
+    require(replayed == completed, "Exact receipt replay was not idempotent")
+    recovered = response_json(
+        client.get(
+            f"/internal/output-outbox/{output_batch_id}",
+            params=authority,
+        ),
+        expected={200},
+    )
+    require(
+        (recovered.get("output_batch") or {}).get("state") == "delivered",
+        "Terminal OutputBatch could not be recovered by ID",
+    )
+    return saved
 
 
 def main() -> int:
@@ -384,15 +450,17 @@ def main() -> int:
             if args.expect_delivery:
                 require(deliveries, "Agent did not select any artifact for delivery")
                 output_dir = Path(args.output_dir)
-                for item in deliveries:
-                    require(isinstance(item, dict), "Delivery ref must be an object")
-                    target = verify_delivery(
-                        client,
-                        delivery=item,
-                        session_id=session_id,
-                        output_dir=output_dir,
-                    )
-                    print(f"[OK] Delivery verified and completed: {target}")
+                output_batch = metadata.get("output_batch") or {}
+                require(isinstance(output_batch, dict), "Missing OutputBatch metadata")
+                targets = deliver_output_batch(
+                    client,
+                    output_batch=output_batch,
+                    session_id=session_id,
+                    output_dir=output_dir,
+                )
+                require(targets, "OutputBatch contained no downloadable artifacts")
+                for target in targets:
+                    print(f"[OK] Outbox delivery verified: {target}")
             else:
                 print(f"[INFO] Selected deliveries: {len(deliveries)}")
 
