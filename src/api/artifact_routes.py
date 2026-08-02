@@ -401,6 +401,8 @@ def create_artifact_router(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ArtifactAccessError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
+        except ArtifactDeliveryError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except IngressConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (ArtifactStorageError, ArtifactIntegrityError) as error:
@@ -458,6 +460,8 @@ def create_artifact_router(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ArtifactAccessError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
+        except ArtifactDeliveryError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @router.get(
         "/internal/output-batches/unknown",

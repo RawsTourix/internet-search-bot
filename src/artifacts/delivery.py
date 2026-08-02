@@ -229,7 +229,7 @@ class FileSystemArtifactDeliveryStore:
         delivery_ids: list[str],
         *,
         output_batch_id: str,
-        input_batch_id: str,
+        input_batch_id: str | None,
         client_instance_id: str,
     ) -> list[ArtifactDeliveryRecord]:
         """Atomically bind selected deliveries to one aggregate output owner."""
@@ -454,7 +454,7 @@ class FileSystemArtifactDeliveryStore:
         self,
         delivery_ids: list[str],
         output_batch_id: str,
-        input_batch_id: str,
+        input_batch_id: str | None,
         client_instance_id: str,
     ) -> list[ArtifactDeliveryRecord]:
         if not delivery_ids:
@@ -466,6 +466,22 @@ class FileSystemArtifactDeliveryStore:
                 for delivery_id in unique_ids
             }
             first = current_by_id[unique_ids[0]]
+            existing_input_ids = {
+                record.input_batch_id
+                for record in current_by_id.values()
+                if record.input_batch_id is not None
+            }
+            if input_batch_id is None:
+                if len(existing_input_ids) > 1:
+                    raise ArtifactDeliveryError(
+                        "OutputBatch deliveries disagree on InputBatch authority"
+                    )
+                effective_input_batch_id = next(
+                    iter(existing_input_ids),
+                    None,
+                )
+            else:
+                effective_input_batch_id = input_batch_id
             updates: dict[str, tuple[ArtifactDeliveryRecord, bool]] = {}
             bound = dict(current_by_id)
             for delivery_id in unique_ids:
@@ -486,7 +502,10 @@ class FileSystemArtifactDeliveryStore:
                     raise ArtifactDeliveryError(
                         "Delivery is already owned by another OutputBatch"
                     )
-                if current.input_batch_id not in {None, input_batch_id}:
+                if current.input_batch_id not in {
+                    None,
+                    effective_input_batch_id,
+                }:
                     raise ArtifactDeliveryError(
                         "Delivery is already bound to another InputBatch"
                     )
@@ -496,13 +515,13 @@ class FileSystemArtifactDeliveryStore:
                     )
                 if (
                     current.output_batch_id == output_batch_id
-                    and current.input_batch_id == input_batch_id
+                    and current.input_batch_id == effective_input_batch_id
                     and current.client_instance_id == client_instance_id
                 ):
                     continue
                 updated = current.model_copy(update={
                     "output_batch_id": output_batch_id,
-                    "input_batch_id": input_batch_id,
+                    "input_batch_id": effective_input_batch_id,
                     "client_instance_id": client_instance_id,
                     "updated_at": utc_now(),
                 })

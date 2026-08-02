@@ -301,6 +301,17 @@ class ArtifactIngressService:
                     duplicate=duplicate_event or duplicate_batch,
                 )
                 result = await self._decorate_result(result, envelope=envelope)
+                # Presentation and durable metadata reads may take longer than
+                # the media-group quiet timeout on slow filesystems. Reset the
+                # authoritative deadline immediately before returning so the
+                # transport receives the full advertised join window.
+                defer_commit = getattr(
+                    self.batch_store,
+                    "defer_commit",
+                    None,
+                )
+                if defer_commit is not None:
+                    await defer_commit(draft.input_batch_id)
                 self._log_submission_result(result, started=started)
                 return result
 

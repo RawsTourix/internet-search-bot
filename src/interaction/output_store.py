@@ -605,7 +605,9 @@ class FileSystemOutputBatchStore:
 
 def build_ready_output_batch(**values: Any) -> OutputBatch:
     now = values.pop("now", None) or utc_now()
+    input_batch_id = values.get("input_batch_id")
     return OutputBatch(
+        schema_version=2 if input_batch_id is not None else 1,
         output_batch_id=values.pop("output_batch_id", new_output_batch_id()),
         state=OutputBatchState.READY,
         created_at=now,

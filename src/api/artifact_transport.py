@@ -418,6 +418,7 @@ class ArtifactTransportFacade:
             session_id=session_id,
             client_type=client_type,
         )
+        self._authorize_output_owner(record, output_batch_id=None)
         return record.public_ref()
 
     async def claim_delivery(

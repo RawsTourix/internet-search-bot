@@ -257,6 +257,7 @@ class OutputBatchAssembler:
             )
 
         batch = build_ready_output_batch(
+            input_batch_id=input_batch.input_batch_id,
             session_id=input_batch.session_id,
             cycle_id=cycle_id,
             sequence_number=input_batch.sequence_number,

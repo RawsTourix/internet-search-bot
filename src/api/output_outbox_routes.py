@@ -110,6 +110,17 @@ def create_output_outbox_router(
             )
 
     async def validate_artifact_ownership(batch) -> None:
+        compatible_states = {
+            OutputBatchState.READY: {
+                "selected",
+                "failed",
+            },
+            OutputBatchState.DELIVERING: {
+                "selected",
+                "failed",
+                "delivering",
+            },
+        }.get(batch.state, set())
         for part in batch.parts:
             if not isinstance(part, ArtifactOutputPart):
                 continue
@@ -132,6 +143,7 @@ def create_output_outbox_router(
                 or record.filename != part.filename
                 or record.mime_type != part.mime_type
                 or record.size_bytes != part.size_bytes
+                or record.state.value not in compatible_states
             ):
                 raise OutputBatchConflictError(
                     "Artifact delivery is outside exact OutputBatch ownership"

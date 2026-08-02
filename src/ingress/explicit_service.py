@@ -49,6 +49,28 @@ class ExplicitCollectionIngressService(ResilientUnifiedArtifactIngressService):
         grouping_mode: InputGroupingMode = InputGroupingMode.ATOMIC,
         grouping_key: str | None = None,
     ) -> InputSubmissionResult:
+        scope_key = self._reservation_scope_key(
+            envelope,
+            session_id=session_id,
+        )
+        async with self._register_ingress_reservation(scope_key):
+            return await self._submit_atomic_with_collection(
+                envelope,
+                session_id=session_id,
+                upload_streams=upload_streams,
+                grouping_mode=grouping_mode,
+                grouping_key=grouping_key,
+            )
+
+    async def _submit_atomic_with_collection(
+        self,
+        envelope: ClientInputEnvelope,
+        *,
+        session_id: str,
+        upload_streams: Mapping[str, AsyncIterator[bytes]] | None,
+        grouping_mode: InputGroupingMode,
+        grouping_key: str | None,
+    ) -> InputSubmissionResult:
         scope = self._collection_scope(envelope, session_id=session_id)
         active = await self.collection_store.get_active(scope)
         if active is not None:

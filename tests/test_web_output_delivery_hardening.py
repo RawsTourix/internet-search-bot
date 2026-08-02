@@ -123,6 +123,15 @@ class WebOutputDeliveryHardeningTests(unittest.TestCase):
                 )
                 self.assertEqual(legacy.status_code, 409)
                 self.assertIn("aggregate OutputBatch receipt", legacy.text)
+                legacy_metadata = client.get(
+                    f"/internal/deliveries/{prepared.delivery_id}",
+                    params={
+                        "session_id": prepared.session_id,
+                        "client_type": "web",
+                    },
+                    headers=headers,
+                )
+                self.assertEqual(legacy_metadata.status_code, 409)
 
                 other_session = client.get(
                     f"/internal/output-outbox/{prepared.output_batch_id}",
@@ -226,6 +235,72 @@ class WebOutputDeliveryHardeningTests(unittest.TestCase):
             self.assertEqual(
                 terminal[0].correlation.output_batch_id,
                 prepared.output_batch_id,
+            )
+
+    def test_ready_batch_with_terminal_artifact_is_rejected_before_claim(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            prepared = asyncio.run(self._prepare(temporary))
+            config = StorageConfigType(root_dir=temporary)
+            storage = create_storage_services(config)
+            artifacts = create_artifact_services(
+                storage_config=config,
+                artifact_config=ArtifactConfigType(),
+                content_store=storage.content_store,
+            )
+            asyncio.run(artifacts.delivery_service.claim(prepared.delivery_id))
+            asyncio.run(artifacts.delivery_service.complete(
+                prepared.delivery_id,
+                receipt={"message_ids": ["corrupt-terminal"]},
+            ))
+            output_store = FileSystemOutputBatchStore(Path(temporary))
+            completion = OutputDeliveryCompletionService(
+                output_store=output_store,
+                artifact_delivery_store=artifacts.delivery_store,
+            )
+            renderer = OutputBatchAssembler(
+                config=OutputRuntimeConfig(),
+                delivery_store=artifacts.delivery_store,
+                output_store=output_store,
+            ).renderer
+            facade = ArtifactTransportFacade(
+                api=SimpleNamespace(
+                    artifact_services=artifacts,
+                    output_store=output_store,
+                    output_completion=completion,
+                    output_renderer=renderer,
+                ),
+                message_processor=object(),
+            )
+
+            async def auth(x_api_key: str = Header(alias="X-API-Key")) -> str:
+                if x_api_key != "web-test-key":
+                    raise HTTPException(status_code=403, detail="Invalid API Key")
+                return x_api_key
+
+            app = FastAPI()
+            app.include_router(create_output_outbox_router(
+                facade=facade,
+                auth_dependency=auth,
+                api_key_scopes={"web-test-key": frozenset({"web"})},
+                api_key_instance_scopes={
+                    "web-test-key": frozenset({("web", "web-1")})
+                },
+            ))
+            with TestClient(app, raise_server_exceptions=False) as client:
+                response = client.post(
+                    f"/internal/output-outbox/{prepared.output_batch_id}/claim",
+                    json={
+                        "session_id": prepared.session_id,
+                        "client_type": "web",
+                        "client_instance_id": "web-1",
+                        "claim_request_id": "oclm_" + "c" * 32,
+                    },
+                    headers={"X-API-Key": "web-test-key"},
+                )
+            self.assertEqual(response.status_code, 409)
+            self.assertEqual(
+                asyncio.run(output_store.get(prepared.output_batch_id)).state.value,
+                "ready",
             )
 
     async def _prepare(self, temporary: str):

@@ -9,7 +9,7 @@ from typing import Annotated, Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 from ..artifacts.models import is_artifact_delivery_id, is_artifact_id
-from ..ingress.models import ClientResponseRoute
+from ..ingress.models import ClientResponseRoute, is_input_batch_id
 from ..localization.models import LocalizationMessage
 from .anchors import ClientResponseAnchor
 from .capabilities import ClientCapabilitySnapshot
@@ -196,8 +196,9 @@ OutputPart = Annotated[
 class OutputBatch(_OutputModel):
     """Immutable semantic manifest plus mutable lifecycle state."""
 
-    schema_version: Literal[1] = 1
+    schema_version: Literal[1, 2] = 1
     output_batch_id: str
+    input_batch_id: str | None = None
     session_id: str
     cycle_id: str
     sequence_number: int = Field(ge=1)
@@ -218,6 +219,19 @@ class OutputBatch(_OutputModel):
         if not is_interaction_id(value, prefix="obat"):
             raise ValueError("invalid output_batch_id")
         return value
+
+    @field_validator("input_batch_id")
+    @classmethod
+    def validate_input_batch_id(cls, value: str | None) -> str | None:
+        if value is not None and not is_input_batch_id(value):
+            raise ValueError("invalid input_batch_id")
+        return value
+
+    @model_validator(mode="after")
+    def validate_schema_authority(self) -> "OutputBatch":
+        if self.schema_version >= 2 and self.input_batch_id is None:
+            raise ValueError("OutputBatch schema v2 requires input_batch_id")
+        return self
 
     @field_validator("session_id", "cycle_id", "locale")
     @classmethod

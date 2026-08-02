@@ -286,13 +286,25 @@ async def lifespan(app: FastAPI):
         await web_adapter.initialize()
         web_initialized = True
         output_recovery = await reconcile_unclaimable_legacy_ready(
-            API.output_store
+            API.output_store,
+            API.artifact_services.delivery_store,
         )
         if output_recovery.cancelled_count:
             logger.warning(
                 "Cancelled %s unclaimable legacy READY OutputBatch records: %s",
                 output_recovery.cancelled_count,
                 list(output_recovery.cancelled_legacy_output_batch_ids),
+            )
+        if output_recovery.repaired_count:
+            logger.warning(
+                "Repaired %s READY OutputBatch ownership bindings: %s",
+                output_recovery.repaired_count,
+                list(output_recovery.repaired_output_batch_ids),
+            )
+        if output_recovery.unrepaired_output_batch_ids:
+            logger.error(
+                "Unsafe READY OutputBatch ownership remains unrepaired: %s",
+                list(output_recovery.unrepaired_output_batch_ids),
             )
         for item in output_recovery.remaining_ready:
             logger.warning(

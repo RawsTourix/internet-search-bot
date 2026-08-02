@@ -101,7 +101,7 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
         reserved_input_batch_id: str | None = None
         original_duplicate: bool | None = None
         scope_key = self._reservation_scope_key(envelope, session_id=session_id)
-        async with self._reservation_locks.hold(scope_key):
+        async with self._hold_ingress_reservation(scope_key):
             list_open = getattr(self.batch_store, "list_open_drafts", None)
             open_drafts = (
                 await list_open(session_id=session_id)
@@ -264,7 +264,14 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
                 original_duplicate = duplicate_event or duplicate_batch
 
         if joined_result is not None:
-            return await self._decorate_result(joined_result, envelope=envelope)
+            decorated = await self._decorate_result(
+                joined_result,
+                envelope=envelope,
+            )
+            defer_commit = getattr(self.batch_store, "defer_commit", None)
+            if defer_commit is not None and decorated.state == "collecting":
+                await defer_commit(decorated.input_batch_id)
+            return decorated
 
         result = await super().submit_atomic(
             envelope,
@@ -348,3 +355,35 @@ class UnifiedArtifactIngressService(ArtifactIngressService):
             envelope.client_instance_id,
             envelope.sender.principal_id,
         )
+
+    @asynccontextmanager
+    async def _register_ingress_reservation(
+        self,
+        scope_key: tuple[str, str, str, str],
+    ):
+        begin = getattr(
+            self.batch_store,
+            "begin_ingress_reservation",
+            None,
+        )
+        end = getattr(
+            self.batch_store,
+            "end_ingress_reservation",
+            None,
+        )
+        if begin is not None:
+            begin(scope_key)
+        try:
+            yield
+        finally:
+            if end is not None:
+                end(scope_key)
+
+    @asynccontextmanager
+    async def _hold_ingress_reservation(
+        self,
+        scope_key: tuple[str, str, str, str],
+    ):
+        async with self._register_ingress_reservation(scope_key):
+            async with self._reservation_locks.hold(scope_key):
+                yield
