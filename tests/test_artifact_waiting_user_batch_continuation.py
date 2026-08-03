@@ -105,6 +105,43 @@ class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+    async def test_interrupted_cycle_preserves_old_refs_and_accepts_resume_batch(
+        self,
+    ):
+        client = _Client()
+        client.pending_cycle = SimpleNamespace(status="interrupted")
+        active_cycle = SimpleNamespace(
+            original_input_batch_id="ibat-before-timeout",
+            artifact_refs=["art-uploaded-file"],
+            cycle_trace=client.trace,
+        )
+        input_batch = SimpleNamespace(
+            input_batch_id="ibat-resume-message",
+            artifact_refs=[],
+            text_parts=[SimpleNamespace()],
+        )
+
+        result = await client.process_query(
+            "resume",
+            session_id="session-1",
+            input_batch=input_batch,
+            active_cycle=active_cycle,
+        )
+
+        self.assertIs(result, active_cycle)
+        self.assertEqual(client.observed_batch_id, "ibat-resume-message")
+        self.assertEqual(active_cycle.artifact_refs, ["art-uploaded-file"])
+        self.assertEqual(
+            client.trace[-1],
+            {
+                "type": "interrupted_input_batch_continued",
+                "previous_input_batch_id": "ibat-before-timeout",
+                "input_batch_id": "ibat-resume-message",
+                "artifact_count": 0,
+                "text_part_count": 1,
+            },
+        )
+
     async def test_fresh_cycle_does_not_bypass_batch_guard(self):
         client = _Client()
         active_cycle = SimpleNamespace(
