@@ -3,12 +3,17 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections import OrderedDict
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from typing import Any
 
 from .presentation_relocation import relocate_precreated_input_presentation
 from .scoped_artifact_bridge import InstanceScopedTelegramArtifactGatewayClient
+
+
+logger = logging.getLogger("TelegramServer.CollectionBridge")
 
 
 class ExplicitCollectionTelegramGatewayClient(
@@ -26,6 +31,8 @@ class ExplicitCollectionTelegramGatewayClient(
         ] = OrderedDict()
         self._maximum_terminal_explicit_batches = 512
         self._active_collection_sessions: set[str] = set()
+        self._active_collection_status_messages: dict[str, str] = {}
+        self._failed_collection_sessions: set[str] = set()
 
     @staticmethod
     def _merge_presentation_ref(
@@ -122,23 +129,90 @@ class ExplicitCollectionTelegramGatewayClient(
             and params.get("assembly_mode") == "explicit"
             and params.get("auto_commit_allowed") is False
         ):
+            session_id = self._session_id_from_envelope(envelope)
+            async with self._explicit_batch_lock:
+                command_status_id = (
+                    self._active_collection_status_messages.get(session_id)
+                )
+            if (
+                command_status_id is not None
+                and str(payload.get("ack_policy") or "") == "create"
+            ):
+                try:
+                    bound = await super().bind_input_presentation(
+                        payload.get("presentation_ref"),
+                        session_id=session_id,
+                        client_message_id=command_status_id,
+                    )
+                except Exception as error:
+                    # Admission is durable even if presentation binding is not.
+                    # Avoid creating a second status; later callbacks still use
+                    # the process-local command handle.
+                    payload["ack_policy"] = "silent"
+                    logger.warning(
+                        "telegram_collection_command_status_bind_failed "
+                        "input_batch_id=%s message_id=%s error_type=%s",
+                        batch_id,
+                        command_status_id,
+                        type(error).__name__,
+                    )
+                else:
+                    payload["ack_policy"] = "update_existing"
+                    payload["presentation_ref"] = self._merge_presentation_ref(
+                        payload.get("presentation_ref"),
+                        bound,
+                        client_message_id=command_status_id,
+                    )
             async with self._explicit_batch_lock:
                 if batch_id not in self._terminal_explicit_batches:
                     current = dict(self._explicit_batches.get(batch_id) or {})
                     current.update({
-                        "session_id": self._session_id_from_envelope(envelope),
+                        "session_id": session_id,
                         "collection_id": params.get("collection_id"),
-                        "file_count": int(params.get("file_count") or 0),
-                        "text_part_count": int(
-                            params.get("text_part_count") or 0
+                        "file_count": max(
+                            int(current.get("file_count") or 0),
+                            int(params.get("file_count") or 0),
+                        ),
+                        "text_part_count": max(
+                            int(current.get("text_part_count") or 0),
+                            int(params.get("text_part_count") or 0),
                         ),
                     })
                     current["presentation_ref"] = self._merge_presentation_ref(
                         current.get("presentation_ref"),
                         payload.get("presentation_ref"),
+                        client_message_id=(
+                            self._active_collection_status_messages.get(
+                                session_id
+                            )
+                        ),
                     )
                     self._explicit_batches[batch_id] = current
         return payload
+
+    @asynccontextmanager
+    async def explicit_presentation_guard(self, input_batch_id: str):
+        """Keep a collecting edit ordered before any terminal transition."""
+
+        normalized = input_batch_id.strip()
+        async with self._explicit_batch_lock:
+            terminal = self._terminal_explicit_batches.get(normalized)
+            active = self._explicit_batches.get(normalized)
+            if terminal is not None:
+                yield {
+                    **dict(terminal),
+                    "terminal": True,
+                }
+            elif active is not None:
+                yield {
+                    **dict(active),
+                    "terminal": False,
+                    "presentation_message_id": self._current_message_id(
+                        active
+                    ),
+                }
+            else:
+                yield None
 
     async def bind_input_presentation(
         self,
@@ -258,6 +332,7 @@ class ExplicitCollectionTelegramGatewayClient(
                 "response": "",
                 "metadata": {
                     "input_collection_pending": True,
+                    "input_batch_id": input_batch_id,
                     "collection_id": explicit.get("collection_id"),
                     "file_count": explicit.get("file_count", 0),
                     "text_part_count": explicit.get("text_part_count", 0),
@@ -301,6 +376,14 @@ class ExplicitCollectionTelegramGatewayClient(
         }:
             async with self._explicit_batch_lock:
                 self._active_collection_sessions.add(session_id)
+                self._failed_collection_sessions.discard(session_id)
+                status_message_id = self._status_message_id_from_route(
+                    response_route
+                )
+                if status_message_id is not None:
+                    self._active_collection_status_messages[session_id] = (
+                        status_message_id
+                    )
         return payload
 
     async def prepare_input_envelope(self, envelope):
@@ -318,6 +401,30 @@ class ExplicitCollectionTelegramGatewayClient(
     async def is_explicit_collection_active(self, session_id: str) -> bool:
         async with self._explicit_batch_lock:
             return session_id in self._active_collection_sessions
+
+    async def claim_explicit_ingress_failure(self, session_id: str) -> bool:
+        """Emit one user-visible failure for a terminal collection cascade."""
+
+        async with self._explicit_batch_lock:
+            if session_id in self._failed_collection_sessions:
+                return False
+            if session_id not in self._active_collection_sessions:
+                return True
+            self._active_collection_sessions.discard(session_id)
+            self._failed_collection_sessions.add(session_id)
+            batch_ids = [
+                batch_id
+                for batch_id, state in self._explicit_batches.items()
+                if state.get("session_id") == session_id
+            ]
+            for batch_id in batch_ids:
+                explicit = self._explicit_batches.pop(batch_id, None)
+                self._remember_terminal_locked(
+                    batch_id,
+                    action="failed",
+                    explicit=explicit,
+                )
+            return True
 
     async def inspect_collection(
         self,
@@ -356,6 +463,7 @@ class ExplicitCollectionTelegramGatewayClient(
         if payload.get("status") == "committed" and batch_id:
             async with self._explicit_batch_lock:
                 self._active_collection_sessions.discard(session_id)
+                self._active_collection_status_messages.pop(session_id, None)
                 explicit = self._explicit_batches.pop(batch_id, None)
                 terminal = self._remember_terminal_locked(
                     batch_id,
@@ -391,6 +499,7 @@ class ExplicitCollectionTelegramGatewayClient(
         if str(payload.get("status") or "") in {"cancelled", "not_found"}:
             async with self._explicit_batch_lock:
                 self._active_collection_sessions.discard(session_id)
+                self._active_collection_status_messages.pop(session_id, None)
         if batch_id:
             async with self._explicit_batch_lock:
                 self._active_collection_sessions.discard(session_id)
@@ -412,6 +521,8 @@ class ExplicitCollectionTelegramGatewayClient(
         await super().clear_session_state(session_id)
         async with self._explicit_batch_lock:
             self._active_collection_sessions.discard(session_id)
+            self._active_collection_status_messages.pop(session_id, None)
+            self._failed_collection_sessions.discard(session_id)
             for mapping in (
                 self._explicit_batches,
                 self._terminal_explicit_batches,
@@ -432,6 +543,20 @@ class ExplicitCollectionTelegramGatewayClient(
             "telegram:conversation:"
             f"{conversation.conversation_id}{suffix}"
         )
+
+    @staticmethod
+    def _status_message_id_from_route(
+        response_route: dict[str, Any],
+    ) -> str | None:
+        metadata = dict(response_route.get("metadata") or {})
+        progress_target = dict(metadata.get("progress_target") or {})
+        value = progress_target.get("message_id")
+        if value is None:
+            value = metadata.get("status_message_id")
+        if value is None:
+            return None
+        normalized = str(value).strip()
+        return normalized or None
 
     async def relocate_input_presentation(
         self,

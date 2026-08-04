@@ -628,22 +628,54 @@ async def _deliver_agent_result(**values):
         return None
 
     if metadata.get("input_collection_pending"):
-        locale = str(metadata.get("progress_locale") or "ru")
-        status_message = await _authoritative_collection_status_message(
-            values=values,
-            metadata=metadata,
+        async def deliver_collection_update():
+            locale = str(metadata.get("progress_locale") or "ru")
+            status_message = await _authoritative_collection_status_message(
+                values=values,
+                metadata=metadata,
+            )
+            return await server.finish_status_or_send_reply(
+                update=values["update"],
+                status_message=status_message,
+                text=server._localized(
+                    "input_collection.collecting",
+                    locale=locale,
+                    file_count=int(metadata.get("file_count") or 0),
+                    text_part_count=int(
+                        metadata.get("text_part_count") or 0
+                    ),
+                ),
+                delivery_mode="edit_status",
+            )
+
+        input_batch_id = str(metadata.get("input_batch_id") or "").strip()
+        presentation_guard = getattr(
+            artifact_gateway,
+            "explicit_presentation_guard",
+            None,
         )
-        return await server.finish_status_or_send_reply(
-            update=values["update"],
-            status_message=status_message,
-            text=server._localized(
-                "input_collection.collecting",
-                locale=locale,
-                file_count=int(metadata.get("file_count") or 0),
-                text_part_count=int(metadata.get("text_part_count") or 0),
-            ),
-            delivery_mode="edit_status",
-        )
+        if input_batch_id and callable(presentation_guard):
+            async with presentation_guard(input_batch_id) as current:
+                if current is not None and current.get("terminal"):
+                    server.logger.info(
+                        "telegram_stale_collection_update_suppressed "
+                        "input_batch_id=%s terminal_action=%s",
+                        input_batch_id,
+                        current.get("action"),
+                    )
+                    return None
+                if current is not None:
+                    metadata["file_count"] = int(
+                        current.get("file_count") or 0
+                    )
+                    metadata["text_part_count"] = int(
+                        current.get("text_part_count") or 0
+                    )
+                    metadata["presentation_message_id"] = current.get(
+                        "presentation_message_id"
+                    )
+                return await deliver_collection_update()
+        return await deliver_collection_update()
 
     completion = _build_output_completion_context(values, metadata)
     token = (

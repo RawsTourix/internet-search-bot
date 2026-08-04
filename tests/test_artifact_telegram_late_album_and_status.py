@@ -1,5 +1,6 @@
 import os
 import unittest
+from contextlib import asynccontextmanager
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -108,6 +109,94 @@ class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
         called_status = finish.await_args.kwargs["status_message"]
         self.assertEqual(called_status.message_id, 200)
 
+    async def test_pending_collection_uses_latest_guarded_counts(self):
+        update = self._update(message_id=51)
+        finish = AsyncMock(return_value=SimpleNamespace(message_id=200))
+
+        class GuardedGateway:
+            @asynccontextmanager
+            async def explicit_presentation_guard(self, input_batch_id):
+                self.input_batch_id = input_batch_id
+                yield {
+                    "terminal": False,
+                    "file_count": 30,
+                    "text_part_count": 6,
+                    "presentation_message_id": "200",
+                }
+
+        gateway = GuardedGateway()
+        with (
+            patch.object(telegram_app, "artifact_gateway", gateway),
+            patch.object(
+                telegram_app.server,
+                "finish_status_or_send_reply",
+                finish,
+            ),
+        ):
+            await telegram_app._deliver_agent_result(
+                update=update,
+                status_message=None,
+                success=True,
+                message="",
+                metadata={
+                    "input_collection_pending": True,
+                    "input_batch_id": "ibat_" + "1" * 32,
+                    "presentation_message_id": None,
+                    "file_count": 29,
+                    "text_part_count": 5,
+                    "progress_locale": "ru",
+                },
+                session_id="telegram:conversation:100",
+            )
+
+        self.assertEqual(gateway.input_batch_id, "ibat_" + "1" * 32)
+        called = finish.await_args.kwargs
+        self.assertEqual(called["status_message"].message_id, 200)
+        self.assertIn("Файлы: 30", called["text"])
+        self.assertIn("Сообщения: 6", called["text"])
+
+    async def test_terminal_collection_suppresses_prepared_stale_update(self):
+        update = self._update(message_id=52)
+        finish = AsyncMock()
+
+        class TerminalGateway:
+            @asynccontextmanager
+            async def explicit_presentation_guard(self, input_batch_id):
+                yield {
+                    "terminal": True,
+                    "action": "committed",
+                }
+
+        with (
+            patch.object(
+                telegram_app,
+                "artifact_gateway",
+                TerminalGateway(),
+            ),
+            patch.object(
+                telegram_app.server,
+                "finish_status_or_send_reply",
+                finish,
+            ),
+        ):
+            result = await telegram_app._deliver_agent_result(
+                update=update,
+                status_message=None,
+                success=True,
+                message="",
+                metadata={
+                    "input_collection_pending": True,
+                    "input_batch_id": "ibat_" + "2" * 32,
+                    "file_count": 29,
+                    "text_part_count": 5,
+                    "progress_locale": "ru",
+                },
+                session_id="telegram:conversation:100",
+            )
+
+        self.assertIsNone(result)
+        finish.assert_not_awaited()
+
     async def test_status_bypasses_busy_session_dispatcher(self):
         update = self._update(message_id=60, media_group_id=None)
         update.effective_message.text = "/status"
@@ -152,6 +241,58 @@ class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
             await telegram_app.server.command_handler(
                 update,
                 SimpleNamespace(),
+            )
+
+        send_status.assert_not_awaited()
+        self.assertIsNone(deliver.await_args.kwargs["status_message"])
+
+    async def test_explicit_standalone_file_reuses_collection_status(self):
+        update = self._update(message_id=71, media_group_id=None)
+        send_status = AsyncMock()
+        deliver = AsyncMock()
+        gateway = SimpleNamespace(
+            is_explicit_collection_active=AsyncMock(return_value=True),
+            submit_envelope=AsyncMock(return_value={
+                "status": "collecting",
+                "input_batch_id": "ibat_" + "3" * 32,
+                "duplicate": False,
+            }),
+            commit_and_run=AsyncMock(return_value={
+                "status": "collecting",
+                "response": "",
+                "metadata": {
+                    "input_collection_pending": True,
+                    "input_batch_id": "ibat_" + "3" * 32,
+                },
+            }),
+        )
+        envelope = SimpleNamespace(attachment_slots=[])
+        with (
+            patch.object(telegram_app.server, "artifact_gateway", gateway),
+            patch.object(
+                telegram_app.server,
+                "send_initial_status_message",
+                send_status,
+            ),
+            patch.object(
+                telegram_app.server,
+                "build_telegram_input_envelope",
+                Mock(return_value=envelope),
+            ),
+            patch.object(
+                telegram_app.server,
+                "bind_input_presentation_status",
+                AsyncMock(),
+            ),
+            patch.object(
+                telegram_app.server,
+                "_deliver_agent_result",
+                deliver,
+            ),
+        ):
+            await telegram_app.server._process_standalone_attachment(
+                update,
+                semantic_parts=[],
             )
 
         send_status.assert_not_awaited()

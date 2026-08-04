@@ -22,7 +22,7 @@ from src.ingress import (
     InputGroupingMode,
     create_ingress_services,
 )
-from src.ingress.store import IngressConflictError
+from src.ingress.store import FileSystemInputBatchStore, IngressConflictError
 from src.storage import StorageConfigType, create_storage_services
 
 
@@ -324,6 +324,33 @@ class ArtifactMetadataPublishRetryTests(unittest.TestCase):
                 list(store.versions_dir.glob(f".tmp-{object_id}-*")),
                 [],
             )
+
+
+class IngressMetadataReplaceRetryTests(unittest.TestCase):
+    def test_transient_permission_error_retries_draft_publication(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = FileSystemInputBatchStore(
+                StorageConfigType(root_dir=str(Path(temporary) / "storage"))
+            )
+            target = store.root / "ibat_test" / "draft.json"
+            real_replace = store._replace_file
+            attempts = []
+
+            def flaky_replace(source: Path, destination: Path) -> None:
+                attempts.append((source, destination))
+                if len(attempts) == 1:
+                    raise PermissionError(13, "transient access denied")
+                real_replace(source, destination)
+
+            store._replace_file = flaky_replace
+            store._write_json(target, {"state": "collecting"})
+
+            self.assertEqual(len(attempts), 2)
+            self.assertEqual(
+                store._read_json(target),
+                {"state": "collecting"},
+            )
+            self.assertEqual(list(target.parent.glob(".draft.json.*.tmp")), [])
 
 
 if __name__ == "__main__":

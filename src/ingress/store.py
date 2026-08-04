@@ -5,10 +5,12 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import os
 import stat
 import tempfile
 import threading
+import time
 from pathlib import Path
 from typing import Any
 
@@ -43,6 +45,9 @@ from ..interaction.capabilities import ClientCapabilitySnapshot
 from ..interaction.parts import ArtifactInputManifest, ArtifactManifestItem
 
 
+logger = logging.getLogger("API.Ingress.Store")
+
+
 class IngressConflictError(RuntimeError):
     """Idempotency key was reused with different semantic input."""
 
@@ -65,6 +70,8 @@ def _fingerprint(value: Any) -> str:
 
 
 class _AtomicJsonStore:
+    _REPLACE_RETRY_DELAYS = (0.01, 0.025, 0.05, 0.1, 0.2, 0.4, 0.8)
+
     def __init__(self, root: Path, *, atomic_writes: bool) -> None:
         self.root = root
         self.atomic_writes = atomic_writes
@@ -74,55 +81,96 @@ class _AtomicJsonStore:
         except OSError as error:
             raise ArtifactStorageError("Failed to initialize ingress storage") from error
 
-    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        data = _canonical_json(payload)
-        temporary: Path | None = None
-        try:
-            if self.atomic_writes:
-                descriptor, name = tempfile.mkstemp(
-                    prefix=f".{path.name}.",
-                    suffix=".tmp",
-                    dir=path.parent,
+    @staticmethod
+    def _replace_file(source: Path, target: Path) -> None:
+        os.replace(source, target)
+
+    def _replace_file_with_retry(self, source: Path, target: Path) -> None:
+        """Retry only transient Windows sharing violations at publication."""
+
+        for attempt, delay in enumerate(
+            (*self._REPLACE_RETRY_DELAYS, None),
+            start=1,
+        ):
+            try:
+                self._replace_file(source, target)
+                return
+            except OSError as error:
+                if delay is None or not isinstance(error, PermissionError):
+                    raise
+                logger.warning(
+                    "ingress_metadata_replace_retry target=%s attempt=%s "
+                    "delay_seconds=%s winerror=%s",
+                    target.name,
+                    attempt,
+                    delay,
+                    getattr(error, "winerror", None),
                 )
-                os.close(descriptor)
-                temporary = Path(name)
-                with temporary.open("wb") as output:
-                    output.write(data)
-                    output.flush()
+                time.sleep(delay)
+
+    def _write_json(self, path: Path, payload: dict[str, Any]) -> None:
+        # Reads and writes use one re-entrant store lock. On Windows even a
+        # short-lived reader can otherwise make replacement of draft.json fail
+        # with a sharing violation while many events join one InputBatch.
+        with self._lock:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            data = _canonical_json(payload)
+            temporary: Path | None = None
+            try:
+                if self.atomic_writes:
+                    descriptor, name = tempfile.mkstemp(
+                        prefix=f".{path.name}.",
+                        suffix=".tmp",
+                        dir=path.parent,
+                    )
+                    os.close(descriptor)
+                    temporary = Path(name)
+                    with temporary.open("wb") as output:
+                        output.write(data)
+                        output.flush()
+                        try:
+                            os.fsync(output.fileno())
+                        except OSError:
+                            pass
+                    self._replace_file_with_retry(temporary, path)
+                    temporary = None
+                else:
+                    path.write_bytes(data)
+            except OSError as error:
+                raise ArtifactStorageError(
+                    "Failed to persist ingress metadata"
+                ) from error
+            finally:
+                if temporary is not None:
                     try:
-                        os.fsync(output.fileno())
+                        temporary.unlink(missing_ok=True)
                     except OSError:
                         pass
-                os.replace(temporary, path)
-                temporary = None
-            else:
-                path.write_bytes(data)
-        except OSError as error:
-            raise ArtifactStorageError("Failed to persist ingress metadata") from error
-        finally:
-            if temporary is not None:
-                try:
-                    temporary.unlink(missing_ok=True)
-                except OSError:
-                    pass
 
-    @staticmethod
-    def _read_json(path: Path) -> dict[str, Any]:
-        if not path.exists() and not path.is_symlink():
-            raise IngressNotFoundError(f"Unknown ingress object {path.name}")
-        try:
-            mode = path.lstat().st_mode
-            if path.is_symlink() or not stat.S_ISREG(mode):
-                raise ArtifactIntegrityError("Invalid ingress metadata file")
-            payload = json.loads(path.read_text(encoding="utf-8"))
-        except (IngressNotFoundError, ArtifactIntegrityError):
-            raise
-        except Exception as error:
-            raise ArtifactStorageError("Failed to load ingress metadata") from error
-        if not isinstance(payload, dict):
-            raise ArtifactIntegrityError("Ingress metadata root must be an object")
-        return payload
+    def _read_json(self, path: Path) -> dict[str, Any]:
+        with self._lock:
+            if not path.exists() and not path.is_symlink():
+                raise IngressNotFoundError(
+                    f"Unknown ingress object {path.name}"
+                )
+            try:
+                mode = path.lstat().st_mode
+                if path.is_symlink() or not stat.S_ISREG(mode):
+                    raise ArtifactIntegrityError(
+                        "Invalid ingress metadata file"
+                    )
+                payload = json.loads(path.read_text(encoding="utf-8"))
+            except (IngressNotFoundError, ArtifactIntegrityError):
+                raise
+            except Exception as error:
+                raise ArtifactStorageError(
+                    "Failed to load ingress metadata"
+                ) from error
+            if not isinstance(payload, dict):
+                raise ArtifactIntegrityError(
+                    "Ingress metadata root must be an object"
+                )
+            return payload
 
 
 class FileSystemIngressEventStore(_AtomicJsonStore):

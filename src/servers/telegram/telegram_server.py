@@ -246,6 +246,17 @@ def _safe_transport_error(
     return _localized("error.internal", locale=locale)
 
 
+async def _claim_explicit_failure_notification(session_id: str) -> bool:
+    claim = getattr(
+        artifact_gateway,
+        "claim_explicit_ingress_failure",
+        None,
+    )
+    if not callable(claim):
+        return True
+    return bool(await claim(session_id))
+
+
 async def send_to_gateway(payload: dict) -> tuple[bool, str, dict[str, Any]]:
     try:
         timeout = httpx.Timeout(
@@ -980,6 +991,13 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as error:
         logger.exception("Telegram semantic text input failed: %r", error)
+        if not await _claim_explicit_failure_notification(session_id):
+            logger.info(
+                "telegram_collection_cascade_error_suppressed "
+                "session_id=%s input_kind=message",
+                session_id,
+            )
+            return
         await _deliver_agent_result(
             update=update,
             status_message=None,
@@ -1098,15 +1116,25 @@ async def _process_standalone_attachment(
     *,
     semantic_parts: list[Any] | None = None,
 ) -> None:
-    status_message = await send_initial_status_message(
-        update,
-        _localized(
-            "input.file_received",
-            locale=detect_progress_locale(update),
-        ),
-    )
     progress_locale = detect_progress_locale(update)
     session_id = _session_for_update(update)
+    explicit_active = False
+    collection_active = getattr(
+        artifact_gateway,
+        "is_explicit_collection_active",
+        None,
+    )
+    if callable(collection_active):
+        explicit_active = await collection_active(session_id)
+    status_message = None
+    if not explicit_active:
+        status_message = await send_initial_status_message(
+            update,
+            _localized(
+                "input.file_received",
+                locale=progress_locale,
+            ),
+        )
     generation = session_generations.current(session_id)
     try:
         if semantic_parts is None:
@@ -1180,6 +1208,13 @@ async def _process_standalone_attachment(
         )
     except Exception as error:
         logger.exception("Standalone Telegram attachment failed: %r", error)
+        if not await _claim_explicit_failure_notification(session_id):
+            logger.info(
+                "telegram_collection_cascade_error_suppressed "
+                "session_id=%s input_kind=file",
+                session_id,
+            )
+            return
         await _deliver_agent_result(
             update=update,
             status_message=status_message,
@@ -1342,11 +1377,14 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
     except Exception as error:
         logger.exception("Telegram media-group member failed: %r", error)
+        notify = await _claim_explicit_failure_notification(group.session_id)
         if not await _claim_group_failure(group):
             return
         abort_group = getattr(media_group_runner, "abort", None)
         if callable(abort_group):
             await abort_group(group_key)
+        if not notify:
+            return
         await _deliver_agent_result(
             update=group.update,
             status_message=group.status_message,

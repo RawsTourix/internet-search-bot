@@ -65,6 +65,7 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
             "input_batch_id": "ibat_" + "2" * 32,
             "duplicate": False,
             "error_code": None,
+            "ack_policy": "create",
             "presentation_ref": {
                 "presentation_id": "iprs_" + "4" * 32,
                 "presentation_token": "plain-token",
@@ -125,6 +126,154 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(pending["status"], "collecting")
         self.assertTrue(pending["metadata"]["input_collection_pending"])
         self.assertEqual(pending["metadata"]["text_part_count"], 1)
+
+    async def test_collection_command_status_is_authoritative_for_updates(self):
+        async def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/internal/input-collections/start":
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "action": "start",
+                        "status": "started",
+                        "duplicate": False,
+                        "collection": None,
+                        "input_batch_id": None,
+                        "draft_state": None,
+                        "file_count": 0,
+                        "text_part_count": 0,
+                        "semantic_part_count": 0,
+                        "committed_batch": None,
+                        "error_code": None,
+                    },
+                )
+            if request.url.path == "/ingress/events":
+                return httpx.Response(
+                    202,
+                    request=request,
+                    json=self._explicit_submission(),
+                )
+            if request.url.path.endswith("/bind"):
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "input_batch_id": "ibat_" + "2" * 32,
+                        "client_message_id": "42",
+                        "presentation_generation": 1,
+                        "state": "bound",
+                    },
+                )
+            raise AssertionError(f"unexpected HTTP call: {request.url.path}")
+
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(handler),
+        )
+        session_id = "telegram:conversation:chat-1"
+        await bridge.start_collection(
+            session_id=session_id,
+            chat_id="chat-1",
+            thread_id=None,
+            principal_id="user-1",
+            idempotency_key="collect-1",
+            locale="ru",
+            response_route={
+                "route_type": "telegram",
+                "conversation_id": "chat-1",
+                "metadata": {
+                    "progress_target": {
+                        "chat_id": "chat-1",
+                        "message_id": 42,
+                    }
+                },
+            },
+        )
+        submission = await bridge.submit_envelope(
+            self._envelope(),
+            progress_locale="ru",
+        )
+        pending = await bridge.commit_and_run(
+            submission["input_batch_id"],
+            session_id=session_id,
+            progress_locale="ru",
+        )
+
+        self.assertEqual(
+            pending["metadata"]["presentation_message_id"],
+            "42",
+        )
+        self.assertEqual(
+            pending["metadata"]["input_batch_id"],
+            submission["input_batch_id"],
+        )
+        self.assertEqual(submission["ack_policy"], "update_existing")
+
+    async def test_out_of_order_submissions_cannot_regress_counts(self):
+        counts = iter(((10, 3), (8, 2)))
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            file_count, text_count = next(counts)
+            payload = self._explicit_submission()
+            payload["presentation_event"]["params"].update({
+                "file_count": file_count,
+                "text_part_count": text_count,
+            })
+            return httpx.Response(202, request=request, json=payload)
+
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(handler),
+        )
+        first = await bridge.submit_envelope(
+            self._group_envelope("newer"),
+            progress_locale="ru",
+        )
+        await bridge.submit_envelope(
+            self._group_envelope("older"),
+            progress_locale="ru",
+        )
+        pending = await bridge.commit_and_run(
+            first["input_batch_id"],
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+        )
+
+        self.assertEqual(pending["metadata"]["file_count"], 10)
+        self.assertEqual(pending["metadata"]["text_part_count"], 3)
+
+    async def test_collection_failure_notification_is_claimed_once(self):
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(
+                lambda request: httpx.Response(500, request=request)
+            ),
+        )
+        session_id = "telegram:conversation:chat-1"
+        batch_id = "ibat_" + "2" * 32
+        bridge._active_collection_sessions.add(session_id)
+        bridge._explicit_batches[batch_id] = {
+            "session_id": session_id,
+            "collection_id": "icol_" + "3" * 32,
+            "file_count": 25,
+            "text_part_count": 3,
+            "presentation_ref": {"client_message_id": "42"},
+        }
+
+        first = await bridge.claim_explicit_ingress_failure(session_id)
+        second = await bridge.claim_explicit_ingress_failure(session_id)
+
+        self.assertTrue(first)
+        self.assertFalse(second)
+        async with bridge.explicit_presentation_guard(batch_id) as state:
+            self.assertTrue(state["terminal"])
+            self.assertEqual(state["action"], "failed")
 
     async def test_active_collection_does_not_bind_text_to_one_of_many_albums(self):
         requests = []
