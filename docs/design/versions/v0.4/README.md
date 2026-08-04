@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-02
+last_reviewed: 2026-08-04
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -27,8 +27,8 @@ Application/hosting profiles определены в
 | 3 | [`v0.4-cycle-compaction`](v0.4-cycle-compaction.md) | implemented | `CycleWorkingMemory` и compaction закрытых segments |
 | 4 | [`v0.4-dag-planning`](v0.4-dag-planning.md) | implemented | Optional runtime-owned DAG без scheduler |
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
-| 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | partial (`AF-25`/`AF-26` live gate) | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
-| 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented; acceptance pending | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
+| 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | implemented | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
+| 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
 | 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Reusable `AgentRuntime`, Service Application composition, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
 | 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и profile-aware transport admission |
@@ -42,6 +42,8 @@ Robustness tests выявили follow-up hardening:
   process-restart reconciliation;
 - `AF-26`: exact active-album sequencing, native document-group delivery,
   READY authority cleanup, terminal status fallback и явный artifact format.
+
+`AF-24`–`AF-26` завершили automated и maintainer live acceptance 2026-08-04.
 
 `v0.4-batch-workflows` реализует:
 
@@ -69,11 +71,16 @@ Thematic PR CI проверяет compile и отдельные artifact/storage
 suites. Точный последний head и результаты run фиксируются в GitHub Actions и
 описании PR, а не дублируются здесь после каждого закрывающего коммита.
 
-Перед закрытием acceptance остаются новый full Windows run и повторные живые
-Telegram scenarios: ordinary AUTO text, canonical controls, preservation collection
-snapshot, WAITING_USER continuation, same-session file handoff, `/reset`, rapid FIFO
-sequence и cancellation до окончания album quiet period. Статус перед release всегда
-проверяется по коду, тестам и live evidence.
+Финальная acceptance `v0.4-file-artifacts-advanced` и
+`v0.4-batch-workflows` завершена 2026-08-04. Полный Windows baseline,
+расширенная synthetic Web/Telegram/artifact прожарка, race/randomized checks и
+живые Telegram scenarios подтвердили принятые контракты без новых deterministic
+или flaky defects. Точное evidence находится в
+[`../../../reports/v0.4-transport-artifact-roast.md`](../../../reports/v0.4-transport-artifact-roast.md),
+тематических README и описании PR.
+
+Общий статус `v0.4` остаётся `partial`, поскольку `v0.4-input-runtime`,
+`v0.4-runtime-modularization` и `v0.4-mcp-registry-foundation` ещё не завершены.
 
 ## Связующие документы версии
 
