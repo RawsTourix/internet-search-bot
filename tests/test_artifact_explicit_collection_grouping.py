@@ -26,6 +26,10 @@ from src.ingress.explicit_policy import (
     EXPLICIT_COLLECTION_ROUTE_METADATA_KEY,
 )
 from src.ingress.store import IngressConflictError
+from src.interaction.presentation import (
+    PresentationAckPolicy,
+    PresentationState,
+)
 from src.storage import StorageConfigType, create_storage_services
 
 
@@ -185,6 +189,93 @@ class ExplicitCollectionGroupingTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(committed.committed_batch.text_parts), 2)
         self.assertEqual(committed.committed_batch.artifact_refs, [])
+
+    async def test_later_explicit_event_relocates_status_below_user_message(self):
+        await self._start_collection()
+        first_envelope = self._text_envelope("relocation-first").model_copy(
+            update={"source_message_id": "400"}
+        )
+        first = await self.service.submit_atomic(
+            first_envelope,
+            session_id=self.session_id,
+        )
+        await self.ingress.presentation_store.bind(
+            first.presentation_ref.presentation_id,
+            client_message_id="500",
+            token=first.presentation_ref.presentation_token,
+        )
+
+        second_envelope = self._text_envelope("relocation-second").model_copy(
+            update={"source_message_id": "600"}
+        )
+        second = await self.service.submit_atomic(
+            second_envelope,
+            session_id=self.session_id,
+        )
+
+        self.assertEqual(second.ack_policy, PresentationAckPolicy.RELOCATE)
+        self.assertEqual(
+            second.presentation_ref.previous_client_message_id,
+            "500",
+        )
+        self.assertEqual(second.presentation_ref.relocation_generation, 2)
+
+    async def test_send_closes_bound_collection_presentation(self):
+        await self._start_collection()
+        submitted = await self.service.submit_atomic(
+            self._text_envelope("presentation-send"),
+            session_id=self.session_id,
+        )
+        ref = submitted.presentation_ref
+        self.assertIsNotNone(ref)
+        self.assertIsNotNone(ref.presentation_token)
+        bound = await self.ingress.presentation_store.bind(
+            ref.presentation_id,
+            client_message_id="500",
+            token=ref.presentation_token,
+        )
+        self.assertEqual(bound.state, PresentationState.BOUND)
+
+        await self.control.commit(
+            self._scope(),
+            idempotency_key="send-presentation",
+        )
+
+        closed = await self.ingress.presentation_store.get(
+            ref.presentation_id
+        )
+        self.assertEqual(closed.state, PresentationState.CLOSED)
+        self.assertEqual(
+            await self.ingress.presentation_store.list_recoverable(),
+            [],
+        )
+
+    async def test_cancel_closes_bound_collection_presentation(self):
+        await self._start_collection()
+        submitted = await self.service.submit_atomic(
+            self._text_envelope("presentation-cancel"),
+            session_id=self.session_id,
+        )
+        ref = submitted.presentation_ref
+        await self.ingress.presentation_store.bind(
+            ref.presentation_id,
+            client_message_id="501",
+            token=ref.presentation_token,
+        )
+
+        await self.control.cancel(
+            self._scope(),
+            idempotency_key="cancel-presentation",
+        )
+
+        closed = await self.ingress.presentation_store.get(
+            ref.presentation_id
+        )
+        self.assertEqual(closed.state, PresentationState.CLOSED)
+        self.assertEqual(
+            await self.ingress.presentation_store.list_recoverable(),
+            [],
+        )
 
     async def test_mixed_files_and_text_share_one_explicit_batch(self):
         await self._start_collection()

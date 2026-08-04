@@ -636,6 +636,7 @@ class TelegramArtifactGatewayClient:
         *,
         session_id: str,
         progress_locale: str,
+        progress_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async with self._client() as client:
             response = await client.post(
@@ -643,6 +644,7 @@ class TelegramArtifactGatewayClient:
                 json={
                     "session_id": session_id,
                     "progress_locale": progress_locale,
+                    "progress_metadata": dict(progress_metadata or {}),
                 },
             )
             response.raise_for_status()

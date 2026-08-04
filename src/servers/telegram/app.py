@@ -28,7 +28,10 @@ from .config import (
     TELEGRAM_READY_OUTBOX_MINIMUM_AGE_SECONDS,
     TELEGRAM_READY_OUTBOX_POLL_SECONDS,
 )
-from .presentation_relocation import apply_relocating_input_ack_policy
+from .presentation_relocation import (
+    apply_relocating_input_ack_policy,
+    replace_unbound_collection_command_status,
+)
 from .ready_outbox import TelegramReadyOutboxWorker
 from .run_progress_bridge import RunScopedProgressTelegramGatewayClient
 from .runtime_state import TelegramSessionDispatcher
@@ -199,15 +202,31 @@ def _queued_process_update(update):
     message = getattr(update, "effective_message", None)
     text = str(getattr(message, "text", "") or "").strip().lower()
     command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
-    # Only short collection-control mutations need transport admission order.
-    # Data handlers proceed concurrently until the Gateway committed-batch
-    # coordinator, so a second batch can actually enter its observable FIFO.
-    # Read-only /status and reset always bypass this lane.
-    if command in {"/collect", "/send", "/cancel"}:
-        return session_dispatcher.submit(
-            session_id,
-            lambda: _base_process_update(update),
+    is_command = command.startswith("/")
+    collection_command = command in {"/collect", "/send", "/cancel"}
+    collection_active = getattr(
+        artifact_gateway,
+        "is_explicit_collection_active_now",
+        lambda _session_id: False,
+    )(session_id)
+    # A collection command and every data update that can observe it share one
+    # exact FIFO admission lane. Ordinary auto-mode messages remain concurrent
+    # once no collection command is pending, so agent execution is not
+    # serialized accidentally. Read-only /status and reset still bypass it.
+    if (
+        collection_command
+        or (
+            not is_command
+            and (
+                collection_active
+                or session_dispatcher.has_pending(session_id)
+            )
         )
+    ):
+        operation = lambda: _base_process_update(update)
+        if collection_command:
+            return session_dispatcher.submit(session_id, operation)
+        return session_dispatcher.submit_shared(session_id, operation)
     return _base_process_update(update)
 
 
@@ -293,7 +312,18 @@ async def _remember_auto_run_presentation(
 
 
 async def _apply_input_ack_policy(*, update, submission, session_id):
-    if _is_committed_text_only_submission(submission):
+    if (
+        submission.get("_telegram_previous_unbound_status_message_id")
+        is not None
+    ):
+        status_message = await replace_unbound_collection_command_status(
+            server=server,
+            gateway=artifact_gateway,
+            update=update,
+            submission=submission,
+            session_id=session_id,
+        )
+    elif _is_committed_text_only_submission(submission):
         status_message = await server.send_initial_status_message(
             update,
             _message_received_text(update, submission),
@@ -312,6 +342,10 @@ async def _apply_input_ack_policy(*, update, submission, session_id):
             session_id=session_id,
         )
     await _remember_presentation_handle(submission, status_message)
+    await server.adopt_input_batch_status(
+        str(submission.get("input_batch_id") or ""),
+        status_message,
+    )
     await _remember_auto_run_presentation(
         update=update,
         submission=submission,

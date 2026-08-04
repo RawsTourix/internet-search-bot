@@ -20,6 +20,7 @@ from src.ingress import (
     create_ingress_services,
 )
 from src.storage import StorageConfigType, create_storage_services
+from src.interaction.presentation import PresentationState
 
 
 async def chunks(value: bytes):
@@ -261,6 +262,44 @@ class ArtifactIngressStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(len(current.attachment_parts), 1)
         self.assertEqual(len(current.text_parts), 1)
+
+    async def test_terminal_draft_closes_legacy_bound_presentation(self):
+        submission = await self.service.submit_atomic(
+            self._instruction_envelope("terminal-presentation"),
+            session_id=self.session_id,
+        )
+        draft = await self.ingress.batch_store.get_draft(
+            submission.input_batch_id
+        )
+        coordinator = self.service.presentation_coordinator
+        _, _, ref = await coordinator.present(
+            input_batch_id=draft.input_batch_id,
+            client_binding_id="telegram:legacy:startup-recovery:-",
+            locale="ru",
+            state="collecting",
+            file_count=0,
+            text_part_count=1,
+            response_anchor=draft.response_anchor,
+        )
+        await self.ingress.presentation_store.bind(
+            ref.presentation_id,
+            client_message_id="700",
+            token=ref.presentation_token,
+        )
+
+        self._recreate_runtime()
+        await self.service.commit_ready_drafts()
+        report = self.service.last_startup_recovery_report
+
+        recovered = await self.ingress.presentation_store.get(
+            ref.presentation_id
+        )
+        self.assertEqual(recovered.state, PresentationState.CLOSED)
+        self.assertIn(ref.presentation_id, report.finalized_presentation_ids)
+        self.assertEqual(
+            await self.ingress.presentation_store.list_recoverable(),
+            [],
+        )
 
 
 if __name__ == "__main__":

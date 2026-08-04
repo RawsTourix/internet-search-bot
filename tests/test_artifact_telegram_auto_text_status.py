@@ -72,6 +72,44 @@ class TelegramAutoTextStatusTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertIs(result, status)
 
+    async def test_first_collection_event_replaces_command_status(self):
+        status = SimpleNamespace(message_id=300)
+        submission = {
+            "status": "collecting",
+            "input_batch_id": "ibat-test",
+            "ack_policy": "create",
+            "_telegram_previous_unbound_status_message_id": "100",
+        }
+        replace = AsyncMock(return_value=status)
+
+        with patch.object(
+            telegram_app,
+            "replace_unbound_collection_command_status",
+            new=replace,
+        ), patch.object(
+            telegram_app,
+            "_remember_presentation_handle",
+            new=AsyncMock(),
+        ), patch.object(
+            telegram_app,
+            "_remember_auto_run_presentation",
+            new=AsyncMock(),
+        ):
+            result = await telegram_app._apply_input_ack_policy(
+                update=self._update(),
+                submission=submission,
+                session_id="telegram:conversation:12345",
+            )
+
+        self.assertIs(result, status)
+        replace.assert_awaited_once_with(
+            server=telegram_app.server,
+            gateway=telegram_app.artifact_gateway,
+            update=self._update(),
+            submission=submission,
+            session_id="telegram:conversation:12345",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

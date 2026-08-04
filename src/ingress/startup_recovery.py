@@ -5,7 +5,13 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass
 
-from .models import CommittedInputBatch, InputBatchDraft, InputGroupingMode
+from ..interaction.presentation import PresentationState
+from .models import (
+    CommittedInputBatch,
+    InputBatchDraft,
+    InputBatchDraftState,
+    InputGroupingMode,
+)
 
 
 logger = logging.getLogger("API.Ingress.StartupRecovery")
@@ -15,6 +21,7 @@ logger = logging.getLogger("API.Ingress.StartupRecovery")
 class IngressStartupRecoveryReport:
     committed_input_batch_ids: tuple[str, ...]
     abandoned_input_batch_ids: tuple[str, ...]
+    finalized_presentation_ids: tuple[str, ...] = ()
 
     @property
     def committed_count(self) -> int:
@@ -23,6 +30,10 @@ class IngressStartupRecoveryReport:
     @property
     def abandoned_count(self) -> int:
         return len(self.abandoned_input_batch_ids)
+
+    @property
+    def finalized_presentation_count(self) -> int:
+        return len(self.finalized_presentation_ids)
 
 
 async def reconcile_ingress_after_restart(
@@ -93,6 +104,42 @@ async def reconcile_ingress_after_restart(
                     draft.session_id,
                 )
 
+    finalized_presentations: list[str] = []
+    if coordinator is not None:
+        recoverable = await coordinator.store.list_recoverable()
+        terminal_states = {
+            InputBatchDraftState.COMMITTED: PresentationState.CLOSED,
+            InputBatchDraftState.CANCELLED: PresentationState.CLOSED,
+            InputBatchDraftState.FAILED: PresentationState.FAILED,
+            InputBatchDraftState.ABANDONED: PresentationState.FAILED,
+        }
+        for presentation in recoverable:
+            try:
+                draft = await batch_store.get_draft(
+                    presentation.input_batch_id
+                )
+                terminal_state = terminal_states.get(draft.state)
+                if terminal_state is None:
+                    continue
+                await coordinator.store.close(
+                    presentation.presentation_id,
+                    state=terminal_state,
+                    error_code=(
+                        draft.failure_code
+                        if terminal_state == PresentationState.FAILED
+                        else None
+                    ),
+                )
+            except Exception:
+                logger.exception(
+                    "ingress_startup_terminal_presentation_finalize_failed "
+                    "input_batch_id=%s presentation_id=%s",
+                    presentation.input_batch_id,
+                    presentation.presentation_id,
+                )
+            else:
+                finalized_presentations.append(presentation.presentation_id)
+
     report = IngressStartupRecoveryReport(
         committed_input_batch_ids=tuple(
             item.input_batch_id for item in committed
@@ -100,10 +147,13 @@ async def reconcile_ingress_after_restart(
         abandoned_input_batch_ids=tuple(
             item.input_batch_id for item in abandoned
         ),
+        finalized_presentation_ids=tuple(finalized_presentations),
     )
     logger.info(
-        "ingress_startup_reconciliation_completed committed=%s abandoned=%s",
+        "ingress_startup_reconciliation_completed committed=%s abandoned=%s "
+        "finalized_presentations=%s",
         report.committed_count,
         report.abandoned_count,
+        report.finalized_presentation_count,
     )
     return report

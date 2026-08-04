@@ -1,3 +1,4 @@
+import asyncio
 import os
 import unittest
 from contextlib import asynccontextmanager
@@ -11,6 +12,7 @@ os.environ.setdefault("TELEGRAM_API_KEY", "telegram-test-key")
 os.environ.setdefault("GATEWAY_URL", "http://gateway.test")
 
 from src.servers.telegram import app as telegram_app
+from src.servers.telegram.runtime_state import TelegramSessionDispatcher
 
 
 class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
@@ -211,6 +213,156 @@ class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
         base.assert_awaited_once_with(update)
         submit.assert_not_called()
 
+    async def test_message_cannot_overtake_pending_collect_command(self):
+        collect = self._update(message_id=61, media_group_id=None)
+        collect.effective_message.text = "/collect"
+        message = self._update(message_id=62, media_group_id=None)
+        message.effective_message.text = "hello"
+        dispatcher = TelegramSessionDispatcher()
+        collect_started = asyncio.Event()
+        release_collect = asyncio.Event()
+        order: list[str] = []
+
+        async def process(update):
+            if update.effective_message.text == "/collect":
+                order.append("collect-start")
+                collect_started.set()
+                await release_collect.wait()
+                order.append("collect-end")
+            else:
+                order.append("message")
+
+        gateway = SimpleNamespace(
+            is_explicit_collection_active_now=lambda _session_id: False,
+        )
+        try:
+            with (
+                patch.object(telegram_app, "_base_process_update", process),
+                patch.object(telegram_app, "session_dispatcher", dispatcher),
+                patch.object(telegram_app, "artifact_gateway", gateway),
+            ):
+                collect_task = asyncio.create_task(
+                    telegram_app._queued_process_update(collect)
+                )
+                await collect_started.wait()
+                message_task = asyncio.create_task(
+                    telegram_app._queued_process_update(message)
+                )
+                await asyncio.sleep(0)
+                self.assertEqual(order, ["collect-start"])
+
+                release_collect.set()
+                await asyncio.gather(collect_task, message_task)
+        finally:
+            await dispatcher.shutdown()
+
+        self.assertEqual(
+            order,
+            ["collect-start", "collect-end", "message"],
+        )
+
+    async def test_active_collection_data_and_send_share_fifo_lane(self):
+        message = self._update(message_id=63, media_group_id=None)
+        message.effective_message.text = "hello"
+        send = self._update(message_id=64, media_group_id=None)
+        send.effective_message.text = "/send"
+        dispatcher = TelegramSessionDispatcher()
+        message_started = asyncio.Event()
+        release_message = asyncio.Event()
+        order: list[str] = []
+
+        async def process(update):
+            if update.effective_message.text == "hello":
+                order.append("message-start")
+                message_started.set()
+                await release_message.wait()
+                order.append("message-end")
+            else:
+                order.append("send")
+
+        gateway = SimpleNamespace(
+            is_explicit_collection_active_now=lambda _session_id: True,
+        )
+        try:
+            with (
+                patch.object(telegram_app, "_base_process_update", process),
+                patch.object(telegram_app, "session_dispatcher", dispatcher),
+                patch.object(telegram_app, "artifact_gateway", gateway),
+            ):
+                message_task = asyncio.create_task(
+                    telegram_app._queued_process_update(message)
+                )
+                await message_started.wait()
+                send_task = asyncio.create_task(
+                    telegram_app._queued_process_update(send)
+                )
+                await asyncio.sleep(0)
+                self.assertEqual(order, ["message-start"])
+
+                release_message.set()
+                await asyncio.gather(message_task, send_task)
+        finally:
+            await dispatcher.shutdown()
+
+        self.assertEqual(
+            order,
+            ["message-start", "message-end", "send"],
+        )
+
+    async def test_active_collection_files_run_in_parallel_before_send(self):
+        first_file = self._update(message_id=65, media_group_id="album-1")
+        first_file.effective_message.text = None
+        second_file = self._update(message_id=66, media_group_id="album-1")
+        second_file.effective_message.text = None
+        send = self._update(message_id=67, media_group_id=None)
+        send.effective_message.text = "/send"
+        dispatcher = TelegramSessionDispatcher()
+        first_started = asyncio.Event()
+        second_started = asyncio.Event()
+        release_files = asyncio.Event()
+        send_started = asyncio.Event()
+
+        async def process(update):
+            message_id = update.effective_message.message_id
+            if message_id == 65:
+                first_started.set()
+                await release_files.wait()
+            elif message_id == 66:
+                second_started.set()
+                await release_files.wait()
+            else:
+                send_started.set()
+
+        gateway = SimpleNamespace(
+            is_explicit_collection_active_now=lambda _session_id: True,
+        )
+        try:
+            with (
+                patch.object(telegram_app, "_base_process_update", process),
+                patch.object(telegram_app, "session_dispatcher", dispatcher),
+                patch.object(telegram_app, "artifact_gateway", gateway),
+            ):
+                first_task = asyncio.create_task(
+                    telegram_app._queued_process_update(first_file)
+                )
+                second_task = asyncio.create_task(
+                    telegram_app._queued_process_update(second_file)
+                )
+                send_task = asyncio.create_task(
+                    telegram_app._queued_process_update(send)
+                )
+
+                await asyncio.wait_for(first_started.wait(), timeout=1.0)
+                await asyncio.wait_for(second_started.wait(), timeout=1.0)
+                self.assertFalse(send_started.is_set())
+
+                release_files.set()
+                await asyncio.gather(first_task, second_task, send_task)
+        finally:
+            await dispatcher.shutdown()
+
+        self.assertTrue(send_started.is_set())
+
     async def test_status_command_does_not_create_processing_message(self):
         update = self._update(message_id=70, media_group_id=None)
         update.effective_message.text = "/status"
@@ -246,17 +398,27 @@ class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
         send_status.assert_not_awaited()
         self.assertIsNone(deliver.await_args.kwargs["status_message"])
 
-    async def test_explicit_standalone_file_reuses_collection_status(self):
+    async def test_explicit_standalone_file_propagates_relocated_status(self):
         update = self._update(message_id=71, media_group_id=None)
-        send_status = AsyncMock()
+        upload_status = SimpleNamespace(message_id=150)
+        send_status = AsyncMock(return_value=upload_status)
         deliver = AsyncMock()
+        relocated_status = SimpleNamespace(message_id=200)
+        apply_ack = AsyncMock(return_value=relocated_status)
+        delete = AsyncMock()
+        stop = AsyncMock()
+        test_application = SimpleNamespace(
+            bot=SimpleNamespace(delete_message=delete),
+        )
+        submission = {
+            "status": "collecting",
+            "input_batch_id": "ibat_" + "3" * 32,
+            "duplicate": False,
+            "ack_policy": "relocate",
+        }
         gateway = SimpleNamespace(
             is_explicit_collection_active=AsyncMock(return_value=True),
-            submit_envelope=AsyncMock(return_value={
-                "status": "collecting",
-                "input_batch_id": "ibat_" + "3" * 32,
-                "duplicate": False,
-            }),
+            submit_envelope=AsyncMock(return_value=submission),
             commit_and_run=AsyncMock(return_value={
                 "status": "collecting",
                 "response": "",
@@ -281,13 +443,23 @@ class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
             ),
             patch.object(
                 telegram_app.server,
-                "bind_input_presentation_status",
-                AsyncMock(),
+                "apply_input_ack_policy",
+                apply_ack,
             ),
             patch.object(
                 telegram_app.server,
                 "_deliver_agent_result",
                 deliver,
+            ),
+            patch.object(
+                telegram_app.server,
+                "application",
+                test_application,
+            ),
+            patch.object(
+                telegram_app.server,
+                "stop_progress_edits",
+                stop,
             ),
         ):
             await telegram_app.server._process_standalone_attachment(
@@ -295,8 +467,100 @@ class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
                 semantic_parts=[],
             )
 
-        send_status.assert_not_awaited()
-        self.assertIsNone(deliver.await_args.kwargs["status_message"])
+        send_status.assert_awaited_once()
+        apply_ack.assert_awaited_once_with(
+            update=update,
+            submission=submission,
+            session_id="telegram:conversation:100",
+        )
+        self.assertIs(
+            submission["_telegram_precreated_status_message"],
+            upload_status,
+        )
+        stop.assert_awaited_once_with(chat_id=100, message_id=150)
+        delete.assert_awaited_once_with(chat_id=100, message_id=150)
+        self.assertIs(
+            deliver.await_args.kwargs["status_message"],
+            relocated_status,
+        )
+
+    async def test_explicit_attachment_ack_uses_relocation_not_legacy_bind(self):
+        update = self._update(message_id=72, media_group_id="album-2")
+        old_status = SimpleNamespace(message_id=100)
+        new_status = SimpleNamespace(message_id=200)
+        apply_ack = AsyncMock(return_value=new_status)
+        bind = AsyncMock()
+        delete = AsyncMock()
+        stop = AsyncMock()
+        test_application = SimpleNamespace(
+            bot=SimpleNamespace(delete_message=delete),
+        )
+        submission = {"ack_policy": "relocate"}
+
+        with (
+            patch.object(
+                telegram_app.server,
+                "apply_input_ack_policy",
+                apply_ack,
+            ),
+            patch.object(
+                telegram_app.server,
+                "bind_input_presentation_status",
+                bind,
+            ),
+            patch.object(
+                telegram_app.server,
+                "application",
+                test_application,
+            ),
+            patch.object(
+                telegram_app.server,
+                "stop_progress_edits",
+                stop,
+            ),
+        ):
+            result = await telegram_app.server.apply_attachment_input_ack_policy(
+                update=update,
+                submission=submission,
+                session_id="telegram:conversation:100",
+                status_message=old_status,
+                explicit_active=True,
+            )
+
+        self.assertIs(result, new_status)
+        apply_ack.assert_awaited_once()
+        bind.assert_not_awaited()
+        stop.assert_awaited_once_with(chat_id=100, message_id=100)
+        delete.assert_awaited_once_with(chat_id=100, message_id=100)
+
+    def test_concurrent_stale_status_cannot_replace_relocated_handle(self):
+        current = SimpleNamespace(message_id=200)
+        stale = SimpleNamespace(message_id=100)
+
+        self.assertIs(
+            telegram_app.server._newest_status_message(current, stale),
+            current,
+        )
+
+    def test_explicit_collecting_text_describes_open_batch(self):
+        text = telegram_app.server._presentation_text({
+            "presentation_event": {
+                "message_key": "input_batch.collecting",
+                "locale": "ru",
+                "params": {
+                    "assembly_mode": "explicit",
+                    "commit_policy": "explicit",
+                    "auto_commit_allowed": False,
+                    "file_count": 30,
+                    "text_part_count": 7,
+                },
+            },
+        })
+
+        self.assertIn("Пакет открыт для добавления", text)
+        self.assertIn("Файлы: 30", text)
+        self.assertIn("Сообщения: 7", text)
+        self.assertIn("/send", text)
 
     def test_text_grouping_error_is_not_reported_as_unsafe_file(self):
         error = telegram_app.server.TelegramArtifactBridgeError(

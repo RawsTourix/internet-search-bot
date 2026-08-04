@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 from .collection_models import (
     InputCollectionState,
     InputDraftControlAction,
@@ -21,6 +23,9 @@ from .models import (
 from .store import FileSystemIngressEventStore
 
 
+logger = logging.getLogger("API.Ingress.DraftControl")
+
+
 class InputDraftControlService:
     """Coordinate user control without exposing filesystem mutation to clients."""
 
@@ -30,10 +35,40 @@ class InputDraftControlService:
         event_store: FileSystemIngressEventStore,
         batch_store,
         collection_store: FileSystemInputCollectionStore,
+        presentation_coordinator=None,
     ) -> None:
         self.event_store = event_store
         self.batch_store = batch_store
         self.collection_store = collection_store
+        self.presentation_coordinator = presentation_coordinator
+
+    async def _finalize_presentation(
+        self,
+        draft: InputBatchDraft | None,
+        *,
+        state: str,
+    ) -> None:
+        if draft is None or self.presentation_coordinator is None:
+            return
+        try:
+            await self.presentation_coordinator.finalize_batch(
+                input_batch_id=draft.input_batch_id,
+                state=state,
+                file_count=len(draft.attachment_parts),
+                text_part_count=len(draft.text_parts),
+                response_anchor=draft.response_anchor,
+            )
+        except Exception:
+            # Batch/collection terminality is the primary durable mutation.
+            # Startup reconciliation can safely retry this secondary lifecycle
+            # update, so a presentation-store outage must not turn a successful
+            # /send or /cancel into an ambiguous client failure.
+            logger.exception(
+                "input_collection_presentation_finalize_deferred "
+                "input_batch_id=%s state=%s",
+                draft.input_batch_id,
+                state,
+            )
 
     async def start_collection(
         self,
@@ -224,6 +259,10 @@ class InputDraftControlService:
             committed = await self.batch_store.get_committed(
                 draft.input_batch_id
             )
+            await self._finalize_presentation(
+                draft,
+                state="committed",
+            )
             collection = await self.collection_store.mark_terminal(
                 collection.collection_id,
                 state=InputCollectionState.COMMITTED,
@@ -307,11 +346,18 @@ class InputDraftControlService:
             collection.collection_id,
             state=InputCollectionState.COMMITTED,
         )
+        terminal_draft = await self.batch_store.get_draft(
+            draft.input_batch_id
+        )
+        await self._finalize_presentation(
+            terminal_draft,
+            state="committed",
+        )
         result = await self._result(
             action=InputDraftControlAction.COMMIT,
             status=InputDraftControlStatus.COMMITTED,
             collection=collection,
-            draft=await self.batch_store.get_draft(draft.input_batch_id),
+            draft=terminal_draft,
             committed_batch=committed,
         )
         return await self._save(
@@ -353,6 +399,10 @@ class InputDraftControlService:
             draft = await self.batch_store.cancel_draft(
                 collection.bound_input_batch_id,
                 code="explicit_collection_cancelled",
+            )
+            await self._finalize_presentation(
+                draft,
+                state="cancelled",
             )
         collection = await self.collection_store.mark_terminal(
             collection.collection_id,

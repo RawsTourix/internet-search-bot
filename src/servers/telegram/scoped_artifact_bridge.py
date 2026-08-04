@@ -239,6 +239,7 @@ class InstanceScopedTelegramArtifactGatewayClient(
         *,
         session_id: str,
         progress_locale: str,
+        progress_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Commit durably first, then run the agent as a distinct HTTP stage.
 
@@ -304,10 +305,11 @@ class InstanceScopedTelegramArtifactGatewayClient(
             session_id,
         )
         try:
-            run_payload = await super().run_committed(
+            run_payload = await self.run_committed(
                 input_batch_id,
                 session_id=session_id,
                 progress_locale=progress_locale,
+                progress_metadata=progress_metadata,
             )
         except asyncio.CancelledError:
             logger.info(

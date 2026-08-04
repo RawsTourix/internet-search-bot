@@ -26,7 +26,9 @@ async def apply_relocating_input_ack_policy(
         )
 
     text = server._presentation_text(submission)
-    new_status = await server.send_initial_status_message(update, text)
+    new_status = submission.get("_telegram_precreated_status_message")
+    if new_status is None:
+        new_status = await server.send_initial_status_message(update, text)
     if new_status is None:
         ref = dict(submission.get("presentation_ref") or {})
         old_message_id = ref.get("previous_client_message_id") or ref.get(
@@ -52,6 +54,95 @@ async def apply_relocating_input_ack_policy(
         chat_id=update.effective_chat.id,
         cleanup_unbound=True,
     )
+
+
+async def replace_unbound_collection_command_status(
+    *,
+    server,
+    gateway,
+    update,
+    submission: dict[str, Any],
+    session_id: str,
+):
+    """Bind the first collecting presentation below its first user event."""
+
+    old_value = submission.get(
+        "_telegram_previous_unbound_status_message_id"
+    )
+    try:
+        old_message_id = int(old_value)
+    except (TypeError, ValueError):
+        return None
+
+    new_status = submission.get("_telegram_precreated_status_message")
+    if new_status is None:
+        new_status = await server.send_initial_status_message(
+            update,
+            server._presentation_text(submission),
+        )
+    new_value = getattr(new_status, "message_id", None)
+    try:
+        new_message_id = int(new_value)
+    except (TypeError, ValueError):
+        return SimpleNamespace(message_id=old_message_id)
+
+    try:
+        await gateway.bind_input_presentation(
+            submission.get("presentation_ref"),
+            session_id=session_id,
+            client_message_id=str(new_message_id),
+        )
+    except Exception as error:
+        server.logger.exception(
+            "telegram_first_collection_status_bind_failed "
+            "old_message_id=%s new_message_id=%s error_type=%s",
+            old_message_id,
+            new_message_id,
+            type(error).__name__,
+        )
+        try:
+            await server.application.bot.delete_message(
+                chat_id=update.effective_chat.id,
+                message_id=new_message_id,
+            )
+        except Exception:
+            server.logger.warning(
+                "telegram_unbound_first_status_cleanup_failed message_id=%s",
+                new_message_id,
+            )
+        return SimpleNamespace(message_id=old_message_id)
+
+    register_redirect = getattr(server, "register_progress_redirect", None)
+    if callable(register_redirect):
+        register_redirect(
+            chat_id=update.effective_chat.id,
+            old_message_id=old_message_id,
+            new_message_id=new_message_id,
+        )
+    await server.stop_progress_edits(
+        chat_id=update.effective_chat.id,
+        message_id=old_message_id,
+    )
+    try:
+        await server.application.bot.delete_message(
+            chat_id=update.effective_chat.id,
+            message_id=old_message_id,
+        )
+    except Exception as error:
+        server.logger.warning(
+            "telegram_provisional_collection_status_delete_failed "
+            "message_id=%s error_type=%s",
+            old_message_id,
+            type(error).__name__,
+        )
+
+    server.logger.info(
+        "telegram_first_collection_status_replaced old_message_id=%s "
+        "new_message_id=%s",
+        old_message_id,
+        new_message_id,
+    )
+    return new_status
 
 
 async def relocate_precreated_input_presentation(

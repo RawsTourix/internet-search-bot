@@ -35,13 +35,17 @@ class ReadyOutputAuthority:
 @dataclass(frozen=True, slots=True)
 class OutputStartupRecoveryReport:
     cancelled_legacy_output_batch_ids: tuple[str, ...]
+    cancelled_test_output_batch_ids: tuple[str, ...]
     repaired_output_batch_ids: tuple[str, ...]
     unrepaired_output_batch_ids: tuple[str, ...]
     remaining_ready: tuple[ReadyOutputAuthority, ...]
 
     @property
     def cancelled_count(self) -> int:
-        return len(self.cancelled_legacy_output_batch_ids)
+        return (
+            len(self.cancelled_legacy_output_batch_ids)
+            + len(self.cancelled_test_output_batch_ids)
+        )
 
     @property
     def repaired_count(self) -> int:
@@ -61,7 +65,7 @@ async def reconcile_unclaimable_legacy_ready(
     """
 
     recoverable = await store.list_recoverable()
-    targets = [
+    legacy_targets = [
         batch
         for batch in recoverable
         if batch.state == OutputBatchState.READY
@@ -69,15 +73,35 @@ async def reconcile_unclaimable_legacy_ready(
             _LEGACY_INSTANCE_PREFIX
         )
     ]
-    cancelled: list[str] = []
-    for batch in targets:
+    test_targets = [
+        batch
+        for batch in recoverable
+        if batch.state == OutputBatchState.READY
+        and _is_completed_smoke_authority(batch)
+    ]
+    cancelled_legacy: list[str] = []
+    for batch in legacy_targets:
         changed = await asyncio.to_thread(
             _cancel_ready_sync,
             store,
             batch.output_batch_id,
+            "unclaimable_legacy_client_instance",
         )
         if changed:
-            cancelled.append(batch.output_batch_id)
+            cancelled_legacy.append(batch.output_batch_id)
+
+    cancelled_test: list[str] = []
+    for batch in test_targets:
+        changed = await asyncio.to_thread(
+            _cancel_ready_sync,
+            store,
+            batch.output_batch_id,
+            "completed_smoke_test_client",
+        )
+        if changed:
+            cancelled_test.append(batch.output_batch_id)
+
+    cancelled = {*cancelled_legacy, *cancelled_test}
 
     repaired: list[str] = []
     unrepaired: list[str] = []
@@ -129,16 +153,19 @@ async def reconcile_unclaimable_legacy_ready(
         if batch.state == OutputBatchState.READY
     )
     report = OutputStartupRecoveryReport(
-        cancelled_legacy_output_batch_ids=tuple(cancelled),
+        cancelled_legacy_output_batch_ids=tuple(cancelled_legacy),
+        cancelled_test_output_batch_ids=tuple(cancelled_test),
         repaired_output_batch_ids=tuple(repaired),
         unrepaired_output_batch_ids=tuple(unrepaired),
         remaining_ready=remaining,
     )
     logger.info(
         "output_startup_authority_reconciliation_completed "
-        "cancelled_legacy=%s repaired_ownership=%s unrepaired=%s "
+        "cancelled_legacy=%s cancelled_test=%s repaired_ownership=%s "
+        "unrepaired=%s "
         "remaining_ready=%s",
-        report.cancelled_count,
+        len(report.cancelled_legacy_output_batch_ids),
+        len(report.cancelled_test_output_batch_ids),
         report.repaired_count,
         len(report.unrepaired_output_batch_ids),
         len(report.remaining_ready),
@@ -239,6 +266,7 @@ async def _repair_ready_artifact_ownership(
 def _cancel_ready_sync(
     store: FileSystemOutputBatchStore,
     output_batch_id: str,
+    error_code: str,
 ) -> bool:
     now = datetime.now(timezone.utc)
     with store._lock:
@@ -246,7 +274,14 @@ def _cancel_ready_sync(
         if current.state != OutputBatchState.READY:
             return False
         instance_id = current.capability_snapshot.client_instance_id
-        if not instance_id.startswith(_LEGACY_INSTANCE_PREFIX):
+        allowed = (
+            error_code == "unclaimable_legacy_client_instance"
+            and instance_id.startswith(_LEGACY_INSTANCE_PREFIX)
+        ) or (
+            error_code == "completed_smoke_test_client"
+            and _is_completed_smoke_authority(current)
+        )
+        if not allowed:
             return False
         state_path = store.records / output_batch_id / "state.json"
         state = store._read(state_path)
@@ -254,16 +289,26 @@ def _cancel_ready_sync(
             state=OutputBatchState.CANCELLED.value,
             completed_at=now.isoformat(),
             updated_at=now.isoformat(),
-            error_code="unclaimable_legacy_client_instance",
+            error_code=error_code,
         )
         store._write(state_path, state)
         logger.warning(
-            "output_batch_cancelled_unclaimable_legacy "
+            "output_batch_cancelled_startup_recovery "
             "output_batch_id=%s session_id=%s client_type=%s "
-            "client_instance_id=%s",
+            "client_instance_id=%s error_code=%s",
             output_batch_id,
             current.session_id,
             current.capability_snapshot.client_type,
             instance_id,
+            error_code,
         )
         return True
+
+
+def _is_completed_smoke_authority(batch: OutputBatch) -> bool:
+    """Recognize only the repository's explicit, non-production smoke client."""
+
+    return (
+        batch.capability_snapshot.client_instance_id == "web-artifact-smoke"
+        and batch.response_route.metadata.get("smoke_test") is True
+    )

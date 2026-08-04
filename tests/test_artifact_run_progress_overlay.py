@@ -124,6 +124,57 @@ class RunProgressOverlayTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(body["progress_locale"], "ru")
         self.assertEqual(body["progress_metadata"], progress_metadata)
 
+    async def test_commit_and_run_forwards_exact_status_to_virtual_run(self):
+        captured: list[httpx.Request] = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            captured.append(request)
+            if request.url.path.endswith("/commit"):
+                payload = {
+                    "status": "committed",
+                    "input_batch_id": "ibat_" + "8" * 32,
+                    "duplicate": False,
+                    "metadata": {},
+                }
+            else:
+                payload = {
+                    "status": "ok",
+                    "response": "done",
+                    "metadata": {},
+                }
+            return httpx.Response(200, request=request, json=payload)
+
+        bridge = RunScopedProgressTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(handler),
+        )
+        batch_id = "ibat_" + "8" * 32
+        progress_metadata = {
+            "progress_callback_url": "http://telegram/internal/progress",
+            "progress_target": {"chat_id": 1, "message_id": 800},
+            "status_message_id": 800,
+        }
+
+        result = await bridge.commit_and_run(
+            batch_id,
+            session_id="telegram:conversation:chat-1",
+            progress_locale="ru",
+            progress_metadata=progress_metadata,
+        )
+
+        self.assertEqual(result["response"], "done")
+        self.assertEqual(
+            [request.url.path for request in captured],
+            [
+                f"/input-batches/{batch_id}/commit",
+                f"/input-batches/{batch_id}/run",
+            ],
+        )
+        run_body = json.loads(captured[1].content)
+        self.assertEqual(run_body["progress_metadata"], progress_metadata)
+
     async def test_auto_status_is_consumed_once_by_exact_committed_run(self):
         captured: list[httpx.Request] = []
         bridge = self._bridge(captured)

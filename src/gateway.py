@@ -290,11 +290,18 @@ async def lifespan(app: FastAPI):
             API.artifact_services.delivery_store,
         )
         if output_recovery.cancelled_count:
-            logger.warning(
-                "Cancelled %s unclaimable legacy READY OutputBatch records: %s",
-                output_recovery.cancelled_count,
-                list(output_recovery.cancelled_legacy_output_batch_ids),
-            )
+            if output_recovery.cancelled_legacy_output_batch_ids:
+                logger.warning(
+                    "Cancelled %s unclaimable legacy READY OutputBatch records: %s",
+                    len(output_recovery.cancelled_legacy_output_batch_ids),
+                    list(output_recovery.cancelled_legacy_output_batch_ids),
+                )
+            if output_recovery.cancelled_test_output_batch_ids:
+                logger.warning(
+                    "Cancelled %s completed smoke-test READY OutputBatch records: %s",
+                    len(output_recovery.cancelled_test_output_batch_ids),
+                    list(output_recovery.cancelled_test_output_batch_ids),
+                )
         if output_recovery.repaired_count:
             logger.warning(
                 "Repaired %s READY OutputBatch ownership bindings: %s",

@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+from collections import deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
-from typing import Any, AsyncIterator, Awaitable, Callable
+from typing import Any, AsyncIterator, Awaitable, Callable, Deque
 
 
 @dataclass(slots=True)
@@ -62,22 +63,29 @@ class _QueuedOperation:
     operation: Operation
     future: asyncio.Future[Any]
     generation: int
+    shared: bool
+
+
+@dataclass(slots=True)
+class _SessionLane:
+    pending: Deque[_QueuedOperation]
+    tasks: set[asyncio.Task[None]]
+    active_shared: int = 0
+    active_exclusive: bool = False
 
 
 class TelegramSessionDispatcher:
-    """One explicit FIFO lane per Telegram conversation/thread.
+    """A fair shared/exclusive admission lane per Telegram conversation.
 
-    ``submit`` is intentionally synchronous: the operation is appended at the
-    exact moment ``Application.process_update(update)`` is called, before
-    python-telegram-bot creates a background task.  This is the distinction
-    from a pool of ``asyncio.Lock`` objects: locks provide mutual exclusion but
-    do not preserve admission order when several already-created tasks race to
-    acquire them.
+    Exclusive operations preserve exact FIFO barriers for collection commands.
+    Consecutive shared operations execute concurrently, while an exclusive
+    operation waits for every earlier shared operation and prevents later work
+    from overtaking it. Admission is intentionally synchronous: updates enter
+    the lane before python-telegram-bot creates background handler tasks.
     """
 
     def __init__(self) -> None:
-        self._queues: dict[str, asyncio.Queue[_QueuedOperation]] = {}
-        self._workers: dict[str, asyncio.Task[None]] = {}
+        self._lanes: dict[str, _SessionLane] = {}
         self._closing = False
         self._generations: dict[str, int] = {}
 
@@ -89,7 +97,23 @@ class TelegramSessionDispatcher:
         return normalized
 
     def submit(self, key: str, operation: Operation) -> Awaitable[Any]:
-        """Append one operation now and return an awaitable for its result."""
+        """Append one exclusive operation and return its result awaitable."""
+
+        return self._submit(key, operation, shared=False)
+
+    def submit_shared(self, key: str, operation: Operation) -> Awaitable[Any]:
+        """Append concurrent work without crossing an exclusive FIFO barrier."""
+
+        return self._submit(key, operation, shared=True)
+
+    def _submit(
+        self,
+        key: str,
+        operation: Operation,
+        *,
+        shared: bool,
+    ) -> Awaitable[Any]:
+        """Synchronously admit one operation and return a coroutine waiter."""
 
         normalized = self._normalize_key(key)
         if self._closing:
@@ -102,22 +126,17 @@ class TelegramSessionDispatcher:
 
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
-        queue = self._queues.get(normalized)
-        if queue is None:
-            queue = asyncio.Queue()
-            self._queues[normalized] = queue
-        queue.put_nowait(_QueuedOperation(
+        lane = self._lanes.get(normalized)
+        if lane is None:
+            lane = _SessionLane(pending=deque(), tasks=set())
+            self._lanes[normalized] = lane
+        lane.pending.append(_QueuedOperation(
             operation=operation,
             future=future,
             generation=self._generations.get(normalized, 0),
+            shared=shared,
         ))
-
-        worker = self._workers.get(normalized)
-        if worker is None or worker.done():
-            self._workers[normalized] = loop.create_task(
-                self._run_lane(normalized, queue),
-                name=f"telegram-session-dispatch:{normalized}",
-            )
+        self._schedule_lane(normalized, lane, loop=loop)
 
         async def wait_for_result() -> Any:
             return await future
@@ -129,43 +148,87 @@ class TelegramSessionDispatcher:
 
         return await self.submit(key, operation)
 
-    async def _run_lane(
+    def _schedule_lane(
         self,
         key: str,
-        queue: asyncio.Queue[_QueuedOperation],
+        lane: _SessionLane,
+        *,
+        loop: asyncio.AbstractEventLoop | None = None,
+    ) -> None:
+        if self._closing or self._lanes.get(key) is not lane:
+            return
+        if lane.active_exclusive:
+            return
+
+        event_loop = loop or asyncio.get_running_loop()
+        if lane.active_shared:
+            # Admit newly arriving shared work immediately, but never cross an
+            # exclusive item already waiting at the head of the FIFO queue.
+            while lane.pending and lane.pending[0].shared:
+                self._start_item(key, lane, lane.pending.popleft(), event_loop)
+            return
+
+        if not lane.pending:
+            self._lanes.pop(key, None)
+            return
+
+        if not lane.pending[0].shared:
+            self._start_item(key, lane, lane.pending.popleft(), event_loop)
+            return
+
+        # One shared phase consists of every consecutive data update admitted
+        # before the next command barrier.
+        while lane.pending and lane.pending[0].shared:
+            self._start_item(key, lane, lane.pending.popleft(), event_loop)
+
+    def _start_item(
+        self,
+        key: str,
+        lane: _SessionLane,
+        item: _QueuedOperation,
+        loop: asyncio.AbstractEventLoop,
+    ) -> None:
+        if item.shared:
+            lane.active_shared += 1
+        else:
+            lane.active_exclusive = True
+        task = loop.create_task(
+            self._execute_item(key, lane, item),
+            name=f"telegram-session-dispatch:{key}",
+        )
+        lane.tasks.add(task)
+
+    async def _execute_item(
+        self,
+        key: str,
+        lane: _SessionLane,
+        item: _QueuedOperation,
     ) -> None:
         token = _CURRENT_DISPATCH_KEY.set(key)
         try:
-            while True:
-                item = await queue.get()
-                try:
-                    if item.generation != self._generations.get(key, 0):
-                        raise RuntimeError(
-                            "Telegram update was invalidated by session reset"
-                        )
-                    result = await item.operation()
-                except asyncio.CancelledError:
-                    if not item.future.done():
-                        item.future.cancel()
-                    raise
-                except BaseException as error:
-                    if not item.future.done():
-                        item.future.set_exception(error)
-                else:
-                    if not item.future.done():
-                        item.future.set_result(result)
-                finally:
-                    queue.task_done()
-
-                # No await between the emptiness check and registry cleanup:
-                # synchronous submit() either happened before this block (and
-                # the queue is non-empty) or will create a fresh worker after it.
-                if queue.empty():
-                    self._queues.pop(key, None)
-                    self._workers.pop(key, None)
-                    return
+            if item.generation != self._generations.get(key, 0):
+                raise RuntimeError("Telegram update was invalidated by session reset")
+            result = await item.operation()
+        except asyncio.CancelledError:
+            if not item.future.done():
+                item.future.cancel()
+            raise
+        except BaseException as error:
+            if not item.future.done():
+                item.future.set_exception(error)
+        else:
+            if not item.future.done():
+                item.future.set_result(result)
         finally:
             _CURRENT_DISPATCH_KEY.reset(token)
+            task = asyncio.current_task()
+            if task is not None:
+                lane.tasks.discard(task)
+            if item.shared:
+                lane.active_shared -= 1
+            else:
+                lane.active_exclusive = False
+            self._schedule_lane(key, lane)
 
     async def reset_session(self, key: str) -> int:
         """Invalidate queued callbacks for one Telegram session generation."""
@@ -173,40 +236,58 @@ class TelegramSessionDispatcher:
         normalized = self._normalize_key(key)
         generation = self._generations.get(normalized, 0) + 1
         self._generations[normalized] = generation
-        queue = self._queues.get(normalized)
-        if queue is not None:
-            while not queue.empty():
-                item = queue.get_nowait()
-                queue.task_done()
+        lane = self._lanes.get(normalized)
+        if lane is not None:
+            while lane.pending:
+                item = lane.pending.popleft()
                 if not item.future.done():
                     item.future.set_exception(
                         RuntimeError(
                             "Telegram update was invalidated by session reset"
                         )
                     )
+            self._schedule_lane(normalized, lane)
         return generation
 
     async def shutdown(self) -> None:
         """Cancel lanes and settle every queued waiter during application stop."""
 
         self._closing = True
-        workers = list(self._workers.values())
-        for worker in workers:
-            worker.cancel()
-        if workers:
-            await asyncio.gather(*workers, return_exceptions=True)
+        tasks = [task for lane in self._lanes.values() for task in lane.tasks]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
-        for queue in self._queues.values():
-            while not queue.empty():
-                item = queue.get_nowait()
+        for lane in self._lanes.values():
+            while lane.pending:
+                item = lane.pending.popleft()
                 if not item.future.done():
                     item.future.cancel()
-                queue.task_done()
-        self._queues.clear()
-        self._workers.clear()
+        self._lanes.clear()
 
     def lane_count(self) -> int:
-        return len(self._workers)
+        return len(self._lanes)
+
+    def has_pending(self, key: str) -> bool:
+        """Return whether the exact session already owns an admission lane.
+
+        The check is synchronous on purpose. ``Application.process_update``
+        calls it before creating a handler task, so a data update arriving
+        immediately after ``/collect`` can be appended behind that command
+        without racing an ``await`` boundary.
+        """
+
+        normalized = self._normalize_key(key)
+        lane = self._lanes.get(normalized)
+        return bool(
+            lane is not None
+            and (
+                lane.pending
+                or lane.active_shared
+                or lane.active_exclusive
+            )
+        )
 
 
 class SessionGenerationRegistry:

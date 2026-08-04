@@ -21,6 +21,7 @@ from src.interaction.ids import new_output_part_id
 from src.interaction.output_models import (
     ArtifactOutputPart,
     OutputBatchKind,
+    TextOutputPart,
 )
 from src.interaction.output_startup_recovery import (
     reconcile_unclaimable_legacy_ready,
@@ -34,6 +35,45 @@ from src.storage.config import StorageConfigType
 
 
 class OutputOwnershipStartupRecoveryTests(unittest.IsolatedAsyncioTestCase):
+    async def test_explicit_web_smoke_ready_batch_is_cancelled(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            snapshot = build_default_capability_registry().resolve(
+                build_web_capability_declaration(),
+                client_type="web",
+                client_instance_id="web-artifact-smoke",
+            )
+            store = FileSystemOutputBatchStore(Path(temporary))
+            batch = build_ready_output_batch(
+                session_id="web:conversation:smoke-test",
+                cycle_id="cycle-smoke-test",
+                sequence_number=1,
+                kind=OutputBatchKind.FINAL,
+                response_route=ClientResponseRoute(
+                    route_type="web",
+                    conversation_id="smoke-test",
+                    metadata={"smoke_test": True},
+                ),
+                locale="ru",
+                capability_snapshot=snapshot,
+                parts=(
+                    TextOutputPart(
+                        part_id=new_output_part_id(),
+                        index=0,
+                        text="smoke result",
+                    ),
+                ),
+            )
+            await store.commit(batch)
+
+            report = await reconcile_unclaimable_legacy_ready(store)
+
+            self.assertEqual(
+                report.cancelled_test_output_batch_ids,
+                (batch.output_batch_id,),
+            )
+            self.assertEqual((await store.get(batch.output_batch_id)).state.value, "cancelled")
+            self.assertEqual(report.remaining_ready, ())
+
     async def test_partially_bound_ready_delivery_is_completed_idempotently(self):
         with tempfile.TemporaryDirectory() as temporary:
             prepared = await self._write_unbound_ready(

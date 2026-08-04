@@ -8,6 +8,7 @@ from telegram.error import BadRequest
 from src.servers.telegram.presentation_relocation import (
     apply_relocating_input_ack_policy,
     relocate_precreated_input_presentation,
+    replace_unbound_collection_command_status,
 )
 
 
@@ -86,6 +87,62 @@ class TelegramPresentationRelocationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(receipt.kwargs["generation"], 1)
         self.assertEqual(receipt.kwargs["deletion_state"], "deleted")
+
+    async def test_first_event_binds_new_status_then_deletes_command_status(self):
+        server = self._server()
+        server.artifact_gateway.bind_input_presentation = AsyncMock(
+            return_value={"state": "bound"}
+        )
+        submission = self._submission()
+        submission["ack_policy"] = "create"
+        submission["_telegram_previous_unbound_status_message_id"] = "100"
+
+        result = await replace_unbound_collection_command_status(
+            server=server,
+            gateway=server.artifact_gateway,
+            update=self._update(),
+            submission=submission,
+            session_id="telegram:conversation:12345",
+        )
+
+        self.assertEqual(result.message_id, 200)
+        server.artifact_gateway.bind_input_presentation.assert_awaited_once_with(
+            submission["presentation_ref"],
+            session_id="telegram:conversation:12345",
+            client_message_id="200",
+        )
+        server.stop_progress_edits.assert_awaited_once_with(
+            chat_id=12345,
+            message_id=100,
+        )
+        server.application.bot.delete_message.assert_awaited_once_with(
+            chat_id=12345,
+            message_id=100,
+        )
+
+    async def test_first_event_bind_failure_keeps_old_command_status(self):
+        server = self._server()
+        server.artifact_gateway.bind_input_presentation = AsyncMock(
+            side_effect=RuntimeError("gateway unavailable")
+        )
+        submission = self._submission()
+        submission["ack_policy"] = "create"
+        submission["_telegram_previous_unbound_status_message_id"] = "100"
+
+        result = await replace_unbound_collection_command_status(
+            server=server,
+            gateway=server.artifact_gateway,
+            update=self._update(),
+            submission=submission,
+            session_id="telegram:conversation:12345",
+        )
+
+        self.assertEqual(result.message_id, 100)
+        server.stop_progress_edits.assert_not_awaited()
+        server.application.bot.delete_message.assert_awaited_once_with(
+            chat_id=12345,
+            message_id=200,
+        )
 
     async def test_precreated_status_relocates_without_creating_another_message(self):
         server = self._server()

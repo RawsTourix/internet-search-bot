@@ -54,14 +54,6 @@ def create_ingress_services(
         ingress_config,
         collection_store=collection_store,
     )
-    draft_control_service = ExplicitInputDraftControlService(
-        event_store=event_store,
-        batch_store=batch_store,
-        collection_store=collection_store,
-        idle_timeout_seconds=(
-            ingress_config.explicit_collection_idle_timeout_seconds
-        ),
-    )
     registry = build_default_capability_registry(
         interaction.client_capabilities.contract_version
     )
@@ -77,6 +69,23 @@ def create_ingress_services(
         storage_root.resolve(strict=False),
         atomic_writes=storage_config.atomic_writes,
     )
+    presentation_coordinator = (
+        InputPresentationCoordinator(
+            presentation_store,
+            config=interaction.input_presentation,
+        )
+        if interaction.input_presentation.enabled
+        else None
+    )
+    draft_control_service = ExplicitInputDraftControlService(
+        event_store=event_store,
+        batch_store=batch_store,
+        collection_store=collection_store,
+        presentation_coordinator=presentation_coordinator,
+        idle_timeout_seconds=(
+            ingress_config.explicit_collection_idle_timeout_seconds
+        ),
+    )
     localization_service = LocalizationService.from_directory(
         config=interaction.localization
     )
@@ -91,14 +100,7 @@ def create_ingress_services(
         draft_control_service=draft_control_service,
         capability_store=capability_store,
         localization_service=localization_service,
-        presentation_coordinator=(
-            InputPresentationCoordinator(
-                presentation_store,
-                config=interaction.input_presentation,
-            )
-            if interaction.input_presentation.enabled
-            else None
-        ),
+        presentation_coordinator=presentation_coordinator,
         telegram_document_grouping=(
             interaction.telegram_output.prefer_document_groups
         ),

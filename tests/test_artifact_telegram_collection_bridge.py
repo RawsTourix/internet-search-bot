@@ -127,7 +127,7 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pending["metadata"]["input_collection_pending"])
         self.assertEqual(pending["metadata"]["text_part_count"], 1)
 
-    async def test_collection_command_status_is_authoritative_for_updates(self):
+    async def test_first_event_replaces_provisional_collection_command_status(self):
         async def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/internal/input-collections/start":
                 return httpx.Response(
@@ -159,7 +159,7 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
                     request=request,
                     json={
                         "input_batch_id": "ibat_" + "2" * 32,
-                        "client_message_id": "42",
+                        "client_message_id": "99",
                         "presentation_generation": 1,
                         "state": "bound",
                     },
@@ -195,6 +195,20 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
             self._envelope(),
             progress_locale="ru",
         )
+        self.assertEqual(submission["ack_policy"], "create")
+        self.assertEqual(
+            submission["_telegram_previous_unbound_status_message_id"],
+            "42",
+        )
+        await bridge.bind_input_presentation(
+            submission["presentation_ref"],
+            session_id=session_id,
+            client_message_id="99",
+        )
+        await bridge.remember_input_presentation_handle(
+            submission,
+            client_message_id="99",
+        )
         pending = await bridge.commit_and_run(
             submission["input_batch_id"],
             session_id=session_id,
@@ -203,13 +217,12 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(
             pending["metadata"]["presentation_message_id"],
-            "42",
+            "99",
         )
         self.assertEqual(
             pending["metadata"]["input_batch_id"],
             submission["input_batch_id"],
         )
-        self.assertEqual(submission["ack_policy"], "update_existing")
 
     async def test_out_of_order_submissions_cannot_regress_counts(self):
         counts = iter(((10, 3), (8, 2)))
@@ -506,6 +519,90 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             requests,
             ["/ingress/events", "/internal/input-collections/send"],
+        )
+
+    async def test_stale_concurrent_handle_cannot_overwrite_relocation(self):
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+        )
+        batch_id = "ibat_" + "7" * 32
+        bridge._explicit_batches[batch_id] = {
+            "session_id": "telegram:conversation:chat-1",
+            "presentation_ref": {
+                "client_message_id": "200",
+                "active_client_message_id": "200",
+                "presentation_generation": 2,
+            },
+        }
+
+        await bridge.remember_input_presentation_handle(
+            {
+                "input_batch_id": batch_id,
+                "ack_policy": "update_existing",
+                "presentation_ref": {
+                    "client_message_id": "100",
+                    "active_client_message_id": "100",
+                    "presentation_generation": 1,
+                },
+            },
+            client_message_id="100",
+        )
+
+        self.assertEqual(
+            bridge._explicit_batches[batch_id]["presentation_ref"]
+            ["active_client_message_id"],
+            "200",
+        )
+
+    async def test_successful_relocation_updates_session_status_cache(self):
+        batch_id = "ibat_" + "8" * 32
+        session_id = "telegram:conversation:chat-1"
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                200,
+                request=request,
+                json={
+                    "input_batch_id": batch_id,
+                    "client_message_id": "200",
+                    "presentation_generation": 2,
+                    "state": "bound",
+                },
+            )
+
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(handler),
+        )
+        bridge._explicit_batches[batch_id] = {
+            "session_id": session_id,
+            "presentation_ref": {
+                "client_message_id": "100",
+                "active_client_message_id": "100",
+                "presentation_generation": 1,
+            },
+        }
+        bridge._active_collection_status_messages[session_id] = "100"
+
+        await bridge.relocate_input_presentation(
+            {
+                "presentation_id": "iprs_" + "8" * 32,
+                "presentation_token": "token",
+                "client_message_id": "100",
+                "active_client_message_id": "100",
+                "presentation_generation": 1,
+            },
+            session_id=session_id,
+            client_message_id="200",
+        )
+
+        self.assertEqual(
+            bridge._active_collection_status_messages[session_id],
+            "200",
         )
 
     async def test_cancel_suppresses_late_group_without_commit_request(self):

@@ -46,6 +46,7 @@ class InputPresentationCoordinator:
             "collecting": "input_batch.collecting",
             "committed": "input_batch.committed",
             "failed": "input_batch.failed",
+            "cancelled": "input_batch.updated",
         }.get(state, "input_batch.updated")
         params = {
             "file_count": file_count,
@@ -130,11 +131,11 @@ class InputPresentationCoordinator:
                 response_anchor.kind.value,
             )
 
-        if state in {"committed", "failed"}:
+        if state in {"committed", "failed", "cancelled"}:
             terminal = (
-                PresentationState.CLOSED
-                if state == "committed"
-                else PresentationState.FAILED
+                PresentationState.FAILED
+                if state == "failed"
+                else PresentationState.CLOSED
             )
             if stored.state == PresentationState.RESERVED:
                 stored = await self.store.defer_terminal(
