@@ -3,7 +3,7 @@ id: design.v0.4.batch-workflows
 version: v0.4
 spec_status: accepted
 implementation_status: implemented
-last_reviewed: 2026-08-01
+last_reviewed: 2026-08-04
 ---
 
 # v0.4-batch-workflows
@@ -132,7 +132,7 @@ Bounded same-session handoff, session reset cleanup,
 `artifact_list(scope=current|session|workspace)`, activation provenance,
 scope-bound cursor и historical read/search/delivery.
 
-### BW-P5 — live acceptance
+### BW-P5 — live acceptance завершён
 
 Последние live-прогоны выявили и исправили:
 
@@ -159,30 +159,45 @@ scope-bound cursor и historical read/search/delivery.
 rotation, best-effort trace service, ingress/delivery integration и события
 межцикловой artifact authority.
 
-## Acceptance gates
+## Acceptance evidence
 
-Перед переводом PR из draft требуются:
+Финальная acceptance завершена 2026-08-04. Подтверждены:
 
-- новый полный Windows suite;
-- ordinary AUTO text с initial status `Сообщение принято. Обрабатываю…`;
-- text-only delivery: `result_ready → cycle_done`, без отдельного `Готово.` при
-  default mode;
-- artifact delivery: tracked `cycle_done` и отдельное `Готово.` после файлов при
-  default mode;
+- полный Windows baseline: `775 passed, 4 skipped, 0 failed`;
+- synthetic Web/Telegram/artifact roast: `5 062 passed, 1 skipped, 0 failed,
+  0 flaky`;
+- `RACE-001`: `1 300/1 300 passed`;
+- `RACE-002`: `3 462/3 462 passed`;
+- Telegram audit matrix: `104 passed`;
+- synthetic live-shaped explicit package из 30 файлов и 7 text parts
+  коммитится как один `InputBatch` с итоговыми счётчиками `30/7`;
+- maintainer live Telegram package из 30 файлов и 8 text parts сохраняет один
+  authoritative presentation и корректные durable итоговые счётчики `30/8`;
+- ordinary AUTO text получает initial status
+  `Сообщение принято. Обрабатываю…`;
+- text-only delivery проходит `result_ready → cycle_done` без отдельного
+  `Готово.` при default mode;
+- artifact delivery сохраняет tracked `cycle_done` и отдельное `Готово.` после
+  файлов при default mode;
 - text-only/files-only/mixed `/collect → /send`;
-- live package `7 + 7 + 7 + 1 files + 2 messages` коммитится как `22/2`;
-- после каждого collection update остаётся один актуальный presentation;
-- `/send` terminalize-ит последний presentation без stale `Пакет собирается`;
-- сохранение terminal collection snapshot;
-- `/collect → package → /send` как continuation после `WAITING_USER`;
-- новый cycle той же session продолжает работу с предыдущим input/created file
-  без re-upload;
-- другая session не получает artifact authority;
-- `/reset` очищает bounded handoff текущей session и не затрагивает другие sessions;
-- rapid FIFO scenario;
-- `/cancel` до завершения album quiet period без позднего commit/409;
+- terminal collection snapshot сохраняется после `/send` и `/cancel`;
+- committed package продолжает suspended `WAITING_USER` cycle;
+- bounded same-session artifact handoff работает между последовательными cycles,
+  не пересекает session boundary и очищается `/reset`;
+- rapid same-session commands соблюдают FIFO barrier;
+- `/cancel` до окончания album quiet period не допускает поздний commit, 409 или
+  AUTO-run;
 - artifact JSONL содержит ingress counts, handoff saved/applied и delivery
-  transitions без file content, credentials и local paths.
+  transitions без file content, credentials и local paths;
+- audit guards зафиксировали ноль вызовов AgentRuntime, LLM, MCP, внешней сети и
+  реального Telegram.
+
+Точный автоматизированный отчёт находится в
+[`../../../../../reports/v0.4-transport-artifact-roast.md`](../../../../../reports/v0.4-transport-artifact-roast.md).
+Он явно фиксирует, что прожарка выполнялась на code SHA `b02f557d...` при dirty
+worktree с обновлённым audit harness; harness, тест и оба отчёта затем были
+зафиксированы отдельным test-only коммитом `779b024c...`. Production-код этим
+коммитом не изменялся.
 
 Параметры Telegram UX в `.env.example`:
 
