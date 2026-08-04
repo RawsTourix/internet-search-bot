@@ -130,7 +130,7 @@ class ExplicitCollectionMultiGroupTests(unittest.IsolatedAsyncioTestCase):
             response_route=self._route(),
         )
 
-    async def test_three_albums_file_and_two_messages_commit_as_22_and_2(self):
+    async def test_live_shaped_batch_commits_as_30_files_and_7_messages(self):
         started = await self.ingress.draft_control_service.start_collection(
             self.scope,
             response_route=self._route(),
@@ -140,7 +140,7 @@ class ExplicitCollectionMultiGroupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(str(started.status.value), "started")
 
         batch_id = None
-        for group_number in (1, 2, 3):
+        for group_number in (1, 2, 3, 4):
             for item_number in range(1, 8):
                 envelope = self._file_envelope(
                     group_number=group_number,
@@ -156,16 +156,20 @@ class ExplicitCollectionMultiGroupTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(result.input_batch_id, batch_id)
                 self.assertEqual(result.state, "collecting")
 
-        extra = self._file_envelope(group_number=4, item_number=1)
-        extra_slot_id = extra.attachment_slots[0].slot_id
-        extra_result = await self.ingress.ingress_service.submit_atomic(
-            extra,
-            session_id=self.session_id,
-            upload_streams={extra_slot_id: chunks(b"extra")},
-        )
-        self.assertEqual(extra_result.input_batch_id, batch_id)
+        for item_number in (1, 2):
+            extra = self._file_envelope(
+                group_number=5,
+                item_number=item_number,
+            )
+            extra_slot_id = extra.attachment_slots[0].slot_id
+            extra_result = await self.ingress.ingress_service.submit_atomic(
+                extra,
+                session_id=self.session_id,
+                upload_streams={extra_slot_id: chunks(b"extra")},
+            )
+            self.assertEqual(extra_result.input_batch_id, batch_id)
 
-        for number in (1, 2):
+        for number in range(1, 8):
             text_result = await self.ingress.ingress_service.submit_atomic(
                 self._text_envelope(number),
                 session_id=self.session_id,
@@ -173,8 +177,8 @@ class ExplicitCollectionMultiGroupTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(text_result.input_batch_id, batch_id)
 
         draft = await self.ingress.batch_store.get_draft(batch_id)
-        self.assertEqual(len(draft.attachment_parts), 22)
-        self.assertEqual(len(draft.text_parts), 2)
+        self.assertEqual(len(draft.attachment_parts), 30)
+        self.assertEqual(len(draft.text_parts), 7)
 
         committed = await self.ingress.draft_control_service.commit(
             self.scope,
@@ -184,10 +188,10 @@ class ExplicitCollectionMultiGroupTests(unittest.IsolatedAsyncioTestCase):
             committed.status,
             InputDraftControlStatus.COMMITTED,
         )
-        self.assertEqual(len(committed.committed_batch.artifact_refs), 22)
-        self.assertEqual(len(committed.committed_batch.text_parts), 2)
-        self.assertEqual(committed.file_count, 22)
-        self.assertEqual(committed.text_part_count, 2)
+        self.assertEqual(len(committed.committed_batch.artifact_refs), 30)
+        self.assertEqual(len(committed.committed_batch.text_parts), 7)
+        self.assertEqual(committed.file_count, 30)
+        self.assertEqual(committed.text_part_count, 7)
 
 
 if __name__ == "__main__":

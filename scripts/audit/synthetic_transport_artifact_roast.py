@@ -30,6 +30,19 @@ CHECKPOINT_JSON = ROOT / "reports" / ".v0.4-transport-artifact-roast.checkpoint.
 AUDIT_CHECKS = "scripts/audit/synthetic_transport_artifact_checks.py"
 
 
+def _current_git_sha() -> str:
+    try:
+        return subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        ).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+
+
 SCENARIOS: dict[str, dict] = {
     "ING-COM-001": {
         "name": "Common ingress, grouping, explicit control and limits",
@@ -51,7 +64,7 @@ SCENARIOS: dict[str, dict] = {
         "selectors": [AUDIT_CHECKS + "::test_web_real_router_valid_replay_and_binary_integrity", AUDIT_CHECKS + "::test_web_real_router_rejects_malformed_manifest", AUDIT_CHECKS + "::test_web_real_router_rejects_missing_unexpected_and_duplicate_uploads", AUDIT_CHECKS + "::test_web_real_router_rejects_two_slots_for_one_upload_field", AUDIT_CHECKS + "::test_web_real_router_rejects_extra_plain_form_field", AUDIT_CHECKS + "::test_web_real_router_rejects_wrong_transport_key"],
     },
     "ING-TG-001": {
-        "name": "Telegram normalization, album, commands and presentation",
+        "name": "Telegram normalization, batch lifecycle, commands and presentation",
         "transport": "telegram",
         "selectors": [
             "tests/test_telegram_semantic_resolvers.py",
@@ -63,6 +76,13 @@ SCENARIOS: dict[str, dict] = {
             "tests/test_artifact_telegram_presentation_relocation.py",
             "tests/test_artifact_telegram_robustness_hardening.py",
             "tests/test_artifact_telegram_exact_group_cleanup.py",
+            "tests/test_artifact_explicit_collection_multi_group.py",
+            "tests/test_artifact_forwarded_batch_regressions.py",
+            "tests/test_artifact_telegram_collection_bridge.py",
+            "tests/test_artifact_telegram_auto_text_status.py",
+            "tests/test_artifact_telegram_session_dispatcher.py",
+            "tests/test_artifact_run_progress_overlay.py",
+            "tests/test_artifact_telegram_run_status_completion.py",
         ],
     },
     "ART-001": {
@@ -155,6 +175,10 @@ RACE_SELECTORS = [
     "tests/test_output_ownership_startup_recovery.py::OutputOwnershipStartupRecoveryTests::test_partially_bound_ready_delivery_is_completed_idempotently",
     "tests/test_output_assembly_commit_once.py::OutputAssemblyCommitOnceTests::test_terminal_output_is_reused_after_delivery_state_changes",
     "tests/test_artifact_telegram_presentation_relocation.py::TelegramPresentationRelocationTests::test_failed_old_delete_keeps_new_handle_authoritative",
+    "tests/test_artifact_explicit_collection_grouping.py::ExplicitCollectionGroupingTests::test_later_explicit_event_relocates_status_below_user_message",
+    "tests/test_artifact_telegram_collection_bridge.py::TelegramCollectionBridgeTests::test_out_of_order_submissions_cannot_regress_counts",
+    "tests/test_artifact_telegram_session_dispatcher.py::TelegramSessionDispatcherTests::test_shared_data_cannot_overtake_waiting_command_barrier",
+    "tests/test_artifact_run_progress_overlay.py::RunProgressOverlayTests::test_commit_and_run_resolves_status_after_commit_boundary",
 ]
 
 
@@ -169,6 +193,11 @@ RANDOM_OPERATIONS = {
     "inspect": "tests/test_artifact_input_draft_control.py::InputDraftControlTests::test_start_is_idempotent_and_scope_has_one_active_collection",
     "duplicate": "tests/test_artifact_ingress.py::ArtifactIngressTests::test_replay_returns_same_event_batch_and_artifact",
     "restart": "tests/test_output_ownership_startup_recovery.py::OutputOwnershipStartupRecoveryTests::test_crash_window_ready_batch_is_repaired_after_stores_reopen",
+    "explicit restart": "tests/test_artifact_explicit_collection_grouping.py::ExplicitCollectionGroupingTests::test_restart_preserves_active_explicit_collection",
+    "forwarded burst": "tests/test_artifact_forwarded_batch_regressions.py::ForwardedTextAlbumRaceTests::test_forwarded_albums_and_adjacent_inputs_share_one_burst",
+    "command barrier": "tests/test_artifact_telegram_session_dispatcher.py::TelegramSessionDispatcherTests::test_shared_data_cannot_overtake_waiting_command_barrier",
+    "status relocation": "tests/test_artifact_explicit_collection_grouping.py::ExplicitCollectionGroupingTests::test_later_explicit_event_relocates_status_below_user_message",
+    "auto-run progress": "tests/test_artifact_run_progress_overlay.py::RunProgressOverlayTests::test_commit_and_run_resolves_status_after_commit_boundary",
     "claim": "tests/test_output_claim_idempotency.py::OutputClaimIdempotencyTests::test_same_request_replays_original_attempt",
     "download": "tests/test_output_outbox_delivery_content.py::OutputOutboxDeliveryContentTests::test_exact_claimed_instance_can_stream_member_bytes",
     "receipt": "tests/test_output_receipt_semantics.py::OutputReceiptSemanticsTests::test_public_reconcile_updates_output_and_artifact_records",
@@ -618,12 +647,12 @@ def main() -> int:
     parser.add_argument("--seed", type=int, default=20260802)
     parser.add_argument("--race-repeats", type=int, default=100)
     parser.add_argument("--random-sequences", type=int, default=200)
-    parser.add_argument("--baseline-passed", type=int, default=723)
+    parser.add_argument("--baseline-passed", type=int, default=775)
     parser.add_argument("--baseline-failed", type=int, default=0)
-    parser.add_argument("--baseline-skipped", type=int, default=0)
+    parser.add_argument("--baseline-skipped", type=int, default=4)
     parser.add_argument("--baseline-subtests", type=int, default=108)
-    parser.add_argument("--baseline-duration", type=float, default=306.65)
-    parser.add_argument("--sha", default="04b6254e5984a328d5ae652c85dd418178c25d5b")
+    parser.add_argument("--baseline-duration", type=float, default=165.935)
+    parser.add_argument("--sha", default=_current_git_sha())
     parser.add_argument("--branch", default="fix/v0.4-ingress-reservation-race")
     parser.add_argument("--initial-worktree-clean", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--host-platform", default="Microsoft Windows NT 10.0.26200.0")
@@ -736,7 +765,7 @@ def main() -> int:
             "No AgentRuntime, LLM, MCP, external HTTP or real Telegram call crossed the installed guards.",
             "Trace failures remained best-effort in the existing durable trace test.",
         ],
-        "baseline_note": "An initial read-only preflight produced 67 collection errors because production imports open logging/*.log. A tmpfs overlay for /app/logging fixed the launch seam. The first complete network-disabled baseline then had one environment-only tiktoken cache miss (722 passed, 1 failed, 108 subtests); after a setup-only cache warm-up, the final baseline was clean.",
+        "baseline_note": "The current clean baseline was re-established after the Telegram ingress and presentation fixes: 775 passed, 0 failed, 4 skipped, with 108 unittest subtests. The synthetic matrix now includes the live-shaped 30-file/7-message batch, explicit and automatic collection paths, command ordering, status relocation, and the commit-boundary progress-target race.",
     }
     _write_reports(payload)
     CHECKPOINT_JSON.unlink(missing_ok=True)
