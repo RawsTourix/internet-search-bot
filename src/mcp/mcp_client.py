@@ -228,6 +228,7 @@ class SessionState:
     last_error: Optional[str] = None
     awaiting_user_input: bool = False
     progress_events: List[Dict[str, Any]] = field(default_factory=list)
+    active_tool: str | None = None
     progress_locale: str = "ru"
 
 
@@ -3651,6 +3652,7 @@ class MCPClient:
         client_type: ClientType | None = None,
         progress_callback=None,
         progress_locale: str = "ru",
+        cycle_id_override: str | None = None,
     ) -> AgentResult:
         """
         Description:
@@ -3671,7 +3673,7 @@ class MCPClient:
         """
         logger.info(f"Начало обработки запроса: '{query}'")
         final_text = []
-        cycle_id = uuid4().hex
+        cycle_id = cycle_id_override or uuid4().hex
         cycle_trace: List[Dict[str, Any]] = []
         messages_for_llm: List[Dict[str, Any]] = []
         session: SessionMemory | None = None
@@ -3690,6 +3692,7 @@ class MCPClient:
             state.last_error = None
             state.awaiting_user_input = False
             state.progress_events = []
+            state.active_tool = None
             state.progress_locale = self._normalize_progress_locale(progress_locale)
 
             # Инициализируем память сессии до построения рабочего контекста.
@@ -4117,10 +4120,12 @@ class MCPClient:
                             )
                             
                             # Вызываем инструмент через соответствующий клиент с таймаутом
+                            state.active_tool = target_tool_name or tool_name
                             result = await asyncio.wait_for(
                                 self._call_registered_tool(tool_name, arguments),
                                 timeout=self.tool_call_timeout
                             )
+                            state.active_tool = None
                             result_metadata = {
                                 "execution_disposition": getattr(
                                     result,
@@ -4265,6 +4270,7 @@ class MCPClient:
                                 )
                             
                         except asyncio.TimeoutError:  # Обработка таймаута
+                            state.active_tool = None
                             error_message = f"Таймаут при вызове инструмента {tool_name}"
                             logger.error(error_message)
                             tool_result_count += 1
@@ -4311,6 +4317,7 @@ class MCPClient:
                             )
                             
                         except Exception as e:
+                            state.active_tool = None
                             error_message = (
                                 f"Ошибка при вызове инструмента {tool_name}: {str(e)}"
                             )

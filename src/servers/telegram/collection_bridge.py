@@ -25,6 +25,7 @@ class ExplicitCollectionTelegramGatewayClient(
             dict[str, Any],
         ] = OrderedDict()
         self._maximum_terminal_explicit_batches = 512
+        self._active_collection_sessions: set[str] = set()
 
     @staticmethod
     def _merge_presentation_ref(
@@ -57,6 +58,7 @@ class ExplicitCollectionTelegramGatewayClient(
     ) -> dict[str, Any]:
         state = {
             "action": str(action),
+            "session_id": (explicit or {}).get("session_id"),
             "collection_id": (explicit or {}).get("collection_id"),
             "file_count": int((explicit or {}).get("file_count") or 0),
             "text_part_count": int(
@@ -124,6 +126,7 @@ class ExplicitCollectionTelegramGatewayClient(
                 if batch_id not in self._terminal_explicit_batches:
                     current = dict(self._explicit_batches.get(batch_id) or {})
                     current.update({
+                        "session_id": self._session_id_from_envelope(envelope),
                         "collection_id": params.get("collection_id"),
                         "file_count": int(params.get("file_count") or 0),
                         "text_part_count": int(
@@ -279,7 +282,7 @@ class ExplicitCollectionTelegramGatewayClient(
         locale: str,
         response_route: dict[str, Any],
     ) -> dict[str, Any]:
-        return await self._collection_control(
+        payload = await self._collection_control(
             "start",
             session_id=session_id,
             chat_id=chat_id,
@@ -291,6 +294,18 @@ class ExplicitCollectionTelegramGatewayClient(
                 "response_route": response_route,
             },
         )
+        if str(payload.get("status") or "") in {
+            "started",
+            "promoted_auto_draft",
+            "already_active",
+        }:
+            async with self._explicit_batch_lock:
+                self._active_collection_sessions.add(session_id)
+        return payload
+
+    async def is_explicit_collection_active(self, session_id: str) -> bool:
+        async with self._explicit_batch_lock:
+            return session_id in self._active_collection_sessions
 
     async def inspect_collection(
         self,
@@ -328,6 +343,7 @@ class ExplicitCollectionTelegramGatewayClient(
         batch_id = str(payload.get("input_batch_id") or "").strip()
         if payload.get("status") == "committed" and batch_id:
             async with self._explicit_batch_lock:
+                self._active_collection_sessions.discard(session_id)
                 explicit = self._explicit_batches.pop(batch_id, None)
                 terminal = self._remember_terminal_locked(
                     batch_id,
@@ -360,8 +376,12 @@ class ExplicitCollectionTelegramGatewayClient(
             idempotency_key=idempotency_key,
         )
         batch_id = str(payload.get("input_batch_id") or "").strip()
+        if str(payload.get("status") or "") in {"cancelled", "not_found"}:
+            async with self._explicit_batch_lock:
+                self._active_collection_sessions.discard(session_id)
         if batch_id:
             async with self._explicit_batch_lock:
+                self._active_collection_sessions.discard(session_id)
                 explicit = self._explicit_batches.pop(batch_id, None)
                 terminal = self._remember_terminal_locked(
                     batch_id,
@@ -375,6 +395,31 @@ class ExplicitCollectionTelegramGatewayClient(
                 )
             await self._close_group_for_batch(batch_id)
         return payload
+
+    async def clear_session_state(self, session_id: str) -> None:
+        await super().clear_session_state(session_id)
+        async with self._explicit_batch_lock:
+            self._active_collection_sessions.discard(session_id)
+            for mapping in (
+                self._explicit_batches,
+                self._terminal_explicit_batches,
+            ):
+                stale = [
+                    batch_id for batch_id, state in mapping.items()
+                    if state.get("session_id") == session_id
+                ]
+                for batch_id in stale:
+                    mapping.pop(batch_id, None)
+
+    @staticmethod
+    def _session_id_from_envelope(envelope) -> str:
+        conversation = envelope.conversation
+        thread_id = getattr(conversation, "thread_id", None)
+        suffix = f":thread:{thread_id}" if thread_id is not None else ""
+        return (
+            "telegram:conversation:"
+            f"{conversation.conversation_id}{suffix}"
+        )
 
     async def relocate_input_presentation(
         self,

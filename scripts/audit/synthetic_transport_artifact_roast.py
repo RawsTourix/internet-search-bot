@@ -226,6 +226,7 @@ class ScenarioResult:
 def _guard_plugin() -> str:
     return r'''
 import json
+import inspect
 import os
 import socket
 from pathlib import Path
@@ -244,6 +245,17 @@ def pytest_configure(config):
     original_connect = socket.socket.connect
     def guarded_connect(sock, address):
         if sock.family in (socket.AF_INET, socket.AF_INET6):
+            # Windows implements ``socket.socketpair()`` with a private
+            # loopback TCP connection.  Asyncio's ProactorEventLoop creates
+            # that self-pipe during setup, before any test code runs.  Permit
+            # only that stdlib-internal connect; real loopback HTTP remains
+            # blocked by the same guard as every other network connection.
+            if any(
+                frame.function == "socketpair"
+                and os.path.basename(frame.filename) == "socket.py"
+                for frame in inspect.stack()
+            ):
+                return original_connect(sock, address)
             COUNTERS["external_http_calls"] += 1
             raise AssertionError(f"external network is forbidden: {address!r}")
         return original_connect(sock, address)
@@ -374,13 +386,21 @@ def _run_pytest(scenario_id: str, spec: dict, selectors: Iterable[str]) -> Scena
             f"--junitxml={junit}",
             *unique_selectors,
         ]
-        completed = subprocess.run(command, cwd=ROOT, env=env, text=True, capture_output=True)
+        completed = subprocess.run(
+            command,
+            cwd=ROOT,
+            env=env,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+        )
         result = ScenarioResult(
             scenario_id=scenario_id,
             name=spec["name"],
             transport=spec["transport"],
             actions=selector_plan,
-            logs=(completed.stdout + "\n" + completed.stderr)[-12000:],
+            logs=((completed.stdout or "") + "\n" + (completed.stderr or ""))[-12000:],
             duration_seconds=round(time.monotonic() - started, 3),
         )
         if junit.exists():
@@ -527,11 +547,11 @@ def _write_reports(payload: dict) -> None:
         f"- External HTTP calls: `{summary['counters']['external_http_calls']}`",
         f"- Real Telegram calls: `{summary['counters']['real_telegram_calls']}`",
         "",
-        "Commands:",
+        "Reproduction command:",
         "",
         *[f"- `{item}`" for item in summary["commands"]],
         "",
-        "The dependency-install and tiktoken-cache warm-up were setup operations, not synthetic scenarios. Every recorded scenario ran in a Docker container with `--network none`; HTTP tests used only `httpx.ASGITransport`.",
+        "Every recorded scenario ran in an isolated pytest subprocess with audit guards blocking AgentRuntime, LLM, MCP, external network and real Telegram boundaries; HTTP route tests used `httpx.ASGITransport`.",
         "",
         "## Existing coverage map",
         "",
@@ -670,7 +690,11 @@ def main() -> int:
     for result in results:
         for key in counters:
             counters[key] += result.guard_counters.get(key, 0)
-    command = f"python scripts/audit/synthetic_transport_artifact_roast.py --seed {args.seed} --race-repeats {args.race_repeats} --random-sequences {args.random_sequences}"
+    command = (
+        "python -X utf8 scripts/audit/synthetic_transport_artifact_roast.py "
+        f"--seed {args.seed} --race-repeats {args.race_repeats} "
+        f"--random-sequences {args.random_sequences} --sha {args.sha}"
+    )
     defects = _failure_details(results, args.seed, command)
     pass_count = sum(item.status == "PASS" for item in results)
     fail_count = sum(item.status == "FAIL" for item in results)
@@ -698,10 +722,7 @@ def main() -> int:
             "random_sequences": 0 if args.skip_race else args.random_sequences,
             "counters": counters,
             "baseline": {"passed": args.baseline_passed, "failed": args.baseline_failed, "skipped": args.baseline_skipped, "subtests": args.baseline_subtests, "duration_seconds": args.baseline_duration},
-            "commands": [
-                "docker run --rm --network none --tmpfs /app/logging:rw,nosuid,nodev,noexec -e PYTHONPATH=/opt/deps:/app -e PYTHONDONTWRITEBYTECODE=1 -e PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 -e TIKTOKEN_CACHE_DIR=/opt/tiktoken-cache -v internet-search-bot-audit-py312:/opt/deps:ro -v internet-search-bot-audit-tiktoken:/opt/tiktoken-cache:ro -v <repo>:/app:ro -w /app python:3.12-slim python -m pytest -p pytest_asyncio.plugin -p no:cacheprovider -q --tb=short",
-                command,
-            ],
+            "commands": [command],
         },
         "scenarios": [_to_jsonable(item) for item in results],
         "stage_heatmap": _stage_heatmap(results),

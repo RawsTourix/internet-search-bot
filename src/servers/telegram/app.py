@@ -183,13 +183,32 @@ _base_process_update = getattr(
 )
 server.application._v04_base_process_update = _base_process_update
 
+_base_reset_process_local_session = server.reset_process_local_session
+
+
+async def _reset_process_local_session(session_id: str) -> None:
+    await session_dispatcher.reset_session(session_id)
+    await _base_reset_process_local_session(session_id)
+
+
+server.reset_process_local_session = _reset_process_local_session
+
 
 def _queued_process_update(update):
     session_id = server._session_for_update(update)
-    return session_dispatcher.submit(
-        session_id,
-        lambda: _base_process_update(update),
-    )
+    message = getattr(update, "effective_message", None)
+    text = str(getattr(message, "text", "") or "").strip().lower()
+    command = text.split(maxsplit=1)[0].split("@", 1)[0] if text else ""
+    # Only short collection-control mutations need transport admission order.
+    # Data handlers proceed concurrently until the Gateway committed-batch
+    # coordinator, so a second batch can actually enter its observable FIFO.
+    # Read-only /status and reset always bypass this lane.
+    if command in {"/collect", "/send", "/cancel"}:
+        return session_dispatcher.submit(
+            session_id,
+            lambda: _base_process_update(update),
+        )
+    return _base_process_update(update)
 
 
 server.application.process_update = _queued_process_update
@@ -204,10 +223,7 @@ server._v04_base_finish_group = _base_finish_group
 
 
 async def _queued_finish_group(group):
-    return await session_dispatcher.run(
-        group.session_id,
-        lambda: _base_finish_group(group),
-    )
+    return await _base_finish_group(group)
 
 
 server._finish_group = _queued_finish_group
@@ -584,6 +600,20 @@ async def _authoritative_collection_status_message(
 
 async def _deliver_agent_result(**values):
     metadata = dict(values.get("metadata") or {})
+    response_generation = metadata.get("telegram_session_generation")
+    if (
+        response_generation is not None
+        and not server.session_generations.is_current(
+            values["session_id"],
+            int(response_generation),
+        )
+    ):
+        server.logger.info(
+            "telegram_terminal_delivery_stale session_id=%s generation=%s",
+            values["session_id"],
+            response_generation,
+        )
+        return None
     if metadata.get("input_collection_terminal_suppressed"):
         status_message = values.get("status_message")
         if status_message is not None:

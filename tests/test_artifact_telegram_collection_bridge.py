@@ -420,6 +420,14 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
             },
         )
 
+        self.assertTrue(await bridge.is_explicit_collection_active(
+            "telegram:conversation:chat-1"
+        ))
+        await bridge.clear_session_state("telegram:conversation:chat-1")
+        self.assertFalse(await bridge.is_explicit_collection_active(
+            "telegram:conversation:chat-1"
+        ))
+
         self.assertEqual(len(captured), 1)
         request = captured[0]
         self.assertEqual(request.url.path, "/internal/input-collections/start")

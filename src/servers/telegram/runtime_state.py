@@ -61,6 +61,7 @@ _CURRENT_DISPATCH_KEY: ContextVar[str | None] = ContextVar(
 class _QueuedOperation:
     operation: Operation
     future: asyncio.Future[Any]
+    generation: int
 
 
 class TelegramSessionDispatcher:
@@ -78,6 +79,7 @@ class TelegramSessionDispatcher:
         self._queues: dict[str, asyncio.Queue[_QueuedOperation]] = {}
         self._workers: dict[str, asyncio.Task[None]] = {}
         self._closing = False
+        self._generations: dict[str, int] = {}
 
     @staticmethod
     def _normalize_key(key: str) -> str:
@@ -104,7 +106,11 @@ class TelegramSessionDispatcher:
         if queue is None:
             queue = asyncio.Queue()
             self._queues[normalized] = queue
-        queue.put_nowait(_QueuedOperation(operation=operation, future=future))
+        queue.put_nowait(_QueuedOperation(
+            operation=operation,
+            future=future,
+            generation=self._generations.get(normalized, 0),
+        ))
 
         worker = self._workers.get(normalized)
         if worker is None or worker.done():
@@ -133,6 +139,10 @@ class TelegramSessionDispatcher:
             while True:
                 item = await queue.get()
                 try:
+                    if item.generation != self._generations.get(key, 0):
+                        raise RuntimeError(
+                            "Telegram update was invalidated by session reset"
+                        )
                     result = await item.operation()
                 except asyncio.CancelledError:
                     if not item.future.done():
@@ -157,6 +167,25 @@ class TelegramSessionDispatcher:
         finally:
             _CURRENT_DISPATCH_KEY.reset(token)
 
+    async def reset_session(self, key: str) -> int:
+        """Invalidate queued callbacks for one Telegram session generation."""
+
+        normalized = self._normalize_key(key)
+        generation = self._generations.get(normalized, 0) + 1
+        self._generations[normalized] = generation
+        queue = self._queues.get(normalized)
+        if queue is not None:
+            while not queue.empty():
+                item = queue.get_nowait()
+                queue.task_done()
+                if not item.future.done():
+                    item.future.set_exception(
+                        RuntimeError(
+                            "Telegram update was invalidated by session reset"
+                        )
+                    )
+        return generation
+
     async def shutdown(self) -> None:
         """Cancel lanes and settle every queued waiter during application stop."""
 
@@ -178,3 +207,21 @@ class TelegramSessionDispatcher:
 
     def lane_count(self) -> int:
         return len(self._workers)
+
+
+class SessionGenerationRegistry:
+    """Cheap event-loop-local epoch fencing for callbacks and progress edits."""
+
+    def __init__(self) -> None:
+        self._values: dict[str, int] = {}
+
+    def current(self, session_id: str) -> int:
+        return self._values.get(session_id, 0)
+
+    def advance(self, session_id: str) -> int:
+        generation = self.current(session_id) + 1
+        self._values[session_id] = generation
+        return generation
+
+    def is_current(self, session_id: str, generation: int) -> bool:
+        return self.current(session_id) == generation

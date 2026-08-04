@@ -107,6 +107,7 @@ async def _handle_input_collection_command(
     command = _command(update)
     locale = server.detect_progress_locale(update)
     session_id = server._session_for_update(update)
+    generation = server.session_generations.current(session_id)
     status_message = await server.send_initial_status_message(
         update,
         server._localized("input.command_received", locale=locale),
@@ -221,6 +222,7 @@ async def _handle_input_collection_command(
         )
         metadata = dict(run_payload.get("metadata") or {})
         metadata.setdefault("progress_locale", locale)
+        metadata["telegram_session_generation"] = generation
         await server._deliver_agent_result(
             update=update,
             status_message=status_message,
@@ -240,7 +242,10 @@ async def _handle_input_collection_command(
             status_message=status_message,
             success=False,
             message=server._safe_transport_error(error, locale=locale),
-            metadata={"progress_locale": locale},
+            metadata={
+                "progress_locale": locale,
+                "telegram_session_generation": generation,
+            },
             session_id=session_id,
         )
 

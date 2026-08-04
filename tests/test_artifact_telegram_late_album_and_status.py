@@ -1,7 +1,7 @@
 import os
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 os.environ.setdefault("BOT_TOKEN", "123456:TEST_TOKEN")
 os.environ.setdefault("WEBHOOK_DOMAIN", "https://example.test")
@@ -101,6 +101,20 @@ class TelegramLateAlbumAndStatusTests(unittest.IsolatedAsyncioTestCase):
         stop.assert_awaited_once_with(chat_id=100, message_id=100)
         called_status = finish.await_args.kwargs["status_message"]
         self.assertEqual(called_status.message_id, 200)
+
+    async def test_status_bypasses_busy_session_dispatcher(self):
+        update = self._update(message_id=60, media_group_id=None)
+        update.effective_message.text = "/status"
+        base = AsyncMock(return_value="status-result")
+        submit = Mock()
+        with (
+            patch.object(telegram_app, "_base_process_update", base),
+            patch.object(telegram_app.session_dispatcher, "submit", submit),
+        ):
+            result = await telegram_app._queued_process_update(update)
+        self.assertEqual(result, "status-result")
+        base.assert_awaited_once_with(update)
+        submit.assert_not_called()
 
 
 if __name__ == "__main__":

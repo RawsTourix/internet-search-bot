@@ -285,6 +285,22 @@ class MessageProcessor:
             f"• ID: {session_id}",
         ]
 
+        execution = await API.execution_coordinator.snapshot(session_id)
+        lines.extend([
+            f"• Execution: {execution.runtime_status}",
+            "• Active cycle: " + (execution.active_cycle_id or "нет"),
+            "• Active InputBatch: "
+            + (execution.active_input_batch_id or "нет"),
+            f"• В очереди batches: {execution.queued_batches}",
+            "• Stop requested: "
+            + ("да" if execution.stop_requested else "нет"),
+        ])
+        if execution.run_seconds is not None:
+            lines.append(
+                "• Время текущего цикла: "
+                + self._format_duration(execution.run_seconds)
+            )
+
         state = getattr(API.mcp_client, "session_states", {}).get(session_id)
         memory = getattr(API.mcp_client, "sessions", {}).get(session_id)
         if state is None:
@@ -297,6 +313,8 @@ class MessageProcessor:
                 + ("да" if state.awaiting_user_input else "нет")
             )
             lines.append(f"• Итераций последнего цикла: {state.iterations}")
+            active_tool = getattr(state, "active_tool", None)
+            lines.append(f"• Активный tool: {active_tool or 'нет'}")
             if state.last_error:
                 lines.append(f"• Последняя ошибка: {state.last_error}")
         if memory is not None:

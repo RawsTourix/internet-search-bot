@@ -149,6 +149,20 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
 
         return await self._activity.is_closed(key)
 
+    async def abort(self, key: str) -> None:
+        """Terminally fence a failed album before later updates reach Gateway."""
+
+        async with self._lock:
+            task = self._tasks.pop(key, None)
+            self._running.discard(key)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._activity.close(key, ignore_late_members=True)
+
     async def schedule(
         self,
         key: str,

@@ -496,6 +496,33 @@ class InstanceScopedTelegramArtifactGatewayClient(
                         )
             self._input_group_condition.notify_all()
 
+    async def clear_session_state(self, session_id: str) -> None:
+        """Drop only process-local input-group hints for one reset session."""
+
+        prefix = "telegram:conversation:"
+        if not session_id.startswith(prefix):
+            return
+        raw = session_id[len(prefix):]
+        if ":thread:" in raw:
+            conversation_id, thread = raw.split(":thread:", 1)
+        else:
+            conversation_id, thread = raw, "-"
+        scope_key = f"{self.client_instance_id}:{conversation_id}:{thread}"
+        async with self._input_group_condition:
+            keys = [
+                key for key, item in self._input_groups.items()
+                if item.scope_key == scope_key
+            ]
+            for key in keys:
+                item = self._input_groups.pop(key)
+                if item.input_batch_id:
+                    groups = self._input_batch_groups.get(item.input_batch_id)
+                    if groups is not None:
+                        groups.discard(key)
+                        if not groups:
+                            self._input_batch_groups.pop(item.input_batch_id, None)
+            self._input_group_condition.notify_all()
+
     def _purge_expired_input_groups(self, now: float) -> None:
         expired = [
             key

@@ -46,6 +46,7 @@ class ArtifactSetDeliveryInput(BaseModel):
 
     artifact_ids: list[str] = Field(min_length=1)
     selected: bool = True
+    redeliver_input: bool = False
 
     @field_validator("artifact_ids")
     @classmethod
@@ -66,7 +67,9 @@ ARTIFACT_DELIVERY_TOOL_DEFINITIONS = (
             "Атомарно выбрать список exact immutable artifact_ids для "
             "доставки текущему клиенту либо отменить весь список. Один файл "
             "тоже передаётся списком. selected означает durable selection, "
-            "а не подтверждённую transport delivery."
+            "а не подтверждённую transport delivery. Входной user_upload "
+            "запрещён по умолчанию: redeliver_input=true допустим только при "
+            "явной просьбе пользователя вернуть входной файл."
         ),
         input_model=ArtifactSetDeliveryInput,
         progress_key="artifact_set_delivery",
@@ -125,6 +128,25 @@ class ArtifactDeliveryToolController:
                         "artifact_list and retry with exact artifact_ids."
                     ),
                     retryable=True,
+                )
+            if (
+                parsed.selected
+                and not parsed.redeliver_input
+                and all(
+                    artifact_id in context.active_cycle.artifact_refs
+                    for artifact_id in parsed.artifact_ids
+                )
+                and await self._contains_input_artifact(parsed.artifact_ids)
+            ):
+                return self._rejected(
+                    parsed.artifact_ids,
+                    code="input_redelivery_requires_explicit_request",
+                    message=(
+                        "Input artifacts are not delivery outputs by default. "
+                        "Set redeliver_input=true only when the user's current "
+                        "request explicitly asks to send those input files back."
+                    ),
+                    retryable=False,
                 )
             raw_client_type = (
                 context.client_type
@@ -262,6 +284,14 @@ class ArtifactDeliveryToolController:
             )
         except (ArtifactStorageError, ArtifactIntegrityError):
             raise
+
+    async def _contains_input_artifact(self, artifact_ids: list[str]) -> bool:
+        store = self.service.artifact_service.artifact_store
+        for artifact_id in dict.fromkeys(artifact_ids):
+            version = await store.get_version(artifact_id)
+            if getattr(version.provenance, "origin", None) == "user_upload":
+                return True
+        return False
 
     @staticmethod
     def _rejected(

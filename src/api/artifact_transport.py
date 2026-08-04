@@ -25,6 +25,7 @@ from ..ingress import (
     resolve_input_grouping,
 )
 from ..storage.errors import StorageStreamSourceError
+from ..runtime import SessionExecutionCoordinator
 
 if TYPE_CHECKING:
     from ..core.message_processor import MessageProcessor
@@ -110,6 +111,11 @@ class ArtifactTransportFacade:
         self.api = api
         self.message_processor = message_processor
         self.providers = dict(providers or {})
+        self.execution_coordinator = getattr(
+            api,
+            "execution_coordinator",
+            SessionExecutionCoordinator(),
+        )
 
     @staticmethod
     def session_id_for(envelope: ClientInputEnvelope) -> str:
@@ -385,25 +391,32 @@ class ArtifactTransportFacade:
         )
         if batch.session_id != session_id:
             raise ArtifactAccessError("Input batch belongs to another session")
-        logger.info(
-            "gateway_agent_batch_started input_batch_id=%s session_id=%s "
-            "artifact_count=%s text_part_count=%s",
-            input_batch_id,
-            session_id,
-            len(batch.artifact_refs),
-            len(batch.text_parts),
+        async def run_one() -> UnifiedResponse:
+            logger.info(
+                "gateway_agent_batch_started input_batch_id=%s session_id=%s "
+                "artifact_count=%s text_part_count=%s",
+                input_batch_id,
+                session_id,
+                len(batch.artifact_refs),
+                len(batch.text_parts),
+            )
+            response = await self.message_processor.process_committed_batch(
+                batch,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+            )
+            logger.info(
+                "gateway_agent_batch_finished input_batch_id=%s session_id=%s",
+                input_batch_id,
+                session_id,
+            )
+            return response
+
+        return await self.execution_coordinator.enqueue(
+            session_id=session_id,
+            input_batch_id=input_batch_id,
+            operation=run_one,
         )
-        response = await self.message_processor.process_committed_batch(
-            batch,
-            progress_callback=progress_callback,
-            progress_locale=progress_locale,
-        )
-        logger.info(
-            "gateway_agent_batch_finished input_batch_id=%s session_id=%s",
-            input_batch_id,
-            session_id,
-        )
-        return response
 
     async def get_delivery_ref(
         self,

@@ -93,6 +93,34 @@ class TelegramSessionDispatcherTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, "inner-result")
         self.assertEqual(order, ["outer-start", "inner", "outer-end"])
 
+    async def test_reset_invalidates_old_queued_callbacks(self):
+        first_started = asyncio.Event()
+        release = asyncio.Event()
+        second_called = False
+
+        async def first():
+            first_started.set()
+            await release.wait()
+
+        async def second():
+            nonlocal second_called
+            second_called = True
+
+        first_task = asyncio.create_task(
+            self.dispatcher.submit("session-1", first)
+        )
+        await first_started.wait()
+        second_task = asyncio.create_task(
+            self.dispatcher.submit("session-1", second)
+        )
+        await asyncio.sleep(0)
+        await self.dispatcher.reset_session("session-1")
+        with self.assertRaisesRegex(RuntimeError, "invalidated"):
+            await second_task
+        release.set()
+        await first_task
+        self.assertFalse(second_called)
+
 
 if __name__ == "__main__":
     unittest.main()

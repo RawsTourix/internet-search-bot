@@ -14,6 +14,27 @@ from src.servers.telegram.media_group_runner import (
 
 
 class TelegramMediaGroupCoordinationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_terminal_abort_fences_late_media_group_members(self):
+        activity = LifetimeMediaGroupActivityCoordinator()
+        runner = LifetimeBoundDebouncedBatchRunner(
+            activity=activity,
+            maximum_lifetime_seconds=1,
+        )
+        called = asyncio.Event()
+        async def callback():
+            called.set()
+
+        await runner.schedule(
+            "bot:chat:-:album",
+            delay_seconds=0.1,
+            callback=callback,
+        )
+        await runner.abort("bot:chat:-:album")
+        self.assertTrue(await runner.is_closed("bot:chat:-:album"))
+        await activity.member_started("bot:chat:-:album", filename="late.md")
+        self.assertIsNone(await activity.snapshot("bot:chat:-:album"))
+        self.assertFalse(called.is_set())
+
     async def test_runner_waits_for_active_member_and_new_quiet_period(self):
         activity = MediaGroupActivityCoordinator()
         runner = DebouncedBatchRunner(activity=activity)

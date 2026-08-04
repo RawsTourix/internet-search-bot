@@ -67,6 +67,7 @@ class ScopedArtifactToolController(ArtifactToolController):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._definitions["artifact_list"] = _SCOPED_LIST_DEFINITION
+        self.committed_batch_store = None
 
     async def _list(
         self,
@@ -161,15 +162,39 @@ class ScopedArtifactToolController(ArtifactToolController):
             include_archived=include_archived,
         )
         for lineage in lineages:
-            for version in await self.service.artifact_store.list_versions(
+            versions = await self.service.artifact_store.list_versions(
                 lineage.artifact_lineage_id
-            ):
+            )
+            if not await self._lineage_is_visible(versions):
+                continue
+            for version in versions:
                 artifact_ids.append(version.artifact_id)
         return ArtifactAccessContext(
             session_id=context.session_id,
             cycle_id=context.cycle_id,
             allowed_artifact_ids=artifact_ids,
         )
+
+    async def _lineage_is_visible(self, versions: list[Any]) -> bool:
+        """Hide user-upload lineages until their whole InputBatch commits."""
+
+        if self.committed_batch_store is None or not versions:
+            return True
+        provenance = getattr(versions[0], "provenance", None)
+        if getattr(provenance, "origin", None) != "user_upload":
+            return True
+        input_batch_id = str(
+            getattr(provenance, "input_batch_id", "") or ""
+        ).strip()
+        if not input_batch_id:
+            return False
+        try:
+            await self.committed_batch_store.get_committed(input_batch_id)
+        except Exception as error:
+            if type(error).__name__ == "IngressNotFoundError":
+                return False
+            raise
+        return True
 
     def _activate_catalog_page(
         self,
