@@ -99,7 +99,7 @@ Update реализован и завершил client-facing workflow до admi
   messages, working memory и artifact refs;
 - additions во время реально выполняющегося cycle всё ещё требуют будущий
   `CycleInbox`;
-- late album callback после `/send`/`/cancel` подавляется terminal tombstone;
+- late album callback после `/send`/`cancel` подавляется terminal tombstone;
 - последний bounded набор artifact refs завершённого cycle наследуется следующим
   cycle той же session;
 - session handoff не пересекает session boundary и очищается вместе с session при
