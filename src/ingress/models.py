@@ -94,6 +94,7 @@ class InputAdmissionMode(str, Enum):
 class InputGroupingMode(str, Enum):
     ATOMIC = "atomic"
     IMMEDIATE_TEXT = "immediate_text"
+    EXPLICIT_COLLECTION = "explicit_collection"
     STANDALONE_ATTACHMENT = "standalone_attachment"
     MEDIA_GROUP = "media_group"
 

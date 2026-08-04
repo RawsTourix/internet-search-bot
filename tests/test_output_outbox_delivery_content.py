@@ -33,7 +33,14 @@ class _ContentFacade:
         self.claim_calls = 0
         self.open_calls = 0
 
-    async def claim_delivery(self, delivery_id, *, session_id, client_type):
+    async def claim_delivery(
+        self,
+        delivery_id,
+        *,
+        session_id,
+        client_type,
+        output_batch_id=None,
+    ):
         self.claim_calls += 1
         return SimpleNamespace(
             delivery_id=delivery_id,
@@ -44,7 +51,14 @@ class _ContentFacade:
             content_hash="sha256:test",
         )
 
-    async def open_delivery(self, delivery_id, *, session_id, client_type):
+    async def open_delivery(
+        self,
+        delivery_id,
+        *,
+        session_id,
+        client_type,
+        output_batch_id=None,
+    ):
         self.open_calls += 1
 
         async def iterator():

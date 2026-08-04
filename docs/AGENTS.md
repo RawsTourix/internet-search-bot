@@ -19,9 +19,15 @@
    baseline и активный этап.
 2. Прочитайте [`design/README.md`](design/README.md), чтобы понять иерархию
    документов и правила каноничности.
-3. Откройте README затронутой версии в `design/versions/`.
-4. Прочитайте только относящиеся к задаче канонические тематические документы.
-5. При утверждении текущего поведения сверяйтесь с кодом и тестами: planned или
+3. Если изменение затрагивает runtime composition, deployment, configuration,
+   MCP transport admission, identity или execution, прочитайте
+   [`design/runtime-and-deployment-profiles.md`](design/runtime-and-deployment-profiles.md).
+4. Откройте README затронутой версии в `design/versions/`.
+5. Если изменение затрагивает внешний сервис, protocol boundary или отдельный
+   deployable component, откройте применимый документ в
+   [`design/contracts/`](design/contracts/README.md).
+6. Прочитайте только относящиеся к задаче канонические тематические документы.
+7. При утверждении текущего поведения сверяйтесь с кодом и тестами: planned или
    provisional спецификация не доказывает наличие реализации.
 
 ## Источники истины
@@ -32,6 +38,10 @@
   версии.
 - README версии задаёт реестр именованных обновлений, их порядок и навигацию.
 - Тематический документ владеет подробным контрактом одной архитектурной темы.
+- `design/runtime-and-deployment-profiles.md` владеет различием application
+  profile, hosting mode, topology, configuration ownership и execution backend.
+- `design/contracts/` владеет сквозными интеграционными контрактами на границе
+  агента и внешних компонентов.
 - `design/roadmap.md` является хронологической сводкой, а не второй
   спецификацией.
 - ADR объясняет причину решения; принятое состояние переносится в канонический
@@ -43,6 +53,20 @@
 конфликте двух канонических документов считайте это дефектом документации, а не
 выбирайте трактовку молча.
 
+## Граница агента и внешних сервисов
+
+- В version-specific документации агента описывайте только ответственность
+  Agent Runtime, registry, policies, adapters и lifecycle orchestration.
+- В cross-version contract допускается описывать обе стороны интеграционной
+  границы, но только как наблюдаемые требования и invariants.
+- Не переносите в документацию агента внутреннюю архитектуру отдельного сервиса:
+  конкретные frameworks, базы данных, очереди, workers, контейнеры и provider
+  implementation принадлежат репозиторию этого сервиса.
+- Не используйте код другого сервиса как каноническую спецификацию агента.
+  Допустима ссылка только на общий contract или public interface.
+- Каждый новый contract должен быть достижим из
+  `design/contracts/README.md` и `design/README.md`.
+
 ## Правила изменений
 
 - Не меняйте уже заложенную концепцию без явного решения пользователя или ADR.
@@ -51,19 +75,25 @@
 - Один канонический Markdown-файл отвечает за одну архитектурную ответственность
   внутри одной версии.
 - Не дублируйте подробные контракты в README, roadmap, ADR или этом файле.
-- Каждый новый документ должен быть достижим из README своей версии либо из
-  cross-version индекса.
-- При изменении спецификации обновляйте зависимости, non-goals, migration path,
+- Каждый новый документ должен быть достижим из README своей версии, из
+  `design/contracts/README.md` либо из cross-version индекса.
+- При изменении спецификации обновляйте dependencies, non-goals, migration path,
   acceptance criteria, release gate, ссылки и metadata статуса.
-- Сохраняйте local/self-hosted mode, если соответствующая версия явно не меняет
-  это требование.
+- Сохраняйте self-hosted Service Application как first-class profile, если
+  соответствующая версия явно не меняет это требование.
+- Не называйте локально запущенный self-hosted service Future Local Agent
+  Application.
+- Не приписывайте Future Local Agent Application реализованные config,
+  permissions, packaging или stdio policy, пока они остаются provisional.
 - Сначала стабилизируйте in-process port/contract, затем вводите process, service,
   database, queue, sandbox или remote execution boundary.
 - Предпочитайте композицию, dependency injection и ports/adapters дальнейшему
   углублению наследования и global mutable state.
 
 Архитектурные инварианты находятся в
-[`design/principles.md`](design/principles.md), эволюция системы — в
+[`design/principles.md`](design/principles.md), runtime/deployment profiles — в
+[`design/runtime-and-deployment-profiles.md`](design/runtime-and-deployment-profiles.md),
+эволюция системы — в
 [`design/architecture-evolution.md`](design/architecture-evolution.md), правила
 зависимостей — в [`design/dependency-rules.md`](design/dependency-rules.md), а
 общие критерии завершения — в
@@ -101,7 +131,12 @@ implementation plan.
 - проверьте относительные ссылки;
 - проверьте уникальность `id`, `update` и `sequence` во frontmatter;
 - проверьте отсутствие двух канонических файлов для одной темы;
-- проверьте согласованность README, current, principles, glossary и roadmap;
+- проверьте согласованность README, current, principles, glossary, runtime
+  profiles и roadmap;
+- проверьте, что agent-side docs не содержат внутреннюю реализацию внешнего
+  сервиса;
+- проверьте, что application profile, hosting mode, topology и execution backend
+  не используются как синонимы;
 - перечислите изменённые файлы и оставшиеся provisional решения.
 
 Не объявляйте версию или архитектурное свойство завершёнными, пока не проверены

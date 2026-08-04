@@ -34,6 +34,16 @@ from .mcp_client import ManagerToolSpec, SessionState
 from .schema import inline_local_schema_refs
 
 
+_MANAGER_ROUTING_RULES = """
+Маршрутизация инструментов:
+- Встроенные manager tools, уже присутствующие в текущем запросе, вызывай напрямую.
+- К ним относятся artifact_*, agent_plan_*, mcp_list_* и mcp_get_*.
+- mcp_call_tool используй только для внешних MCP-инструментов, найденных через
+  mcp_list_tools.
+- Никогда не передавай имя встроенного manager tool в mcp_call_tool.
+""".strip()
+
+
 class ArtifactDeliveryMixin:
     """Add input artifacts and delivery without bypassing inherited runtime."""
 
@@ -47,6 +57,9 @@ class ArtifactDeliveryMixin:
             and artifact_services.config.enabled
         )
         self._session_artifact_handoffs: dict[str, list[str]] = {}
+        self.artifact_trace_service = (
+            artifact_services.trace_service if artifacts_enabled else None
+        )
         self.artifact_delivery_tool_controller = (
             ArtifactDeliveryToolController(artifact_services.delivery_service)
             if artifacts_enabled
@@ -58,6 +71,15 @@ class ArtifactDeliveryMixin:
                 artifact_services.artifact_service,
                 artifact_services.delivery_service,
             )
+
+    def clear_session(self, session_id: str) -> None:
+        """Clear artifact handoff state and the inherited session state."""
+
+        self._session_artifact_handoffs.pop(session_id, None)
+        super().clear_session(session_id)
+
+    def _create_system_message(self) -> str:
+        return f"{super()._create_system_message()}\n\n{_MANAGER_ROUTING_RULES}"
 
     def _build_manager_tools(self) -> dict[str, ManagerToolSpec]:
         tools = super()._build_manager_tools()
@@ -94,6 +116,27 @@ class ArtifactDeliveryMixin:
             )
         return tools
 
+    async def _manager_call_tool(
+        self,
+        arguments: dict[str, Any],
+    ) -> dict[str, Any]:
+        target_tool_name = str(arguments.get("tool_name") or "").strip()
+        if target_tool_name and self._is_manager_tool(target_tool_name):
+            return {
+                "type": "invalid_tool_routing",
+                "tool_name": "mcp_call_tool",
+                "target_tool_name": target_tool_name,
+                "retryable": True,
+                "corrective_action": (
+                    f"Call {target_tool_name} directly as a native manager tool."
+                ),
+                "message": (
+                    "mcp_call_tool accepts only external MCP tools discovered "
+                    "through mcp_list_tools."
+                ),
+            }
+        return await super()._manager_call_tool(arguments)
+
     async def process_query(self, *args: Any, **kwargs: Any):
         input_batch = kwargs.pop("input_batch", None)
         client_type = kwargs.get("client_type")
@@ -129,6 +172,14 @@ class ArtifactDeliveryMixin:
                 result.artifacts = [
                     item.model_dump(mode="json") for item in refs
                 ]
+                result_status = str(
+                    getattr(result.status, "value", result.status)
+                )
+                if result_status == "done":
+                    await self._trace_handoff_saved(
+                        session_id=session_id,
+                        cycle_id=cycle_id,
+                    )
             return result
         finally:
             reset_artifact_request_input_batch(batch_token)
@@ -148,7 +199,16 @@ class ArtifactDeliveryMixin:
             if self.artifact_config is not None
             else 32
         )
-        refs = list(dict.fromkeys(context.active_cycle.artifact_refs))[-maximum:]
+        input_batch = get_artifact_request_input_batch()
+        input_refs = (
+            list(input_batch.artifact_refs)
+            if input_batch is not None
+            else []
+        )
+        refs = list(dict.fromkeys([
+            *context.active_cycle.artifact_refs,
+            *input_refs,
+        ]))[-maximum:]
         handoffs = getattr(self, "_session_artifact_handoffs", None)
         if handoffs is None:
             handoffs = {}
@@ -211,9 +271,19 @@ class ArtifactDeliveryMixin:
                     "Additional committed batches require CycleInbox runtime"
                 )
             context.active_cycle.original_input_batch_id = input_batch.input_batch_id
+            activated_input_refs: list[str] = []
             for artifact_id in input_batch.artifact_refs:
                 if artifact_id not in context.active_cycle.artifact_refs:
                     context.active_cycle.artifact_refs.append(artifact_id)
+                    activated_input_refs.append(artifact_id)
+            if activated_input_refs:
+                self._trace_event(
+                    context.active_cycle.cycle_trace,
+                    "input_batch_artifacts_activated",
+                    input_batch_id=input_batch.input_batch_id,
+                    artifact_count=len(activated_input_refs),
+                    artifact_ids=activated_input_refs,
+                )
         return context
 
     async def _refresh_artifact_state(
@@ -232,7 +302,87 @@ class ArtifactDeliveryMixin:
             context.active_cycle.artifact_candidate_refs = [
                 item.candidate_id for item in available
             ]
+        await self._trace_pending_authority_events(context)
         await super()._refresh_artifact_state(context)
+
+    async def _trace_handoff_saved(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+    ) -> None:
+        if self.artifact_trace_service is None:
+            return
+        refs = list(self._session_artifact_handoffs.get(session_id, ()))
+        await self.artifact_trace_service.record(
+            session_id=session_id,
+            cycle_id=cycle_id,
+            event_type="artifact_handoff_saved",
+            stage="session_authority",
+            status="succeeded",
+            direction="internal",
+            metrics={"artifact_count": len(refs)},
+            data={
+                "artifact_ids": refs,
+                "bounded_limit": (
+                    self.artifact_config.max_artifacts_per_cycle
+                    if self.artifact_config is not None
+                    else 32
+                ),
+            },
+        )
+
+    async def _trace_pending_authority_events(
+        self,
+        context: ManagerToolContext,
+    ) -> None:
+        if self.artifact_trace_service is None:
+            return
+        recorded_types = {
+            str(item.get("source_event_type") or "")
+            for item in context.active_cycle.cycle_trace
+            if item.get("type") == "artifact_trace_authority_recorded"
+        }
+        for item in list(context.active_cycle.cycle_trace):
+            event_type = str(item.get("type") or "")
+            if event_type in recorded_types:
+                continue
+            if event_type == "artifact_authority_inherited":
+                await self.artifact_trace_service.record(
+                    session_id=context.session_id,
+                    cycle_id=context.cycle_id,
+                    event_type="artifact_handoff_applied",
+                    stage="session_authority",
+                    status="succeeded",
+                    direction="internal",
+                    metrics={
+                        "artifact_count": int(item.get("artifact_count") or 0)
+                    },
+                    data={"artifact_ids": list(item.get("artifact_ids") or [])},
+                )
+            elif event_type == "input_batch_artifacts_activated":
+                await self.artifact_trace_service.record(
+                    session_id=context.session_id,
+                    cycle_id=context.cycle_id,
+                    event_type="input_batch_artifacts_activated",
+                    stage="session_authority",
+                    status="succeeded",
+                    direction="inbound",
+                    correlation={
+                        "input_batch_id": item.get("input_batch_id")
+                    },
+                    metrics={
+                        "artifact_count": int(item.get("artifact_count") or 0)
+                    },
+                    data={"artifact_ids": list(item.get("artifact_ids") or [])},
+                )
+            else:
+                continue
+            context.active_cycle.cycle_trace.append({
+                "type": "artifact_trace_authority_recorded",
+                "source_event_type": event_type,
+            })
+            recorded_types.add(event_type)
 
     async def _call_registered_tool(
         self,

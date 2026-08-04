@@ -3,13 +3,13 @@
 from __future__ import annotations
 
 import json
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterable
 from typing import Any
 from urllib.parse import quote
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 from starlette.datastructures import UploadFile
 
 from ..artifacts import (
@@ -62,6 +62,12 @@ class InputPresentationBindRequest(BaseModel):
     client_message_id: str
 
 
+class RunCommittedBatchWithProgressRequest(RunCommittedBatchRequest):
+    """One execution request with a non-persisted presentation overlay."""
+
+    progress_metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 ProgressCallbackFactory = Callable[[Any], Any]
 
 
@@ -77,6 +83,22 @@ def _upload_stream(upload: UploadFile) -> AsyncIterator[bytes]:
             await upload.close()
 
     return iterator()
+
+
+async def _close_uploads(uploads: Iterable[UploadFile]) -> None:
+    """Best-effort close every distinct multipart upload handle."""
+
+    closed: set[int] = set()
+    for upload in uploads:
+        identity = id(upload)
+        if identity in closed:
+            continue
+        closed.add(identity)
+        try:
+            await upload.close()
+        except Exception:
+            # Cleanup must not hide the authoritative validation/ingress result.
+            pass
 
 
 def _committed_batch_payload(batch) -> dict[str, Any]:
@@ -134,6 +156,20 @@ def _submission_payload(
     return payload
 
 
+def _with_run_progress_metadata(batch, metadata: dict[str, Any] | None):
+    """Return an in-memory route overlay without mutating durable InputBatch."""
+
+    overlay = dict(metadata or {})
+    if not overlay:
+        return batch
+    route = batch.response_route
+    merged = dict(route.metadata or {})
+    merged.update(overlay)
+    return batch.model_copy(update={
+        "response_route": route.model_copy(update={"metadata": merged})
+    })
+
+
 def create_artifact_router(
     *,
     facade: ArtifactTransportFacade,
@@ -142,9 +178,18 @@ def create_artifact_router(
 ) -> APIRouter:
     router = APIRouter()
 
-    async def run_batch(batch, *, progress_locale: str):
+    async def run_batch(
+        batch,
+        *,
+        progress_locale: str,
+        progress_metadata: dict[str, Any] | None = None,
+    ):
+        presentation_batch = _with_run_progress_metadata(
+            batch,
+            progress_metadata,
+        )
         callback = (
-            progress_callback_factory(batch)
+            progress_callback_factory(presentation_batch)
             if progress_callback_factory is not None
             else None
         )
@@ -219,17 +264,52 @@ def create_artifact_router(
         run: bool = False,
         progress_locale: str = "ru",
     ):
+        form = await request.form()
+        form_items = list(form.multi_items())
+        uploads = [
+            value
+            for _, value in form_items
+            if isinstance(value, UploadFile)
+        ]
         try:
-            form = await request.form()
-            raw_manifest = form.get("manifest")
-            if not isinstance(raw_manifest, str):
+            manifest_values = [
+                value
+                for field_name, value in form_items
+                if field_name == "manifest"
+            ]
+            if (
+                len(manifest_values) != 1
+                or not isinstance(manifest_values[0], str)
+            ):
                 raise HTTPException(
                     status_code=422,
-                    detail="Multipart request requires a JSON manifest field",
+                    detail=(
+                        "Multipart request requires exactly one JSON "
+                        "manifest field"
+                    ),
                 )
-            envelope = ClientInputEnvelope.model_validate_json(raw_manifest)
+
+            unexpected_plain_fields = sorted({
+                field_name
+                for field_name, value in form_items
+                if not isinstance(value, UploadFile)
+                and field_name != "manifest"
+            })
+            if unexpected_plain_fields:
+                raise HTTPException(
+                    status_code=422,
+                    detail=(
+                        "Unexpected multipart form fields: "
+                        f"{unexpected_plain_fields}"
+                    ),
+                )
+
+            envelope = ClientInputEnvelope.model_validate_json(
+                manifest_values[0]
+            )
+
             upload_fields: dict[str, UploadFile] = {}
-            for field_name, value in form.multi_items():
+            for field_name, value in form_items:
                 if not isinstance(value, UploadFile):
                     continue
                 if field_name in upload_fields:
@@ -239,26 +319,41 @@ def create_artifact_router(
                     )
                 upload_fields[field_name] = value
 
-            streams: dict[str, AsyncIterator[bytes]] = {}
-            expected_fields: set[str] = set()
+            expected_fields: dict[str, str] = {}
             for slot in envelope.attachment_slots:
                 field_name = slot.upload_field_name
                 if field_name is None:
                     continue
-                expected_fields.add(field_name)
-                upload = upload_fields.get(field_name)
-                if upload is None:
+                previous_slot_id = expected_fields.get(field_name)
+                if previous_slot_id is not None:
                     raise HTTPException(
                         status_code=422,
-                        detail=f"Missing multipart field {field_name!r}",
+                        detail=(
+                            f"Multipart field {field_name!r} is referenced "
+                            f"by multiple attachment slots: "
+                            f"{previous_slot_id!r}, {slot.slot_id!r}"
+                        ),
                     )
-                streams[slot.slot_id] = _upload_stream(upload)
-            unexpected = set(upload_fields) - expected_fields
+                expected_fields[field_name] = slot.slot_id
+
+            missing = sorted(set(expected_fields) - set(upload_fields))
+            if missing:
+                raise HTTPException(
+                    status_code=422,
+                    detail=f"Missing multipart fields: {missing}",
+                )
+
+            unexpected = sorted(set(upload_fields) - set(expected_fields))
             if unexpected:
                 raise HTTPException(
                     status_code=422,
-                    detail=f"Unexpected multipart fields: {sorted(unexpected)}",
+                    detail=f"Unexpected multipart fields: {unexpected}",
                 )
+
+            streams = {
+                slot_id: _upload_stream(upload_fields[field_name])
+                for field_name, slot_id in expected_fields.items()
+            }
 
             result = await facade.submit_envelope(
                 envelope,
@@ -301,6 +396,8 @@ def create_artifact_router(
                 status_code=503,
                 detail="Ingress storage unavailable",
             ) from error
+        finally:
+            await _close_uploads(uploads)
 
     @router.post(
         "/input-batches/{input_batch_id}/commit",
@@ -372,6 +469,8 @@ def create_artifact_router(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ArtifactAccessError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
+        except ArtifactDeliveryError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
         except IngressConflictError as error:
             raise HTTPException(status_code=409, detail=str(error)) from error
         except (ArtifactStorageError, ArtifactIntegrityError) as error:
@@ -386,7 +485,7 @@ def create_artifact_router(
     )
     async def run_input_batch(
         input_batch_id: str,
-        body: RunCommittedBatchRequest,
+        body: RunCommittedBatchWithProgressRequest,
     ):
         try:
             batch = await facade.api.ingress_services.batch_store.get_committed(
@@ -397,6 +496,7 @@ def create_artifact_router(
             response = await run_batch(
                 batch,
                 progress_locale=body.progress_locale,
+                progress_metadata=body.progress_metadata,
             )
             return {
                 "status": "ok",
@@ -428,6 +528,8 @@ def create_artifact_router(
             raise HTTPException(status_code=404, detail=str(error)) from error
         except ArtifactAccessError as error:
             raise HTTPException(status_code=403, detail=str(error)) from error
+        except ArtifactDeliveryError as error:
+            raise HTTPException(status_code=409, detail=str(error)) from error
 
     @router.get(
         "/internal/output-batches/unknown",

@@ -3,7 +3,7 @@ id: design.roadmap
 version: cross-version
 spec_status: summary
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-02
 ---
 
 # Roadmap v0.3 → v0.10
@@ -11,18 +11,21 @@ last_reviewed: 2026-07-27
 > **Роль документа:** хронологическая сводка. Канонический список именованных
 > updates и их порядок определяются README соответствующей версии в
 > [`versions/`](versions/), текущий baseline — в [`current.md`](current.md), а
-> подробные contracts — в тематических спецификациях.
+> подробные contracts — в тематических спецификациях и [`contracts/`](contracts/README.md).
+
+Application profiles, hosting modes и execution boundaries определены в
+[`runtime-and-deployment-profiles.md`](runtime-and-deployment-profiles.md).
 
 ## Общая траектория
 
 ```text
 v0.3  agent loop baseline
   ↓
-v0.4  workspace, artifacts, input runtime и modularization
+v0.4  workspace, artifacts, input runtime, modularization и MCP registry foundation
   ↓
 v0.5  PostgreSQL, durable state и RAG
   ↓
-v0.6  AgentRun/TaskRun, workers и workflow orchestration
+v0.6  AgentRun/TaskRun, workers, workflow orchestration и distributed registry
   ↓
 v0.7  skills и extension platform
   ↓
@@ -33,7 +36,7 @@ v0.9  single-node isolated execution
 v0.10 distributed execution plane
 ```
 
-Физическая архитектура развивается постепенно:
+Физическая архитектура Service Application развивается постепенно:
 
 ```text
 large orchestration class
@@ -44,6 +47,10 @@ large orchestration class
 → isolated execution plane
 → distributed runners
 ```
+
+Future Local Agent Application не является дополнительной ступенью этой
+service-side декомпозиции. После стабилизации AgentRuntime он может быть
+спроектирован как отдельный composition root поверх общего ядра.
 
 См. [`architecture-evolution.md`](architecture-evolution.md).
 
@@ -75,6 +82,9 @@ large orchestration class
 + compact runtime projections
 + durable files/input/delivery
 + optional local DAG
++ reusable AgentRuntime and explicit Service Application composition
++ modular tool runtime and local MCP registry foundation
++ revisioned application configuration
 ```
 
 Именованные updates:
@@ -86,8 +96,10 @@ v0.4-cycle-compaction
 v0.4-dag-planning
 v0.4-file-artifacts
 v0.4-file-artifacts-advanced
+v0.4-batch-workflows
 v0.4-input-runtime
 v0.4-runtime-modularization
+v0.4-mcp-registry-foundation
 ```
 
 `v0.4-file-artifacts-advanced` завершает semantic input/output, capabilities,
@@ -98,7 +110,33 @@ checkpoints, control inbox и finalization race barrier.
 
 `v0.4-runtime-modularization` после functional v0.4 декомпозирует
 `mcp_client.py`, вводит `AgentRuntime`, LLM/tool/event/repository ports,
-composition extensions и composition root.
+composition extensions, явный Service Application composition root и
+`ConfigProvider`. Канонический service configuration filename меняется с
+`mcp.config` на `agent.config`; validated immutable snapshots позволяют применять
+поддерживаемые изменения без обязательного restart Gateway.
+
+Обновление не реализует Future Local Agent Application, но не привязывает
+AgentRuntime к server adapters и оставляет возможность отдельного local
+composition root позднее.
+
+`v0.4-mcp-registry-foundation` добавляет config-backed scopes
+`builtin|instance|user|session`, trusted execution/presentation metadata,
+side-effect-aware retry, lifecycle ownership opaque remote handles и
+profile-aware transport admission.
+
+Новые builtin MCP integrations используют Streamable HTTP. stdio/executable
+остаётся поддерживаемым adapter общего MCP runtime, но Service Application не
+запускает user/session-provided executable code. Self-hosted operator сможет
+явно разрешить operator-managed instance stdio через deployment policy.
+Существующие builtin stdio/executable integrations являются migration legacy.
+
+Registry update реализует только сторону агента; внутреннее устройство
+конкретного MCP-сервиса не входит в документацию агента.
+
+Общие contracts:
+
+- [`runtime-and-deployment-profiles.md`](runtime-and-deployment-profiles.md);
+- [`contracts/builtin-mcp-service-contract.md`](contracts/builtin-mcp-service-contract.md).
 
 Канонический реестр: [`versions/v0.4/README.md`](versions/v0.4/README.md).
 
@@ -136,7 +174,9 @@ v0.5.7-persistence-stabilization
 - lazy extraction/chunking;
 - pgvector keyword/semantic/hybrid retrieval;
 - provenance/evidence;
-- filesystem migration и v0.6-ready durable state.
+- filesystem migration и v0.6-ready durable state;
+- owner-ready repositories для будущих per-user settings и registry data;
+- сохранение single-process self-hosted Service Application.
 
 Канонический реестр: [`versions/v0.5/README.md`](versions/v0.5/README.md).
 
@@ -162,19 +202,24 @@ v0.6.5-interventions-and-cycle-inbox
 v0.6.6-event-bus-and-delivery
 v0.6.7-background-workers
 v0.6.8-object-storage-and-payload-runtime
-v0.6.9-capability-registry-scopes
+v0.6.9-distributed-capability-registry
 v0.6.10-service-boundary-stabilization
-```
-
-Execution modes:
-
-```text
-DIRECT | SINGLE_TASK | PLANNED_TASK | WORKFLOW
 ```
 
 Версия вводит durable jobs/leases, `TaskContextManifest`, workflow revisions,
 safe fork/join, user interventions, progress event bus, background workers,
 object storage и первые обоснованные process boundaries.
+
+Тот же `AgentRuntime` может исполняться in-process либо внутри Agent Runtime
+worker/service. In-process self-hosted development не называется Local Agent
+Application.
+
+`v0.6.9` не проектирует scopes заново: он переносит registry foundation v0.4 в
+PostgreSQL-backed multi-process runtime, публикует worker-visible revisions и
+добавляет ownership-aware synchronization/recovery.
+
+ConfigProvider revision contract также расширяется на multi-process propagation,
+а не заменяется новым способом загрузки конфигурации.
 
 Канонический реестр: [`versions/v0.6/README.md`](versions/v0.6/README.md).
 
@@ -196,7 +241,11 @@ v0.7.7-extension-platform-stabilization
 
 Skills выбираются task-scoped, загружаются bounded и подключаются через
 providers/policies/hooks. Required capabilities не являются разрешениями.
-Registry использует scopes `builtin`, `instance`, `user`, `session`.
+Registry использует scopes `builtin`, `instance`, `user`, `session`, введённые
+для MCP registry foundation и расширенные до distributed revisions в v0.6.
+
+Application profile задаёт capability ceiling: skill не может включить host
+terminal, executable transport или другую запрещённую capability.
 
 Канонический реестр: [`versions/v0.7/README.md`](versions/v0.7/README.md).
 
@@ -221,6 +270,13 @@ TaskRun и AgentCycle остаются разными сущностями. Tele
 через explicit linking flow. Every durable resource получает owner/scope,
 negative authorization tests и quota enforcement.
 
+Self-hosted и managed остаются hosting modes Service Application. Per-user MCP
+definitions, credentials и preferences хранятся через owner-aware repositories,
+а не в общем operator `agent.config`.
+
+Future Local Agent Application остаётся отдельным application profile и не
+является специальным auth mode v0.8.
+
 Канонический реестр: [`versions/v0.8/README.md`](versions/v0.8/README.md).
 
 ---
@@ -243,6 +299,10 @@ Potentially untrusted code/process/file execution переносится в ephe
 sandbox. AgentRuntime, DB, Redis, auth и provider credentials остаются в trusted
 control plane. `ExecutionBackend` скрывает local/container implementation,
 workspace materialized по exact refs, outputs commit-ятся до teardown.
+
+Terminal manager tools Service Application используют execution port и approved
+sandbox backend. `LocalProcessExecutionBackend`, sandbox instance и Future Local
+Agent Application не являются одним понятием.
 
 Канонический реестр: [`versions/v0.9/README.md`](versions/v0.9/README.md).
 
@@ -269,6 +329,24 @@ double commit. Object storage обеспечивает remote workspace. Docker,
 Kubernetes, gVisor и microVM остаются adapters одного execution contract.
 
 Канонический реестр: [`versions/v0.10/README.md`](versions/v0.10/README.md).
+
+---
+
+## Future Local Agent Application
+
+После стабилизации AgentRuntime может быть отдельно спроектирован local
+executable profile:
+
+```text
+Local CLI / Desktop / IDE integration
+→ separate local composition root
+→ local configuration and permissions
+→ host terminal/filesystem and stdio MCP under user policy
+```
+
+Roadmap пока не назначает этому профилю номер версии, packaging, язык или сроки.
+Он должен переиспользовать AgentRuntime и общие contracts, а не создавать fork
+agent loop.
 
 ---
 

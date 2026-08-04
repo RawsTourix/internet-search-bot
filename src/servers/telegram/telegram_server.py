@@ -4,6 +4,7 @@ import logging
 import os
 import re
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -35,6 +36,7 @@ from .artifact_bridge import (
     TelegramArtifactGatewayClient,
     build_telegram_input_envelope,
     extract_telegram_attachments,
+    telegram_media_group_key,
     telegram_session_id,
 )
 from .config import (
@@ -70,7 +72,7 @@ telegram_output_executor = TelegramOutputPlanExecutor()
 telegram_localization = LocalizationService.from_directory(
     config=LocalizationConfigType()
 )
-from .runtime_state import KeyedAsyncLockPool
+from .runtime_state import KeyedAsyncLockPool, SessionGenerationRegistry
 from ...utils.telegram_formatting import (
     markdown_to_plain_text,
     markdown_to_telegram_html,
@@ -117,8 +119,26 @@ progress_edit_state: dict[str, dict[str, Any]] = {}
 progress_edit_queues: dict[str, asyncio.Queue[tuple[int, str]]] = {}
 progress_edit_workers: dict[str, asyncio.Task[None]] = {}
 progress_edit_versions: dict[str, int] = {}
+retired_progress_targets: OrderedDict[str, str] = OrderedDict()
+MAX_RETIRED_PROGRESS_TARGETS = 4096
 media_groups: dict[str, "PendingMediaGroup"] = {}
 media_groups_guard = asyncio.Lock()
+session_generations = SessionGenerationRegistry()
+
+
+def register_progress_redirect(
+    *,
+    chat_id: int | str,
+    old_message_id: int,
+    new_message_id: int,
+) -> None:
+    """Permanently fence one superseded handle from future progress edits."""
+
+    key = f"{chat_id}:{old_message_id}"
+    retired_progress_targets[key] = str(new_message_id)
+    retired_progress_targets.move_to_end(key)
+    while len(retired_progress_targets) > MAX_RETIRED_PROGRESS_TARGETS:
+        retired_progress_targets.popitem(last=False)
 
 
 @dataclass(slots=True)
@@ -130,6 +150,7 @@ class PendingMediaGroup:
     update: Update
     status_message: Any
     response_metadata: dict[str, Any]
+    generation: int = 0
     failed: bool = False
     terminal_notified: bool = False
 
@@ -224,7 +245,10 @@ def _safe_transport_error(
     error: BaseException,
     *,
     locale: str = "ru",
+    input_kind: str = "file",
 ) -> str:
+    if input_kind == "message":
+        return _localized("error.input_message", locale=locale)
     if isinstance(error, httpx.HTTPStatusError):
         return _localized(
             "error.transport_http",
@@ -238,6 +262,17 @@ def _safe_transport_error(
     if isinstance(error, TelegramArtifactBridgeError):
         return _localized("error.unsafe_file", locale=locale)
     return _localized("error.internal", locale=locale)
+
+
+async def _claim_explicit_failure_notification(session_id: str) -> bool:
+    claim = getattr(
+        artifact_gateway,
+        "claim_explicit_ingress_failure",
+        None,
+    )
+    if not callable(claim):
+        return True
+    return bool(await claim(session_id))
 
 
 async def send_to_gateway(payload: dict) -> tuple[bool, str, dict[str, Any]]:
@@ -299,6 +334,109 @@ async def bind_input_presentation_status(
         )
 
 
+def _newest_status_message(current: Any, candidate: Any) -> Any:
+    """Keep the newest Telegram handle when concurrent callbacks complete."""
+
+    if candidate is None:
+        return current
+    if current is None:
+        return candidate
+    try:
+        current_id = int(getattr(current, "message_id"))
+        candidate_id = int(getattr(candidate, "message_id"))
+    except (AttributeError, TypeError, ValueError):
+        return candidate
+    return candidate if candidate_id >= current_id else current
+
+
+async def adopt_input_batch_status(
+    input_batch_id: str,
+    status_message: Any,
+) -> None:
+    """Propagate one relocated handle to every live callback for the batch."""
+
+    normalized = input_batch_id.strip()
+    if not normalized or status_message is None:
+        return
+    async with media_groups_guard:
+        for group in media_groups.values():
+            if group.input_batch_id != normalized:
+                continue
+            group.status_message = _newest_status_message(
+                group.status_message,
+                status_message,
+            )
+            group.response_metadata = _progress_metadata(
+                group.update,
+                group.status_message,
+                request_id=normalized,
+            )
+
+
+async def apply_attachment_input_ack_policy(
+    *,
+    update: Update,
+    submission: dict[str, Any],
+    session_id: str,
+    status_message: Any,
+    explicit_active: bool,
+) -> Any:
+    """Apply one presentation policy without duplicating an initial status."""
+
+    policy = str(submission.get("ack_policy") or "silent")
+    if not explicit_active and policy == "create" and status_message is not None:
+        await bind_input_presentation_status(
+            submission=submission,
+            status_message=status_message,
+            session_id=session_id,
+        )
+        return status_message
+    if explicit_active and status_message is not None:
+        submission["_telegram_precreated_status_message"] = status_message
+    acknowledged = await apply_input_ack_policy(
+        update=update,
+        submission=submission,
+        session_id=session_id,
+    )
+    authoritative = (
+        acknowledged
+        if explicit_active and acknowledged is not None
+        else _newest_status_message(status_message, acknowledged)
+    )
+    candidate_id = getattr(status_message, "message_id", None)
+    authoritative_id = getattr(authoritative, "message_id", None)
+    candidate_is_authoritative = (
+        candidate_id is not None
+        and authoritative_id is not None
+        and int(candidate_id) == int(authoritative_id)
+    )
+    if explicit_active and status_message is not None and not candidate_is_authoritative:
+        if candidate_id is not None:
+            await stop_progress_edits(
+                chat_id=update.effective_chat.id,
+                message_id=int(candidate_id),
+            )
+            try:
+                await application.bot.delete_message(
+                    chat_id=update.effective_chat.id,
+                    message_id=int(candidate_id),
+                )
+            except Exception as error:
+                if authoritative_id is not None:
+                    register_progress_redirect(
+                        chat_id=update.effective_chat.id,
+                        old_message_id=int(candidate_id),
+                        new_message_id=int(authoritative_id),
+                    )
+                logger.warning(
+                    "telegram_losing_upload_status_delete_failed "
+                    "message_id=%s error_type=%s",
+                    candidate_id,
+                    type(error).__name__,
+                )
+    return authoritative
+
+
 def _presentation_text(submission: dict[str, Any]) -> str:
     event = submission.get("presentation_event") or {}
     key = str(event.get("message_key") or "")
@@ -306,6 +444,15 @@ def _presentation_text(submission: dict[str, Any]) -> str:
     locale = normalize_locale(event.get("locale"))
     if not key:
         key = "input_batch.updated"
+    if (
+        key == "input_batch.collecting"
+        and (
+            params.get("assembly_mode") == "explicit"
+            or params.get("commit_policy") == "explicit"
+            or params.get("auto_commit_allowed") is False
+        )
+    ):
+        key = "input_collection.collecting"
     return _localized(
         key,
         locale=locale,
@@ -386,10 +533,21 @@ def _progress_metadata(
         if progress_request_id is not None:
             metadata["progress_request_id"] = str(progress_request_id)
         if chat_id is not None and status_message_id is not None:
-            metadata["progress_target"] = {
+            progress_target = {
                 "chat_id": chat_id,
                 "message_id": status_message_id,
             }
+            # Some non-message updates and compatibility callers do not expose
+            # ``effective_message``.  Preserve the historical target shape for
+            # those callers; generation fencing is available for real Telegram
+            # message updates where a stable session can be derived.
+            if message is not None:
+                session_id = _session_for_update(update)
+                progress_target.update(
+                    session_id=session_id,
+                    session_generation=session_generations.current(session_id),
+                )
+            metadata["progress_target"] = progress_target
     if TELEGRAM_PROGRESS_CALLBACK_URL:
         metadata["progress_callback_url"] = TELEGRAM_PROGRESS_CALLBACK_URL
     if TELEGRAM_PROGRESS_CALLBACK_TOKEN:
@@ -705,6 +863,20 @@ async def _deliver_agent_result(
     metadata: dict[str, Any],
     session_id: str,
 ) -> None:
+    response_generation = metadata.get("telegram_session_generation")
+    if (
+        response_generation is not None
+        and not session_generations.is_current(
+            session_id,
+            int(response_generation),
+        )
+    ):
+        logger.info(
+            "telegram_terminal_delivery_stale session_id=%s generation=%s",
+            session_id,
+            response_generation,
+        )
+        return
     locale_name = normalize_locale(
         metadata.get("progress_locale") or detect_progress_locale(update)
     )
@@ -844,6 +1016,9 @@ def _session_for_update(update: Update) -> str:
 async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_text = update.effective_message.text or ""
     words = full_text.split()
+    normalized_command = (
+        words[0].lower().split("@", 1)[0] if words else ""
+    )
     payload = {
         "id": str(uuid.uuid4()),
         "timestamp": datetime.now().isoformat(),
@@ -860,19 +1035,33 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "command": words[0] if words else "",
         "arguments": words[1:],
     }
-    status_message = await send_initial_status_message(
-        update,
-        _localized(
-            "input.command_received",
-            locale=detect_progress_locale(update),
-        ),
-    )
+    status_message = None
+    if normalized_command not in {"/status", "/reset"}:
+        status_message = await send_initial_status_message(
+            update,
+            _localized(
+                "input.command_received",
+                locale=detect_progress_locale(update),
+            ),
+        )
     attach_progress_metadata(
         payload=payload,
         update=update,
         status_message=status_message,
     )
+    if normalized_command == "/reset":
+        await reset_process_local_session(_session_for_update(update))
     success, message, metadata = await send_to_gateway(payload)
+    if normalized_command == "/status" and success:
+        activity = await media_group_activity.snapshot_all()
+        message = (
+            f"{message}\n\nTelegram transport:\n"
+            f"• Активных media groups: {len(media_groups)}\n"
+            f"• In-flight downloads: {activity['in_flight']}"
+        )
+    metadata["telegram_session_generation"] = session_generations.current(
+        _session_for_update(update)
+    )
     await _deliver_agent_result(
         update=update,
         status_message=status_message,
@@ -885,6 +1074,7 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     session_id = _session_for_update(update)
+    generation = session_generations.current(session_id)
     progress_locale = detect_progress_locale(update)
     try:
         semantic_parts = await telegram_input_resolvers.resolve(
@@ -920,6 +1110,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
         metadata = payload.get("metadata", {}) or {}
         metadata.setdefault("progress_locale", progress_locale)
+        metadata["telegram_session_generation"] = generation
         await _deliver_agent_result(
             update=update,
             status_message=status_message,
@@ -930,12 +1121,26 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     except Exception as error:
         logger.exception("Telegram semantic text input failed: %r", error)
+        if not await _claim_explicit_failure_notification(session_id):
+            logger.info(
+                "telegram_collection_cascade_error_suppressed "
+                "session_id=%s input_kind=message",
+                session_id,
+            )
+            return
         await _deliver_agent_result(
             update=update,
             status_message=None,
             success=False,
-            message=_safe_transport_error(error, locale=progress_locale),
-            metadata={"progress_locale": progress_locale},
+            message=_safe_transport_error(
+                error,
+                locale=progress_locale,
+                input_kind="message",
+            ),
+            metadata={
+                "progress_locale": progress_locale,
+                "telegram_session_generation": generation,
+            },
             session_id=session_id,
         )
 
@@ -975,12 +1180,27 @@ async def _expire_group(group: PendingMediaGroup) -> None:
 
 async def _finish_group(group: PendingMediaGroup) -> None:
     try:
+        if not session_generations.is_current(
+            group.session_id,
+            group.generation,
+        ):
+            logger.info(
+                "telegram_media_group_callback_stale session_id=%s group_key=%s",
+                group.session_id,
+                group.key,
+            )
+            return
         if group.failed or group.input_batch_id is None:
             return
         payload = await artifact_gateway.commit_and_run(
             group.input_batch_id,
             session_id=group.session_id,
             progress_locale=group.progress_locale,
+            progress_metadata_provider=lambda: _progress_metadata(
+                group.update,
+                group.status_message,
+                request_id=group.input_batch_id,
+            ),
         )
         if payload.get("run_skipped_duplicate"):
             await finish_status_or_send_reply(
@@ -995,6 +1215,7 @@ async def _finish_group(group: PendingMediaGroup) -> None:
             return
         metadata = payload.get("metadata", {}) or {}
         metadata.setdefault("progress_locale", group.progress_locale)
+        metadata["telegram_session_generation"] = group.generation
         await _deliver_agent_result(
             update=group.update,
             status_message=group.status_message,
@@ -1013,7 +1234,10 @@ async def _finish_group(group: PendingMediaGroup) -> None:
                 error,
                 locale=group.progress_locale,
             ),
-            metadata={"progress_locale": group.progress_locale},
+            metadata={
+                "progress_locale": group.progress_locale,
+                "telegram_session_generation": group.generation,
+            },
             session_id=group.session_id,
         )
     finally:
@@ -1022,20 +1246,34 @@ async def _finish_group(group: PendingMediaGroup) -> None:
                 media_groups.pop(group.key, None)
 
 
-async def _process_standalone_attachment(update: Update) -> None:
+async def _process_standalone_attachment(
+    update: Update,
+    *,
+    semantic_parts: list[Any] | None = None,
+) -> None:
+    progress_locale = detect_progress_locale(update)
+    session_id = _session_for_update(update)
+    explicit_active = False
+    collection_active = getattr(
+        artifact_gateway,
+        "is_explicit_collection_active",
+        None,
+    )
+    if callable(collection_active):
+        explicit_active = await collection_active(session_id)
     status_message = await send_initial_status_message(
         update,
         _localized(
             "input.file_received",
-            locale=detect_progress_locale(update),
+            locale=progress_locale,
         ),
     )
-    progress_locale = detect_progress_locale(update)
-    session_id = _session_for_update(update)
+    generation = session_generations.current(session_id)
     try:
-        semantic_parts = await telegram_input_resolvers.resolve(
-            update.effective_message,
-        )
+        if semantic_parts is None:
+            semantic_parts = await telegram_input_resolvers.resolve(
+                update.effective_message,
+            )
         envelope = build_telegram_input_envelope(
             update,
             bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
@@ -1053,10 +1291,12 @@ async def _process_standalone_attachment(update: Update) -> None:
             envelope,
             progress_locale=progress_locale,
         )
-        await bind_input_presentation_status(
+        status_message = await apply_attachment_input_ack_policy(
+            update=update,
             submission=submission,
             status_message=status_message,
             session_id=session_id,
+            explicit_active=explicit_active,
         )
         if submission.get("status") == "failed":
             raise TelegramArtifactBridgeError("Ingress rejected the attachment")
@@ -1078,6 +1318,11 @@ async def _process_standalone_attachment(update: Update) -> None:
             batch_id,
             session_id=session_id,
             progress_locale=progress_locale,
+            progress_metadata=_progress_metadata(
+                update,
+                status_message,
+                request_id=batch_id,
+            ),
         )
         if payload.get("run_skipped_duplicate"):
             await finish_status_or_send_reply(
@@ -1092,6 +1337,7 @@ async def _process_standalone_attachment(update: Update) -> None:
             return
         metadata = payload.get("metadata", {}) or {}
         metadata.setdefault("progress_locale", progress_locale)
+        metadata["telegram_session_generation"] = generation
         await _deliver_agent_result(
             update=update,
             status_message=status_message,
@@ -1102,19 +1348,31 @@ async def _process_standalone_attachment(update: Update) -> None:
         )
     except Exception as error:
         logger.exception("Standalone Telegram attachment failed: %r", error)
+        if not await _claim_explicit_failure_notification(session_id):
+            logger.info(
+                "telegram_collection_cascade_error_suppressed "
+                "session_id=%s input_kind=file",
+                session_id,
+            )
+            return
         await _deliver_agent_result(
             update=update,
             status_message=status_message,
             success=False,
             message=_safe_transport_error(error, locale=progress_locale),
-            metadata={"progress_locale": progress_locale},
+            metadata={
+                "progress_locale": progress_locale,
+                "telegram_session_generation": generation,
+            },
             session_id=session_id,
         )
 
 
 async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    if not extract_telegram_attachments(message):
+    attachments = extract_telegram_attachments(message)
+    semantic_parts: list[Any] | None = None
+    if not attachments:
         semantic_parts = await telegram_input_resolvers.resolve(message)
         if not semantic_parts:
             await message.reply_text(
@@ -1124,24 +1382,51 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             )
             return
-    media_group_id = getattr(message, "media_group_id", None)
-    if media_group_id is None:
+    preliminary = build_telegram_input_envelope(
+        update,
+        bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
+        semantic_parts=semantic_parts,
+    )
+    if preliminary.attachment_slots:
+        semantic_parts = await telegram_input_resolvers.resolve(
+            message,
+            attachment_slots=tuple(preliminary.attachment_slots),
+        )
+        preliminary = preliminary.model_copy(
+            update={"semantic_parts": semantic_parts}
+        )
+    prepare_envelope = getattr(
+        artifact_gateway,
+        "prepare_input_envelope",
+        None,
+    )
+    if callable(prepare_envelope):
+        preliminary = await prepare_envelope(preliminary)
+    effective_group_key = telegram_media_group_key(preliminary)
+    if effective_group_key is None:
         key = (
             f"{TELEGRAM_BOT_INSTANCE_ID}:{update.update_id}:"
             f"{message.message_id}"
         )
         async with standalone_lock_pool.hold(key):
-            await _process_standalone_attachment(update)
+            await _process_standalone_attachment(
+                update,
+                semantic_parts=semantic_parts,
+            )
         return
 
-    thread_id = getattr(message, "message_thread_id", None)
-    group_key = (
-        f"{TELEGRAM_BOT_INSTANCE_ID}:{update.effective_chat.id}:"
-        f"{thread_id or '-'}:{media_group_id}"
-    )
+    group_key = effective_group_key
     session_id = _session_for_update(update)
     progress_locale = detect_progress_locale(update)
     created_group = False
+    explicit_active = False
+    collection_active = getattr(
+        artifact_gateway,
+        "is_explicit_collection_active",
+        None,
+    )
+    if callable(collection_active):
+        explicit_active = await collection_active(session_id)
     async with media_groups_guard:
         group = media_groups.get(group_key)
         if group is None:
@@ -1160,6 +1445,7 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 update=update,
                 status_message=status_message,
                 response_metadata=_progress_metadata(update, status_message),
+                generation=session_generations.current(session_id),
             )
             media_groups[group_key] = group
             created_group = True
@@ -1169,22 +1455,39 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             update,
             bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
             response_metadata=group.response_metadata,
+            semantic_parts=semantic_parts,
         )
-        envelope = envelope.model_copy(update={
-            "semantic_parts": await telegram_input_resolvers.resolve(
-                update.effective_message,
-                attachment_slots=tuple(envelope.attachment_slots),
+        if callable(prepare_envelope):
+            envelope = await prepare_envelope(envelope)
+        if telegram_media_group_key(envelope) != group_key:
+            raise TelegramArtifactBridgeError(
+                "Telegram forwarded burst grouping changed during submission"
             )
-        })
         submission = await artifact_gateway.submit_envelope(
             envelope,
             progress_locale=progress_locale,
         )
-        await bind_input_presentation_status(
+        candidate_status = group.status_message
+        acknowledged_status = await apply_attachment_input_ack_policy(
+            update=update,
             submission=submission,
-            status_message=group.status_message,
+            status_message=candidate_status,
             session_id=session_id,
+            explicit_active=explicit_active,
         )
+        async with media_groups_guard:
+            if media_groups.get(group_key) is group:
+                if explicit_active and group.status_message is candidate_status:
+                    group.status_message = acknowledged_status
+                else:
+                    group.status_message = _newest_status_message(
+                        group.status_message,
+                        acknowledged_status,
+                    )
+                group.response_metadata = _progress_metadata(
+                    update,
+                    group.status_message,
+                )
         if group.failed:
             logger.info(
                 "telegram_media_group_member_ignored_after_terminal "
@@ -1228,7 +1531,13 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             )
     except Exception as error:
         logger.exception("Telegram media-group member failed: %r", error)
+        notify = await _claim_explicit_failure_notification(group.session_id)
         if not await _claim_group_failure(group):
+            return
+        abort_group = getattr(media_group_runner, "abort", None)
+        if callable(abort_group):
+            await abort_group(group_key)
+        if not notify:
             return
         await _deliver_agent_result(
             update=group.update,
@@ -1279,12 +1588,51 @@ async def lifespan(app: FastAPI):
     ])
     logger.info("Telegram webhook and artifact workflows started")
     yield
+    await artifact_gateway.close()
     await media_group_runner.cancel_all()
     await stop_all_progress_edits()
     await application.bot.delete_webhook()
     await application.stop()
     await application.shutdown()
     logger.info("Telegram bot stopped")
+
+
+async def reset_process_local_session(session_id: str) -> None:
+    """Invalidate transport-local callbacks, groups, edits and collection hints."""
+
+    session_generations.advance(session_id)
+    async with media_groups_guard:
+        groups = [
+            group for group in media_groups.values()
+            if group.session_id == session_id
+        ]
+        for group in groups:
+            group.failed = True
+            group.terminal_notified = True
+            media_groups.pop(group.key, None)
+    abort_group = getattr(media_group_runner, "abort", None)
+    if callable(abort_group):
+        for group in groups:
+            await abort_group(group.key)
+
+    prefix = session_id.removeprefix("telegram:conversation:")
+    chat_id = prefix.split(":thread:", 1)[0]
+    if chat_id.lstrip("-").isdigit():
+        for key in list(
+            set(progress_edit_workers)
+            | set(progress_edit_queues)
+            | set(progress_edit_state)
+        ):
+            if key.startswith(f"{chat_id}:"):
+                _, message_id = key.split(":", maxsplit=1)
+                await stop_progress_edits(
+                    chat_id=int(chat_id),
+                    message_id=int(message_id),
+                )
+
+    clear_session = getattr(artifact_gateway, "clear_session_state", None)
+    if callable(clear_session):
+        await clear_session(session_id)
 
 
 app = FastAPI(
@@ -1370,6 +1718,17 @@ async def internal_progress_handler(request: Request):
             return {"status": "ignored", "reason": "non-telegram client"}
         if not isinstance(event, dict) or not isinstance(target, dict):
             raise ValueError("Progress event and target must be objects")
+        target_session = str(target.get("session_id") or "").strip()
+        target_generation = target.get("session_generation")
+        if (
+            target_session
+            and target_generation is not None
+            and not session_generations.is_current(
+                target_session,
+                int(target_generation),
+            )
+        ):
+            return {"status": "ignored", "reason": "stale session generation"}
         if event.get("visibility", "user") != "user":
             return {"status": "ignored", "reason": "non-user visibility"}
         if event.get("type") == "iteration_started":
@@ -1381,6 +1740,12 @@ async def internal_progress_handler(request: Request):
         message_id = target.get("message_id") or target.get("status_message_id")
         if chat_id is None or message_id is None:
             return {"status": "ignored", "reason": "missing target"}
+        target_key = f"{chat_id}:{message_id}"
+        if target_key in retired_progress_targets:
+            return {
+                "status": "ignored",
+                "reason": "superseded presentation target",
+            }
         return {
             "status": "queued",
             "version": enqueue_progress_message(

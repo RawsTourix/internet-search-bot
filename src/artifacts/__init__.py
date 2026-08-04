@@ -83,6 +83,17 @@ from .promotion import ArtifactCandidatePromotionService
 from .server_policy import apply_local_workspace_server_policy
 from .service import ArtifactSearchResult, ArtifactService, ArtifactTextReadResult
 from .text_operations import apply_exact_text_patch, enforce_text_size
+from .tracing import (
+    ArtifactTraceArtifact,
+    ArtifactTraceCorrelation,
+    ArtifactTraceError,
+    ArtifactTraceEvent,
+    ArtifactTraceService,
+    ArtifactTraceStore,
+    ArtifactTraceTransport,
+    FileSystemArtifactTraceStore,
+    new_artifact_trace_event_id,
+)
 from .validators import ArtifactValidationReport, validate_native_text
 from .workspace import (
     ArtifactInputBinding,
@@ -145,6 +156,13 @@ __all__ = [
     "ArtifactStorageError",
     "ArtifactStore",
     "ArtifactTextReadResult",
+    "ArtifactTraceArtifact",
+    "ArtifactTraceCorrelation",
+    "ArtifactTraceError",
+    "ArtifactTraceEvent",
+    "ArtifactTraceService",
+    "ArtifactTraceStore",
+    "ArtifactTraceTransport",
     "ArtifactValidationError",
     "ArtifactValidationReport",
     "ArtifactVersion",
@@ -157,6 +175,7 @@ __all__ = [
     "FileSystemArtifactCandidateStore",
     "FileSystemArtifactDeliveryStore",
     "FileSystemArtifactStore",
+    "FileSystemArtifactTraceStore",
     "LegacyArtifactMigrator",
     "LegacyMigrationReport",
     "apply_exact_text_patch",
@@ -174,6 +193,7 @@ __all__ = [
     "new_artifact_delivery_id",
     "new_artifact_id",
     "new_artifact_lineage_id",
+    "new_artifact_trace_event_id",
     "normalize_artifact_filename",
     "recover_stale_delivery_claims",
     "register_artifact_progress_messages",

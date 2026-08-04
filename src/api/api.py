@@ -3,6 +3,7 @@ import os
 from collections.abc import AsyncIterator, Mapping
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from uuid import uuid4
 
 from .config import (
     AGENT_CONFIG_PATH,
@@ -38,6 +39,7 @@ from ..mcp.mcp_client import load_config
 from ..planning import create_planning_services, load_planning_config
 from ..planning.runtime_context import PlanningAwareContentStore
 from ..storage import StorageServices, create_storage_services
+from ..runtime import SessionExecutionCoordinator
 from ..interaction.config import (
     load_interaction_config,
     safe_interaction_config_summary,
@@ -81,6 +83,7 @@ class Api:
 
     def __init__(self, config_path):
         try:
+            self.execution_coordinator = SessionExecutionCoordinator()
             logger.info(
                 "Загрузка конфигурации MCP, LLM, storage, memory, runtime, "
                 "planning, artifacts и ingress"
@@ -224,6 +227,15 @@ class Api:
                     self.interaction_config.output_runtime.enabled
                 ),
             )
+            controller = getattr(
+                self.mcp_client,
+                "artifact_tool_controller",
+                None,
+            )
+            if controller is not None:
+                controller.committed_batch_store = (
+                    self.ingress_services.batch_store
+                )
         except Exception as error:
             raise APIError(f"Ошибка инициализации Api: {error!r}") from error
 
@@ -407,24 +419,30 @@ class Api:
                         ),
                     )
                 )
-            result = await self.mcp_client.process_query(
-                "",
+            async with self.execution_coordinator.run_lease(
                 session_id=session_id,
-                client_type=batch.client_type,
-                progress_callback=progress_callback,
-                progress_locale=progress_locale,
-                input_batch=batch,
-            )
-            if (
-                result.status == AgentStatus.DONE
-                and self.interaction_config.output_runtime.enabled
+                input_batch_id=input_batch_id,
+                cycle_id=(cycle_id := uuid4().hex),
             ):
-                await self.output_assembler.assemble_final(
-                    result=result,
+                result = await self.mcp_client.process_query(
+                    "",
+                    session_id=session_id,
+                    client_type=batch.client_type,
+                    progress_callback=progress_callback,
+                    progress_locale=progress_locale,
                     input_batch=batch,
-                    capability_snapshot=capability_snapshot,
-                    locale=batch.locale or progress_locale,
+                    cycle_id_override=cycle_id,
                 )
+                if (
+                    result.status == AgentStatus.DONE
+                    and self.interaction_config.output_runtime.enabled
+                ):
+                    await self.output_assembler.assemble_final(
+                        result=result,
+                        input_batch=batch,
+                        capability_snapshot=capability_snapshot,
+                        locale=batch.locale or progress_locale,
+                    )
             return result
         except APIError:
             raise
@@ -446,13 +464,18 @@ class Api:
         try:
             if not await self.mcp_client.list_tools():
                 logger.warning("Нет зарегистрированных инструментов")
-            result = await self.mcp_client.process_query(
-                message,
+            async with self.execution_coordinator.run_lease(
                 session_id=session_id,
-                client_type=client_type,
-                progress_callback=progress_callback,
-                progress_locale=progress_locale,
-            )
+                cycle_id=(cycle_id := uuid4().hex),
+            ):
+                result = await self.mcp_client.process_query(
+                    message,
+                    session_id=session_id,
+                    client_type=client_type,
+                    progress_callback=progress_callback,
+                    progress_locale=progress_locale,
+                    cycle_id_override=cycle_id,
+                )
             logger.info("Ответ получен")
             return result
         except Exception as error:
@@ -478,6 +501,7 @@ class Api:
         self.mcp_client.clear_session(session_id)
 
     async def stop(self):
+        await self.execution_coordinator.shutdown()
         try:
             await self.mcp_client.cleanup()
         except Exception as error:

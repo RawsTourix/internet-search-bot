@@ -547,9 +547,11 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
         await telegram_server.stop_all_progress_edits()
         telegram_server.progress_edit_state.clear()
         telegram_server.progress_edit_versions.clear()
+        telegram_server.retired_progress_targets.clear()
 
     async def asyncTearDown(self):
         await telegram_server.stop_all_progress_edits()
+        telegram_server.retired_progress_targets.clear()
 
     def test_attach_progress_metadata_enables_local_callback(self):
         payload = {"id": "request-1", "metadata": {}}
@@ -642,6 +644,39 @@ class TelegramProgressTests(unittest.IsolatedAsyncioTestCase):
             release.set()
             queue = telegram_server.progress_edit_queues["10:20"]
             await asyncio.wait_for(queue.join(), timeout=1)
+
+    async def test_internal_endpoint_never_edits_retired_status(self):
+        telegram_server.register_progress_redirect(
+            chat_id=10,
+            old_message_id=20,
+            new_message_id=30,
+        )
+        request = SimpleNamespace(
+            headers={
+                "X-Progress-Token": (
+                    telegram_server.TELEGRAM_PROGRESS_CALLBACK_TOKEN
+                )
+            },
+            json=AsyncMock(return_value={
+                "client_type": "telegram",
+                "target": {"chat_id": 10, "message_id": 20},
+                "event": {
+                    "type": "cycle_started",
+                    "message": "Starting",
+                    "visibility": "user",
+                },
+            }),
+        )
+
+        with patch.object(
+            telegram_server,
+            "enqueue_progress_message",
+        ) as enqueue:
+            result = await telegram_server.internal_progress_handler(request)
+
+        self.assertEqual(result["status"], "ignored")
+        self.assertEqual(result["reason"], "superseded presentation target")
+        enqueue.assert_not_called()
 
     async def test_progress_dispatcher_serializes_newer_edit_after_slow_one(self):
         first_started = asyncio.Event()

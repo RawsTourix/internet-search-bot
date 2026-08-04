@@ -41,6 +41,17 @@ TELEGRAM_BOT_INSTANCE_ID = os.getenv(
 TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS = float(
     os.getenv("TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS", "2.5")
 )
+# A separate Telegram text message may be bound to exactly one active album in
+# the same chat/thread only during this short transport-level window.
+TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS = float(
+    os.getenv("TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS", "10")
+)
+# Forwarded text updates can overtake earlier forwarded album updates because
+# webhook processing is concurrent. Only forwarded text may wait briefly for
+# that exact earlier album to become active; ordinary text remains immediate.
+TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS = float(
+    os.getenv("TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS", "1.5")
+)
 # Emergency ceiling for one Telegram album workflow. Expiry never commits a
 # partial batch; the group ends with a transport-level error instead.
 TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS = float(
@@ -48,6 +59,12 @@ TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS = float(
 )
 if TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS <= 0:
     raise ValueError("TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS must be positive")
+if TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS <= 0:
+    raise ValueError("TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS must be positive")
+if TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS < 0:
+    raise ValueError(
+        "TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS must not be negative"
+    )
 if TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS <= 0:
     raise ValueError("TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS must be positive")
 if (
@@ -57,6 +74,22 @@ if (
     raise ValueError(
         "TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS must not be shorter than "
         "TELEGRAM_MEDIA_GROUP_QUIET_PERIOD_SECONDS"
+    )
+if (
+    TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS
+    > TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS
+):
+    raise ValueError(
+        "TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS must not exceed "
+        "TELEGRAM_MEDIA_GROUP_MAX_LIFETIME_SECONDS"
+    )
+if (
+    TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS
+    > TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS
+):
+    raise ValueError(
+        "TELEGRAM_FORWARDED_TEXT_JOIN_WAIT_SECONDS must not exceed "
+        "TELEGRAM_MEDIA_GROUP_TEXT_JOIN_WINDOW_SECONDS"
     )
 
 TELEGRAM_DELIVERY_SPOOL_MEMORY_BYTES = int(
@@ -99,3 +132,24 @@ TELEGRAM_FINAL_DELIVERY_MODE = os.getenv(
     "TELEGRAM_FINAL_DELIVERY_MODE",
     "send_new",
 )
+
+# Controls the optional standalone completion message ("Готово.") after a
+# confirmed OutputBatch receipt. The tracked run-status message is finalized
+# independently for every terminal delivery state.
+TELEGRAM_FINAL_STATUS_MODE = os.getenv(
+    "TELEGRAM_FINAL_STATUS_MODE",
+    "artefacts_only",
+).strip().lower()
+# Accept the project-wide American spelling as an alias while keeping the
+# public values requested for this transport setting stable.
+if TELEGRAM_FINAL_STATUS_MODE == "artifacts_only":
+    TELEGRAM_FINAL_STATUS_MODE = "artefacts_only"
+if TELEGRAM_FINAL_STATUS_MODE not in {
+    "always",
+    "artefacts_only",
+    "never",
+}:
+    raise ValueError(
+        "TELEGRAM_FINAL_STATUS_MODE must be one of: "
+        "always, artefacts_only, never"
+    )

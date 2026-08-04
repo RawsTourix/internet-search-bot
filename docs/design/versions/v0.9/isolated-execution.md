@@ -4,7 +4,7 @@ version: v0.9
 document_role: architecture-overview
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-02
 ---
 
 # Архитектура single-node isolated execution
@@ -13,6 +13,10 @@ last_reviewed: 2026-07-27
 
 Предоставить агенту безопасную среду Python/shell/file execution, не помещая
 недоверенный код в Gateway, Agent Runtime worker или host project filesystem.
+
+Application/hosting profiles и отличие sandbox от Future Local Agent Application
+определены в
+[`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md).
 
 ## Trust boundary
 
@@ -42,12 +46,60 @@ Control plane не передаёт sandbox:
 
 - generated/user-provided Python или shell commands;
 - coding/data-analysis tasks;
+- terminal manager operations Service Application;
 - skill execution с process capability;
 - file conversion/processing с повышенным trust risk;
 - bounded package/tool operations, если профиль это разрешает.
 
 Обычный LLM reasoning, exact retrieval и безопасный remote MCP call не обязаны
 создавать sandbox.
+
+Service Application не использует host process execution как fallback, если
+approved sandbox backend недоступен.
+
+## Sandbox не равен Local Agent Application
+
+```text
+Local Agent Application
+≠ LocalProcessExecutionBackend
+≠ ephemeral SandboxInstance
+```
+
+Sandbox является bounded execution environment Service Application и обычно
+живёт не дольше `TaskRun`/`ExecutionAttempt`.
+
+Future Local Agent Application — отдельный user-owned application profile с
+собственным composition root, local configuration, host permissions и product
+UX. Он сможет переиспользовать часть execution contracts, но не реализуется
+созданием постоянного sandbox instance.
+
+`LocalProcessExecutionBackend` допускается только как trusted development/testing
+adapter или другой явно разрешённый bounded backend. Его имя не означает, что
+AgentRuntime получил общий доступ к host machine.
+
+## Terminal manager tools
+
+Terminal manager tools используют нейтральный application port:
+
+```text
+terminal manager tools
+→ CommandExecutionPort
+→ SandboxCommandExecutor
+→ ExecutionBackend
+```
+
+Tool contract не импортирует Docker SDK и не знает physical host paths.
+`ExecutionRequest` определяет bounded command, workspace, limits, declared
+outputs и policy coordinates.
+
+Конкретные tool names и shell UX утверждаются отдельно, но Service Application
+сохраняет инварианты:
+
+- command выполняется только через approved execution backend;
+- LLM не выбирает privileged/container flags;
+- sandbox не получает control-plane secrets;
+- terminal output ограничен и наблюдаем;
+- созданные файлы не обходят artifact/delivery pipeline.
 
 ## Lifecycle и привязка
 
@@ -98,6 +150,10 @@ DockerExecutionBackend         isolated production/default single-node path
 ```
 
 AgentRuntime и skills не зависят от Docker SDK.
+
+`CommandExecutionPort` может адаптировать terminal operations к
+`ExecutionBackend`, не превращая terminal manager tools в direct container or
+host-process clients.
 
 ## SandboxSpec
 
@@ -168,6 +224,19 @@ verify principal/scope
 
 Physical host paths не попадают в LLM/task contracts.
 
+Файл, созданный terminal command внутри sandbox, не становится автоматически
+пользовательским результатом:
+
+```text
+sandbox file
+→ declared-output validation
+→ durable content/artifact import
+→ explicit delivery selection
+→ OutputBatch/client delivery
+```
+
+Terminal не вызывает Telegram/Web delivery и не получает их credentials.
+
 ## Security policy
 
 Минимум:
@@ -222,13 +291,16 @@ state.
 - output upload failure → attempt не становится succeeded;
 - teardown failure → result сохраняется, instance помечается orphan cleanup;
 - ambiguous commit → idempotency key/fencing generation предотвращает duplicate
-  artifact version/result.
+  artifact version/result;
+- sandbox unavailable → structured capability unavailable, без host fallback.
 
 ## Non-goals
 
 - полноценная VM isolation guarantee;
 - distributed placement;
-- permanent user environment;
+- permanent per-user environment;
+- Future Local Agent Application;
+- host terminal permission/approval UX local executable продукта;
 - arbitrary internet access;
 - прямое выполнение AgentRuntime/DB внутри sandbox;
 - Kubernetes как обязательная dependency.

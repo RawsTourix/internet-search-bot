@@ -4,7 +4,7 @@ version: v0.7
 document_role: implementation-plan
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-01
 ---
 
 # Пошаговый план v0.7
@@ -56,6 +56,12 @@ user
 session
 ```
 
+Scope model переиспользует contract
+[`v0.4-mcp-registry-foundation`](../v0.4/v0.4-mcp-registry-foundation/README.md),
+а durable/distributed semantics —
+[`v0.6.9-distributed-capability-registry`](../v0.6/distributed-capability-registry.md).
+SkillRegistry не создаёт вторую несовместимую трактовку scope/precedence.
+
 Registry обеспечивает:
 
 - immutable snapshot/revision;
@@ -66,7 +72,7 @@ Registry обеспечивает:
 - visibility filters;
 - cache invalidation;
 - recovery after restart;
-- совместимость с MCP capability registry v0.6.
+- совместимость с MCP capability registry contracts v0.4 и v0.6.
 
 `user` ownership полноценно enforced после v0.8, но schema и API уже принимают
 scope/owner context.
@@ -179,6 +185,7 @@ regression scenarios.
 
 ## Non-goals v0.7
 
+- новая scope-модель, несовместимая с MCP registry;
 - полноценные accounts/auth UI;
 - автоматическое доверие user-provided skill;
 - произвольная установка OS packages в control plane;

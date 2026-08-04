@@ -33,6 +33,14 @@ class IngressConfigType(BaseModel):
     media_group_maximum_wait_seconds: float = Field(default=300.0, gt=0)
     standalone_attachment_maximum_wait_seconds: float = Field(default=2.0, gt=0)
 
+    # Explicit collections survive short restarts but must not reserve one user
+    # scope forever. Activity refreshes this timeout; expiration preserves audit
+    # evidence by transitioning collection and draft to ABANDONED.
+    explicit_collection_idle_timeout_seconds: float = Field(
+        default=3600.0,
+        gt=0,
+    )
+
     @model_validator(mode="after")
     def validate_part_limits(self) -> "IngressConfigType":
         if (

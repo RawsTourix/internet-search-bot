@@ -7,7 +7,10 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from ..artifacts.delivery import FileSystemArtifactDeliveryStore
+from ..artifacts.delivery import (
+    ArtifactDeliveryRecord,
+    FileSystemArtifactDeliveryStore,
+)
 from ..artifacts.errors import ArtifactStorageError
 from ..artifacts.models import ArtifactDeliveryState
 from .errors import OutputBatchConflictError
@@ -57,14 +60,73 @@ class OutputDeliveryCompletionService:
         self,
         receipt: OutputDeliveryReceipt,
     ) -> OutputBatch:
-        return await asyncio.to_thread(self._apply_sync, receipt, False)
+        completed, before, records = await asyncio.to_thread(
+            self._apply_and_capture_sync,
+            receipt,
+            False,
+        )
+        await self._trace_artifact_transitions(before, records)
+        return completed
 
     async def reconcile_unknown(
         self,
         receipt: OutputDeliveryReceipt,
     ) -> OutputBatch:
         """Resolve one unknown attempt across OutputBatch and artifact stores."""
-        return await asyncio.to_thread(self._apply_sync, receipt, True)
+        completed, before, records = await asyncio.to_thread(
+            self._apply_and_capture_sync,
+            receipt,
+            True,
+        )
+        await self._trace_artifact_transitions(before, records)
+        return completed
+
+    def _apply_and_capture_sync(
+        self,
+        receipt: OutputDeliveryReceipt,
+        reconciling: bool,
+    ) -> tuple[
+        OutputBatch,
+        dict[str, ArtifactDeliveryState],
+        list[ArtifactDeliveryRecord],
+    ]:
+        with (
+            self._lock,
+            self.output_store._lock,
+            self.artifact_delivery_store._lock,
+        ):
+            batch = self.output_store._load_sync(receipt.output_batch_id)
+            delivery_ids = [
+                part.delivery_id
+                for part in batch.parts
+                if isinstance(part, ArtifactOutputPart)
+            ]
+            before = {
+                delivery_id: self.artifact_delivery_store._load_sync(
+                    delivery_id
+                ).state
+                for delivery_id in delivery_ids
+            }
+            completed = self._apply_sync(receipt, reconciling)
+            records = [
+                self.artifact_delivery_store._load_sync(delivery_id)
+                for delivery_id in delivery_ids
+            ]
+            return completed, before, records
+
+    async def _trace_artifact_transitions(
+        self,
+        before: dict[str, ArtifactDeliveryState],
+        records: list[ArtifactDeliveryRecord],
+    ) -> None:
+        trace = getattr(
+            self.artifact_delivery_store,
+            "trace_external_transitions",
+            None,
+        )
+        if trace is None or not before:
+            return
+        await trace(before, records)
 
     async def recover_stale_claims(
         self,
@@ -391,18 +453,31 @@ class OutputDeliveryCompletionService:
                     "updated_at": datetime.now(timezone.utc),
                     "last_error": error or current.last_error,
                     "receipt": merged_receipt,
+                    "output_batch_id": transport_receipt["output_batch_id"],
+                    "client_instance_id": transport_receipt[
+                        "client_instance_id"
+                    ],
                 }
             )
             self.artifact_delivery_store._write_sync(updated, replace=True)
             return
 
-        self.artifact_delivery_store._transition_sync(
+        transitioned = self.artifact_delivery_store._transition_sync(
             delivery_id,
             target,
             allowed,
             error,
             transport_receipt,
         )
+        bound = transitioned.model_copy(
+            update={
+                "output_batch_id": transport_receipt["output_batch_id"],
+                "client_instance_id": transport_receipt[
+                    "client_instance_id"
+                ],
+            }
+        )
+        self.artifact_delivery_store._write_sync(bound, replace=True)
 
     @staticmethod
     def _validate_artifact_authority(batch, part, record) -> None:
@@ -415,6 +490,7 @@ class OutputDeliveryCompletionService:
             or record.filename != part.filename
             or record.mime_type != part.mime_type
             or record.size_bytes != part.size_bytes
+            or record.output_batch_id not in {None, batch.output_batch_id}
             or bound_output not in {None, batch.output_batch_id}
         ):
             raise OutputBatchConflictError(

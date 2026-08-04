@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 import uuid
@@ -25,6 +26,9 @@ from .api.legacy_delivery_guard import LegacyTelegramDeliveryGuardMiddleware
 from .api.output_outbox_routes import create_output_outbox_router
 from .core.message_processor import MessageProcessor
 from .core.models import ClientType, MessageType, UnifiedMessage, WebMessage
+from .interaction.output_startup_recovery import (
+    reconcile_unclaimable_legacy_ready,
+)
 
 
 load_dotenv()
@@ -260,16 +264,106 @@ artifact_transport = ArtifactTransportFacade(
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Запуск Multi-Protocol Gateway...")
-    await telegram_adapter.initialize()
-    await web_adapter.initialize()
-    await API.start()
-    logger.info("Gateway успешно запущен")
-    yield
-    logger.info("Остановка Gateway...")
-    await API.stop()
-    await web_adapter.shutdown()
-    await telegram_adapter.shutdown()
+    """Own startup and shutdown resources in one cancellation-safe task.
+
+    MCP streamable HTTP contexts contain AnyIO cancel scopes and must be exited
+    by the same asyncio task that entered them. A forced Uvicorn shutdown throws
+    ``CancelledError`` at the lifespan ``yield``; the ``finally`` block is
+    therefore essential. Without it, Python later finalizes the async generator
+    in another task and AnyIO reports ``Attempted to exit cancel scope in a
+    different task``.
+    """
+
+    telegram_initialized = False
+    web_initialized = False
+    api_start_attempted = False
+    shutdown_cancellation: asyncio.CancelledError | None = None
+
+    try:
+        logger.info("Запуск Multi-Protocol Gateway...")
+        await telegram_adapter.initialize()
+        telegram_initialized = True
+        await web_adapter.initialize()
+        web_initialized = True
+        output_recovery = await reconcile_unclaimable_legacy_ready(
+            API.output_store,
+            API.artifact_services.delivery_store,
+        )
+        if output_recovery.cancelled_count:
+            if output_recovery.cancelled_legacy_output_batch_ids:
+                logger.warning(
+                    "Cancelled %s unclaimable legacy READY OutputBatch records: %s",
+                    len(output_recovery.cancelled_legacy_output_batch_ids),
+                    list(output_recovery.cancelled_legacy_output_batch_ids),
+                )
+            if output_recovery.cancelled_test_output_batch_ids:
+                logger.warning(
+                    "Cancelled %s completed smoke-test READY OutputBatch records: %s",
+                    len(output_recovery.cancelled_test_output_batch_ids),
+                    list(output_recovery.cancelled_test_output_batch_ids),
+                )
+        if output_recovery.repaired_count:
+            logger.warning(
+                "Repaired %s READY OutputBatch ownership bindings: %s",
+                output_recovery.repaired_count,
+                list(output_recovery.repaired_output_batch_ids),
+            )
+        if output_recovery.unrepaired_output_batch_ids:
+            logger.error(
+                "Unsafe READY OutputBatch ownership remains unrepaired: %s",
+                list(output_recovery.unrepaired_output_batch_ids),
+            )
+        for item in output_recovery.remaining_ready:
+            logger.warning(
+                "Recoverable READY OutputBatch remains: "
+                "output_batch_id=%s session_id=%s kind=%s "
+                "client_type=%s client_instance_id=%s",
+                item.output_batch_id,
+                item.session_id,
+                item.kind,
+                item.client_type,
+                item.client_instance_id,
+            )
+        api_start_attempted = True
+        await API.start()
+        logger.info("Gateway успешно запущен")
+        yield
+    finally:
+        logger.info("Остановка Gateway...")
+
+        if api_start_attempted:
+            try:
+                # Keep this await in the lifespan task. Moving it to a shielded
+                # child task would violate AnyIO cancel-scope ownership.
+                await API.stop()
+            except asyncio.CancelledError as error:
+                shutdown_cancellation = error
+                logger.warning(
+                    "Остановка API runtime была повторно отменена; "
+                    "завершаю transport cleanup"
+                )
+            except Exception as error:
+                logger.exception("Ошибка остановки API runtime: %r", error)
+
+        if web_initialized:
+            try:
+                await web_adapter.shutdown()
+            except asyncio.CancelledError as error:
+                shutdown_cancellation = shutdown_cancellation or error
+            except Exception as error:
+                logger.exception("Ошибка остановки Web adapter: %r", error)
+
+        if telegram_initialized:
+            try:
+                await telegram_adapter.shutdown()
+            except asyncio.CancelledError as error:
+                shutdown_cancellation = shutdown_cancellation or error
+            except Exception as error:
+                logger.exception("Ошибка остановки Telegram adapter: %r", error)
+
+        logger.info("Gateway остановлен")
+        if shutdown_cancellation is not None:
+            raise shutdown_cancellation
 
 
 origins = os.getenv("CORS_ORIGINS", "*").split(",")

@@ -52,7 +52,10 @@ class UnifiedInputRuntimeFoundationTests(unittest.IsolatedAsyncioTestCase):
             storage_config=self.storage_config,
             ingress_config=IngressConfigType(
                 max_batch_total_bytes=2 * 1024 * 1024,
-                media_group_quiet_timeout_seconds=0.12,
+                # Keep a wide margin over filesystem and scheduler jitter: the
+                # race under test is deadline reset/commit coordination, not a
+                # 120 ms wall-clock performance requirement.
+                media_group_quiet_timeout_seconds=0.5,
                 media_group_sealing_grace_seconds=0.0,
                 media_group_maximum_wait_seconds=1.0,
             ),

@@ -86,6 +86,7 @@ class ArtifactRuntimeCoordinator:
             read_artifact_ids=read_ids,
             deliveries=deliveries,
         )
+        activation_by_id = self._activation_by_id(context)
         maximum = self.service.config.max_runtime_artifact_summaries
         manifest_items = tuple(
             ArtifactManifestItem(
@@ -101,6 +102,24 @@ class ArtifactRuntimeCoordinator:
                     key
                     for key, enabled in item.capabilities.model_dump().items()
                     if enabled
+                ),
+                activation_reason=self._activation_value(
+                    activation_by_id.get(item.artifact_id),
+                    "reason",
+                    fallback=(
+                        "created_in_cycle"
+                        if item.created_in_current_cycle
+                        else "current_input_batch"
+                    ),
+                ),
+                activation_scope=self._activation_value(
+                    activation_by_id.get(item.artifact_id),
+                    "scope",
+                    fallback="current",
+                ),
+                activation_source_operation_id=self._activation_value(
+                    activation_by_id.get(item.artifact_id),
+                    "source_operation_id",
                 ),
             )
             for item in catalog.items[:maximum]
@@ -144,3 +163,29 @@ class ArtifactRuntimeCoordinator:
         )
         context.active_cycle.artifact_state = state
         return state
+
+    @staticmethod
+    def _activation_by_id(context: ManagerToolContext) -> dict[str, dict]:
+        result: dict[str, dict] = {}
+        for item in getattr(context.active_cycle, "artifact_activations", []) or []:
+            if not isinstance(item, dict):
+                continue
+            artifact_id = str(item.get("artifact_id") or "")
+            if artifact_id and artifact_id not in result:
+                result[artifact_id] = item
+        return result
+
+    @staticmethod
+    def _activation_value(
+        record: dict | None,
+        key: str,
+        *,
+        fallback: str | None = None,
+    ) -> str | None:
+        if record is None:
+            return fallback
+        value = record.get(key)
+        if hasattr(value, "value"):
+            value = value.value
+        normalized = str(value).strip() if value is not None else ""
+        return normalized or fallback

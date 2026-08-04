@@ -4,7 +4,7 @@ version: v0.8
 document_role: implementation-plan
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-02
 ---
 
 # Пошаговый план v0.8
@@ -12,7 +12,16 @@ last_reviewed: 2026-07-27
 ## Общая цель
 
 Добавить accounts, linked identities, conversations и точное
-ownership/authorization всех durable resources, сохранив local/self-hosted mode.
+ownership/authorization всех durable resources Service Application, сохранив
+self-hosted и managed hosting modes.
+
+Application profiles, configuration ownership и отличие локально запущенного
+self-hosted service от Future Local Agent Application определены в
+[`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md).
+
+Future Local Agent Application не входит в v0.8. Версия сохраняет совместимые
+principal/ownership contracts, но не проектирует local executable UX, host
+permissions или отдельную local root configuration.
 
 ## Реестр updates
 
@@ -25,6 +34,9 @@ ownership/authorization всех durable resources, сохранив local/self-
 | 5 | `v0.8.5-authorization-and-ownership` | Exact access control всех resources |
 | 6 | `v0.8.6-quotas-settings-and-secrets` | Limits, configuration и secret references |
 | 7 | `v0.8.7-security-hardening` | Threat model, audit и multi-user release gate |
+
+Новые updates из-за deployment-profile clarification не добавляются. Изменение
+уточняет boundaries уже запланированных работ.
 
 ## v0.8.1-identity-model
 
@@ -50,8 +62,12 @@ AgentCycle
 - principal представляет действующего субъекта, включая service/system principal;
 - conversation не равна auth session или runtime process session;
 - ownership metadata мигрируется для всех existing resources;
-- local single-user deployment имеет explicit system/local principal, а не
-  скрытый `default` без модели.
+- single-user self-hosted Service Application имеет explicit system/local
+  principal, а не скрытый `default` без модели;
+- contracts допускают local/system principal будущего Local Agent, не фиксируя
+  его account/login UX в v0.8;
+- application profile, hosting mode и principal type не смешиваются в одну
+  сущность или строковый `mode`.
 
 ## v0.8.2-authentication
 
@@ -66,10 +82,12 @@ AgentCycle
 - rate limits и brute-force protection;
 - secure cookie/token strategy в зависимости от selected interface;
 - logout all sessions и credential rotation;
-- audit events без secret/token values.
+- audit events без secret/token values;
+- bootstrap/trusted-local flow для self-hosted Service Application, если он будет
+  утверждён отдельной policy, без удаления principal/ownership checks.
 
 Точный protocol и UI утверждаются перед реализацией, но domain/session contracts
-не зависят от FastAPI route shape.
+не зависят от FastAPI route shape, hosting mode или конкретного client surface.
 
 ## v0.8.3-linked-identities
 
@@ -94,6 +112,9 @@ authenticated account
 - migration existing Telegram user/chat bindings;
 - no trust based only on user-supplied Telegram ID.
 
+Linked identities относятся к Service Application workspace. Возможная
+синхронизация с Future Local Agent не входит в этот update.
+
 ## v0.8.4-conversations-and-workspaces
 
 ### Scope
@@ -103,13 +124,17 @@ authenticated account
 - shared message history и client-specific presentation bindings;
 - workspace membership/owner;
 - active/pinned/archive state;
-- conversation settings и selected runtime profile;
+- conversation settings и selected model/tool/runtime preferences;
 - exact artifact/memory/run relations;
 - cross-client resume;
 - deletion/retention semantics;
 - group chat policy и future collaboration readiness.
 
 Transport message remains distinct from logical `InputBatch`/conversation turn.
+
+Web, Telegram, network CLI и network IDE clients используют один Service
+Application API. Запуск клиента на машине пользователя не превращает его в
+Future Local Agent Application и не выдаёт host execution capabilities.
 
 ## v0.8.5-authorization-and-ownership
 
@@ -124,6 +149,7 @@ identity/auth_session_id when applicable
 conversation/workspace scope
 request_id
 permissions/roles
+application/deployment policy revision when relevant
 ```
 
 ### Enforcement
@@ -135,6 +161,10 @@ permissions/roles
 - service-to-service calls используют отдельную identity;
 - sharing/collaboration grants explicit и auditable;
 - user scope registry становится полноценно enforced;
+- обычный пользователь не может назначить MCP/skill definition scope `builtin`
+  или `instance`;
+- MCP transport admission остаётся policy Service Application: user/session
+  executable definitions не запускаются в trusted control plane;
 - negative authorization tests обязательны.
 
 ### Tenant model
@@ -142,6 +172,9 @@ permissions/roles
 Первый release может использовать account как tenant. Отдельная organization
 entity добавляется только при реальной необходимости, но contracts не должны
 смешивать principal и tenant.
+
+Self-hosted single-user deployment может иметь один explicit local/system
+principal, оставаясь Service Application с теми же ownership predicates.
 
 ## v0.8.6-quotas-settings-and-secrets
 
@@ -163,16 +196,24 @@ accounting там, где race существенен.
 
 - account/profile;
 - conversation/workspace;
-- models/runtime profiles;
-- enabled skills/MCP scopes;
+- models/runtime preferences;
+- enabled skills/MCP definitions and scopes;
 - localization/client preferences;
 - retention/privacy.
+
+Per-user settings не становятся секциями общего operator-owned `agent.config`.
+Они хранятся через owner-aware repositories и изменяются через application API.
+`ConfigProvider` Service Application продолжает владеть deployment/operator
+configuration, а не пользовательскими данными.
 
 ### Secrets
 
 Хранятся как encrypted/managed secret references. Raw secret не попадает в LLM
 context, trace, progress, artifact metadata или sandbox manifest. Rotation и
 revocation имеют audit.
+
+User credential reference не раскрывается в registry listing и не даёт внешнему
+MCP/tool больше permissions, чем выдано effective policy.
 
 ## v0.8.7-security-hardening
 
@@ -189,6 +230,8 @@ revocation имеют audit.
 - abuse and quota bypass tests;
 - secrets exposure review;
 - backup/restore с owner relations;
+- managed/self-hosted policy-default review;
+- transport-admission bypass tests для user/session MCP definitions;
 - security review sandbox prerequisites v0.9.
 
 ### Gate v0.9
@@ -198,7 +241,9 @@ revocation имеют audit.
   но не raw credentials;
 - sandbox input materializer проверяет access до execution;
 - per-user quotas готовы резервировать execution resources;
-- runner/sandbox получает short-lived least-privilege access only.
+- runner/sandbox получает short-lived least-privilege access only;
+- отсутствие sandbox не приводит к host-process fallback Service Application;
+- self-hosted operator privileges не смешиваются с ordinary user permissions.
 
 ## Non-goals v0.8
 
@@ -207,4 +252,8 @@ revocation имеют audit.
 - permanent per-user VM/container;
 - distributed runner fleet;
 - доказательство абсолютной безопасности;
-- автоматическая передача user credentials внешним tools/skills.
+- автоматическая передача user credentials внешним tools/skills;
+- реализация Future Local Agent Application;
+- local executable packaging, host terminal permission UX или local root config;
+- синхронизация local-agent и service conversations;
+- превращение `agent.config` в хранилище per-user settings.

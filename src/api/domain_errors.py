@@ -1,11 +1,13 @@
-"""Central HTTP mapping for stable domain errors exposed by the Gateway."""
+"""Central HTTP registration for stable Gateway domain contracts."""
 
 from __future__ import annotations
 
 import logging
+import os
 
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import JSONResponse
+from fastapi.security import APIKeyHeader
 from pydantic import ValidationError
 
 from ..artifacts import (
@@ -33,6 +35,7 @@ from ..interaction.errors import (
 
 
 logger = logging.getLogger("Gateway.DomainErrors")
+_DOMAIN_API_KEY_HEADER = APIKeyHeader(name="X-API-Key", auto_error=False)
 
 
 def _response(status_code: int, error: Exception) -> JSONResponse:
@@ -45,8 +48,97 @@ def _response(status_code: int, error: Exception) -> JSONResponse:
     )
 
 
+def _configured_transport_authority():
+    scopes: dict[str, set[str]] = {}
+    instances: dict[str, set[tuple[str, str]]] = {}
+    telegram_instance = (
+        os.getenv("TELEGRAM_BOT_INSTANCE_ID", "default").strip()
+        or "default"
+    )
+    for environment_name, scope, instance_scope in (
+        (
+            "TELEGRAM_API_KEY",
+            "telegram",
+            ("telegram", telegram_instance),
+        ),
+        ("WEB_API_KEY", "web", ("web", "*")),
+        ("INTERNAL_API_KEY", "*", ("*", "*")),
+    ):
+        value = os.getenv(environment_name, "").strip()
+        if not value:
+            continue
+        scopes.setdefault(value, set()).add(scope)
+        instances.setdefault(value, set()).add(instance_scope)
+    return (
+        {key: frozenset(value) for key, value in scopes.items()},
+        {key: frozenset(value) for key, value in instances.items()},
+    )
+
+
+async def _domain_api_key_auth(
+    api_key: str | None = Depends(_DOMAIN_API_KEY_HEADER),
+) -> str:
+    scopes, _ = _configured_transport_authority()
+    if not api_key:
+        raise HTTPException(status_code=401, detail="Missing API Key")
+    if api_key not in scopes:
+        raise HTTPException(status_code=403, detail="Invalid API Key")
+    return api_key
+
+
+def _register_input_collection_routes(app: FastAPI) -> None:
+    if getattr(app.state, "input_collection_routes_registered", False):
+        return
+    scopes, instance_scopes = _configured_transport_authority()
+    if not scopes:
+        logger.debug(
+            "Input collection routes skipped: no transport API keys configured"
+        )
+        return
+
+    # Imported lazily to keep exception models independent from the global API
+    # composition root during unit-test module import.
+    from .api import API
+    from .input_collection_routes import create_input_collection_router
+
+    app.include_router(
+        create_input_collection_router(
+            api=API,
+            auth_dependency=_domain_api_key_auth,
+            api_key_scopes=scopes,
+            api_key_instance_scopes=instance_scopes,
+        )
+    )
+    app.state.input_collection_routes_registered = True
+
+
+def _register_presentation_relocation_routes(app: FastAPI) -> None:
+    if getattr(app.state, "presentation_relocation_routes_registered", False):
+        return
+    scopes, _ = _configured_transport_authority()
+    if not scopes:
+        logger.debug(
+            "Presentation relocation routes skipped: no transport API keys configured"
+        )
+        return
+
+    from .api import API
+    from .presentation_relocation_routes import (
+        create_presentation_relocation_router,
+    )
+
+    app.include_router(
+        create_presentation_relocation_router(
+            api=API,
+            auth_dependency=_domain_api_key_auth,
+            api_key_scopes=scopes,
+        )
+    )
+    app.state.presentation_relocation_routes_registered = True
+
+
 def register_domain_exception_handlers(app: FastAPI) -> None:
-    """Register one authoritative HTTP policy for shared runtime domains."""
+    """Register authoritative HTTP error policy and shared domain routes."""
 
     not_found = (
         ArtifactDeliveryNotFoundError,
@@ -131,3 +223,6 @@ def register_domain_exception_handlers(app: FastAPI) -> None:
             return _response(_status, error)
 
         app.add_exception_handler(error_type, handle_unavailable)
+
+    _register_input_collection_routes(app)
+    _register_presentation_relocation_routes(app)

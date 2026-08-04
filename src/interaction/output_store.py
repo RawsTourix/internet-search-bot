@@ -216,6 +216,37 @@ class FileSystemOutputBatchStore:
             )
             return batch, True
 
+    def _rollback_new_commit_sync(self, batch: OutputBatch) -> None:
+        """Remove only an unclaimed READY commit during cross-store rollback."""
+
+        with self._lock:
+            batch_dir = self.records / batch.output_batch_id
+            state_path = batch_dir / "state.json"
+            manifest_path = batch_dir / "manifest.json"
+            identity = self._identity(batch.session_id, batch.cycle_id, batch.kind)
+            index_path = self.cycle_index / f"{identity}.json"
+            if not batch_dir.exists():
+                return
+            state = self._read(state_path)
+            pointer = self._read(index_path)
+            if (
+                state.get("state") != OutputBatchState.READY.value
+                or state.get("attempt_id") is not None
+                or pointer.get("output_batch_id") != batch.output_batch_id
+            ):
+                raise OutputBatchConflictError(
+                    "cannot roll back a claimed or replaced OutputBatch"
+                )
+            try:
+                index_path.unlink()
+                state_path.unlink()
+                manifest_path.unlink()
+                batch_dir.rmdir()
+            except OSError as error:
+                raise InteractionStorageError(
+                    "failed to roll back new OutputBatch commit"
+                ) from error
+
     async def get(self, output_batch_id: str) -> OutputBatch:
         return await asyncio.to_thread(self._load_sync, output_batch_id)
 
@@ -574,7 +605,9 @@ class FileSystemOutputBatchStore:
 
 def build_ready_output_batch(**values: Any) -> OutputBatch:
     now = values.pop("now", None) or utc_now()
+    input_batch_id = values.get("input_batch_id")
     return OutputBatch(
+        schema_version=2 if input_batch_id is not None else 1,
         output_batch_id=values.pop("output_batch_id", new_output_batch_id()),
         state=OutputBatchState.READY,
         created_at=now,

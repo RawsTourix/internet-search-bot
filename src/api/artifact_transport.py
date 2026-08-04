@@ -9,7 +9,11 @@ from typing import TYPE_CHECKING, Any, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from ..artifacts import ArtifactAccessError, ArtifactDeliveryRef
+from ..artifacts import (
+    ArtifactAccessError,
+    ArtifactDeliveryError,
+    ArtifactDeliveryRef,
+)
 from ..core.models import ClientType, UnifiedResponse
 from ..ingress import (
     ClientInputEnvelope,
@@ -21,6 +25,7 @@ from ..ingress import (
     resolve_input_grouping,
 )
 from ..storage.errors import StorageStreamSourceError
+from ..runtime import SessionExecutionCoordinator
 
 if TYPE_CHECKING:
     from ..core.message_processor import MessageProcessor
@@ -106,6 +111,11 @@ class ArtifactTransportFacade:
         self.api = api
         self.message_processor = message_processor
         self.providers = dict(providers or {})
+        self.execution_coordinator = getattr(
+            api,
+            "execution_coordinator",
+            SessionExecutionCoordinator(),
+        )
 
     @staticmethod
     def session_id_for(envelope: ClientInputEnvelope) -> str:
@@ -381,25 +391,32 @@ class ArtifactTransportFacade:
         )
         if batch.session_id != session_id:
             raise ArtifactAccessError("Input batch belongs to another session")
-        logger.info(
-            "gateway_agent_batch_started input_batch_id=%s session_id=%s "
-            "artifact_count=%s text_part_count=%s",
-            input_batch_id,
-            session_id,
-            len(batch.artifact_refs),
-            len(batch.text_parts),
+        async def run_one() -> UnifiedResponse:
+            logger.info(
+                "gateway_agent_batch_started input_batch_id=%s session_id=%s "
+                "artifact_count=%s text_part_count=%s",
+                input_batch_id,
+                session_id,
+                len(batch.artifact_refs),
+                len(batch.text_parts),
+            )
+            response = await self.message_processor.process_committed_batch(
+                batch,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+            )
+            logger.info(
+                "gateway_agent_batch_finished input_batch_id=%s session_id=%s",
+                input_batch_id,
+                session_id,
+            )
+            return response
+
+        return await self.execution_coordinator.enqueue(
+            session_id=session_id,
+            input_batch_id=input_batch_id,
+            operation=run_one,
         )
-        response = await self.message_processor.process_committed_batch(
-            batch,
-            progress_callback=progress_callback,
-            progress_locale=progress_locale,
-        )
-        logger.info(
-            "gateway_agent_batch_finished input_batch_id=%s session_id=%s",
-            input_batch_id,
-            session_id,
-        )
-        return response
 
     async def get_delivery_ref(
         self,
@@ -414,6 +431,7 @@ class ArtifactTransportFacade:
             session_id=session_id,
             client_type=client_type,
         )
+        self._authorize_output_owner(record, output_batch_id=None)
         return record.public_ref()
 
     async def claim_delivery(
@@ -422,6 +440,7 @@ class ArtifactTransportFacade:
         *,
         session_id: str,
         client_type: ClientType,
+        output_batch_id: str | None = None,
     ) -> ArtifactDeliveryRef:
         record = await self.api.artifact_services.delivery_store.get(delivery_id)
         self._authorize_delivery(
@@ -429,6 +448,7 @@ class ArtifactTransportFacade:
             session_id=session_id,
             client_type=client_type,
         )
+        self._authorize_output_owner(record, output_batch_id=output_batch_id)
         return await self.api.artifact_services.delivery_service.claim(delivery_id)
 
     async def open_delivery(
@@ -437,7 +457,15 @@ class ArtifactTransportFacade:
         *,
         session_id: str,
         client_type: ClientType,
+        output_batch_id: str | None = None,
     ) -> AsyncIterator[bytes]:
+        record = await self.api.artifact_services.delivery_store.get(delivery_id)
+        self._authorize_delivery(
+            record,
+            session_id=session_id,
+            client_type=client_type,
+        )
+        self._authorize_output_owner(record, output_batch_id=output_batch_id)
         return self.api.artifact_services.delivery_service.iter_content(
             delivery_id,
             session_id=session_id,
@@ -455,6 +483,7 @@ class ArtifactTransportFacade:
             session_id=request.session_id,
             client_type=request.client_type,
         )
+        self._reject_legacy_completion(record)
         return await self.api.artifact_services.delivery_service.complete(
             delivery_id,
             receipt=request.receipt,
@@ -471,6 +500,7 @@ class ArtifactTransportFacade:
             session_id=request.session_id,
             client_type=request.client_type,
         )
+        self._reject_legacy_completion(record)
         return await self.api.artifact_services.delivery_service.fail(
             delivery_id,
             error=request.error,
@@ -486,6 +516,30 @@ class ArtifactTransportFacade:
         ):
             raise ArtifactAccessError(
                 "Delivery is outside the current client authority"
+            )
+
+    @staticmethod
+    def _authorize_output_owner(
+        record,
+        *,
+        output_batch_id: str | None,
+    ) -> None:
+        if record.output_batch_id is None:
+            if output_batch_id is not None:
+                raise ArtifactDeliveryError(
+                    "Delivery is not owned by the requested OutputBatch"
+                )
+            return
+        if record.output_batch_id != output_batch_id:
+            raise ArtifactDeliveryError(
+                "Output-owned delivery requires exact OutputBatch authority"
+            )
+
+    @staticmethod
+    def _reject_legacy_completion(record) -> None:
+        if record.output_batch_id is not None:
+            raise ArtifactDeliveryError(
+                "Output-owned delivery requires aggregate OutputBatch receipt"
             )
 
 

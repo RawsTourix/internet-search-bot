@@ -6,6 +6,7 @@ import asyncio
 import logging
 import time
 from collections.abc import Awaitable, Callable
+from contextvars import ContextVar, Token
 
 from .artifact_bridge import (
     DebouncedBatchRunner,
@@ -15,13 +16,34 @@ from .artifact_bridge import (
 
 logger = logging.getLogger("TelegramServer.MediaGroupRunner")
 
+_CURRENT_MEDIA_GROUP_CALLBACK_KEY: ContextVar[str | None] = ContextVar(
+    "telegram_media_group_callback_key",
+    default=None,
+)
+
+
+def get_current_media_group_callback_key() -> str | None:
+    """Return the exact group whose quiet callback is currently executing."""
+
+    return _CURRENT_MEDIA_GROUP_CALLBACK_KEY.get()
+
+
+def _set_current_media_group_callback_key(key: str) -> Token[str | None]:
+    return _CURRENT_MEDIA_GROUP_CALLBACK_KEY.set(key)
+
+
+def _reset_current_media_group_callback_key(
+    token: Token[str | None],
+) -> None:
+    _CURRENT_MEDIA_GROUP_CALLBACK_KEY.reset(token)
+
 
 class MediaGroupLifetimeExceeded(RuntimeError):
     """The Telegram album stayed open beyond its configured lifetime."""
 
 
 class LifetimeMediaGroupActivityCoordinator(MediaGroupActivityCoordinator):
-    """Track the first member time and suppress late terminal callbacks."""
+    """Track the first member time and retain bounded closed-group tombstones."""
 
     def __init__(self, *, tombstone_ttl_seconds: float = 600.0) -> None:
         super().__init__()
@@ -29,6 +51,11 @@ class LifetimeMediaGroupActivityCoordinator(MediaGroupActivityCoordinator):
         self._opened_at: dict[str, float] = {}
         self._closed_at: dict[str, float] = {}
         self._tombstone_ttl_seconds = max(1.0, tombstone_ttl_seconds)
+
+    async def is_closed(self, key: str) -> bool:
+        async with self._lifetime_lock:
+            self._prune_tombstones_locked()
+            return key in self._closed_at
 
     async def member_started(self, key: str, *, filename: str | None = None) -> None:
         async with self._lifetime_lock:
@@ -117,6 +144,25 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
         self._activity = coordinator
         self.maximum_lifetime_seconds = maximum_lifetime_seconds
 
+    async def is_closed(self, key: str) -> bool:
+        """Return whether this exact Telegram album already reached a terminal callback."""
+
+        return await self._activity.is_closed(key)
+
+    async def abort(self, key: str) -> None:
+        """Terminally fence a failed album before later updates reach Gateway."""
+
+        async with self._lock:
+            task = self._tasks.pop(key, None)
+            self._running.discard(key)
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        await self._activity.close(key, ignore_late_members=True)
+
     async def schedule(
         self,
         key: str,
@@ -126,6 +172,8 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
         timeout_callback: Callable[[], Awaitable[None]] | None = None,
         reset: bool = True,
     ) -> bool:
+        if await self._activity.is_closed(key):
+            return False
         async with self._lock:
             if key in self._running:
                 return False
@@ -184,7 +232,15 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
                 if self._tasks.get(key) is not asyncio.current_task():
                     return
                 self._running.add(key)
-            await callback()
+            callback_token = _set_current_media_group_callback_key(key)
+            try:
+                await callback()
+                # Once the exact callback completes, this Telegram album ID is
+                # terminal regardless of whether it committed, remained pending
+                # in /collect, or was suppressed after /send or /cancel.
+                ignore_late_members = True
+            finally:
+                _reset_current_media_group_callback_key(callback_token)
         except asyncio.CancelledError:
             raise
         except MediaGroupLifetimeExceeded:
@@ -198,6 +254,7 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
                 snapshot,
             )
             if timeout_callback is not None:
+                timeout_token = _set_current_media_group_callback_key(key)
                 try:
                     await timeout_callback()
                 except Exception:
@@ -206,6 +263,8 @@ class LifetimeBoundDebouncedBatchRunner(DebouncedBatchRunner):
                         "group_key=%s",
                         key,
                     )
+                finally:
+                    _reset_current_media_group_callback_key(timeout_token)
         except Exception:
             ignore_late_members = True
             logger.exception(

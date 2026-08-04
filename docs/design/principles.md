@@ -3,7 +3,7 @@ id: design.principles
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-02
 ---
 
 # Главные принципы
@@ -132,3 +132,42 @@ last_reviewed: 2026-07-27
     assumption в v0.10.
 95. Идентификатор принятого или начатого update стабилен и не меняется при
     последующей реорганизации документации.
+96. Scope определяет visibility/precedence registry, но не является разрешением.
+97. Trusted tool execution, presentation и lifecycle metadata берутся из
+    доверенного registry, а не из произвольного tool output.
+98. MCP transport lifecycle и lifecycle remote resource являются независимыми.
+99. Remote resource handle является opaque; Agent Runtime хранит ownership
+    coordinates, но не внутреннее состояние внешнего сервиса.
+100. Lifecycle hooks универсальны, а automatic remote-resource integration
+     разрешается только trusted policy для конкретного binding.
+101. Cleanup со стороны Agent Runtime является bounded best effort; внешний
+     сервис остаётся владельцем окончательной expiration/orphan cleanup.
+102. Mutating tool call с неопределённым transport outcome получает `unknown` и
+     не повторяется автоматически.
+103. Canonical progress создаёт Agent Runtime; внешний MCP-сервис не управляет
+     локализованным пользовательским UI.
+104. Application profile, hosting mode, runtime topology, environment и execution
+     backend являются разными архитектурными осями.
+105. Текущий проект развивается как Service Application; self-hosted и managed
+     являются hosting modes одного серверного приложения.
+106. Запуск self-hosted Service Application на локальной машине не превращает его
+     в Future Local Agent Application.
+107. AgentRuntime не зависит от Service Application или Future Local Agent
+     Application и создаётся через profile-specific composition root.
+108. Security-critical application profile и его capability ceiling не
+     переключаются произвольным пользовательским config value внутри runtime.
+109. Поддержка MCP transport adapter не означает admission этого transport во
+     всех application/hosting profiles.
+110. Service Application не запускает user-provided executable MCP code внутри
+     trusted control plane; operator-managed instance integration является
+     отдельной policy boundary.
+111. Operator configuration deployment и per-user configuration имеют разных
+     owners и persistence boundaries.
+112. Terminal/process capability работает через execution port; Service
+     Application связывает его с approved sandbox backend, а Future Local Agent
+     сможет использовать host executor под отдельной permission policy.
+113. Файл, созданный terminal или sandbox execution, становится durable artifact
+     и delivery result только через declared import, artifact и delivery
+     contracts.
+114. `LocalProcessExecutionBackend`, ephemeral sandbox и Future Local Agent
+     Application являются разными понятиями и lifecycle boundaries.

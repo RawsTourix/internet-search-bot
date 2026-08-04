@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
 import re
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -183,6 +184,13 @@ class MediaGroupActivityCoordinator:
                 "in_flight": state.in_flight,
                 "failed": state.failed,
                 "last_error": state.last_error,
+            }
+
+    async def snapshot_all(self) -> dict[str, int]:
+        async with self._lock:
+            return {
+                "groups": len(self._states),
+                "in_flight": sum(state.in_flight for state in self._states.values()),
             }
 
 
@@ -506,6 +514,8 @@ class TelegramArtifactGatewayClient:
         self.transport = transport
         self.delivery_spool_memory_bytes = delivery_spool_memory_bytes
         self.media_group_activity = media_group_activity or _media_group_activity
+        self._telegram_download_client: httpx.AsyncClient | None = None
+        self._telegram_download_client_lock = asyncio.Lock()
 
     def _client(self, *, read_timeout: float = 1800.0) -> httpx.AsyncClient:
         return httpx.AsyncClient(
@@ -626,6 +636,7 @@ class TelegramArtifactGatewayClient:
         *,
         session_id: str,
         progress_locale: str,
+        progress_metadata: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         async with self._client() as client:
             response = await client.post(
@@ -633,6 +644,7 @@ class TelegramArtifactGatewayClient:
                 json={
                     "session_id": session_id,
                     "progress_locale": progress_locale,
+                    "progress_metadata": dict(progress_metadata or {}),
                 },
             )
             response.raise_for_status()
@@ -721,40 +733,141 @@ class TelegramArtifactGatewayClient:
         file_id: str,
         *,
         transport: httpx.AsyncBaseTransport | None = None,
+        max_attempts: int = 3,
+        deadline_seconds: float = 210.0,
+        base_backoff_seconds: float = 0.25,
     ) -> TelegramFileStream:
         if not file_id.strip() or len(file_id) > 1024 or any(
             character in file_id for character in "\r\n"
         ):
             raise TelegramArtifactBridgeError("Invalid Telegram file ID")
-        telegram_file = await bot.get_file(file_id)
-        file_path = str(getattr(telegram_file, "file_path", "") or "")
-        if not file_path.startswith(("https://", "http://")):
-            raise TelegramArtifactBridgeError("Telegram returned no downloadable file URL")
-        size = getattr(telegram_file, "file_size", None)
+        if max_attempts < 1:
+            raise ValueError("max_attempts must be positive")
+        if deadline_seconds <= 0:
+            raise ValueError("deadline_seconds must be positive")
+        deadline = time.monotonic() + deadline_seconds
+        last_error: BaseException | None = None
+        spool: SpooledTemporaryFile | None = None
+        actual_size = 0
+
+        for attempt in range(1, max_attempts + 1):
+            candidate = SpooledTemporaryFile(
+                max_size=self.delivery_spool_memory_bytes,
+                mode="w+b",
+            )
+            ephemeral_client: httpx.AsyncClient | None = None
+            try:
+                telegram_file = await bot.get_file(file_id)
+                file_path = str(getattr(telegram_file, "file_path", "") or "")
+                if not file_path.startswith(("https://", "http://")):
+                    raise TelegramArtifactBridgeError(
+                        "Telegram returned no downloadable file URL"
+                    )
+                expected_size = getattr(telegram_file, "file_size", None)
+                if transport is None:
+                    client = await self._shared_telegram_download_client()
+                else:
+                    ephemeral_client = httpx.AsyncClient(
+                        timeout=httpx.Timeout(10.0, read=180.0),
+                        transport=transport,
+                    )
+                    client = ephemeral_client
+                async with client.stream("GET", file_path) as response:
+                    response.raise_for_status()
+                    actual_size = 0
+                    async for chunk in response.aiter_bytes(64 * 1024):
+                        if chunk:
+                            candidate.write(chunk)
+                            actual_size += len(chunk)
+                if expected_size is not None and actual_size != int(expected_size):
+                    raise httpx.RemoteProtocolError(
+                        "Telegram file size mismatch after download"
+                    )
+                candidate.seek(0)
+                spool = candidate
+                logger.info(
+                    "telegram_file_download_succeeded file_id_length=%s "
+                    "attempt=%s size_bytes=%s",
+                    len(file_id),
+                    attempt,
+                    actual_size,
+                )
+                break
+            except asyncio.CancelledError:
+                candidate.close()
+                raise
+            except BaseException as error:
+                candidate.close()
+                last_error = error
+                retryable = self._is_retryable_telegram_download_error(error)
+                remaining = deadline - time.monotonic()
+                logger.warning(
+                    "telegram_file_download_attempt_failed file_id_length=%s "
+                    "attempt=%s max_attempts=%s retryable=%s error_type=%s",
+                    len(file_id),
+                    attempt,
+                    max_attempts,
+                    retryable,
+                    type(error).__name__,
+                )
+                if not retryable or attempt >= max_attempts or remaining <= 0:
+                    break
+                delay = min(
+                    remaining,
+                    base_backoff_seconds * (2 ** (attempt - 1))
+                    + random.uniform(0.0, base_backoff_seconds / 2),
+                )
+                if delay > 0:
+                    await asyncio.sleep(delay)
+            finally:
+                if ephemeral_client is not None:
+                    await ephemeral_client.aclose()
+
+        if spool is None:
+            if isinstance(last_error, BadRequest):
+                raise last_error
+            error_type = type(last_error).__name__ if last_error else "UnknownError"
+            raise TelegramArtifactBridgeError(
+                f"Telegram file download failed after retries: {error_type}"
+            ) from last_error
 
         async def iterator() -> AsyncIterator[bytes]:
             try:
-                async with httpx.AsyncClient(
-                    timeout=httpx.Timeout(10.0, read=180.0),
-                    transport=transport,
-                ) as client:
-                    async with client.stream("GET", file_path) as response:
-                        response.raise_for_status()
-                        async for chunk in response.aiter_bytes(64 * 1024):
-                            if chunk:
-                                yield chunk
-            except httpx.HTTPError as error:
-                logger.exception(
-                    "telegram_file_download_failed file_id_length=%s "
-                    "error_type=%s",
-                    len(file_id),
-                    type(error).__name__,
-                )
-                raise TelegramArtifactBridgeError(
-                    f"Telegram file download failed: {type(error).__name__}"
-                ) from error
+                while True:
+                    chunk = spool.read(64 * 1024)
+                    if not chunk:
+                        break
+                    yield chunk
+            finally:
+                spool.close()
 
-        return TelegramFileStream(size_bytes=size, iterator=iterator())
+        return TelegramFileStream(size_bytes=actual_size, iterator=iterator())
+
+    async def _shared_telegram_download_client(self) -> httpx.AsyncClient:
+        async with self._telegram_download_client_lock:
+            client = self._telegram_download_client
+            if client is None or client.is_closed:
+                client = httpx.AsyncClient(
+                    timeout=httpx.Timeout(10.0, read=180.0),
+                )
+                self._telegram_download_client = client
+            return client
+
+    @staticmethod
+    def _is_retryable_telegram_download_error(error: BaseException) -> bool:
+        if isinstance(error, (TimedOut, NetworkError, httpx.RequestError)):
+            return True
+        if isinstance(error, httpx.HTTPStatusError):
+            status_code = error.response.status_code
+            return status_code == 429 or 500 <= status_code <= 599
+        return False
+
+    async def close(self) -> None:
+        async with self._telegram_download_client_lock:
+            client = self._telegram_download_client
+            self._telegram_download_client = None
+        if client is not None and not client.is_closed:
+            await client.aclose()
 
     @staticmethod
     def telegram_input_file(

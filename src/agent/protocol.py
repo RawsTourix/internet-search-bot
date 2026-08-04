@@ -118,6 +118,7 @@ class ProgressEvent(BaseModel):
         "artifact_version_conflict",
         "artifact_validation_failed",
         "artifact_read_completed",
+        "artifact_catalog_activated",
         "artifact_tool_input_materialized",
         "artifact_candidate_saved",
         "artifact_tool_input_released",

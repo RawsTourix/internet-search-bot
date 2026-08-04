@@ -3,7 +3,7 @@ id: design.v0.9.index
 version: v0.9
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-02
 ---
 
 # v0.9 — Single-node isolated execution
@@ -25,11 +25,27 @@ AgentRun
 Sandbox не является durable хранилищем, не живёт всё время conversation и не
 получает unrestricted credentials control plane.
 
+Application/hosting profiles и отличие sandbox от Future Local Agent Application
+определены в
+[`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md).
+
+```text
+LocalProcessExecutionBackend
+≠ SandboxInstance
+≠ Future Local Agent Application
+```
+
+Terminal manager tools Service Application используют нейтральный execution port
+и approved sandbox backend. Недоступность sandbox не разрешает fallback на host
+process Gateway/Agent Runtime worker.
+
 ## Читать
 
-1. [`isolated-execution.md`](isolated-execution.md) — control/execution plane,
+1. [`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md)
+   — application profiles, terminal boundary и local-agent distinction.
+2. [`isolated-execution.md`](isolated-execution.md) — control/execution plane,
    workspace, security и lifecycle contracts.
-2. [`implementation-plan.md`](implementation-plan.md) — последовательные updates
+3. [`implementation-plan.md`](implementation-plan.md) — последовательные updates
    и hardening gate.
 
 ## Именованные updates
@@ -46,6 +62,8 @@ Sandbox не является durable хранилищем, не живёт вс
 
 ## Зависимости
 
+- [`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md)
+  — Service Application и Future Local Agent boundaries;
 - [`../v0.6/README.md`](../v0.6/README.md) — TaskRun/jobs/object storage;
 - [`../v0.7/README.md`](../v0.7/README.md) — capabilities/executor profiles;
 - [`../v0.8/README.md`](../v0.8/README.md) — principal/ownership/quotas;
@@ -53,3 +71,5 @@ Sandbox не является durable хранилищем, не живёт вс
 - [`../../release-gates.md`](../../release-gates.md) — sandbox gate.
 
 Distributed runner fleet относится к [`../v0.10/README.md`](../v0.10/README.md).
+Future Local Agent Application не входит в v0.9 и проектируется отдельно после
+стабилизации общего AgentRuntime.

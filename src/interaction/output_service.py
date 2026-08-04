@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -96,6 +97,11 @@ class OutputBatchAssembler:
             kind=OutputBatchKind.FINAL,
         )
         if existing is not None:
+            await self._ensure_output_bindings(
+                existing,
+                input_batch=input_batch,
+                client_instance_id=snapshot.client_instance_id,
+            )
             result.output_batch = existing.model_dump(mode="json")
             return existing
 
@@ -251,6 +257,7 @@ class OutputBatchAssembler:
             )
 
         batch = build_ready_output_batch(
+            input_batch_id=input_batch.input_batch_id,
             session_id=input_batch.session_id,
             cycle_id=cycle_id,
             sequence_number=input_batch.sequence_number,
@@ -262,7 +269,20 @@ class OutputBatchAssembler:
             parts=tuple(parts),
         )
         self.renderer.plan(batch)
-        committed, _ = await self.output_store.commit(batch)
+        committed, bound_records = await asyncio.to_thread(
+            self._commit_with_output_bindings_sync,
+            batch,
+            records,
+            input_batch.input_batch_id,
+            snapshot.client_instance_id,
+        )
+        trace_bindings = getattr(
+            self.delivery_store,
+            "trace_output_bindings",
+            None,
+        )
+        if trace_bindings is not None and bound_records:
+            await trace_bindings(bound_records)
         logger.info(
             "output_batch_ready output_batch_id=%s session_id=%s cycle_id=%s "
             "part_count=%s",
@@ -273,6 +293,64 @@ class OutputBatchAssembler:
         )
         result.output_batch = committed.model_dump(mode="json")
         return committed
+
+    def _commit_with_output_bindings_sync(
+        self,
+        batch: OutputBatch,
+        records: list[ArtifactDeliveryRecord],
+        input_batch_id: str,
+        client_instance_id: str,
+    ) -> tuple[OutputBatch, list[ArtifactDeliveryRecord]]:
+        """Commit aggregate authority and artifact ownership as one unit."""
+
+        with self.output_store._lock, self.delivery_store._lock:
+            committed, created = self.output_store._commit_sync(batch)
+            try:
+                bound = self.delivery_store._bind_output_batch_sync(
+                    [record.delivery_id for record in records],
+                    committed.output_batch_id,
+                    input_batch_id,
+                    client_instance_id,
+                )
+            except BaseException:
+                if created:
+                    self.output_store._rollback_new_commit_sync(committed)
+                raise
+        return committed, bound if created else []
+
+    async def _ensure_output_bindings(
+        self,
+        batch: OutputBatch,
+        *,
+        input_batch: CommittedInputBatch,
+        client_instance_id: str,
+    ) -> None:
+        delivery_ids = [
+            part.delivery_id
+            for part in batch.parts
+            if isinstance(part, ArtifactOutputPart)
+        ]
+        if not delivery_ids:
+            return
+        prior = [await self.delivery_store.get(item) for item in delivery_ids]
+        bound = await self.delivery_store.bind_output_batch(
+            delivery_ids,
+            output_batch_id=batch.output_batch_id,
+            input_batch_id=input_batch.input_batch_id,
+            client_instance_id=client_instance_id,
+        )
+        newly_bound = [
+            record
+            for previous, record in zip(prior, bound, strict=True)
+            if previous.output_batch_id is None
+        ]
+        trace_bindings = getattr(
+            self.delivery_store,
+            "trace_output_bindings",
+            None,
+        )
+        if trace_bindings is not None and newly_bound:
+            await trace_bindings(newly_bound)
 
     @staticmethod
     def _validate_semantic_artifact_compatibility(

@@ -205,6 +205,63 @@ class TelegramArtifactBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(b"".join(chunks), b"exact")
         self.assertEqual(stream.size_bytes, 5)
 
+    async def test_open_telegram_file_retries_with_fresh_file_url(self):
+        attempts = 0
+
+        async def handler(request):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise httpx.ConnectTimeout("temporary timeout", request=request)
+            return httpx.Response(200, content=b"exact")
+
+        class RefreshingBot(FakeBot):
+            def __init__(self):
+                super().__init__()
+                self.get_file_calls = 0
+
+            async def get_file(self, file_id):
+                self.get_file_calls += 1
+                return await super().get_file(file_id)
+
+        bot = RefreshingBot()
+        client = TelegramArtifactGatewayClient(
+            gateway_url="https://gateway.example",
+            api_key="key",
+        )
+        stream = await client.open_telegram_file(
+            bot,
+            "file-id",
+            transport=httpx.MockTransport(handler),
+            base_backoff_seconds=0,
+        )
+        body = b"".join([chunk async for chunk in stream.iterator])
+        self.assertEqual(body, b"exact")
+        self.assertEqual(attempts, 2)
+        self.assertEqual(bot.get_file_calls, 2)
+
+    async def test_open_telegram_file_exhausts_bounded_retries_once(self):
+        attempts = 0
+
+        async def handler(request):
+            nonlocal attempts
+            attempts += 1
+            raise httpx.ReadTimeout("temporary timeout", request=request)
+
+        client = TelegramArtifactGatewayClient(
+            gateway_url="https://gateway.example",
+            api_key="key",
+        )
+        with self.assertRaisesRegex(RuntimeError, "after retries"):
+            await client.open_telegram_file(
+                FakeBot(),
+                "file-id",
+                transport=httpx.MockTransport(handler),
+                max_attempts=3,
+                base_backoff_seconds=0,
+            )
+        self.assertEqual(attempts, 3)
+
     async def test_delivery_success_verifies_bytes_and_posts_receipt(self):
         data = b"report body"
         digest = "sha256:" + hashlib.sha256(data).hexdigest()

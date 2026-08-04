@@ -1,11 +1,26 @@
 """Public API for transport-neutral file ingress."""
 
+from .collection_models import (
+    InputAssemblyMode,
+    InputCollectionRecord,
+    InputCollectionState,
+    InputCommitPolicy,
+    InputDraftControlAction,
+    InputDraftControlConflictError,
+    InputDraftControlResult,
+    InputDraftControlStatus,
+    InputDraftScope,
+    is_input_collection_id,
+    new_input_collection_id,
+)
+from .collection_store import FileSystemInputCollectionStore
 from .compat import legacy_message_to_input_envelope
 from .config import (
     IngressConfigType,
     IngressConfigValidationError,
     load_ingress_config,
 )
+from .draft_control import InputDraftControlService
 from .factory import IngressServices, create_ingress_services
 from .models import (
     ClientAttachmentLocator,
@@ -55,6 +70,7 @@ __all__ = [
     "CommittedInputBatch",
     "FileSystemIngressEventStore",
     "FileSystemInputBatchStore",
+    "FileSystemInputCollectionStore",
     "IngressAttachmentSlot",
     "IngressConfigType",
     "IngressConfigValidationError",
@@ -64,10 +80,20 @@ __all__ = [
     "IngressTextPart",
     "IngressValidationError",
     "InputAdmissionMode",
+    "InputAssemblyMode",
     "InputAttachmentPart",
     "InputAttachmentState",
     "InputBatchDraft",
     "InputBatchDraftState",
+    "InputCollectionRecord",
+    "InputCollectionState",
+    "InputCommitPolicy",
+    "InputDraftControlAction",
+    "InputDraftControlConflictError",
+    "InputDraftControlResult",
+    "InputDraftControlService",
+    "InputDraftControlStatus",
+    "InputDraftScope",
     "InputGroupingAmbiguityError",
     "InputGroupingDecision",
     "InputGroupingMode",
@@ -75,9 +101,11 @@ __all__ = [
     "create_ingress_services",
     "is_ingress_event_id",
     "is_input_batch_id",
+    "is_input_collection_id",
     "legacy_message_to_input_envelope",
     "load_ingress_config",
     "new_ingress_event_id",
     "new_input_batch_id",
+    "new_input_collection_id",
     "resolve_input_grouping",
 ]

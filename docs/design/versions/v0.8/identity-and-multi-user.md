@@ -3,7 +3,9 @@ id: design.v0.8.identity-and-multi-user
 version: v0.8
 spec_status: provisional
 implementation_status: planned
+last_reviewed: 2026-08-02
 ---
+
 # Часть XII. v0.8 — предварительная концепция Identity & Multi-user Workspace
 
 > **Статус раздела:** предварительная архитектурная концепция. Точные auth
@@ -11,12 +13,15 @@ implementation_status: planned
 > выбраны и должны проектироваться отдельными пакетами после стабилизации
 > предыдущих версий.
 
+Application/hosting profiles определены в
+[`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md).
+
 ## 143. Главная идея v0.8
 
-`v0.8` превращает однопользовательский/local runtime в систему, где несколько
-пользователей могут иметь изолированные аккаунты, conversations, memory,
-artifacts, skills, MCP configurations, workflows и settings через разные client
-surfaces.
+`v0.8` превращает текущий single-user/self-hosted Service Application baseline в
+систему, где несколько пользователей могут иметь изолированные аккаунты,
+conversations, memory, artifacts, skills, MCP configurations, workflows и
+settings через разные client surfaces.
 
 ```text
 Identity + Authorization + Conversations
@@ -27,6 +32,10 @@ Identity + Authorization + Conversations
 
 Авторизация является входной частью обновления. Главная архитектурная задача —
 не форма логина, а корректная изоляция и владение данными.
+
+Future Local Agent Application остаётся отдельным application profile. Он может
+переиспользовать identity/ownership models, но его local single-user UX и
+configuration не проектируются этой версией.
 
 ---
 
@@ -72,6 +81,10 @@ User
 transport/client principal. Он не становится полноценным account автоматически
 до явного Identity linking.
 
+Self-hosted single-user Service Application и Future Local Agent Application
+используют explicit local/system principal, а не скрытый глобальный `default` без
+ownership model.
+
 ---
 
 ## 145. Accounts и linked identities
@@ -109,7 +122,7 @@ Scopes `builtin`, `instance`, `user`, `session` становятся реаль�
 
 ```text
 builtin  → system policy
-instance → deployment policy
+instance → deployment operator policy
 user     → owner_user_id / explicit grants
 session  → связанная conversation/run boundary
 ```
@@ -118,6 +131,10 @@ session  → связанная conversation/run boundary
 query обязана включать authorization predicate. Negative tests должны доказать,
 что user A не получает artifact, chunk, result или MCP config user B ни прямым
 ID, ни semantic search, ни reply/client binding.
+
+Scope не принимается как доверенное пользовательское заявление. Service API
+назначает `user`/`session` scope на основании authenticated principal и не
+позволяет обычному пользователю создать `builtin` или `instance` definition.
 
 Role/team/workspace sharing можно добавить позднее; MVP может оставаться strictly
 private-per-user.
@@ -129,16 +146,20 @@ private-per-user.
 Пользователь получает явные chats/conversations: создать, продолжить,
 переименовать, архивировать, переключить и просмотреть durable run/artifacts.
 
-Web, Telegram, CLI и будущий VS Code client должны обращаться к одному Agent
-Runtime/API, а не содержать собственную бизнес-логику агента.
+Web, Telegram, network CLI и будущий network VS Code client обращаются к одному
+Service Application API, а не содержат собственную бизнес-логику агента.
 
 ```text
 Telegram ─────┐
 Web ──────────┤
-CLI ──────────┼→ Client API / Agent Runtime
-VS Code ──────┤
+network CLI ──┼→ Client API / Service Application / Agent Runtime
+VS Code client┤
 other clients ┘
 ```
+
+Network client не становится Future Local Agent Application только потому, что
+работает на машине пользователя. Локальный executable profile имеет отдельный
+composition root и permission model.
 
 Точная Telegram UX-модель требует отдельного проектирования: меню, commands,
 reply bindings и выбор conversation не должны нарушать active run или смешивать
@@ -146,30 +167,68 @@ reply bindings и выбор conversation не должны нарушать act
 
 ---
 
-## 148. Deployment и LLM provider modes
+## 148. Hosting modes и application profiles
 
-Финальный продукт не обязан сразу становиться публичным SaaS. Архитектура должна
-сохранять несколько режимов:
+Финальный продукт не обязан сразу становиться публичным SaaS. Service
+Application сохраняет два first-class hosting modes:
 
 ```text
-local
-  Agent + PostgreSQL/Redis + Web/CLI + local/cloud LLM
+self-hosted service
+  пользователь, команда или разработчик разворачивает собственный instance
+  на локальной машине, сервере или в контейнерах
 
-self-hosted
-  пользователь или команда разворачивает свой instance
-
-managed
-  потенциальный публичный сервис
+managed service
+  deployment контролируется оператором и может обслуживать множество users
 ```
 
-Local/self-hosted mode остаётся first-class: допускается bootstrap local admin
-или явно упрощённый trusted-local mode.
+Self-hosted и managed используют одни identity/domain contracts. Self-hosted
+mode может допускать bootstrap local admin или явно упрощённый trusted-local flow,
+но ownership/principal не исчезают из модели.
 
-Пользователь может выбирать hosted model, собственный API endpoint или local
-OpenAI-compatible/Ollama endpoint, когда runtime работает в той же сети/машине.
-Hosted runtime для пользовательской local LLM потребует отдельного authenticated
-connector/node с исходящим соединением; открытие LLM-порта в интернет не является
-рекомендуемой архитектурой и не обязано входить в `v0.8`.
+Runtime topology задаётся отдельно:
+
+```text
+single-process | multi-process | distributed
+```
+
+Локально запущенный self-hosted service остаётся Service Application и не
+становится Future Local Agent Application.
+
+Future Local Agent Application — отдельный возможный executable profile поверх
+общего AgentRuntime. Его packaging, local config, host permissions, offline mode
+и синхронизация с service не входят в `v0.8`.
+
+Пользователь Service Application может выбирать hosted model, собственный API
+endpoint или local OpenAI-compatible/Ollama endpoint, когда runtime имеет к нему
+разрешённый сетевой доступ. Managed service для пользовательской local LLM
+потребует отдельного authenticated connector/node с исходящим соединением;
+открытие LLM-порта в интернет не является рекомендуемой архитектурой и не
+обязано входить в `v0.8`.
+
+---
+
+## 148.1. Operator и user configuration
+
+Service operator configuration (`agent.config` после modularization) содержит
+развёртывание, builtin/instance integrations, infrastructure policies и secret
+references.
+
+Per-user settings не редактируют общий service config:
+
+```text
+user MCP definitions
+user credentials
+model/runtime preferences
+conversation/workspace settings
+retention/privacy preferences
+→ owner-aware repositories and application APIs
+```
+
+`v0.8` добавляет полноценные ownership, authorization и protected credential
+boundaries для этих данных.
+
+Future Local Agent Application получит отдельную local root configuration; её
+формат не определяется этой версией.
 
 ---
 
@@ -196,7 +255,7 @@ Audit проводится только на принадлежащем разр
 Security развивается раньше `v0.8`:
 
 ```text
-v0.4 → untrusted files/tool outputs and artifact isolation
+v0.4 → untrusted files/tool outputs, artifact isolation и transport admission
 v0.5 → retrieval authorization hooks and provenance
 v0.6 → worker/service trust boundaries, queues and secrets isolation
 v0.7 → untrusted external skills and capability enforcement
@@ -205,8 +264,7 @@ v0.8 → account isolation, auth sessions and linked identities
 
 Предварительный MVP `v0.8` не обязан включать billing, public signup,
 organization roles, marketplace или production SaaS operations. Открытыми
-остаются auth protocol, recovery policy, Telegram linking UX, local trusted mode
-и deployment topology.
+остаются auth protocol, recovery policy, Telegram linking UX, trusted-local
+self-hosted flow и deployment topology.
 
 ---
-

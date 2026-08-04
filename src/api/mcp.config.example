@@ -34,6 +34,27 @@
             "startup_required": false
         },
         {
+            "name": "remote_streamable",
+            "alias": "remote",
+            "connect_type": "streamable_http",
+            "url": "https://mcp.example.com/mcp",
+            "headers": {
+                "Authorization": "Bearer replace_with_remote_mcp_token"
+            },
+            "enabled": false,
+            "startup_required": false
+        },
+        {
+            "name": "legacy_http",
+            "alias": "legacy",
+            "connect_type": "http",
+            "host": "127.0.0.1",
+            "port": 8080,
+            "path": "/mcp",
+            "enabled": false,
+            "startup_required": false
+        },
+        {
             "name": "git",
             "alias": "git",
             "connect_type": "executable",
@@ -51,6 +72,7 @@
         "api_url": "https://integrate.api.nvidia.com/v1/chat/completions",
         "api_key": "your_api_key",
         "model": "moonshotai/kimi-k2.6",
+        "headers": {},
         "tokenizer_encoding": null,
         "is_openai_compatible": true,
         "max_tokens": 4096,
@@ -111,7 +133,10 @@
         "max_container_entries_inspected": 2048,
         "max_workspace_bytes": 268435456,
         "workspace_ttl_seconds": 3600,
-        "delivery_claim_timeout_seconds": 900
+        "delivery_claim_timeout_seconds": 900,
+        "trace_enabled": true,
+        "trace_max_file_bytes": 8388608,
+        "trace_max_string_chars": 2000
     },
     "ingress": {
         "enabled": true,
@@ -120,10 +145,17 @@
         "max_batch_total_bytes": 268435456,
         "max_text_parts_per_batch": 64,
         "max_text_part_chars": 100000,
+        "max_semantic_parts_per_batch": 128,
+        "max_semantic_metadata_bytes_per_part": 16384,
+        "max_semantic_total_bytes": 524288,
+        "max_poll_options": 20,
+        "max_poll_option_chars": 1000,
+        "max_vcard_chars": 16384,
         "media_group_quiet_timeout_seconds": 0.8,
         "media_group_sealing_grace_seconds": 0.5,
         "media_group_maximum_wait_seconds": 300,
-        "standalone_attachment_maximum_wait_seconds": 2
+        "standalone_attachment_maximum_wait_seconds": 2,
+        "explicit_collection_idle_timeout_seconds": 3600
     },
     "client_capabilities": {
         "contract_version": 1,

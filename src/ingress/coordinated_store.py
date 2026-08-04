@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from collections import Counter
 from datetime import datetime, timezone
 
 from .grouping import FileSystemGroupedInputBatchStore, _OPEN_STATES
@@ -24,6 +25,30 @@ from .semantic_limits import (
 
 class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
     """Add exact draft joins without moving policy into transport handlers."""
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._active_ingress_reservations: Counter[
+            tuple[str, str, str, str]
+        ] = Counter()
+
+    def begin_ingress_reservation(
+        self,
+        scope: tuple[str, str, str, str],
+    ) -> None:
+        with self._lock:
+            self._active_ingress_reservations[scope] += 1
+
+    def end_ingress_reservation(
+        self,
+        scope: tuple[str, str, str, str],
+    ) -> None:
+        with self._lock:
+            count = self._active_ingress_reservations.get(scope, 0)
+            if count <= 1:
+                self._active_ingress_reservations.pop(scope, None)
+            else:
+                self._active_ingress_reservations[scope] = count - 1
 
     async def append_event_to_batch(
         self,
@@ -200,13 +225,36 @@ class FileSystemCoordinatedInputBatchStore(FileSystemGroupedInputBatchStore):
                     "Input batch belongs to another session"
                 )
             now = datetime.now(timezone.utc)
+            maximum_is_open = (
+                draft.maximum_deadline is None
+                or now < draft.maximum_deadline
+            )
+            instance_id = (
+                draft.capability_snapshot.client_instance_id
+                if draft.capability_snapshot is not None
+                else ""
+            )
+            reservation_scope = (
+                draft.session_id,
+                draft.client_type.value,
+                instance_id,
+                draft.sender.principal_id,
+            )
+            if (
+                maximum_is_open
+                and self._active_ingress_reservations.get(
+                    reservation_scope,
+                    0,
+                )
+                > 0
+            ):
+                return None, 0.01
             if (
                 draft.grouping_mode == InputGroupingMode.MEDIA_GROUP
                 and draft.quiet_deadline is not None
                 and now < draft.quiet_deadline
                 and (
-                    draft.maximum_deadline is None
-                    or now < draft.maximum_deadline
+                    maximum_is_open
                 )
             ):
                 quiet_remaining = (

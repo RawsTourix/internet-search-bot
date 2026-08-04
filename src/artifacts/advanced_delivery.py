@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from .delivery import (
     ArtifactDeliveryRecord,
     ArtifactDeliveryService,
@@ -23,6 +25,255 @@ class AdvancedFileSystemArtifactDeliveryStore(FileSystemArtifactDeliveryStore):
     exact artifact version. DELIVERING and UNKNOWN heads are never silently
     replaced because their bytes may already have reached the client.
     """
+
+    def __init__(
+        self,
+        storage_config,
+        *,
+        trace_service=None,
+    ) -> None:
+        super().__init__(storage_config)
+        self.trace_service = trace_service
+
+    async def select(self, record: ArtifactDeliveryRecord) -> ArtifactDeliveryRecord:
+        before = await self.list_cycle(
+            session_id=record.session_id,
+            cycle_id=record.cycle_id,
+        )
+        selected = await super().select(record)
+        await self._trace_selection_delta(before, [selected])
+        return selected
+
+    async def select_many(
+        self,
+        records: list[ArtifactDeliveryRecord],
+    ) -> list[ArtifactDeliveryRecord]:
+        if not records:
+            return []
+        first = records[0]
+        before = await self.list_cycle(
+            session_id=first.session_id,
+            cycle_id=first.cycle_id,
+        )
+        selected = await super().select_many(records)
+        await self._trace_selection_delta(before, selected)
+        return selected
+
+    async def transition(
+        self,
+        delivery_id: str,
+        *,
+        target: ArtifactDeliveryState,
+        allowed_from: set[ArtifactDeliveryState],
+        error: str | None = None,
+        receipt: dict[str, Any] | None = None,
+    ) -> ArtifactDeliveryRecord:
+        before = await self.get(delivery_id)
+        record = await super().transition(
+            delivery_id,
+            target=target,
+            allowed_from=allowed_from,
+            error=error,
+            receipt=receipt,
+        )
+        if before.state != record.state:
+            await self._trace_records(
+                [record],
+                event_type=self._transition_event_type(target),
+                status=self._transition_status(target),
+                error=error,
+            )
+        return record
+
+    async def transition_many(
+        self,
+        delivery_ids: list[str],
+        *,
+        target: ArtifactDeliveryState,
+        allowed_from: set[ArtifactDeliveryState],
+        receipt_by_delivery_id: dict[str, dict[str, Any]] | None = None,
+        error: str | None = None,
+    ) -> list[ArtifactDeliveryRecord]:
+        unique_ids = list(dict.fromkeys(delivery_ids))
+        before = {
+            delivery_id: await self.get(delivery_id)
+            for delivery_id in unique_ids
+        }
+        records = await super().transition_many(
+            delivery_ids,
+            target=target,
+            allowed_from=allowed_from,
+            receipt_by_delivery_id=receipt_by_delivery_id,
+            error=error,
+        )
+        changed = [
+            record
+            for record in records
+            if before[record.delivery_id].state != record.state
+        ]
+        await self._trace_records(
+            changed,
+            event_type=self._transition_event_type(target),
+            status=self._transition_status(target),
+            error=error,
+        )
+        return records
+
+    async def cancel_many(
+        self,
+        delivery_ids: list[str],
+    ) -> list[ArtifactDeliveryRecord]:
+        unique_ids = list(dict.fromkeys(delivery_ids))
+        before = {
+            delivery_id: await self.get(delivery_id)
+            for delivery_id in unique_ids
+        }
+        records = await super().cancel_many(delivery_ids)
+        changed = [
+            record
+            for record in records
+            if before[record.delivery_id].state != record.state
+        ]
+        await self._trace_records(
+            changed,
+            event_type="artifact_delivery_cancelled",
+            status="succeeded",
+        )
+        return records
+
+    async def trace_output_bindings(
+        self,
+        records: list[ArtifactDeliveryRecord],
+    ) -> None:
+        """Record the point where aggregate output becomes the sole owner."""
+
+        await self._trace_records(
+            records,
+            event_type="artifact_delivery_output_bound",
+            status="observed",
+        )
+
+    async def trace_external_transitions(
+        self,
+        before_states: dict[str, ArtifactDeliveryState],
+        records: list[ArtifactDeliveryRecord],
+    ) -> None:
+        """Trace atomic cross-store transitions applied by output completion."""
+
+        for record in records:
+            if before_states.get(record.delivery_id) == record.state:
+                continue
+            await self._trace_records(
+                [record],
+                event_type=self._transition_event_type(record.state),
+                status=self._transition_status(record.state),
+                error=record.last_error,
+            )
+
+    async def _trace_selection_delta(
+        self,
+        before: list[ArtifactDeliveryRecord],
+        selected: list[ArtifactDeliveryRecord],
+    ) -> None:
+        """Trace new selections and superseded heads, not idempotent lookups."""
+
+        before_by_id = {item.delivery_id: item for item in before}
+        new_records = [
+            item for item in selected if item.delivery_id not in before_by_id
+        ]
+        await self._trace_records(
+            new_records,
+            event_type="artifact_delivery_selected",
+            status="succeeded",
+        )
+
+        superseded: list[ArtifactDeliveryRecord] = []
+        for delivery_id, previous in before_by_id.items():
+            current = await self.get(delivery_id)
+            if (
+                previous.state != current.state
+                and current.state == ArtifactDeliveryState.CANCELLED
+            ):
+                superseded.append(current)
+        await self._trace_records(
+            superseded,
+            event_type="artifact_delivery_cancelled",
+            status="succeeded",
+        )
+
+    async def _trace_records(
+        self,
+        records: list[ArtifactDeliveryRecord],
+        *,
+        event_type: str,
+        status: str,
+        error: str | None = None,
+    ) -> None:
+        if self.trace_service is None:
+            return
+        for record in records:
+            await self.trace_service.record(
+                session_id=record.session_id,
+                cycle_id=record.cycle_id,
+                event_type=event_type,
+                stage="delivery",
+                status=status,
+                direction="outbound",
+                correlation={
+                    "input_batch_id": record.input_batch_id,
+                    "output_batch_id": record.output_batch_id,
+                    "delivery_id": record.delivery_id,
+                },
+                transport={
+                    "client_type": record.client_type,
+                    "client_instance_id": record.client_instance_id,
+                },
+                artifact={
+                    "artifact_id": record.artifact_id,
+                    "artifact_lineage_id": record.artifact_lineage_id,
+                    "content_id": record.content_id,
+                    "filename": record.filename,
+                    "format_id": record.format_id,
+                    "mime_type": record.mime_type,
+                    "size_bytes": record.size_bytes,
+                    "content_hash": record.content_hash,
+                },
+                metrics={
+                    "attempt_count": record.attempt_count,
+                    "selection_index": record.selection_index,
+                },
+                error=(
+                    {
+                        "error_type": "ArtifactDeliveryError",
+                        "message": error,
+                    }
+                    if error
+                    else None
+                ),
+                data={"state": record.state.value},
+            )
+
+    @staticmethod
+    def _transition_event_type(target: ArtifactDeliveryState) -> str:
+        return {
+            ArtifactDeliveryState.SELECTED: "artifact_delivery_selected",
+            ArtifactDeliveryState.DELIVERING: "artifact_delivery_started",
+            ArtifactDeliveryState.DELIVERED: "artifact_delivery_succeeded",
+            ArtifactDeliveryState.FAILED: "artifact_delivery_failed",
+            ArtifactDeliveryState.UNKNOWN: "artifact_delivery_unknown",
+            ArtifactDeliveryState.CANCELLED: "artifact_delivery_cancelled",
+        }[target]
+
+    @staticmethod
+    def _transition_status(target: ArtifactDeliveryState) -> str:
+        return {
+            ArtifactDeliveryState.SELECTED: "succeeded",
+            ArtifactDeliveryState.DELIVERING: "started",
+            ArtifactDeliveryState.DELIVERED: "succeeded",
+            ArtifactDeliveryState.FAILED: "failed",
+            ArtifactDeliveryState.UNKNOWN: "unknown",
+            ArtifactDeliveryState.CANCELLED: "succeeded",
+        }[target]
 
     def _select_many_sync(
         self,

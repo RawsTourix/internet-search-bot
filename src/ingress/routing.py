@@ -6,6 +6,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 
 from ..core.models import ClientType
+from .collection_models import is_input_collection_id
+from .explicit_policy import (
+    EXPLICIT_COLLECTION_GROUPING_MODE,
+    EXPLICIT_COLLECTION_ROUTE_METADATA_KEY,
+)
 from .models import (
     ClientInputEnvelope,
     InputAdmissionMode,
@@ -84,6 +89,41 @@ def _compatible_open_attachment_drafts(
     return result
 
 
+def _explicit_collection_id(envelope: ClientInputEnvelope) -> str | None:
+    metadata = envelope.response_route.metadata or {}
+    value = metadata.get(EXPLICIT_COLLECTION_ROUTE_METADATA_KEY)
+    if value is None:
+        return None
+    collection_id = str(value).strip()
+    if not is_input_collection_id(collection_id):
+        raise ValueError("Invalid server-owned input collection ID")
+    return collection_id
+
+
+def _compatible_explicit_collection_drafts(
+    envelope: ClientInputEnvelope,
+    open_drafts: Sequence[InputBatchDraft],
+    *,
+    collection_id: str,
+) -> list[InputBatchDraft]:
+    result: list[InputBatchDraft] = []
+    for draft in open_drafts:
+        if draft.state not in _OPEN_DRAFT_STATES:
+            continue
+        if draft.grouping_mode != EXPLICIT_COLLECTION_GROUPING_MODE:
+            continue
+        if draft.grouping_key != collection_id:
+            continue
+        if draft.client_type != envelope.client_type:
+            continue
+        if draft.conversation != envelope.conversation:
+            continue
+        if draft.sender.principal_id != envelope.sender.principal_id:
+            continue
+        result.append(draft)
+    return result
+
+
 def resolve_input_grouping(
     envelope: ClientInputEnvelope,
     *,
@@ -91,14 +131,38 @@ def resolve_input_grouping(
 ) -> InputGroupingDecision:
     """Resolve one transport event into the shared logical-input grouping.
 
-    Client-specific hints such as Telegram ``media_group_id`` are interpreted
-    here, while draft mutation remains the responsibility of the common ingress
-    store. Text-only events may join exactly one open attachment draft with the
-    same authoritative conversation/thread/sender scope. Ambiguous joins are
-    rejected instead of guessing.
+    Server-owned explicit collection authority takes precedence over transport
+    grouping hints. Otherwise client-specific hints such as Telegram
+    ``media_group_id`` are interpreted here, while draft mutation remains the
+    responsibility of the common ingress store. Ambiguous joins are rejected
+    instead of guessing.
     """
 
     prefix = _scope_prefix(envelope)
+    collection_id = _explicit_collection_id(envelope)
+    if collection_id is not None:
+        candidates = _compatible_explicit_collection_drafts(
+            envelope,
+            open_drafts,
+            collection_id=collection_id,
+        )
+        if len(candidates) > 1:
+            raise InputGroupingAmbiguityError(
+                "Explicit collection matches multiple open input drafts."
+            )
+        # Exact joins bypass the streaming path and therefore are only valid for
+        # events without attachment slots. Attachment events reuse the exact
+        # group key through create_for_event(), then continue through ingestion.
+        joined_input_batch_id = (
+            candidates[0].input_batch_id
+            if candidates and not envelope.attachment_slots
+            else None
+        )
+        return InputGroupingDecision(
+            mode=EXPLICIT_COLLECTION_GROUPING_MODE,
+            key=collection_id,
+            joined_input_batch_id=joined_input_batch_id,
+        )
 
     if envelope.client_type == ClientType.TELEGRAM and envelope.attachment_slots:
         if envelope.source_group_id:

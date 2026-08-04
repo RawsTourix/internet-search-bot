@@ -109,6 +109,46 @@ def create_output_outbox_router(
                 detail="API key is not authorized for this client instance",
             )
 
+    async def validate_artifact_ownership(batch) -> None:
+        compatible_states = {
+            OutputBatchState.READY: {
+                "selected",
+                "failed",
+            },
+            OutputBatchState.DELIVERING: {
+                "selected",
+                "failed",
+                "delivering",
+            },
+        }.get(batch.state, set())
+        for part in batch.parts:
+            if not isinstance(part, ArtifactOutputPart):
+                continue
+            try:
+                record = await facade.api.artifact_services.delivery_store.get(
+                    part.delivery_id
+                )
+            except ArtifactDeliveryNotFoundError as error:
+                raise OutputBatchConflictError(
+                    "OutputBatch artifact delivery record is missing"
+                ) from error
+            if (
+                record.output_batch_id != batch.output_batch_id
+                or record.session_id != batch.session_id
+                or record.cycle_id != batch.cycle_id
+                or record.client_type != batch.capability_snapshot.client_type
+                or record.client_instance_id
+                != batch.capability_snapshot.client_instance_id
+                or record.artifact_id != part.artifact_id
+                or record.filename != part.filename
+                or record.mime_type != part.mime_type
+                or record.size_bytes != part.size_bytes
+                or record.state.value not in compatible_states
+            ):
+                raise OutputBatchConflictError(
+                    "Artifact delivery is outside exact OutputBatch ownership"
+                )
+
     @router.get("/internal/output-outbox/ready")
     async def list_ready_output_batches(
         client_type: str,
@@ -140,6 +180,39 @@ def create_output_outbox_router(
         except (InteractionIntegrityError, InteractionStorageError) as error:
             raise HTTPException(status_code=503, detail=str(error)) from error
 
+    @router.get("/internal/output-outbox/{output_batch_id}")
+    async def get_output_batch(
+        output_batch_id: str,
+        session_id: str,
+        client_type: str,
+        client_instance_id: str,
+        api_key: str = Depends(auth_dependency),
+    ):
+        """Read one batch in any state without claiming or mutating it."""
+
+        require_transport_scope(api_key, client_type, client_instance_id)
+        try:
+            batch = await facade.api.output_store.get(output_batch_id)
+            service.validate_authority(
+                batch,
+                session_id=session_id,
+                client_type=client_type,
+                client_instance_id=client_instance_id,
+            )
+            plan = facade.api.output_renderer.plan(batch)
+            return {
+                "output_batch": batch.model_dump(mode="json"),
+                "delivery_plan": plan.model_dump(mode="json"),
+            }
+        except OutputBatchNotFoundError as error:
+            raise HTTPException(status_code=404, detail=str(error)) from error
+        except PermissionError as error:
+            raise HTTPException(status_code=403, detail=str(error)) from error
+        except (InteractionValidationError, ValueError) as error:
+            raise HTTPException(status_code=422, detail=str(error)) from error
+        except (InteractionIntegrityError, InteractionStorageError) as error:
+            raise HTTPException(status_code=503, detail=str(error)) from error
+
     @router.post("/internal/output-outbox/{output_batch_id}/claim")
     async def claim_ready_output_batch(
         output_batch_id: str,
@@ -159,6 +232,7 @@ def create_output_outbox_router(
                 client_type=body.client_type,
                 client_instance_id=body.client_instance_id,
             )
+            await validate_artifact_ownership(batch)
             claimed, attempt_id = await claim_service.claim(
                 output_batch_id,
                 claim_request_id=body.claim_request_id,
@@ -223,6 +297,7 @@ def create_output_outbox_router(
                 delivery_id,
                 session_id=session_id,
                 client_type=normalized_client,
+                output_batch_id=batch.output_batch_id,
             )
             if (
                 ref.artifact_id != part.artifact_id
@@ -237,6 +312,7 @@ def create_output_outbox_router(
                 delivery_id,
                 session_id=session_id,
                 client_type=normalized_client,
+                output_batch_id=batch.output_batch_id,
             )
             encoded_filename = quote(ref.filename, safe="")
             return StreamingResponse(

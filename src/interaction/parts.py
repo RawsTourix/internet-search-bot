@@ -171,6 +171,9 @@ class ArtifactManifestItem(_PartModel):
     size_bytes: int = Field(ge=0)
     purpose: Literal["input", "working", "deliverable"]
     capabilities: tuple[str, ...] = ()
+    activation_reason: str | None = None
+    activation_scope: str | None = None
+    activation_source_operation_id: str | None = None
 
     @field_validator("artifact_id")
     @classmethod
@@ -185,6 +188,18 @@ class ArtifactManifestItem(_PartModel):
         if not is_artifact_lineage_id(value):
             raise ValueError("invalid artifact_lineage_id")
         return value
+
+    @field_validator(
+        "activation_reason",
+        "activation_scope",
+        "activation_source_operation_id",
+    )
+    @classmethod
+    def normalize_activation_text(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        return normalized or None
 
 
 class ArtifactInputManifest(_PartModel):
