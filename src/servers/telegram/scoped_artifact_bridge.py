@@ -28,6 +28,7 @@ class _ActiveInputGroup:
     source_group_id: str
     input_batch_id: str | None
     last_activity: float
+    forwarded_burst: bool = False
 
 
 class InstanceScopedTelegramArtifactGatewayClient(
@@ -95,6 +96,7 @@ class InstanceScopedTelegramArtifactGatewayClient(
         *,
         progress_locale: str,
     ) -> dict[str, Any]:
+        envelope = await self.prepare_input_envelope(envelope)
         original_group_key = telegram_media_group_key(envelope)
         group_key = original_group_key
 
@@ -102,6 +104,7 @@ class InstanceScopedTelegramArtifactGatewayClient(
             group_key is None
             and list(getattr(envelope, "text_parts", None) or [])
             and not list(getattr(envelope, "attachment_slots", None) or [])
+            and await self._allow_text_group_join(envelope)
         ):
             wait_seconds = (
                 self.forwarded_text_join_wait_seconds
@@ -156,6 +159,80 @@ class InstanceScopedTelegramArtifactGatewayClient(
                     self._input_group_condition.notify_all()
         return payload
 
+    async def prepare_input_envelope(self, envelope):
+        """Coalesce one forwarded Telegram burst before handler grouping.
+
+        Telegram assigns a different ``media_group_id`` to every forwarded
+        album even when the user selected all messages in one forwarding
+        action.  While the first forwarded group is still open, normalize
+        later forwarded albums and adjacent standalone files to its exact
+        transport group.  The existing media-group quiet boundary then owns
+        the commit; no semantic content or filename is consulted.
+        """
+
+        attachments = list(getattr(envelope, "attachment_slots", None) or [])
+        if not attachments:
+            return envelope
+        scope_key = self._input_scope_key(envelope)
+        if not scope_key:
+            return envelope
+        forwarded = self._is_forwarded_envelope(envelope)
+        current_group_key = telegram_media_group_key(envelope)
+        now = time.monotonic()
+        async with self._input_group_condition:
+            self._purge_expired_input_groups(now)
+            bursts = [
+                item
+                for item in self._input_groups.values()
+                if item.scope_key == scope_key and item.forwarded_burst
+            ]
+            target = (
+                max(
+                    bursts,
+                    key=lambda item: (item.last_activity, item.group_key),
+                )
+                if bursts
+                else None
+            )
+            if forwarded and target is None:
+                source_group_id = str(
+                    getattr(envelope, "source_group_id", "") or ""
+                ).strip()
+                if not source_group_id:
+                    message_id = str(
+                        getattr(envelope, "source_message_id", "") or ""
+                    ).strip()
+                    if not message_id:
+                        return envelope
+                    source_group_id = f"forwarded-burst-{message_id}"
+                    envelope = envelope.model_copy(
+                        update={"source_group_id": source_group_id}
+                    )
+                group_key = telegram_media_group_key(envelope)
+                if group_key is None:
+                    return envelope
+                target = _ActiveInputGroup(
+                    group_key=group_key,
+                    scope_key=scope_key,
+                    source_group_id=source_group_id,
+                    input_batch_id=None,
+                    last_activity=now,
+                    forwarded_burst=True,
+                )
+                self._input_groups[group_key] = target
+                self._input_group_condition.notify_all()
+            elif target is not None and (forwarded or current_group_key is None):
+                if current_group_key != target.group_key:
+                    envelope = envelope.model_copy(
+                        update={"source_group_id": target.source_group_id}
+                    )
+                target.last_activity = now
+                self._input_group_condition.notify_all()
+        return envelope
+
+    async def _allow_text_group_join(self, envelope) -> bool:
+        return True
+
     async def commit_and_run(
         self,
         input_batch_id: str,
@@ -180,17 +257,16 @@ class InstanceScopedTelegramArtifactGatewayClient(
             session_id,
         )
         try:
-            async with self._client(read_timeout=30.0) as client:
-                response = await client.post(
-                    f"{self.gateway_url}/input-batches/{input_batch_id}/commit",
-                    json={
-                        "session_id": session_id,
-                        "progress_locale": progress_locale,
-                        "run": False,
-                    },
-                )
-                response.raise_for_status()
-                commit_payload = response.json()
+            commit_payload = await self._post_json_with_retry(
+                f"/input-batches/{input_batch_id}/commit",
+                {
+                    "session_id": session_id,
+                    "progress_locale": progress_locale,
+                    "run": False,
+                },
+                attempts=3,
+                read_timeout=180.0,
+            )
         except asyncio.CancelledError:
             logger.info(
                 "telegram_input_batch_commit_cancelled input_batch_id=%s",
@@ -321,9 +397,14 @@ class InstanceScopedTelegramArtifactGatewayClient(
                     source_group_id=source_group_id,
                     input_batch_id=None,
                     last_activity=now,
+                    forwarded_burst=self._is_forwarded_envelope(envelope),
                 )
             else:
                 current.last_activity = now
+                current.forwarded_burst = (
+                    current.forwarded_burst
+                    or self._is_forwarded_envelope(envelope)
+                )
             self._input_group_condition.notify_all()
 
     async def _resolve_single_active_group(
@@ -550,7 +631,7 @@ class InstanceScopedTelegramArtifactGatewayClient(
         return f"{self.client_instance_id}:{conversation_id}:{thread}"
 
     @staticmethod
-    def _is_forwarded_text(envelope) -> bool:
+    def _is_forwarded_envelope(envelope) -> bool:
         for part in list(getattr(envelope, "semantic_parts", None) or []):
             raw_type = getattr(part, "type", None)
             part_type = getattr(raw_type, "value", raw_type)
@@ -558,19 +639,22 @@ class InstanceScopedTelegramArtifactGatewayClient(
                 return True
         return False
 
+    _is_forwarded_text = _is_forwarded_envelope
+
     async def _post_json_with_retry(
         self,
         path: str,
         payload: dict[str, Any],
         *,
         attempts: int = 3,
+        read_timeout: float = 30.0,
     ) -> dict[str, Any]:
         """Retry one idempotent claim or exact receipt payload unchanged."""
 
         last_error: BaseException | None = None
         for attempt in range(attempts):
             try:
-                async with self._client(read_timeout=30.0) as client:
+                async with self._client(read_timeout=read_timeout) as client:
                     response = await client.post(
                         f"{self.gateway_url}{path}",
                         json=payload,

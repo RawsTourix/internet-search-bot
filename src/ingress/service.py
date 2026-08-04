@@ -30,6 +30,7 @@ from ..interaction.presentation_service import InputPresentationCoordinator
 from ..interaction.presentation import PresentationAckPolicy
 from ..localization.service import LocalizationService
 from .config import IngressConfigType
+from .explicit_policy import is_explicit_collection_draft
 from .models import (
     ClientInputEnvelope,
     CommittedInputBatch,
@@ -727,6 +728,7 @@ class ArtifactIngressService:
                 file_count=len(draft.attachment_parts),
                 text_part_count=len(draft.text_parts),
                 response_anchor=draft.response_anchor,
+                allow_relocation=not is_explicit_collection_draft(draft),
             )
             if (
                 ack

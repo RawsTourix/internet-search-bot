@@ -40,6 +40,7 @@ class InputPresentationCoordinator:
         file_count: int,
         text_part_count: int,
         response_anchor,
+        allow_relocation: bool = True,
     ) -> tuple[PresentationAckPolicy, InputPresentationEvent, PublicPresentationRef]:
         key = {
             "collecting": "input_batch.collecting",
@@ -72,7 +73,7 @@ class InputPresentationCoordinator:
         relocation_reserved = False
         previous_message_id: str | None = None
         if not created:
-            if self._should_relocate(
+            if allow_relocation and self._should_relocate(
                 stored,
                 state=state,
                 response_anchor=response_anchor,

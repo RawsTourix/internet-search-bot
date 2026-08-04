@@ -1,6 +1,7 @@
 import asyncio
 import json
 import unittest
+from unittest.mock import AsyncMock, patch
 
 import httpx
 
@@ -11,6 +12,54 @@ from src.servers.telegram.scoped_artifact_bridge import (
 
 
 class TelegramStagedCommitRunTests(unittest.IsolatedAsyncioTestCase):
+    async def test_commit_read_timeout_retries_and_reconciles_duplicate(self):
+        input_batch_id = "ibat_" + "0" * 32
+        attempts = 0
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            nonlocal attempts
+            if request.url.path.endswith("/commit"):
+                attempts += 1
+                if attempts == 1:
+                    raise httpx.ReadTimeout(
+                        "commit response was lost",
+                        request=request,
+                    )
+                return httpx.Response(
+                    200,
+                    request=request,
+                    json={
+                        "status": "committed",
+                        "input_batch_id": input_batch_id,
+                        "duplicate": True,
+                        "committed_batch": {
+                            "input_batch_id": input_batch_id,
+                        },
+                    },
+                )
+            raise AssertionError("reconciled duplicate must not call /run")
+
+        client = InstanceScopedTelegramArtifactGatewayClient(
+            gateway_url="http://gateway.test",
+            api_key="key",
+            client_instance_id="default",
+            transport=httpx.MockTransport(handler),
+        )
+
+        with patch(
+            "src.servers.telegram.scoped_artifact_bridge.asyncio.sleep",
+            new=AsyncMock(),
+        ):
+            result = await client.commit_and_run(
+                input_batch_id,
+                session_id="telegram:conversation:100",
+                progress_locale="ru",
+            )
+
+        self.assertEqual(attempts, 2)
+        self.assertTrue(result["duplicate"])
+        self.assertTrue(result["run_skipped_duplicate"])
+
     async def test_commit_finishes_before_agent_run_and_payload_is_merged(self):
         requests: list[tuple[str, dict]] = []
 

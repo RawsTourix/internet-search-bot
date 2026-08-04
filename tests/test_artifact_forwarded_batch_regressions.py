@@ -200,41 +200,51 @@ class ForwardedTextAlbumRaceTests(unittest.IsolatedAsyncioTestCase):
         )
 
     @staticmethod
-    def _file_envelope() -> ClientInputEnvelope:
+    def _file_envelope(
+        *,
+        message_id: str = "10",
+        group_id: str | None = "album-1",
+        forwarded: bool = True,
+    ) -> ClientInputEnvelope:
+        semantic_parts = (
+            [
+                ForwardedMessageInputPart(
+                    part_id=f"forward-{message_id}",
+                    origin_type="MessageOriginUser",
+                    source_message_id=message_id,
+                )
+            ]
+            if forwarded
+            else []
+        )
         return ClientInputEnvelope(
-            idempotency_key="telegram:file:10",
+            idempotency_key=f"telegram:file:{message_id}",
             client_type=ClientType.TELEGRAM,
             client_instance_id="default",
             conversation=ClientConversationRef(conversation_id="100"),
             sender=ClientSenderRef(principal_id="200"),
-            source_update_id="u-10",
-            source_message_id="10",
-            source_group_id="album-1",
+            source_update_id=f"u-{message_id}",
+            source_message_id=message_id,
+            source_group_id=group_id,
             occurred_at=datetime.now(timezone.utc),
             attachment_slots=[
                 IngressAttachmentSlot(
-                    slot_id="slot-10",
+                    slot_id=f"slot-{message_id}",
                     media_kind="document",
                     original_filename="10.txt",
                     declared_mime_type="text/plain",
                     declared_size_bytes=1,
                     transport_locator=ClientAttachmentLocator(
                         provider="telegram",
-                        locator="file-10",
+                        locator=f"file-{message_id}",
                     ),
                 )
             ],
-            semantic_parts=[
-                ForwardedMessageInputPart(
-                    part_id="forward-10",
-                    origin_type="MessageOriginUser",
-                    source_message_id="10",
-                )
-            ],
+            semantic_parts=semantic_parts,
             response_route=ClientResponseRoute(
                 route_type="telegram",
                 conversation_id="100",
-                reply_to_message_id="10",
+                reply_to_message_id=message_id,
             ),
         )
 
@@ -312,6 +322,35 @@ class ForwardedTextAlbumRaceTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(result["input_batch_id"], self.group_batches["atomic"])
         self.assertIsNone(self.requests[-1].get("source_group_id"))
+
+    async def test_forwarded_albums_and_adjacent_inputs_share_one_burst(self):
+        results = []
+        for envelope in (
+            self._file_envelope(message_id="10", group_id="album-1"),
+            self._file_envelope(message_id="11", group_id="album-2"),
+            self._file_envelope(message_id="12", group_id=None),
+            self._file_envelope(
+                message_id="13",
+                group_id=None,
+                forwarded=False,
+            ),
+            self._text_envelope(forwarded=False, message_id="14"),
+        ):
+            results.append(
+                await self.client.submit_envelope(
+                    envelope,
+                    progress_locale="ru",
+                )
+            )
+
+        self.assertEqual(
+            {item["input_batch_id"] for item in results},
+            {results[0]["input_batch_id"]},
+        )
+        self.assertEqual(
+            {item.get("source_group_id") for item in self.requests},
+            {"album-1"},
+        )
 
     def test_forwarded_wait_rejects_negative_value(self):
         with self.assertRaisesRegex(ValueError, "must not be negative"):

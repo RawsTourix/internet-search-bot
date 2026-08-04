@@ -303,6 +303,18 @@ class ExplicitCollectionTelegramGatewayClient(
                 self._active_collection_sessions.add(session_id)
         return payload
 
+    async def prepare_input_envelope(self, envelope):
+        """Keep explicit collection routing independent of album hints."""
+
+        session_id = self._session_id_from_envelope(envelope)
+        if await self.is_explicit_collection_active(session_id):
+            return envelope
+        return await super().prepare_input_envelope(envelope)
+
+    async def _allow_text_group_join(self, envelope) -> bool:
+        session_id = self._session_id_from_envelope(envelope)
+        return not await self.is_explicit_collection_active(session_id)
+
     async def is_explicit_collection_active(self, session_id: str) -> bool:
         async with self._explicit_batch_lock:
             return session_id in self._active_collection_sessions

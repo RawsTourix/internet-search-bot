@@ -126,6 +126,47 @@ class TelegramCollectionBridgeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(pending["metadata"]["input_collection_pending"])
         self.assertEqual(pending["metadata"]["text_part_count"], 1)
 
+    async def test_active_collection_does_not_bind_text_to_one_of_many_albums(self):
+        requests = []
+
+        async def handler(request: httpx.Request) -> httpx.Response:
+            payload = json.loads(request.content.decode("utf-8"))
+            requests.append(payload)
+            return httpx.Response(
+                202,
+                request=request,
+                json=self._explicit_submission(),
+            )
+
+        bridge = ExplicitCollectionTelegramGatewayClient(
+            gateway_url="http://gateway",
+            api_key="telegram-key",
+            client_instance_id="bot-1",
+            transport=httpx.MockTransport(handler),
+        )
+        bridge._active_collection_sessions.add(
+            "telegram:conversation:chat-1"
+        )
+
+        await bridge.submit_envelope(
+            self._group_envelope("1"),
+            progress_locale="ru",
+        )
+        await bridge.submit_envelope(
+            self._group_envelope("2"),
+            progress_locale="ru",
+        )
+        text = await bridge.submit_envelope(
+            self._envelope(),
+            progress_locale="ru",
+        )
+
+        self.assertEqual(text["input_batch_id"], "ibat_" + "2" * 32)
+        self.assertEqual(
+            [item.get("source_group_id") for item in requests],
+            ["album-1", "album-2", None],
+        )
+
     async def test_multiple_groups_release_one_callback_at_a_time(self):
         requests = []
         submission_payload = self._explicit_submission()

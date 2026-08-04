@@ -225,6 +225,25 @@ class InputPresentationRelocationTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertNotEqual(policy, PresentationAckPolicy.RELOCATE)
 
+    async def test_explicit_collection_can_keep_one_bound_status_message(self):
+        await self._bound_record()
+        coordinator = InputPresentationCoordinator(self.store)
+
+        policy, _, ref = await coordinator.present(
+            input_batch_id=self.batch_id,
+            client_binding_id=self.binding_id,
+            locale="ru",
+            state="collecting",
+            file_count=7,
+            text_part_count=2,
+            response_anchor=self._anchor("110", "c"),
+            allow_relocation=False,
+        )
+
+        self.assertNotEqual(policy, PresentationAckPolicy.RELOCATE)
+        self.assertEqual(ref.client_message_id, "100")
+        self.assertIsNone(ref.relocation_generation)
+
 
 if __name__ == "__main__":
     unittest.main()

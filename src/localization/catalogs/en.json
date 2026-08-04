@@ -17,6 +17,7 @@
   "error.context_limit": "⚠️ The task was paused because the working context reached its limit.\n\nType: {error_type}\nIteration: {iteration}\nThe task state has been saved for continuation.",
   "error.infrastructure_interruption": "⚠️ The task was interrupted by an infrastructure error.\n\nType: {error_type}\nIteration: {iteration}\nThe task state has been saved and can be resumed later.",
   "error.internal": "An internal error occurred while processing the file.",
+  "error.input_message": "The incoming message could not be processed. Please send it again later.",
   "error.llm_configuration": "⚠️ The task stopped because of an LLM configuration error.\n\nType: {error_type}\nIteration: {iteration}\nCheck the API URL, endpoint, model name, or provider settings.",
   "error.request": "An error occurred while processing the request:\n{message}",
   "error.transport_http": "The processing service returned HTTP {status_code}.",

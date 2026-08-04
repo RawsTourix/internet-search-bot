@@ -35,6 +35,7 @@ from .artifact_bridge import (
     TelegramArtifactGatewayClient,
     build_telegram_input_envelope,
     extract_telegram_attachments,
+    telegram_media_group_key,
     telegram_session_id,
 )
 from .config import (
@@ -226,7 +227,10 @@ def _safe_transport_error(
     error: BaseException,
     *,
     locale: str = "ru",
+    input_kind: str = "file",
 ) -> str:
+    if input_kind == "message":
+        return _localized("error.input_message", locale=locale)
     if isinstance(error, httpx.HTTPStatusError):
         return _localized(
             "error.transport_http",
@@ -871,6 +875,9 @@ def _session_for_update(update: Update) -> str:
 async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     full_text = update.effective_message.text or ""
     words = full_text.split()
+    normalized_command = (
+        words[0].lower().split("@", 1)[0] if words else ""
+    )
     payload = {
         "id": str(uuid.uuid4()),
         "timestamp": datetime.now().isoformat(),
@@ -887,20 +894,19 @@ async def command_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "command": words[0] if words else "",
         "arguments": words[1:],
     }
-    status_message = await send_initial_status_message(
-        update,
-        _localized(
-            "input.command_received",
-            locale=detect_progress_locale(update),
-        ),
-    )
+    status_message = None
+    if normalized_command not in {"/status", "/reset"}:
+        status_message = await send_initial_status_message(
+            update,
+            _localized(
+                "input.command_received",
+                locale=detect_progress_locale(update),
+            ),
+        )
     attach_progress_metadata(
         payload=payload,
         update=update,
         status_message=status_message,
-    )
-    normalized_command = (
-        words[0].lower().split("@", 1)[0] if words else ""
     )
     if normalized_command == "/reset":
         await reset_process_local_session(_session_for_update(update))
@@ -978,7 +984,11 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             update=update,
             status_message=None,
             success=False,
-            message=_safe_transport_error(error, locale=progress_locale),
+            message=_safe_transport_error(
+                error,
+                locale=progress_locale,
+                input_kind="message",
+            ),
             metadata={
                 "progress_locale": progress_locale,
                 "telegram_session_generation": generation,
@@ -1083,7 +1093,11 @@ async def _finish_group(group: PendingMediaGroup) -> None:
                 media_groups.pop(group.key, None)
 
 
-async def _process_standalone_attachment(update: Update) -> None:
+async def _process_standalone_attachment(
+    update: Update,
+    *,
+    semantic_parts: list[Any] | None = None,
+) -> None:
     status_message = await send_initial_status_message(
         update,
         _localized(
@@ -1095,9 +1109,10 @@ async def _process_standalone_attachment(update: Update) -> None:
     session_id = _session_for_update(update)
     generation = session_generations.current(session_id)
     try:
-        semantic_parts = await telegram_input_resolvers.resolve(
-            update.effective_message,
-        )
+        if semantic_parts is None:
+            semantic_parts = await telegram_input_resolvers.resolve(
+                update.effective_message,
+            )
         envelope = build_telegram_input_envelope(
             update,
             bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
@@ -1180,7 +1195,9 @@ async def _process_standalone_attachment(update: Update) -> None:
 
 async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     message = update.effective_message
-    if not extract_telegram_attachments(message):
+    attachments = extract_telegram_attachments(message)
+    semantic_parts: list[Any] | None = None
+    if not attachments:
         semantic_parts = await telegram_input_resolvers.resolve(message)
         if not semantic_parts:
             await message.reply_text(
@@ -1190,21 +1207,40 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
                 )
             )
             return
-    media_group_id = getattr(message, "media_group_id", None)
-    if media_group_id is None:
+    preliminary = build_telegram_input_envelope(
+        update,
+        bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
+        semantic_parts=semantic_parts,
+    )
+    if preliminary.attachment_slots:
+        semantic_parts = await telegram_input_resolvers.resolve(
+            message,
+            attachment_slots=tuple(preliminary.attachment_slots),
+        )
+        preliminary = preliminary.model_copy(
+            update={"semantic_parts": semantic_parts}
+        )
+    prepare_envelope = getattr(
+        artifact_gateway,
+        "prepare_input_envelope",
+        None,
+    )
+    if callable(prepare_envelope):
+        preliminary = await prepare_envelope(preliminary)
+    effective_group_key = telegram_media_group_key(preliminary)
+    if effective_group_key is None:
         key = (
             f"{TELEGRAM_BOT_INSTANCE_ID}:{update.update_id}:"
             f"{message.message_id}"
         )
         async with standalone_lock_pool.hold(key):
-            await _process_standalone_attachment(update)
+            await _process_standalone_attachment(
+                update,
+                semantic_parts=semantic_parts,
+            )
         return
 
-    thread_id = getattr(message, "message_thread_id", None)
-    group_key = (
-        f"{TELEGRAM_BOT_INSTANCE_ID}:{update.effective_chat.id}:"
-        f"{thread_id or '-'}:{media_group_id}"
-    )
+    group_key = effective_group_key
     session_id = _session_for_update(update)
     progress_locale = detect_progress_locale(update)
     created_group = False
@@ -1246,13 +1282,14 @@ async def attachment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE)
             update,
             bot_instance_id=TELEGRAM_BOT_INSTANCE_ID,
             response_metadata=group.response_metadata,
+            semantic_parts=semantic_parts,
         )
-        envelope = envelope.model_copy(update={
-            "semantic_parts": await telegram_input_resolvers.resolve(
-                update.effective_message,
-                attachment_slots=tuple(envelope.attachment_slots),
+        if callable(prepare_envelope):
+            envelope = await prepare_envelope(envelope)
+        if telegram_media_group_key(envelope) != group_key:
+            raise TelegramArtifactBridgeError(
+                "Telegram forwarded burst grouping changed during submission"
             )
-        })
         submission = await artifact_gateway.submit_envelope(
             envelope,
             progress_locale=progress_locale,
