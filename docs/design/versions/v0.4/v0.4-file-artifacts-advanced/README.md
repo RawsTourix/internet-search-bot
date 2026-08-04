@@ -2,8 +2,8 @@
 id: design.v0.4.file-artifacts-advanced
 version: v0.4
 spec_status: accepted
-implementation_status: partial
-last_reviewed: 2026-07-29
+implementation_status: implemented
+last_reviewed: 2026-08-04
 ---
 
 # v0.4-file-artifacts-advanced
@@ -111,8 +111,12 @@ Artifact validation suite содержит **168 успешных тестов**
 - terminal status fallback;
 - prompt-contract без filename-format эвристики.
 
-Статус update временно `partial` до полного локального suite и live Windows
-проверки native group после attach-mapping fix.
+Финальная acceptance завершена 2026-08-04. Полный Windows baseline, расширенная
+synthetic Web/Telegram/artifact прожарка и maintainer live Telegram scenarios
+подтвердили `AF-24`–`AF-26`; новых deterministic defects и flaky failures не
+обнаружено. Точные итоговые метрики и provenance запуска зафиксированы в
+[`../../../../../reports/v0.4-transport-artifact-roast.md`](../../../../../reports/v0.4-transport-artifact-roast.md)
+и в PR.
 
 Runtime-конфигурация находится в корне
 [`src/api/mcp.config.example`](../../../../../src/api/mcp.config.example) в
