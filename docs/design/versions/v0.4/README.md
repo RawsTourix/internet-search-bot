@@ -76,7 +76,7 @@ suites. Точный последний head и результаты run фик�
 расширенная synthetic Web/Telegram/artifact прожарка, race/randomized checks и
 живые Telegram scenarios подтвердили принятые контракты без новых deterministic
 или flaky defects. Точное evidence находится в
-[`../../../reports/v0.4-transport-artifact-roast.md`](../../../reports/v0.4-transport-artifact-roast.md),
+[`../../../../reports/v0.4-transport-artifact-roast.md`](../../../../reports/v0.4-transport-artifact-roast.md),
 тематических README и описании PR.
 
 Общий статус `v0.4` остаётся `partial`, поскольку `v0.4-input-runtime`,
