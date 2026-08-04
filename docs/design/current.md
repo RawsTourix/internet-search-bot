@@ -3,7 +3,7 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-08-02
+last_reviewed: 2026-08-04
 ---
 
 # Текущий архитектурный baseline
@@ -54,18 +54,17 @@ environment = development
 - `v0.4-cycle-compaction`;
 - `v0.4-dag-planning`;
 - `v0.4-file-artifacts`;
-- кодовые slices `v0.4-file-artifacts-advanced`;
+- `v0.4-file-artifacts-advanced`;
 - `v0.4-batch-workflows`.
 
-`v0.4-file-artifacts-advanced` сохраняет partial acceptance status только из-за
-оставшихся live gates AF-25/AF-26. Durable reservation, recovery, forwarded
-sequencing, native Telegram document albums, delivery receipts и commit/run
-boundary реализованы и покрыты regression suites.
+`v0.4-file-artifacts-advanced` завершил automated и maintainer live acceptance.
+Durable reservation, recovery, forwarded sequencing, native Telegram document
+albums, delivery receipts и commit/run boundary реализованы, покрыты regression
+suites и подтверждены финальной прожаркой.
 
 ## v0.4-batch-workflows
 
-Кодовый update реализован. Он завершает client-facing workflow до admission в
-AgentCycle:
+Update реализован и завершил client-facing workflow до admission в AgentCycle:
 
 - AUTO text-only input запускается без artificial delay и получает user-facing
   initial status `Сообщение принято. Обрабатываю…`;
@@ -120,24 +119,25 @@ planning suite
 API suite
 ```
 
-Точный последний head и результаты run фиксируются в GitHub Actions и описании PR,
-чтобы этот архитектурный baseline не устаревал после каждого документационного
-коммита.
+Финальная acceptance завершена 2026-08-04:
 
-Перед переводом PR из draft остаются release/live gates:
+- полный Windows baseline: `775 passed, 4 skipped, 0 failed`;
+- synthetic Web/Telegram/artifact roast: `5 062 passed, 1 skipped, 0 failed,
+  0 flaky`;
+- `RACE-001`: `1 300/1 300 passed`;
+- `RACE-002`: `3 462/3 462 passed`;
+- Telegram audit matrix: `104 passed`;
+- maintainer live Telegram scenarios подтвердили AUTO/EXPLICIT workflows,
+  authoritative presentation, restart/recovery, WAITING_USER continuation,
+  same-session artifact handoff, `/reset`, FIFO commands и cancellation во время
+  album settling;
+- synthetic audit не вызвал AgentRuntime, LLM, MCP, внешнюю сеть или реальный
+  Telegram.
 
-- новый полный Windows suite;
-- ordinary AUTO text: правильный initial status, `result_ready → cycle_done` и
-  отсутствие отдельного `Готово.` для text-only ответа при default mode;
-- files-only/text-only/mixed `/collect → /send`;
-- подтверждение сохранения collection snapshot;
-- WAITING_USER continuation в обоих направлениях: новый instruction к старому
-  файлу и новый файл к старому instruction;
-- повторная работа с файлом в следующем независимом cycle той же session;
-- `/reset`, после которого старый bounded artifact handoff больше не наследуется;
-- rapid-command/FIFO scenario;
-- отмена до завершения album quiet period;
-- финальный acceptance audit.
+Точные метрики, coverage gaps и provenance запуска находятся в
+[`../../reports/v0.4-transport-artifact-roast.md`](../../reports/v0.4-transport-artifact-roast.md)
+и описании PR. Зафиксированные gaps относятся к отсутствию некоторых единых
+synthetic seams и не являются обнаруженными production defects.
 
 Канонический документ:
 [`versions/v0.4/v0.4-batch-workflows/README.md`](versions/v0.4/v0.4-batch-workflows/README.md).
@@ -204,8 +204,8 @@ test или migration evidence.
 
 1. используйте v0.3 как реализованный baseline;
 2. применяйте отмеченные реализованные updates v0.4;
-3. учитывайте AF-24–AF-26 по их code/live status;
-4. учитывайте `v0.4-batch-workflows` как code-complete, acceptance-pending;
+3. учитывайте `AF-24`–`AF-26` как implemented и accepted;
+4. учитывайте `v0.4-batch-workflows` как implemented и accepted;
 5. не приписывайте durable active-cycle additions до `v0.4-input-runtime`;
 6. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
 7. не приписывайте scopes, trusted presentation, admission и remote handle
