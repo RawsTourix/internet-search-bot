@@ -6,7 +6,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Callable
 
 import httpx
 
@@ -240,6 +240,9 @@ class InstanceScopedTelegramArtifactGatewayClient(
         session_id: str,
         progress_locale: str,
         progress_metadata: dict[str, Any] | None = None,
+        progress_metadata_provider: (
+            Callable[[], dict[str, Any] | None] | None
+        ) = None,
     ) -> dict[str, Any]:
         """Commit durably first, then run the agent as a distinct HTTP stage.
 
@@ -304,12 +307,21 @@ class InstanceScopedTelegramArtifactGatewayClient(
             input_batch_id,
             session_id,
         )
+        # A grouped Telegram presentation can relocate while the durable
+        # commit request is in flight. Resolve its transport handle only at
+        # the exact /run boundary so cycle_started never targets the status
+        # that commit-time ingress callbacks have just superseded.
+        run_progress_metadata = (
+            progress_metadata_provider()
+            if progress_metadata_provider is not None
+            else progress_metadata
+        )
         try:
             run_payload = await self.run_committed(
                 input_batch_id,
                 session_id=session_id,
                 progress_locale=progress_locale,
-                progress_metadata=progress_metadata,
+                progress_metadata=run_progress_metadata,
             )
         except asyncio.CancelledError:
             logger.info(

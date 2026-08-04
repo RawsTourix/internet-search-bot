@@ -331,6 +331,7 @@ class ExplicitCollectionTelegramGatewayClient(
         session_id: str,
         progress_locale: str,
         progress_metadata: dict[str, Any] | None = None,
+        progress_metadata_provider=None,
     ) -> dict[str, Any]:
         async with self._explicit_batch_lock:
             terminal = dict(
@@ -376,6 +377,7 @@ class ExplicitCollectionTelegramGatewayClient(
             session_id=session_id,
             progress_locale=progress_locale,
             progress_metadata=progress_metadata,
+            progress_metadata_provider=progress_metadata_provider,
         )
 
     async def start_collection(

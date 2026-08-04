@@ -1196,7 +1196,7 @@ async def _finish_group(group: PendingMediaGroup) -> None:
             group.input_batch_id,
             session_id=group.session_id,
             progress_locale=group.progress_locale,
-            progress_metadata=_progress_metadata(
+            progress_metadata_provider=lambda: _progress_metadata(
                 group.update,
                 group.status_message,
                 request_id=group.input_batch_id,
