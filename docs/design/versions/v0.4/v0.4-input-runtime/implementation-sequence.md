@@ -12,11 +12,14 @@ last_reviewed: 2026-08-05
 ## Статус реализации
 
 - `IR-1 — Domain models, config и repository ports`: implemented;
-- `IR-2`—`IR-10`: planned.
+- `IR-2 — Filesystem repositories и coordination service`: implemented;
+- `IR-3`—`IR-10`: planned.
 
-IR-1 подтверждён HEAD `83f544669e5b658884bc717f7256ec22c062b264`,
-workflow #21 и #471 и targeted suite `83 passed`. Этап не изменяет observable
-production behaviour и не означает реализацию следующих runtime stages.
+IR-1 и IR-2 подтверждены code HEAD
+`0795eac762e96818c4b777b9aea5f4e9b855e2c0`, workflow #55 и #488 и targeted
+suite `117 passed`. Эти этапы создают domain/config/repository и durable
+filesystem foundations, но не изменяют observable production behaviour:
+production admission и agent-loop integration начинаются с IR-3.
 
 ## Назначение
 
@@ -203,6 +206,13 @@ tests/test_input_runtime_interfaces.py or type/contract tests
 ---
 
 # IR-2 — Filesystem repositories и coordination service
+
+## Статус
+
+Implemented и подтверждён CI. Реализованы durable filesystem adapters,
+atomic-write/restart contracts, claims, sequence repair, bounded coordination и
+global identity fencing. Production admission/API integration в этот этап не
+входит.
 
 ## Цель
 
@@ -637,7 +647,7 @@ Handler persists emission before returning success to model.
 ## Delivery
 
 Prefer reuse of output/delivery lifecycle primitives without pretending emission
-is terminal `OutputBatch`. If separate store/outbox is introduced, receipts и
+is terminal `OutputBatch`. If separate store/outbox is introduced, receipts and
 unknown semantics mirror existing interaction contracts.
 
 ## Tests
