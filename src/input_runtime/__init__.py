@@ -1,0 +1,60 @@
+"""Public input-runtime contracts. Importing this package has no side effects."""
+from .config import InputRuntimeConfigType, load_input_runtime_config
+from .errors import (
+    InputRuntimeCapacityError, InputRuntimeClaimError,
+    InputRuntimeConfigValidationError, InputRuntimeConflictError,
+    InputRuntimeConsistencyError, InputRuntimeError,
+    InputRuntimeFinalizationError, InputRuntimeNotFoundError,
+    InputRuntimeStaleGenerationError, InputRuntimeStorageError,
+    InputRuntimeValidationError,
+)
+from .factory import InputRuntimeDependencies, InputRuntimeRepositoryBundle
+from .interfaces import (
+    ActiveCycleSnapshotRepository, AgentEmissionRepository,
+    ContextRevisionRepository, CycleInboxRepository, FinalizationRepository,
+    InputAdmissionRepository, SessionControlRepository,
+    SessionInputRuntimeRepository,
+)
+from .models import (
+    ActiveCycleSnapshot, AgentEmission, AgentEmissionClaim,
+    AgentEmissionImportance, AgentEmissionKind, AgentEmissionState,
+    AgentEmissionVisibility, CheckpointDecision, CheckpointName,
+    CheckpointOutcome, ClaimedInboxRange, ContextRevisionReason,
+    ControlAction, ControlOutcome, CycleContextRevision,
+    CycleFinalizationRecord, CycleInboxItem, CycleInboxState,
+    CycleRuntimeStatus, FinalizationState, InputAdmissionAction,
+    InputAdmissionKind, InputAdmissionOutcome, InputAdmissionRecord,
+    InputAdmissionState, SessionControlCommand, SessionControlKind,
+    SessionControlState, SessionInputRuntimeState, is_agent_emission_id,
+    is_context_revision_id, is_cycle_inbox_item_id, is_finalization_id,
+    is_input_admission_id, is_session_control_id, new_agent_emission_id,
+    new_context_revision_id, new_cycle_inbox_item_id, new_finalization_id,
+    new_input_admission_id, new_session_control_id,
+)
+__all__ = [
+    "ActiveCycleSnapshot", "ActiveCycleSnapshotRepository", "AgentEmission",
+    "AgentEmissionClaim", "AgentEmissionImportance", "AgentEmissionKind",
+    "AgentEmissionRepository", "AgentEmissionState", "AgentEmissionVisibility",
+    "CheckpointDecision", "CheckpointName", "CheckpointOutcome",
+    "ClaimedInboxRange", "ContextRevisionReason", "ContextRevisionRepository",
+    "ControlAction", "ControlOutcome", "CycleContextRevision",
+    "CycleFinalizationRecord", "CycleInboxItem", "CycleInboxRepository",
+    "CycleInboxState", "CycleRuntimeStatus", "FinalizationRepository",
+    "FinalizationState", "InputAdmissionAction", "InputAdmissionKind",
+    "InputAdmissionOutcome", "InputAdmissionRecord", "InputAdmissionRepository",
+    "InputAdmissionState", "InputRuntimeCapacityError", "InputRuntimeClaimError",
+    "InputRuntimeConfigType", "InputRuntimeConfigValidationError",
+    "InputRuntimeConflictError", "InputRuntimeConsistencyError",
+    "InputRuntimeDependencies", "InputRuntimeError",
+    "InputRuntimeFinalizationError", "InputRuntimeNotFoundError",
+    "InputRuntimeRepositoryBundle", "InputRuntimeStaleGenerationError",
+    "InputRuntimeStorageError", "InputRuntimeValidationError",
+    "SessionControlCommand", "SessionControlKind", "SessionControlRepository",
+    "SessionControlState", "SessionInputRuntimeRepository",
+    "SessionInputRuntimeState", "is_agent_emission_id",
+    "is_context_revision_id", "is_cycle_inbox_item_id", "is_finalization_id",
+    "is_input_admission_id", "is_session_control_id",
+    "load_input_runtime_config", "new_agent_emission_id",
+    "new_context_revision_id", "new_cycle_inbox_item_id", "new_finalization_id",
+    "new_input_admission_id", "new_session_control_id",
+]
