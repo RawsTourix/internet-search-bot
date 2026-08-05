@@ -26,18 +26,15 @@ class InputRuntimeConfigType(BaseModel):
     max_intermediate_message_chars: int = 3500
 
     @field_validator(
-        "max_queued_batches_per_session",
-        "max_queued_bytes_per_session",
-        "max_batches_per_checkpoint",
-        "max_batch_bytes_per_checkpoint",
-        "claim_lease_seconds",
-        "max_intermediate_messages_per_cycle",
+        "max_queued_batches_per_session", "max_queued_bytes_per_session",
+        "max_batches_per_checkpoint", "max_batch_bytes_per_checkpoint",
+        "claim_lease_seconds", "max_intermediate_messages_per_cycle",
         "max_intermediate_message_chars",
     )
     @classmethod
     def validate_positive_integer(cls, value: int) -> int:
-        if value <= 0:
-            raise ValueError("input-runtime limits must be positive")
+        if isinstance(value, bool) or value <= 0:
+            raise ValueError("input-runtime limits must be positive integers")
         return value
 
     @field_validator("min_intermediate_message_interval_seconds")
@@ -58,7 +55,11 @@ class InputRuntimeConfigType(BaseModel):
 
 def parse_input_runtime_config(raw: Mapping[str, Any] | None) -> InputRuntimeConfigType:
     try:
-        return InputRuntimeConfigType.model_validate(dict(raw or {}))
+        if raw is None:
+            return InputRuntimeConfigType()
+        if not isinstance(raw, Mapping):
+            raise TypeError("input_runtime section must be an object")
+        return InputRuntimeConfigType.model_validate(dict(raw))
     except Exception as error:
         raise InputRuntimeConfigValidationError(
             f"Invalid input_runtime configuration: {error}"
@@ -69,14 +70,18 @@ def load_input_runtime_config(config_path: str | Path) -> InputRuntimeConfigType
     path = Path(config_path)
     try:
         payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        if not isinstance(payload, dict):
+            raise TypeError("configuration root must be a JSON object")
+        section = payload.get("input_runtime")
+        if section is None and "input_runtime" in payload:
+            raise TypeError("input_runtime section must be an object")
+        return parse_input_runtime_config(section)
+    except InputRuntimeConfigValidationError:
+        raise
+    except Exception as error:
         raise InputRuntimeConfigValidationError(
-            f"Cannot read input_runtime configuration from {path}: {error}"
+            f"Cannot load input_runtime configuration from {path}: {error}"
         ) from error
-    section = payload.get("input_runtime", {})
-    if not isinstance(section, Mapping):
-        raise InputRuntimeConfigValidationError("input_runtime section must be an object")
-    return parse_input_runtime_config(section)
 
 
 def safe_input_runtime_config_summary(config: InputRuntimeConfigType) -> dict[str, Any]:

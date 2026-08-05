@@ -11,6 +11,7 @@ on:
       - "src/input_runtime/**"
       - "tests/test_input_runtime_*.py"
       - "src/api/mcp.config.example"
+      - "scripts/audit_configuration_examples.py"
       - ".github/workflows/validate-input-runtime.yml"
 
 permissions:
@@ -35,5 +36,10 @@ jobs:
       - name: Compile input runtime
         run: python -m compileall -q src/input_runtime
 
-      - name: Run input-runtime contracts and config audit
-        run: python -m pytest -q tests/test_input_runtime_models.py tests/test_input_runtime_config.py tests/test_input_runtime_interfaces.py
+      - name: Run input-runtime contracts and common config audit
+        run: >-
+          python -m pytest -q
+          tests/test_input_runtime_models.py
+          tests/test_input_runtime_config.py
+          tests/test_input_runtime_interfaces.py
+          tests/test_artifact_configuration_examples.py
