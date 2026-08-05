@@ -1,0 +1,39 @@
+name: Validate Input Runtime
+
+on:
+  pull_request:
+    branches:
+      - feature
+    paths:
+      - "src/input_runtime/**"
+      - "tests/test_input_runtime_*.py"
+      - "src/api/mcp.config.example"
+      - ".github/workflows/validate-input-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-input-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt
+
+      - name: Compile input runtime
+        run: python -m compileall -q src/input_runtime
+
+      - name: Run input-runtime contracts
+        run: python -m pytest -q tests/test_input_runtime_models.py tests/test_input_runtime_config.py tests/test_input_runtime_interfaces.py
+
+      - name: Run configuration regressions
+        run: python -m pytest -q tests/test_config_examples.py tests/test_api_config_logging.py
