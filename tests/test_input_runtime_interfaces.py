@@ -1,5 +1,4 @@
 import inspect
-
 from src.input_runtime import interfaces
 
 PORTS = [
@@ -20,14 +19,12 @@ EXPECTED = {
     interfaces.SessionControlRepository: {"append", "get_by_idempotency_key", "acknowledge", "apply", "reject", "list_pending", "cancel_generation"},
     interfaces.ActiveCycleSnapshotRepository: {"create_if_absent", "get", "compare_and_swap", "list_active", "list_resumable", "cancel_generation"},
     interfaces.ContextRevisionRepository: {"append_revision", "get", "get_latest", "list_for_cycle"},
-    interfaces.AgentEmissionRepository: {"create_if_absent", "get_by_idempotency_key", "claim_delivery", "complete_delivery", "fail_delivery", "list_pending_delivery", "cancel_generation"},
+    interfaces.AgentEmissionRepository: {"create_if_absent", "get_by_idempotency_key", "claim_delivery", "complete_delivery", "fail_delivery", "recover_expired_delivery_claims", "list_pending_delivery", "cancel_generation"},
     interfaces.FinalizationRepository: {"prepare", "get", "advance", "abort", "list_recoverable", "cancel_generation"},
 }
 
-
 def methods(port):
     return {name for name, value in inspect.getmembers(port, inspect.isfunction) if not name.startswith("_")}
-
 
 def test_ports_are_runtime_checkable_command_protocols():
     assert all(getattr(port, "_is_protocol", False) for port in PORTS)
@@ -35,27 +32,23 @@ def test_ports_are_runtime_checkable_command_protocols():
         assert expected <= methods(port)
         assert not (methods(port) & {"save", "load", "patch", "execute"})
 
-
 def test_cas_ports_require_expected_revision():
     for port in (interfaces.SessionInputRuntimeRepository, interfaces.ActiveCycleSnapshotRepository):
         assert "expected_revision" in inspect.signature(port.compare_and_swap).parameters
-
 
 def test_inbox_claim_transitions_are_fenced_by_typed_claim():
     for name in ("mark_applying", "mark_applied", "requeue_claim"):
         parameter = inspect.signature(getattr(interfaces.CycleInboxRepository, name)).parameters["claim"]
         assert "ClaimedInboxRange" in str(parameter.annotation)
 
-
-def test_delivery_transitions_require_claim_token():
-    for name in ("complete_delivery", "fail_delivery"):
+def test_delivery_transitions_require_claim_token_and_recovery():
+    for name in ("claim_delivery", "complete_delivery", "fail_delivery"):
         assert "claim_token" in inspect.signature(getattr(interfaces.AgentEmissionRepository, name)).parameters
-
+    assert "now" in inspect.signature(interfaces.AgentEmissionRepository.recover_expired_delivery_claims).parameters
 
 def test_finalization_transitions_are_state_fenced():
     for name in ("advance", "abort"):
         assert "expected_state" in inspect.signature(getattr(interfaces.FinalizationRepository, name)).parameters
-
 
 def test_generation_cancellation_and_recovery_listing_exist_before_backend():
     for port in (interfaces.InputAdmissionRepository, interfaces.CycleInboxRepository,

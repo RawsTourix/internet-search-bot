@@ -23,21 +23,14 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-
       - name: Install dependencies
-        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest
-
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest pytest-asyncio
       - name: Compile input runtime
         run: python -m compileall -q src/input_runtime
-
       - name: Run input-runtime contracts and common config audit
-        run: >-
-          python -m pytest -q
-          tests/test_input_runtime_*.py
-          tests/test_artifact_configuration_examples.py
+        run: python -m pytest -q tests/test_input_runtime_*.py tests/test_artifact_configuration_examples.py
