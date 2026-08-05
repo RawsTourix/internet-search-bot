@@ -1,8 +1,24 @@
 """Public facade for v0.4 input-runtime contracts."""
 
-from .config import InputRuntimeConfigType, load_input_runtime_config, parse_input_runtime_config, safe_input_runtime_config_summary
-from .errors import InputRuntimeConfigValidationError, InputRuntimeConflictError, InputRuntimeError, InputRuntimeNotFoundError
-from .factory import InputRuntimeContracts, InputRuntimeRepositories, create_input_runtime_contracts
+from .config import (
+    InputRuntimeConfigType,
+    load_input_runtime_config,
+    parse_input_runtime_config,
+    safe_input_runtime_config_summary,
+)
+from .coordination import SessionLockRegistry
+from .errors import (
+    InputRuntimeConfigValidationError,
+    InputRuntimeConflictError,
+    InputRuntimeError,
+    InputRuntimeNotFoundError,
+)
+from .factory import (
+    InputRuntimeContracts,
+    InputRuntimeRepositories,
+    create_filesystem_input_runtime_repositories,
+    create_input_runtime_contracts,
+)
 from .models import (
     ActiveCycleSnapshot, AdmissionKind, AdmissionState, AgentEmission,
     CheckpointAction, CheckpointName, CheckpointOutcome, ClaimedInboxRange,

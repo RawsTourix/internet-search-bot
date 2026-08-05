@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.storage import StorageConfigType
+
 from .config import InputRuntimeConfigType
 from .interfaces import (
     ActiveCycleSnapshotRepository,
@@ -42,3 +44,23 @@ def create_input_runtime_contracts(
 ) -> InputRuntimeContracts:
     """Build the infrastructure-neutral contract bundle used by later stages."""
     return InputRuntimeContracts(config=config, repositories=repositories)
+
+
+def create_filesystem_input_runtime_repositories(
+    *,
+    storage_config: StorageConfigType,
+) -> InputRuntimeRepositories:
+    """Build durable filesystem adapters without connecting them to the API."""
+    from .filesystem import FileSystemInputRuntimeRepositories
+
+    adapters = FileSystemInputRuntimeRepositories(storage_config)
+    return InputRuntimeRepositories(
+        sessions=adapters.sessions,
+        admissions=adapters.admissions,
+        inbox=adapters.inbox,
+        controls=adapters.controls,
+        snapshots=adapters.snapshots,
+        context_revisions=adapters.context_revisions,
+        emissions=adapters.emissions,
+        finalizations=adapters.finalizations,
+    )
