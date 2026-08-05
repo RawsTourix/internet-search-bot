@@ -3,7 +3,7 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-08-04
+last_reviewed: 2026-08-05
 ---
 
 # Текущий архитектурный baseline
@@ -150,10 +150,33 @@ v0.4-input-runtime
 → v0.4-mcp-registry-foundation
 ```
 
-`v0.4-input-runtime` добавит durable `CycleInbox`, safe checkpoints, control inbox
-и finalization races для сообщений, поступающих уже во время active AgentCycle.
+`v0.4-input-runtime` подробно спроектирован, но production implementation ещё не
+начат. Принятый target включает:
+
+- durable admission committed batches и `CycleInbox`;
+- additions в один active AgentCycle;
+- safe checkpoints и ordered `input_batch_update`;
+- linear context revisions;
+- `/stop`, `/continue` и generation-fenced `/reset`;
+- additions during pause без automatic resume;
+- durable intermediate AgentEmission;
+- stale `DONE`/`WAITING_USER` suppression;
+- finalization barrier и filesystem recovery;
+- repository ports для PostgreSQL v0.5;
+- identity/relations для interventions, task branches и scheduler v0.6.
+
 Текущий in-process Telegram FIFO dispatcher не подменяет этот runtime и не
-переживает restart.
+переживает restart. Текущий специальный WAITING_USER continuation является
+переходным foundation, а не общим active-cycle admission.
+
+Каноническая спецификация:
+[`versions/v0.4/v0.4-input-runtime/README.md`](versions/v0.4/v0.4-input-runtime/README.md).
+
+Пошаговая реализация:
+[`versions/v0.4/v0.4-input-runtime/implementation-sequence.md`](versions/v0.4/v0.4-input-runtime/implementation-sequence.md).
+
+Telegram history rewind по edited message зафиксирован как provisional/deferred
+client-specific follow-up и не входит в текущий release gate.
 
 `v0.4-runtime-modularization` декомпозирует orchestration core без изменения
 принятых контрактов, вводит переиспользуемый `AgentRuntime`, `ToolDispatcher`,
@@ -206,12 +229,15 @@ test или migration evidence.
 2. применяйте отмеченные реализованные updates v0.4;
 3. учитывайте `AF-24`–`AF-26` как implemented и accepted;
 4. учитывайте `v0.4-batch-workflows` как implemented и accepted;
-5. не приписывайте durable active-cycle additions до `v0.4-input-runtime`;
-6. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
-7. не приписывайте scopes, trusted presentation, admission и remote handle
+5. считайте `v0.4-input-runtime` accepted design и active implementation target,
+   но не приписывайте его production behavior до code/test evidence;
+6. не приписывайте durable active-cycle additions, `/stop`/`/continue` и
+   intermediate emissions текущему `feature` до реализации;
+7. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
+8. не приписывайте scopes, trusted presentation, admission и remote handle
    lifecycle до `v0.4-mcp-registry-foundation`;
-8. не называйте текущий self-hosted Service Application Future Local Agent;
-9. проверяйте затронутый код и tests для точного implementation status;
-10. используйте v0.5–v0.10 только как будущие ограничения;
-11. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`;
-12. не смешивайте sandbox execution backend и Future Local Agent Application.
+9. не называйте текущий self-hosted Service Application Future Local Agent;
+10. проверяйте затронутый код и tests для точного implementation status;
+11. используйте v0.5–v0.10 только как будущие ограничения;
+12. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`;
+13. не смешивайте sandbox execution backend и Future Local Agent Application.
