@@ -228,7 +228,7 @@ intervention_id
 - [`../v0.4-file-artifacts-advanced/README.md`](../v0.4-file-artifacts-advanced/README.md);
 - [`../v0.4-cycle-compaction.md`](../v0.4-cycle-compaction.md);
 - [`../v0.4-dag-planning.md`](../v0.4-dag-planning.md);
-- [`../../runtime-and-deployment-profiles.md`](../../runtime-and-deployment-profiles.md).
+- [`../../../runtime-and-deployment-profiles.md`](../../../runtime-and-deployment-profiles.md).
 
 ## Release boundary
 
