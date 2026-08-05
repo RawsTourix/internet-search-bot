@@ -3,7 +3,7 @@ id: design.v0.5.index
 version: v0.5
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-07-27
+last_reviewed: 2026-08-05
 ---
 
 # v0.5 — PostgreSQL и RAG
@@ -39,11 +39,29 @@ extraction, chunking, embeddings и provenance-aware retrieval без обяза
 - [`../v0.4/v0.4-storage-foundation.md`](../v0.4/v0.4-storage-foundation.md);
 - [`../v0.4/v0.4-file-artifacts.md`](../v0.4/v0.4-file-artifacts.md);
 - [`../v0.4/v0.4-dag-planning.md`](../v0.4/v0.4-dag-planning.md);
-- [`../v0.4/v0.4-input-runtime.md`](../v0.4/v0.4-input-runtime.md);
+- [`../v0.4/v0.4-input-runtime/README.md`](../v0.4/v0.4-input-runtime/README.md);
+- [`../v0.4/v0.4-input-runtime/domain-models-and-state-machines.md`](../v0.4/v0.4-input-runtime/domain-models-and-state-machines.md);
+- [`../v0.4/v0.4-input-runtime/finalization-and-recovery.md`](../v0.4/v0.4-input-runtime/finalization-and-recovery.md);
 - [`../v0.4/v0.4-runtime-modularization/README.md`](../v0.4/v0.4-runtime-modularization/README.md).
 
 `v0.5` заменяет filesystem backend совместимыми implementations и добавляет
 retrieval, но не меняет базовые domain boundaries v0.4.
+
+Особенно сохраняются IDs/transitions input runtime:
+
+```text
+InputAdmissionRecord
+CycleInboxItem
+SessionControlCommand
+ActiveCycleSnapshot
+CycleContextRevision
+AgentEmission
+CycleFinalizationRecord
+```
+
+PostgreSQL может объединить несколько filesystem records в transactional
+aggregate/table layout, но не меняет semantic state machines, sequence/watermark
+contract и idempotency relations.
 
 Distributed workers и queues относятся к
 [`../v0.6/README.md`](../v0.6/README.md). Общий persistence gate находится в
