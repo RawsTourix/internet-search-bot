@@ -64,6 +64,34 @@ def _literal_strings(node: ast.AST | None, bindings: dict[str, set[str]]) -> set
     return set()
 
 
+def _record_loop_bindings(node: ast.For, bindings: dict[str, set[str]]) -> None:
+    if not isinstance(node.iter, (ast.Tuple, ast.List)):
+        return
+    items = list(node.iter.elts)
+    if isinstance(node.target, ast.Name):
+        values = {
+            item.value.strip() for item in items
+            if isinstance(item, ast.Constant) and isinstance(item.value, str) and item.value.strip()
+        }
+        if values:
+            bindings[node.target.id] = values
+        return
+    if not isinstance(node.target, (ast.Tuple, ast.List)):
+        return
+    for index, target in enumerate(node.target.elts):
+        if not isinstance(target, ast.Name):
+            continue
+        values: set[str] = set()
+        for item in items:
+            if not isinstance(item, (ast.Tuple, ast.List)) or index >= len(item.elts):
+                continue
+            value = item.elts[index]
+            if isinstance(value, ast.Constant) and isinstance(value.value, str) and value.value.strip():
+                values.add(value.value.strip())
+        if values:
+            bindings[target.id] = values
+
+
 def _environment_audit(root: Path = REPOSITORY_ROOT) -> tuple[set[str], list[str]]:
     keys: set[str] = set()
     unresolved: set[str] = set()
@@ -77,6 +105,8 @@ def _environment_audit(root: Path = REPOSITORY_ROOT) -> tuple[set[str], list[str
                 for target in targets:
                     if value and isinstance(target, ast.Name):
                         bindings[target.id] = value
+            elif isinstance(node, ast.For):
+                _record_loop_bindings(node, bindings)
         for node in ast.walk(tree):
             argument = None
             is_read = False
@@ -114,7 +144,8 @@ def discover_config_root_sections(root: Path = REPOSITORY_ROOT) -> set[str]:
     sections: set[str] = set()
     for path in iter_production_python_files(root):
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-        for function in [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("load_") and "config" in node.name]:
+        loaders = [node for node in ast.walk(tree) if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name.startswith("load_") and "config" in node.name]
+        for function in loaders:
             for node in ast.walk(function):
                 if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) and node.func.attr == "get" and isinstance(node.func.value, ast.Name) and node.func.value.id in {"config", "payload"} and node.args and isinstance(node.args[0], ast.Constant) and isinstance(node.args[0].value, str):
                     sections.add(node.args[0].value)
