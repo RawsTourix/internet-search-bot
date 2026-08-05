@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from . import _filesystem_session as session_repository_module
 from ._filesystem_common import validated_copy
 from ._filesystem_cycle import FileSystemCycleInboxRepository as _CycleInboxBase
 from ._filesystem_cycle import _same_inbox_relation
@@ -17,7 +18,12 @@ from .models import (
     InputAdmissionRecord,
     SessionInputRuntimeState,
 )
-from .serialization import atomic_write_model, read_model
+from .serialization import read_model
+
+
+def atomic_write_model(path, model):
+    """Forward writes through the canonical session module test seam."""
+    return session_repository_module.atomic_write_model(path, model)
 
 
 class FileSystemInputAdmissionRepository(_AdmissionBase):
