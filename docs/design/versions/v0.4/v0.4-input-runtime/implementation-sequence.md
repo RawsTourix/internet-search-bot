@@ -3,11 +3,20 @@ id: design.v0.4.input-runtime.sequence
 version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
-implementation_status: planned
+implementation_status: partial
 last_reviewed: 2026-08-05
 ---
 
 # Последовательность реализации v0.4-input-runtime
+
+## Статус реализации
+
+- `IR-1 — Domain models, config и repository ports`: implemented;
+- `IR-2`—`IR-10`: planned.
+
+IR-1 подтверждён HEAD `83f544669e5b658884bc717f7256ec22c062b264`,
+workflow #21 и #471 и targeted suite `83 passed`. Этап не изменяет observable
+production behaviour и не означает реализацию следующих runtime stages.
 
 ## Назначение
 
@@ -63,6 +72,11 @@ src/ingress/*
 ---
 
 # IR-1 — Domain models, config и repository ports
+
+## Статус
+
+Implemented и подтверждён CI. Production runtime integration в этот этап не
+входит.
 
 ## Цель
 
@@ -623,7 +637,7 @@ Handler persists emission before returning success to model.
 ## Delivery
 
 Prefer reuse of output/delivery lifecycle primitives without pretending emission
-is terminal `OutputBatch`. If separate store/outbox is introduced, receipts and
+is terminal `OutputBatch`. If separate store/outbox is introduced, receipts и
 unknown semantics mirror existing interaction contracts.
 
 ## Tests

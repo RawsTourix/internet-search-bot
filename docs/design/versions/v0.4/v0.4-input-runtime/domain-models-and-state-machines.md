@@ -3,11 +3,23 @@ id: design.v0.4.input-runtime.models
 version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
-implementation_status: planned
+implementation_status: partial
 last_reviewed: 2026-08-05
 ---
 
 # Domain models и state machines
+
+## Статус реализации
+
+IR-1 foundation реализован: добавлены Pydantic v2 domain records, устойчивые
+`str`-enums состояний и checkpoints, configuration model/loader и
+command-oriented repository ports. Контракты подтверждены HEAD
+`83f544669e5b658884bc717f7256ec22c062b264`, workflow #21 и #471 и targeted
+suite `83 passed`.
+
+Это evidence только для моделей, configuration и repository interfaces.
+Описанные ниже runtime transitions, admission, filesystem persistence,
+checkpoints, controls и finalization ещё не подключены к production runtime.
 
 ## Назначение
 

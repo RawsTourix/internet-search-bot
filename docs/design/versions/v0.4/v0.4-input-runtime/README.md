@@ -9,6 +9,21 @@ last_reviewed: 2026-08-05
 
 # v0.4-input-runtime
 
+## Статус реализации
+
+`IR-1` реализован и подтверждён CI. Этапы `IR-2`—`IR-10` остаются planned.
+
+Evidence для foundation-контрактов:
+
+- HEAD: `83f544669e5b658884bc717f7256ec22c062b264`;
+- `Validate Input Runtime` run #21 — success;
+- `Validate v0.4 file artifacts PR` run #471 — success;
+- targeted input-runtime и общий configuration audit: `83 passed`.
+
+На текущем этапе production runtime behaviour не изменён: admission,
+filesystem repositories, safe checkpoints, `/stop`/`/continue`, emissions и
+finalization ещё не подключены к рабочему runtime.
+
 ## Назначение
 
 Обновление превращает текущий последовательный `AgentCycle` в управляемый

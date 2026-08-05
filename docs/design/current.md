@@ -150,8 +150,13 @@ v0.4-input-runtime
 → v0.4-mcp-registry-foundation
 ```
 
-`v0.4-input-runtime` подробно спроектирован, но production implementation ещё не
-начат. Принятый target включает:
+В `v0.4-input-runtime` реализован и подтверждён CI только foundation-этап IR-1:
+domain models, enums, configuration и repository ports. Admission, filesystem
+stores, checkpoints, `/stop`/`/continue`, emissions и finalization ещё не
+подключены. Поэтому новое observable production behaviour этому update пока не
+приписывается.
+
+Принятый target включает:
 
 - durable admission committed batches и `CycleInbox`;
 - additions в один active AgentCycle;
@@ -229,8 +234,8 @@ test или migration evidence.
 2. применяйте отмеченные реализованные updates v0.4;
 3. учитывайте `AF-24`–`AF-26` как implemented и accepted;
 4. учитывайте `v0.4-batch-workflows` как implemented и accepted;
-5. считайте `v0.4-input-runtime` accepted design и active implementation target,
-   но не приписывайте его production behavior до code/test evidence;
+5. считайте IR-1 `v0.4-input-runtime` реализованным foundation, но не
+   приписывайте runtime behaviour этапов IR-2—IR-10;
 6. не приписывайте durable active-cycle additions, `/stop`/`/continue` и
    intermediate emissions текущему `feature` до реализации;
 7. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
