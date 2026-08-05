@@ -11,18 +11,25 @@ last_reviewed: 2026-08-05
 
 ## Статус реализации
 
-`IR-1` реализован и подтверждён CI. Этапы `IR-2`—`IR-10` остаются planned.
+`IR-1` и `IR-2` реализованы и подтверждены CI. Этапы `IR-3`—`IR-10` остаются
+planned.
 
-Evidence для foundation-контрактов:
+Evidence для filesystem foundation:
 
-- HEAD: `83f544669e5b658884bc717f7256ec22c062b264`;
-- `Validate Input Runtime` run #21 — success;
-- `Validate v0.4 file artifacts PR` run #471 — success;
-- targeted input-runtime и общий configuration audit: `83 passed`.
+- HEAD: `97ddb369a797b10d6508ad265c350e0fc28e80e3`;
+- `Validate Input Runtime` run #43 — success;
+- `Validate v0.4 file artifacts PR` run #482 — success;
+- targeted input-runtime и общий configuration audit: `107 passed`.
 
-На текущем этапе production runtime behaviour не изменён: admission,
-filesystem repositories, safe checkpoints, `/stop`/`/continue`, emissions и
-finalization ещё не подключены к рабочему runtime.
+IR-2 добавил filesystem implementations repository ports, короткую bounded
+session coordination boundary, атомарные записи, coordinated sequence allocation,
+claim fencing/recovery, authoritative `payload_size_bytes`, recoverable hot-path
+indexes и generation-fenced cancellation/recovery contracts.
+
+Production runtime behaviour пока не изменён: filesystem repositories не
+подключены к `Api`, committed batches ещё не проходят новый admission service,
+safe checkpoints, `/stop`/`/continue`, emissions и finalization barrier не
+подключены к рабочему agent loop.
 
 ## Назначение
 
