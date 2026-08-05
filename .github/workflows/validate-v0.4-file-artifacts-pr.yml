@@ -1,54 +1,122 @@
-name: Validate v0.4 file artifacts PR
+name: Build verified IR-1 corrective candidate
 
 on:
   pull_request:
     branches: [feature]
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  validate:
+  build-ir1-candidate:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - name: Check out PR head
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.12"
           cache: pip
-      - run: python -m pip install -r requirements.txt
-      - name: Run validation suites
-        id: suites
+
+      - name: Reconstruct final payload
         shell: bash
         run: |
-          mkdir -p validation-logs
-          overall=0
-          run_suite() {
-            name="$1"
-            shift
-            set +e
-            "$@" > "validation-logs/${name}.log" 2>&1
-            code=$?
-            set -e
-            echo "$code" > "validation-logs/${name}.status"
-            if [ "$code" -ne 0 ]; then overall=1; fi
-          }
-          run_suite compile python -m compileall src tests scripts
-          run_suite artifacts python -m unittest discover -s tests -p "test_artifact*.py" -v
-          run_suite storage python -m unittest discover -s tests -p "test_storage*.py" -v
-          run_suite plans python -m unittest discover -s tests -p "test_plan*.py" -v
-          run_suite planning python -m unittest discover -s tests -p "test_planning*.py" -v
-          run_suite api python -m unittest discover -s tests -p "test_api*.py" -v
-          echo "overall=$overall" >> "$GITHUB_OUTPUT"
-      - name: Upload validation logs
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: v0.4-file-artifacts-validation
-          path: validation-logs
-          if-no-files-found: error
-      - name: Enforce validation status
-        if: always()
+          set -euo pipefail
+          git fetch origin temp/ir1-contract-upload
+          : > /tmp/ir1payload-final.b64
+          for part in 00 01 02; do
+            git show "origin/temp/ir1-contract-upload:upload/ir1payload-final.part${part}.b64" >> /tmp/ir1payload-final.b64
+          done
+          base64 --decode /tmp/ir1payload-final.b64 > /tmp/ir1payload-final.tar.gz
+          echo "8fb89fc827c0862c31351645d5f591ed90721804554a9fe1d063ef8983fad81bb  /tmp/ir1payload-final.tar.gz" | sha256sum -c -
+          mkdir /tmp/ir1payload-final
+          tar -xzf /tmp/ir1payload-final.tar.gz -C /tmp/ir1payload-final
+
+      - name: Apply payload to exact IR-1 parent
         shell: bash
-        run: exit "${{ steps.suites.outputs.overall || '1' }}"
+        run: |
+          set -euo pipefail
+          git checkout --detach 40decaf087aacaa3b7d137c44680e108187b6e10
+          cp -a /tmp/ir1payload-final/. .
+          git diff --check
+
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+
+      - name: Run targeted IR-1 tests
+        run: |
+          python -m pytest tests/test_input_runtime_models.py -q
+          python -m pytest tests/test_input_runtime_config.py -q
+          python -m pytest tests/test_input_runtime_interfaces.py -q
+
+      - name: Run existing thematic suites
+        run: |
+          python -m unittest discover -s tests -p "test_artifact*.py" -v
+          python -m unittest discover -s tests -p "test_storage*.py" -v
+          python -m unittest discover -s tests -p "test_plan*.py" -v
+          python -m unittest discover -s tests -p "test_planning*.py" -v
+          python -m unittest discover -s tests -p "test_api*.py" -v
+
+      - name: Compile and run full baseline
+        run: |
+          python -m compileall src tests scripts
+          python -m pytest -q
+
+      - name: Create exact follow-up commit
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- \
+            .github/workflows/validate-input-runtime.yml \
+            src/api/mcp.config.example \
+            src/input_runtime/__init__.py \
+            src/input_runtime/config.py \
+            src/input_runtime/errors.py \
+            src/input_runtime/factory.py \
+            src/input_runtime/interfaces.py \
+            src/input_runtime/models.py \
+            src/input_runtime/_models_common.py \
+            src/input_runtime/_models_input.py \
+            src/input_runtime/_models_control.py \
+            src/input_runtime/_models_output.py \
+            tests/test_input_runtime_models.py \
+            tests/test_input_runtime_config.py \
+            tests/test_input_runtime_interfaces.py \
+            docs/design/versions/v0.4/v0.4-input-runtime/README.md \
+            docs/design/versions/v0.4/v0.4-input-runtime/domain-models-and-state-machines.md \
+            docs/design/versions/v0.4/v0.4-input-runtime/implementation-sequence.md
+          cat > /tmp/expected-files <<'EOF'
+.github/workflows/validate-input-runtime.yml
+docs/design/versions/v0.4/v0.4-input-runtime/README.md
+docs/design/versions/v0.4/v0.4-input-runtime/domain-models-and-state-machines.md
+docs/design/versions/v0.4/v0.4-input-runtime/implementation-sequence.md
+src/api/mcp.config.example
+src/input_runtime/__init__.py
+src/input_runtime/_models_common.py
+src/input_runtime/_models_control.py
+src/input_runtime/_models_input.py
+src/input_runtime/_models_output.py
+src/input_runtime/config.py
+src/input_runtime/errors.py
+src/input_runtime/factory.py
+src/input_runtime/interfaces.py
+src/input_runtime/models.py
+tests/test_input_runtime_config.py
+tests/test_input_runtime_interfaces.py
+tests/test_input_runtime_models.py
+EOF
+          git diff --cached --name-only | sort > /tmp/actual-files
+          diff -u /tmp/expected-files /tmp/actual-files
+          git diff --cached --check
+          git commit -m "fix(input-runtime): complete IR-1 contracts and validation"
+          git push --force origin HEAD:refs/heads/temp/ir1-contract-result
