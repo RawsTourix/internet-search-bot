@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-04
+last_reviewed: 2026-08-05
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -29,7 +29,7 @@ Application/hosting profiles определены в
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | implemented | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
-| 8 | [`v0.4-input-runtime`](v0.4-input-runtime.md) | partial/planned | `CycleInbox`, safe checkpoints и active-cycle input |
+| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial/planned | Active-cycle additions, `CycleInbox`, `/stop`/`/continue`, context revisions, intermediate emissions и finalization barrier |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Reusable `AgentRuntime`, Service Application composition, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
 | 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и profile-aware transport admission |
 
@@ -79,6 +79,12 @@ suites. Точный последний head и результаты run фик�
 [`../../../../reports/v0.4-transport-artifact-roast.md`](../../../../reports/v0.4-transport-artifact-roast.md),
 тематических README и описании PR.
 
+`v0.4-input-runtime` теперь подробно спроектирован как отдельный update package.
+Он вводит durable admission, additions в один active AgentCycle, safe
+checkpoints, линейные context revisions, `/stop`/`/continue`, durable
+intermediate messages, stale-finalization barrier и filesystem recovery ports с
+заделом на PostgreSQL `v0.5` и scheduler/interventions `v0.6`.
+
 Общий статус `v0.4` остаётся `partial`, поскольку `v0.4-input-runtime`,
 `v0.4-runtime-modularization` и `v0.4-mcp-registry-foundation` ещё не завершены.
 
@@ -114,7 +120,10 @@ v0.4-storage-foundation
 - `v0.4-batch-workflows` заканчивается до durable active-cycle additions.
 - Текущий Telegram FIFO dispatcher является in-process acceptance boundary, а не
   заменой `CycleInbox`.
-- `v0.4-input-runtime` отвечает за `CycleInbox` и safe checkpoints.
+- [`v0.4-input-runtime`](v0.4-input-runtime/README.md) отвечает за durable
+  admission, `CycleInbox`, checkpoints, pause/resume, emissions и terminal
+  barrier. Пошаговая реализация находится в
+  [`implementation-sequence.md`](v0.4-input-runtime/implementation-sequence.md).
 - `v0.4-runtime-modularization` меняет ownership, вводит reusable AgentRuntime,
   generic ports, явный Service Application composition и `ConfigProvider`;
   `mcp.config` становится compatibility filename, а `agent.config` — canonical
