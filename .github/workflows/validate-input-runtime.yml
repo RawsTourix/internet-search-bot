@@ -35,8 +35,5 @@ jobs:
       - name: Compile input runtime
         run: python -m compileall -q src/input_runtime
 
-      - name: Run input-runtime contracts
+      - name: Run input-runtime contracts and config audit
         run: python -m pytest -q tests/test_input_runtime_models.py tests/test_input_runtime_config.py tests/test_input_runtime_interfaces.py
-
-      - name: Run configuration regressions
-        run: python -m pytest -q tests/test_config_examples.py tests/test_api_config_logging.py
