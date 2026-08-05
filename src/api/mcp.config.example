@@ -23,13 +23,7 @@
             "alias": "pw",
             "connect_type": "executable",
             "executable": "npx",
-            "args": [
-                "-y",
-                "@playwright/mcp@latest",
-                "--output-dir=C:\\Programming\\internet-search-bot\\.playwright-mcp",
-                "--user-data-dir=C:\\Programming\\internet-search-bot\\.playwright-profile",
-                "--output-mode=file"
-            ],
+            "args": ["-y", "@playwright/mcp@latest", "--output-dir=C:\\Programming\\internet-search-bot\\.playwright-mcp", "--user-data-dir=C:\\Programming\\internet-search-bot\\.playwright-profile", "--output-mode=file"],
             "enabled": true,
             "startup_required": false
         },
@@ -38,9 +32,7 @@
             "alias": "remote",
             "connect_type": "streamable_http",
             "url": "https://mcp.example.com/mcp",
-            "headers": {
-                "Authorization": "Bearer replace_with_remote_mcp_token"
-            },
+            "headers": {"Authorization": "Bearer replace_with_remote_mcp_token"},
             "enabled": false,
             "startup_required": false
         },
@@ -59,11 +51,7 @@
             "alias": "git",
             "connect_type": "executable",
             "executable": "uvx",
-            "args": [
-                "mcp-server-git",
-                "--repository",
-                "C:/Programming/Проекты Python/internet-search-bot"
-            ],
+            "args": ["mcp-server-git", "--repository", "C:/Programming/Проекты Python/internet-search-bot"],
             "enabled": false,
             "startup_required": false
         }
@@ -92,6 +80,17 @@
         "mcp_reconnect_timeout": 10,
         "mcp_runtime_close_timeout": 10,
         "mcp_call_retries_after_recovery": 1
+    },
+    "input_runtime": {
+        "enabled": true,
+        "max_queued_batches_per_session": 64,
+        "max_queued_bytes_per_session": 268435456,
+        "max_batches_per_checkpoint": 8,
+        "max_batch_bytes_per_checkpoint": 67108864,
+        "claim_lease_seconds": 300,
+        "max_intermediate_messages_per_cycle": 16,
+        "min_intermediate_message_interval_seconds": 15.0,
+        "max_intermediate_message_chars": 3500
     },
     "storage": {
         "backend": "filesystem",
@@ -165,10 +164,7 @@
     },
     "localization": {
         "default_locale": "ru",
-        "supported_locales": [
-            "ru",
-            "en"
-        ],
+        "supported_locales": ["ru", "en"],
         "fallback_locale": "ru",
         "fail_on_missing_required_key": false,
         "max_params": 32,
