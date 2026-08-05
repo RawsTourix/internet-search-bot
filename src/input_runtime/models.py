@@ -52,12 +52,14 @@ def new_finalization_id() -> str:
 class InputRuntimeModel(BaseModel):
     model_config = ConfigDict(extra="forbid", validate_assignment=True)
 
-    @field_validator("created_at", "updated_at", "admitted_at", "applied_at", "cancelled_at", "enqueued_at", "claimed_at", "acknowledged_at", "delivered_at", mode="before", check_fields=False)
+    @field_validator(
+        "created_at", "updated_at", "admitted_at", "applied_at",
+        "cancelled_at", "enqueued_at", "claimed_at", "claim_expires_at",
+        "acknowledged_at", "delivered_at", mode="before", check_fields=False,
+    )
     @classmethod
     def validate_timestamp(cls, value: Any) -> Any:
-        if value is None:
-            return value
-        if not isinstance(value, datetime):
+        if value is None or not isinstance(value, datetime):
             return value
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("durable timestamps must be timezone-aware")
@@ -66,8 +68,7 @@ class InputRuntimeModel(BaseModel):
     @field_validator(*_ID_PATTERNS.keys(), check_fields=False)
     @classmethod
     def validate_stable_id(cls, value: str, info: Any) -> str:
-        pattern = _ID_PATTERNS[info.field_name]
-        if not pattern.fullmatch(value):
+        if not _ID_PATTERNS[info.field_name].fullmatch(value):
             raise ValueError(f"invalid stable {info.field_name}")
         return value
 
@@ -84,15 +85,19 @@ class SessionInputRuntimeState(InputRuntimeModel):
     session_id: str
     generation: int = Field(ge=0)
     active_cycle_id: str | None = None
-    cycle_status: Literal["idle", "running", "waiting_user", "pause_requested", "paused_by_user", "interrupted", "finalizing", "done", "error", "cancelled"] = "idle"
-    accepted_through_session_sequence: int = Field(default=-1, ge=-1)
-    active_cycle_accepted_through_sequence: int = Field(default=-1, ge=-1)
-    active_cycle_applied_through_sequence: int = Field(default=-1, ge=-1)
+    cycle_status: Literal[
+        "idle", "running", "waiting_user", "pause_requested",
+        "paused_by_user", "interrupted", "finalizing",
+        "done", "error", "cancelled",
+    ] = "idle"
+    accepted_through_session_sequence: int = Field(default=0, ge=0)
+    active_cycle_accepted_through_sequence: int = Field(default=0, ge=0)
+    active_cycle_applied_through_sequence: int = Field(default=0, ge=0)
     pending_control_sequence: int = Field(default=0, ge=0)
     applied_control_sequence: int = Field(default=0, ge=0)
     active_context_revision_id: str | None = None
     finalization_id: str | None = None
-    revision: int = Field(default=0, ge=0)
+    revision: int = Field(default=1, ge=1)
     created_at: datetime
     updated_at: datetime
 
@@ -104,11 +109,11 @@ class SessionInputRuntimeState(InputRuntimeModel):
             raise ValueError("applied control watermark cannot exceed pending watermark")
         if self.cycle_status == "idle" and self.active_cycle_id is not None:
             raise ValueError("idle session cannot have an active cycle")
-        if self.cycle_status not in {"idle", "done", "error", "cancelled"} and self.active_cycle_id is None:
+        if self.cycle_status not in {"idle", *TERMINAL_SESSION_STATUSES} and self.active_cycle_id is None:
             raise ValueError("active cycle status requires active_cycle_id")
         if self.cycle_status == "finalizing" and self.finalization_id is None:
             raise ValueError("finalizing status requires finalization_id")
-        if self.finalization_id is not None and self.cycle_status not in {"finalizing", "done", "error", "cancelled"}:
+        if self.finalization_id is not None and self.cycle_status not in {"finalizing", *TERMINAL_SESSION_STATUSES}:
             raise ValueError("finalization_id is invalid for current status")
         if self.cycle_status in TERMINAL_SESSION_STATUSES:
             if self.active_cycle_applied_through_sequence != self.active_cycle_accepted_through_sequence:
@@ -124,11 +129,14 @@ class InputAdmissionRecord(InputRuntimeModel):
     admission_id: str = Field(default_factory=new_admission_id)
     session_id: str
     input_batch_id: str
-    session_sequence: int = Field(ge=0)
+    session_sequence: int = Field(ge=1)
     target_cycle_id: str
     cycle_sequence: int = Field(ge=0)
     admitted_generation: int = Field(ge=0)
-    admission_kind: Literal["start_cycle", "continue_running", "resume_waiting", "queue_paused", "resume_interrupted"]
+    admission_kind: Literal[
+        "start_cycle", "continue_running", "resume_waiting",
+        "queue_paused", "resume_interrupted",
+    ]
     state: Literal["admitted", "applied", "cancelled", "failed_terminal"] = "admitted"
     idempotency_key: str
     admitted_at: datetime
@@ -156,7 +164,10 @@ class InputAdmissionRecord(InputRuntimeModel):
 
 
 class InputAdmissionOutcome(InputRuntimeModel):
-    outcome: Literal["start_cycle", "queued_running", "resume_waiting", "queued_paused", "resume_interrupted", "duplicate", "capacity_blocked"]
+    outcome: Literal[
+        "start_cycle", "queued_running", "resume_waiting",
+        "queued_paused", "resume_interrupted", "duplicate", "capacity_blocked",
+    ]
     admission: InputAdmissionRecord | None = None
     retryable: bool = False
     reason_code: str | None = None
@@ -166,8 +177,11 @@ class InputAdmissionOutcome(InputRuntimeModel):
         if self.outcome == "capacity_blocked":
             if self.admission is not None or not self.retryable or not self.reason_code:
                 raise ValueError("capacity_blocked must be retryable and have no admission")
-        elif self.admission is None:
-            raise ValueError("successful admission outcome requires admission")
+        else:
+            if self.admission is None:
+                raise ValueError("non-capacity outcome requires admission")
+            if self.retryable:
+                raise ValueError("successful/duplicate outcome cannot be retryable")
         return self
 
 
@@ -179,7 +193,9 @@ class CycleInboxItem(InputRuntimeModel):
     input_batch_id: str
     cycle_sequence: int = Field(ge=1)
     generation: int = Field(ge=0)
-    state: Literal["queued", "claimed", "applying", "applied", "cancelled", "failed_terminal"] = "queued"
+    state: Literal[
+        "queued", "claimed", "applying", "applied", "cancelled", "failed_terminal",
+    ] = "queued"
     claim_token: str | None = None
     claim_expires_at: datetime | None = None
     attempt_count: int = Field(default=0, ge=0)
@@ -191,9 +207,14 @@ class CycleInboxItem(InputRuntimeModel):
 
     @model_validator(mode="after")
     def validate_state(self) -> "CycleInboxItem":
-        claimed = self.state in {"claimed", "applying"}
-        if claimed != bool(self.claim_token and self.claim_expires_at and self.claimed_at):
-            raise ValueError("claimed/applying item requires complete claim fields")
+        claim_fields = (self.claim_token, self.claim_expires_at, self.claimed_at)
+        if self.state in {"claimed", "applying"}:
+            if not all(claim_fields):
+                raise ValueError("claimed/applying item requires complete claim fields")
+            if self.claim_expires_at <= self.claimed_at:
+                raise ValueError("claim expiry must follow claim time")
+        elif any(value is not None for value in claim_fields):
+            raise ValueError("claim fields are only valid for claimed/applying items")
         if self.state == "applied" and self.applied_at is None:
             raise ValueError("applied inbox item requires applied_at")
         if self.state != "applied" and self.applied_at is not None:
@@ -224,8 +245,15 @@ class ClaimedInboxRange(InputRuntimeModel):
         sequences = [item.cycle_sequence for item in self.items]
         if sequences != list(range(self.first_cycle_sequence, self.last_cycle_sequence + 1)):
             raise ValueError("claim items must be contiguous")
-        if any(item.cycle_id != self.cycle_id or item.generation != self.generation or item.claim_token != self.claim_token for item in self.items):
-            raise ValueError("claim item identity mismatch")
+        if any(
+            item.state not in {"claimed", "applying"}
+            or item.cycle_id != self.cycle_id
+            or item.generation != self.generation
+            or item.claim_token != self.claim_token
+            or item.claim_expires_at != self.claim_expires_at
+            for item in self.items
+        ):
+            raise ValueError("claim item identity/state mismatch")
         return self
 
 
@@ -257,6 +285,8 @@ class SessionControlCommand(InputRuntimeModel):
             raise ValueError("pause/continue require target_cycle_id")
         if self.state in {"acknowledged", "applied"} and self.acknowledged_at is None:
             raise ValueError("acknowledged/applied control requires acknowledged_at")
+        if self.state not in {"acknowledged", "applied"} and self.acknowledged_at is not None:
+            raise ValueError("acknowledged_at is only valid after acknowledgement")
         if self.state == "applied" and self.applied_at is None:
             raise ValueError("applied control requires applied_at")
         if self.state != "applied" and self.applied_at is not None:
@@ -273,6 +303,12 @@ class ControlOutcome(InputRuntimeModel):
     command: SessionControlCommand
     effective_cycle_status: str | None = None
 
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "ControlOutcome":
+        if self.outcome != "duplicate" and self.command.state != self.outcome:
+            raise ValueError("control outcome must match command state")
+        return self
+
 
 class ActiveCycleSnapshot(InputRuntimeModel):
     cycle_id: str
@@ -285,19 +321,19 @@ class ActiveCycleSnapshot(InputRuntimeModel):
     cycle_trace: list[dict[str, Any]] = Field(default_factory=list)
     working_memory_ref: str | None = None
     applied_input_batch_ids: list[str] = Field(default_factory=list)
-    applied_through_cycle_sequence: int = Field(ge=0)
+    applied_through_cycle_sequence: int = Field(default=0, ge=0)
     active_context_revision_id: str
     waiting_question: str | None = None
     pause_reason: str | None = None
     interruption_reason: str | None = None
     active_plan_id: str | None = None
-    active_plan_revision: int | None = Field(default=None, ge=0)
+    active_plan_revision: int | None = Field(default=None, ge=1)
     active_plan_node_id: str | None = None
     artifact_refs: list[str] = Field(default_factory=list)
     read_artifact_refs: list[str] = Field(default_factory=list)
     result_refs: list[str] = Field(default_factory=list)
     config_revision: str | None = None
-    snapshot_revision: int = Field(ge=0)
+    snapshot_revision: int = Field(default=1, ge=1)
     safe_checkpoint: str
     created_at: datetime
     updated_at: datetime
@@ -317,6 +353,10 @@ class ActiveCycleSnapshot(InputRuntimeModel):
             raise ValueError("paused snapshot requires pause_reason")
         if self.status == "interrupted" and not self.interruption_reason:
             raise ValueError("interrupted snapshot requires interruption_reason")
+        if self.active_plan_id is None and any(
+            value is not None for value in (self.active_plan_revision, self.active_plan_node_id)
+        ):
+            raise ValueError("plan revision/node require active_plan_id")
         if self.updated_at < self.created_at:
             raise ValueError("updated_at cannot precede created_at")
         return self
@@ -330,7 +370,7 @@ class CycleContextRevision(InputRuntimeModel):
     parent_revision_ids: list[str] = Field(default_factory=list)
     reason: Literal["initial_input", "input_applied", "resumed", "recovered"]
     applied_input_batch_ids: list[str] = Field(default_factory=list)
-    applied_through_cycle_sequence: int = Field(ge=0)
+    applied_through_cycle_sequence: int = Field(default=0, ge=0)
     added_artifact_refs: list[str] = Field(default_factory=list)
     constraint_summary: str | None = None
     created_at: datetime
@@ -390,7 +430,10 @@ class CycleFinalizationRecord(InputRuntimeModel):
     expected_accepted_sequence: int = Field(ge=0)
     expected_applied_sequence: int = Field(ge=0)
     expected_control_sequence: int = Field(ge=0)
-    state: Literal["prepared", "aborted_new_input", "aborted_control", "result_persisted", "output_ready", "terminal_committed", "failed_recoverable", "failed_terminal"] = "prepared"
+    state: Literal[
+        "prepared", "aborted_new_input", "aborted_control", "result_persisted",
+        "output_ready", "terminal_committed", "failed_recoverable", "failed_terminal",
+    ] = "prepared"
     result_ref: str | None = None
     output_batch_id: str | None = None
     failure_code: str | None = None
@@ -418,9 +461,22 @@ class CycleFinalizationRecord(InputRuntimeModel):
 
 class CheckpointOutcome(InputRuntimeModel):
     checkpoint: str
-    action: Literal["continue", "input_applied", "pause", "wait", "interrupt", "abort_finalization"]
+    action: Literal[
+        "continue", "input_applied", "pause", "wait", "interrupt", "abort_finalization",
+    ]
     context_revision_id: str | None = None
     applied_through_cycle_sequence: int = Field(default=0, ge=0)
     applied_input_batch_ids: tuple[str, ...] = ()
     control_sequence: int = Field(default=0, ge=0)
     reason_code: str | None = None
+
+    @model_validator(mode="after")
+    def validate_outcome(self) -> "CheckpointOutcome":
+        if self.action == "input_applied":
+            if self.context_revision_id is None or not self.applied_input_batch_ids:
+                raise ValueError("input_applied requires revision and applied batch ids")
+        elif self.applied_input_batch_ids:
+            raise ValueError("applied batch ids are only valid for input_applied")
+        if self.action in {"pause", "wait", "interrupt", "abort_finalization"} and not self.reason_code:
+            raise ValueError("non-continue checkpoint outcome requires reason_code")
+        return self

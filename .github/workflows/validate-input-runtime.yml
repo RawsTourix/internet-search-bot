@@ -1,6 +1,9 @@
 name: Validate Input Runtime
 
 on:
+  push:
+    branches:
+      - feat/v0.4-input-runtime
   pull_request:
     branches:
       - feature
