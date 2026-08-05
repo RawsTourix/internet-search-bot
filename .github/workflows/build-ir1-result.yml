@@ -1,0 +1,58 @@
+name: Build verified IR-1 corrective commit
+
+on:
+  push:
+    branches:
+      - temp/ir1-contract-upload
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: |
+          python -m pip install -r requirements.txt
+          python -m pip install pytest
+      - name: Reconstruct payload
+        run: |
+          cat upload/ir1payload.part*.b64 | base64 --decode > /tmp/ir1payload.tar.gz
+          echo "227f5bab6a263ff14183862f340e7c85e74256760810f32770f02f10a2df0f44  /tmp/ir1payload.tar.gz" | sha256sum -c -
+          mkdir /tmp/ir1payload
+          tar -xzf /tmp/ir1payload.tar.gz -C /tmp/ir1payload
+      - name: Apply payload
+        run: |
+          git fetch origin feat/v0.4-input-runtime
+          git checkout -B feat/v0.4-input-runtime origin/feat/v0.4-input-runtime
+          test "$(git rev-parse HEAD)" = "40decaf087aacaa3b7d137c44680e108187b6e10"
+          cp -a /tmp/ir1payload/. .
+          git diff --check
+      - name: Validate IR-1
+        run: |
+          python -m pytest tests/test_input_runtime_models.py -q
+          python -m pytest tests/test_input_runtime_config.py -q
+          python -m pytest tests/test_input_runtime_interfaces.py -q
+          python -m compileall src tests
+          python -m unittest discover -s tests -p "test_artifact*.py" -v
+          python -m unittest discover -s tests -p "test_storage*.py" -v
+          python -m unittest discover -s tests -p "test_plan*.py" -v
+          python -m unittest discover -s tests -p "test_planning*.py" -v
+          python -m unittest discover -s tests -p "test_api*.py" -v
+          python -m pytest -q
+      - name: Publish verified commit candidate
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/workflows/validate-input-runtime.yml src/api/mcp.config.example src/input_runtime tests/test_input_runtime_*.py docs/design/versions/v0.4/v0.4-input-runtime/README.md docs/design/versions/v0.4/v0.4-input-runtime/domain-models-and-state-machines.md docs/design/versions/v0.4/v0.4-input-runtime/implementation-sequence.md
+          git diff --cached --check
+          git commit -m "fix(input-runtime): complete IR-1 contracts and validation"
+          echo "RESULT_SHA=$(git rev-parse HEAD)"
+          git push origin HEAD:refs/heads/temp/ir1-contract-result
