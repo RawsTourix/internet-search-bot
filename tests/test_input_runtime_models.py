@@ -63,7 +63,12 @@ def test_initial_admission_uses_cycle_sequence_zero_and_round_trips():
     )
     assert InputAdmissionRecord.model_validate_json(record.model_dump_json()) == record
     with pytest.raises(ValidationError):
-        record.model_copy(update={"admission_id": "client-message-1"})
+        InputAdmissionRecord(
+            admission_id="client-message-1", session_id="s", input_batch_id="ibat2",
+            session_sequence=1, target_cycle_id="cycle", cycle_sequence=1,
+            admitted_generation=0, admission_kind="continue_running",
+            idempotency_key="ibat2", admitted_at=NOW,
+        )
 
 
 def test_inbox_claim_fields_are_state_dependent():
