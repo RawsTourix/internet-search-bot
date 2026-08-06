@@ -14,12 +14,13 @@ last_reviewed: 2026-08-06
 `IR-1`, `IR-2` и `IR-3` реализованы и подтверждены CI. Этапы `IR-4`—`IR-10`
 остаются planned, поэтому общий update сохраняет статус `partial`.
 
-Evidence для завершённого admission foundation:
+Evidence для завершённого и hardened admission foundation:
 
-- code HEAD: `4929b703d7f6e200392661b2b66205b8fa4ca034`;
-- `Validate Input Runtime` run #73 — success;
-- `Validate v0.4 file artifacts PR` run #497 — success;
-- targeted input-runtime и общий configuration audit: `181 passed`.
+- основной IR-3 code SHA: `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- IR-3 hardening commit: `d11db7f2a2f8caae900f3bc94ed91de020059231`;
+- итоговый hardened code HEAD: `5441250069c0b2984461e8dd63429f3928c7918c`;
+- `Validate Input Runtime` run #79 — success, `187 passed`;
+- `Validate v0.4 file artifacts PR` run #500 — success.
 
 IR-3 подключил IR-1/IR-2 repositories в production composition и ввёл общий
 `InputAdmissionService` для каждого immutable `CommittedInputBatch`. Initial batch
@@ -28,15 +29,33 @@ IR-3 подключил IR-1/IR-2 repositories в production composition и вв
 FIFO `CycleInboxItem` того же cycle, возвращает structured acknowledgement и не
 вызывает второй `MCPClient.process_query()`.
 
+Финальный hardening закрыл три admission/runner contract gap:
+
+- count/byte capacity authority теперь определяется pending/admitted admissions
+  активного cycle, поэтому admission с ещё не восстановленным inbox уже занимает
+  reservation и не позволяет обойти limit после crash;
+- между pre-run setup и `process_query()` записывается durable runtime handoff
+  marker: ошибка до handoff остаётся retryable, а неоднозначность после handoff
+  переводит cycle в `interrupted` и запрещает blind replay LLM/tool side effects;
+- `SessionExecutionCoordinator.wake()` выставляет event только для exact
+  reserved/active `cycle_id`; поздний wake старого cycle не будит новый cycle.
+
 Duplicate replay возвращает существующую relation, capacity block является typed
 и retryable, а record-first crash windows admission/inbox/runner-start покрыты
-reconciliation tests. `WAITING_USER` временно сохраняет compatibility adapter;
-`interrupted` не выполняет unsafe automatic replay.
+reconciliation tests. `WAITING_USER` временно сохраняет compatibility adapter,
+но после durable runtime handoff неоднозначный failure больше не requeue-ит input
+для автоматического повторного `process_query()`. `interrupted` не выполняет
+unsafe automatic replay.
 
 Queued additions на IR-3 ещё не применяются к работающему LLM context. Safe
 checkpoints, общий input applier, context revisions и snapshot ownership относятся
-к IR-4. `/stop`, `/continue`, intermediate emissions, finalization barrier и
-startup recovery lifecycle также ещё не реализованы.
+к IR-4. Для IR-4 отдельно зафиксировано: `WAITING_USER` reply при наличии более
+ранних queued additions должен применяться вместе с ними через общий FIFO
+`CycleInputApplier`, а не обходить очередь через compatibility path.
+
+Для IR-7 зафиксировано: любой pending accepted input должен подавлять stale
+`DONE`, question или output до terminal commit. `/stop`, `/continue`, intermediate
+emissions, finalization barrier и startup recovery lifecycle ещё не реализованы.
 
 IR-2 добавил filesystem implementations repository ports, атомарные записи,
 bounded reference-counted coordination, authoritative session-local

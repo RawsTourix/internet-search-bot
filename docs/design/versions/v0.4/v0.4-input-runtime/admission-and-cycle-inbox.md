@@ -11,23 +11,38 @@ last_reviewed: 2026-08-06
 
 ## Статус реализации
 
-IR-3 реализован поверх IR-1/IR-2 и подтверждён CI на code SHA
-`4929b703d7f6e200392661b2b66205b8fa4ca034`:
+IR-3 реализован поверх IR-1/IR-2 и после contract hardening подтверждён CI:
 
-- `Validate Input Runtime` run #73 — success, `181 passed`;
-- `Validate v0.4 file artifacts PR` run #497 — success;
+- основной IR-3 code SHA: `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- hardening commit: `d11db7f2a2f8caae900f3bc94ed91de020059231`;
+- итоговый hardened code HEAD: `5441250069c0b2984461e8dd63429f3928c7918c`;
+- `Validate Input Runtime` run #79 — success, `187 passed`;
+- `Validate v0.4 file artifacts PR` run #500 — success;
 - every production `CommittedInputBatch` проходит `InputAdmissionService`;
 - второй committed batch во время `running` получает durable admission и FIFO
   `CycleInboxItem` того же cycle, но не запускает второй `process_query()`;
 - deterministic no-parallel test подтверждает `process_query call count == 1`
   при трёх последовательных additions;
 - duplicate/capacity/crash windows replay-safe и recoverable;
-- `WAITING_USER` временно использует compatibility adapter того же cycle.
+- capacity reservation остаётся authoritative даже при crash между admission и
+  inbox publication;
+- durable runtime handoff marker запрещает blind replay после неоднозначного
+  `process_query()` или последующего persistence failure;
+- `WAITING_USER` временно использует compatibility adapter того же cycle, но
+  неоднозначный post-handoff failure не requeue-ится автоматически;
+- late wake несовпадающего cycle не изменяет wake event нового cycle.
 
-IR-3 заканчивается на admission/queue boundary. Queued additions ещё не
-применяются к LLM context: checkpoints, общий `CycleInputApplier` и context
+IR-3 заканчивается на admission/queue и runner-handoff boundary. Queued additions
+ещё не применяются к LLM context: checkpoints, общий `CycleInputApplier` и context
 revisions относятся к IR-4. `/stop`, `/continue`, emissions и finalization
 barrier также ещё не реализованы.
+
+Для следующих этапов зафиксированы два обязательных контракта:
+
+- IR-4: `WAITING_USER` reply при наличии более ранних queued additions должен
+  применяться через общий FIFO `CycleInputApplier` вместе с ними;
+- IR-7: pending accepted input должен подавлять stale `DONE`, question и output
+  до terminal commit.
 
 ## Назначение
 
@@ -146,6 +161,21 @@ Admission существует, но session watermark отстаёт.
 Recovery вычисляет expected watermark из ordered admission records и выполняет
 compare-and-swap repair.
 
+#### После durable admission, до inbox publication
+
+Admission уже является authoritative capacity reservation. Даже если
+`CycleInboxItem` ещё отсутствует после crash, новый batch не может обойти
+`max_queued_batches_per_session` или `max_queued_bytes_per_session`.
+
+Повтор exact batch:
+
+```text
+find existing admission
+→ reuse original session/cycle sequence
+→ create exactly one missing inbox item
+→ return existing relation
+```
+
 #### После B/C, до UI acknowledgement
 
 Повтор transport request/idempotency key возвращает существующий admission
@@ -237,6 +267,22 @@ step. Остаток остаётся queued.
 
 Queue limits проверяются до durable admission acknowledgement.
 
+### Authoritative capacity reservation
+
+Count/byte reservation определяется не наличием inbox file, а authoritative
+admission records активного cycle. Capacity занимает admission, для которого:
+
+```text
+cycle_sequence > 0
+cycle_sequence > active_cycle_applied_through_sequence
+state == admitted/pending
+payload_size_bytes учитывается в byte limit
+```
+
+Initial admission с `cycle_sequence == 0` не является addition и capacity не
+занимает. Applied/cancelled/failed-terminal records очередь не занимают.
+Отсутствующий после crash inbox не освобождает reservation до reconciliation.
+
 ### Running/paused cycle
 
 Если limit исчерпан:
@@ -301,12 +347,34 @@ admission queued
 → runner читает durable state в checkpoint
 ```
 
+`SessionExecutionCoordinator.wake(session_id, cycle_id=...)` выставляет event
+только если `cycle_id` совпадает с exact reserved/active cycle. Несовпадающий
+late wake возвращает `False` и не изменяет event нового cycle.
+
 Потерянный signal безопасен: runner всё равно проверяет inbox перед следующим
 LLM request, `WAITING_USER` и finalization. После restart recovery создаёт новый
 runner/resume command по policy.
 
 `SessionExecutionCoordinator` остаётся execution lease/wakeup foundation, но не
 source of truth очереди.
+
+## Runtime handoff boundary
+
+IR-3 использует минимальный durable marker между безопасным setup и первым
+side-effecting вызовом Agent Runtime:
+
+```text
+resolve authoritative batch/capabilities
+→ durable RuntimeHandoffRecord(handed_off)
+→ invoke process_query()
+→ complete либо mark ambiguous
+```
+
+Ошибка до marker оставляет admission retryable. После marker duplicate не может
+повторно вызвать `process_query()`. Исключение после invocation либо после
+успешного runtime result, но до следующего persistence step, переводит marker и
+cycle в ambiguous/interrupted contract без automatic replay внешних действий.
+Этот marker не заменяет IR-4 active snapshot и не реализует IR-8 startup recovery.
 
 ## WAITING_USER migration
 
@@ -323,9 +391,24 @@ committed reply
 → common CycleInputApplier
 ```
 
+После durable runtime handoff compatibility path не requeue-ит claim при
+неоднозначной ошибке: такой requeue был бы blind replay потенциально выполненных
+LLM/tool side effects.
+
+Обязательный контракт IR-4: если перед `WAITING_USER` reply уже существуют более
+ранние queued additions, reply не может обходить их. Общий `CycleInputApplier`
+должен применить contiguous FIFO range в порядке cycle sequence.
+
 После parity tests mixin удаляется. Artifact refs прежнего и нового batch
 сохраняются через общий context/application path, а не через временную замену
 `original_input_batch_id`.
+
+## Finalization follow-up
+
+Обязательный контракт IR-7: наличие pending accepted input должно подавлять stale
+`DONE`, question и output до terminal commit. Durable admission watermark является
+основанием abort/recheck finalization, даже если inbox/application ещё не успели
+завершиться.
 
 ## Diagnostics
 
@@ -353,5 +436,8 @@ Raw user text, file payload и secrets в diagnostics не выводятся.
 - queue head применяется строго FIFO;
 - claim expiry не дублирует LLM message;
 - commit/admission crash windows восстанавливаются;
+- missing inbox admission продолжает занимать count/byte capacity;
+- runtime handoff ambiguity не приводит к automatic replay;
+- late wake старого cycle не будит новый cycle;
 - capacity limit не теряет committed input;
 - lost wakeup не блокирует последующее checkpoint применение.
