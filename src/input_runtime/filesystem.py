@@ -6,6 +6,7 @@ from pathlib import Path
 
 from src.storage import StorageConfigType
 
+from ._filesystem_handoff import FileSystemRuntimeHandoffRepository
 from ._filesystem_identity_recovery_cycle import (
     FileSystemActiveCycleSnapshotRepository,
     FileSystemContextRevisionRepository,
@@ -42,6 +43,11 @@ class FileSystemInputRuntimeRepositories:
             locks=locks,
         )
         self.inbox = FileSystemCycleInboxRepository(root=root, locks=locks)
+        self.handoffs = FileSystemRuntimeHandoffRepository(
+            root=root,
+            locks=locks,
+        )
+        self.sessions.runtime_handoffs = self.handoffs
         self.controls = FileSystemSessionControlRepository(
             root=root,
             locks=locks,

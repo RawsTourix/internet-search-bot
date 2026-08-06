@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Mapping
@@ -526,18 +527,35 @@ class Api:
         ):
             raise APIError("Admitted cycle authority is stale")
 
+    @staticmethod
+    async def _await_cancellation_cleanup(cleanup) -> None:
+        """Finish durable cleanup even if cancellation is requested again."""
+        cleanup_task = asyncio.create_task(cleanup)
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            cleanup_task.result()
+        except Exception:
+            logger.exception("Runtime cancellation cleanup failed")
+
     async def _runtime_handoff_marker(
         self,
         admission,
         *,
         handoff_token: str | None,
     ):
-        if handoff_token is None:
-            return None
         marker = await self.input_admission_service.get_runtime_handoff(
             admission
         )
-        if marker is None or marker.handoff_token != handoff_token:
+        if marker is None:
+            return None
+        if (
+            handoff_token is not None
+            and marker.handoff_token != handoff_token
+        ):
             return None
         return marker
 
@@ -552,16 +570,83 @@ class Api:
             admission,
             handoff_token=handoff_token,
         )
-        if marker is None:
+        if marker is None or marker.state == RuntimeHandoffState.COMPLETED:
             return False
+        if marker.state == RuntimeHandoffState.AMBIGUOUS:
+            return True
         marker = await (
             self.input_admission_service.mark_runtime_handoff_ambiguous(
+                admission,
+                handoff_token=marker.handoff_token,
+                error_code=error_code,
+            )
+        )
+        return marker is not None and marker.state == RuntimeHandoffState.AMBIGUOUS
+
+    async def _cleanup_initial_runtime_failure(
+        self,
+        admission,
+        *,
+        handoff_token: str | None,
+        error_code: str,
+    ) -> None:
+        ambiguous = False
+        try:
+            ambiguous = await self._record_runtime_handoff_ambiguity(
                 admission,
                 handoff_token=handoff_token,
                 error_code=error_code,
             )
-        )
-        return marker is not None and marker.state != RuntimeHandoffState.COMPLETED
+        except Exception:
+            logger.exception("Failed to persist admitted runner ambiguity")
+        if ambiguous:
+            try:
+                await self.input_admission_service.record_cycle_status(
+                    session_id=admission.session_id,
+                    cycle_id=admission.target_cycle_id,
+                    status=CycleStatus.INTERRUPTED,
+                )
+            except Exception:
+                logger.exception("Failed to record admitted runner interruption")
+
+    async def _cleanup_waiting_runtime_failure(
+        self,
+        admission,
+        *,
+        claim,
+        handoff_token: str | None,
+        error_code: str,
+        pre_handoff_error_code: str,
+    ) -> None:
+        ambiguous = False
+        try:
+            ambiguous = await self._record_runtime_handoff_ambiguity(
+                admission,
+                handoff_token=handoff_token,
+                error_code=error_code,
+            )
+        except Exception:
+            logger.exception("Failed to persist compatibility ambiguity")
+        if claim is not None and not ambiguous:
+            try:
+                await (
+                    self.input_admission_service
+                    .requeue_waiting_compatibility_apply(
+                        claim,
+                        error_code=pre_handoff_error_code,
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to requeue compatibility claim")
+        if ambiguous:
+            try:
+                await self.input_admission_service.record_cycle_status(
+                    session_id=admission.session_id,
+                    cycle_id=admission.target_cycle_id,
+                    status=CycleStatus.INTERRUPTED,
+                )
+            except Exception:
+                logger.exception("Failed to record compatibility interruption")
 
     async def start_admitted_cycle(
         self,
@@ -632,46 +717,29 @@ class Api:
                     handoff_token=handoff_token,
                 )
                 return result
-        except APIError:
-            ambiguous = False
-            try:
-                ambiguous = await self._record_runtime_handoff_ambiguity(
+        except asyncio.CancelledError:
+            await self._await_cancellation_cleanup(
+                self._cleanup_initial_runtime_failure(
                     admission,
                     handoff_token=handoff_token,
-                    error_code="initial_runtime_handoff_ambiguous",
+                    error_code="initial_runtime_cancelled",
                 )
-            except Exception:
-                logger.exception("Failed to persist admitted runner ambiguity")
-            if ambiguous:
-                try:
-                    await self.input_admission_service.record_cycle_status(
-                        session_id=admission.session_id,
-                        cycle_id=cycle_id,
-                        status=CycleStatus.INTERRUPTED,
-                    )
-                except Exception:
-                    logger.exception("Failed to record admitted runner interruption")
+            )
+            raise
+        except APIError:
+            await self._cleanup_initial_runtime_failure(
+                admission,
+                handoff_token=handoff_token,
+                error_code="initial_runtime_handoff_ambiguous",
+            )
             raise
         except Exception as error:
             logger.error("Ошибка запуска admitted cycle: %r", error)
-            ambiguous = False
-            try:
-                ambiguous = await self._record_runtime_handoff_ambiguity(
-                    admission,
-                    handoff_token=handoff_token,
-                    error_code="initial_runtime_handoff_ambiguous",
-                )
-            except Exception:
-                logger.exception("Failed to persist admitted runner ambiguity")
-            if ambiguous:
-                try:
-                    await self.input_admission_service.record_cycle_status(
-                        session_id=admission.session_id,
-                        cycle_id=cycle_id,
-                        status=CycleStatus.INTERRUPTED,
-                    )
-                except Exception:
-                    logger.exception("Failed to record admitted runner interruption")
+            await self._cleanup_initial_runtime_failure(
+                admission,
+                handoff_token=handoff_token,
+                error_code="initial_runtime_handoff_ambiguous",
+            )
             raise APIError(f"Ошибка запуска admitted cycle: {error}") from error
 
     async def resume_admitted_cycle(
@@ -754,67 +822,40 @@ class Api:
                     handoff_token=handoff_token,
                 )
                 return result
-        except APIError:
-            ambiguous = False
-            try:
-                ambiguous = await self._record_runtime_handoff_ambiguity(
+        except asyncio.CancelledError:
+            await self._await_cancellation_cleanup(
+                self._cleanup_waiting_runtime_failure(
                     admission,
+                    claim=claim,
                     handoff_token=handoff_token,
-                    error_code="waiting_runtime_handoff_ambiguous",
+                    error_code="waiting_runtime_cancelled",
+                    pre_handoff_error_code=(
+                        "waiting_compatibility_pre_handoff_cancelled"
+                    ),
                 )
-            except Exception:
-                logger.exception("Failed to persist compatibility ambiguity")
-            if claim is not None and not ambiguous:
-                try:
-                    await (
-                        self.input_admission_service
-                        .requeue_waiting_compatibility_apply(
-                            claim,
-                            error_code="waiting_compatibility_pre_handoff_failed",
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to requeue compatibility claim")
-            if ambiguous:
-                try:
-                    await self.input_admission_service.record_cycle_status(
-                        session_id=admission.session_id,
-                        cycle_id=cycle_id,
-                        status=CycleStatus.INTERRUPTED,
-                    )
-                except Exception:
-                    logger.exception("Failed to record compatibility interruption")
+            )
+            raise
+        except APIError:
+            await self._cleanup_waiting_runtime_failure(
+                admission,
+                claim=claim,
+                handoff_token=handoff_token,
+                error_code="waiting_runtime_handoff_ambiguous",
+                pre_handoff_error_code=(
+                    "waiting_compatibility_pre_handoff_failed"
+                ),
+            )
             raise
         except Exception as error:
-            ambiguous = False
-            try:
-                ambiguous = await self._record_runtime_handoff_ambiguity(
-                    admission,
-                    handoff_token=handoff_token,
-                    error_code="waiting_runtime_handoff_ambiguous",
-                )
-            except Exception:
-                logger.exception("Failed to persist compatibility ambiguity")
-            if claim is not None and not ambiguous:
-                try:
-                    await (
-                        self.input_admission_service
-                        .requeue_waiting_compatibility_apply(
-                            claim,
-                            error_code="waiting_compatibility_pre_handoff_failed",
-                        )
-                    )
-                except Exception:
-                    logger.exception("Failed to requeue compatibility claim")
-            if ambiguous:
-                try:
-                    await self.input_admission_service.record_cycle_status(
-                        session_id=admission.session_id,
-                        cycle_id=cycle_id,
-                        status=CycleStatus.INTERRUPTED,
-                    )
-                except Exception:
-                    logger.exception("Failed to record compatibility interruption")
+            await self._cleanup_waiting_runtime_failure(
+                admission,
+                claim=claim,
+                handoff_token=handoff_token,
+                error_code="waiting_runtime_handoff_ambiguous",
+                pre_handoff_error_code=(
+                    "waiting_compatibility_pre_handoff_failed"
+                ),
+            )
             raise APIError(f"Ошибка resume admitted cycle: {error}") from error
 
     async def _call_agent_batch_compatibility(

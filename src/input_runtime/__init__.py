@@ -27,6 +27,7 @@ from .factory import (
     create_input_runtime_contracts,
 )
 from .handoff import RuntimeHandoffRecord, RuntimeHandoffState
+from .interfaces import RuntimeHandoffRepository
 from .models import (
     ActiveCycleSnapshot, AdmissionKind, AdmissionState, AgentEmission,
     CheckpointAction, CheckpointName, CheckpointOutcome, ClaimedInboxRange,

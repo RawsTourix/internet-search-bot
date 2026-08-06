@@ -6,11 +6,7 @@ from datetime import datetime
 
 from .admission import InputAdmissionAction, InputAdmissionOutcome
 from .errors import InputRuntimeConflictError
-from .handoff import (
-    FileSystemRuntimeHandoffStore,
-    RuntimeHandoffRecord,
-    RuntimeHandoffState,
-)
+from .handoff import RuntimeHandoffRecord, RuntimeHandoffState
 from .models import (
     AdmissionKind,
     AdmissionState,
@@ -33,20 +29,7 @@ class InputAdmissionService(_BaseInputAdmissionService):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        root = self.repositories.coordination_root or getattr(
-            self.repositories.sessions, "root", None
-        )
-        locks = self.repositories.coordination_locks or getattr(
-            self.repositories.sessions, "locks", None
-        )
-        if root is None or locks is None:
-            raise InputRuntimeConflictError(
-                "runtime handoff store requires durable coordination composition"
-            )
-        self.runtime_handoffs = FileSystemRuntimeHandoffStore(
-            root=root,
-            locks=locks,
-        )
+        self.runtime_handoffs = self.repositories.handoffs
 
     async def _capacity_reason(
         self,
