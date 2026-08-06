@@ -3,11 +3,31 @@ id: design.v0.4.input-runtime.admission
 version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
-implementation_status: planned
-last_reviewed: 2026-08-05
+implementation_status: implemented
+last_reviewed: 2026-08-06
 ---
 
 # Admission и CycleInbox
+
+## Статус реализации
+
+IR-3 реализован поверх IR-1/IR-2 и подтверждён CI на code SHA
+`4929b703d7f6e200392661b2b66205b8fa4ca034`:
+
+- `Validate Input Runtime` run #73 — success, `181 passed`;
+- `Validate v0.4 file artifacts PR` run #497 — success;
+- every production `CommittedInputBatch` проходит `InputAdmissionService`;
+- второй committed batch во время `running` получает durable admission и FIFO
+  `CycleInboxItem` того же cycle, но не запускает второй `process_query()`;
+- deterministic no-parallel test подтверждает `process_query call count == 1`
+  при трёх последовательных additions;
+- duplicate/capacity/crash windows replay-safe и recoverable;
+- `WAITING_USER` временно использует compatibility adapter того же cycle.
+
+IR-3 заканчивается на admission/queue boundary. Queued additions ещё не
+применяются к LLM context: checkpoints, общий `CycleInputApplier` и context
+revisions относятся к IR-4. `/stop`, `/continue`, emissions и finalization
+barrier также ещё не реализованы.
 
 ## Назначение
 
@@ -52,11 +72,12 @@ Typed outcome:
 
 ```python
 class InputAdmissionOutcome(BaseModel):
-    admission_id: str
+    admission_id: str | None
     input_batch_id: str
     session_id: str
-    target_cycle_id: str
-    cycle_sequence: int
+    target_cycle_id: str | None
+    session_sequence: int | None
+    cycle_sequence: int | None
 
     action: Literal[
         "start_cycle",
@@ -65,11 +86,14 @@ class InputAdmissionOutcome(BaseModel):
         "queued_paused",
         "resume_interrupted",
         "duplicate",
+        "capacity_blocked",
     ]
 
     should_start_runner: bool
     should_wake_runner: bool
     user_projection_key: str
+    retryable: bool
+    reason_code: str
 ```
 
 ## Decision table

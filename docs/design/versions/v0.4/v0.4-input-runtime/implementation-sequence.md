@@ -13,13 +13,20 @@ last_reviewed: 2026-08-06
 
 - `IR-1 — Domain models, config и repository ports`: implemented;
 - `IR-2 — Filesystem repositories и coordination service`: implemented;
-- `IR-3`—`IR-10`: planned.
+- `IR-3 — Admission service и initial-cycle integration`: implemented;
+- `IR-4`—`IR-10`: planned.
 
-IR-1 и IR-2 подтверждены code HEAD
-`c7ed199deb0dfe042cff6055989a76e371537755`, workflow #67 и #494 и targeted
-suite `164 passed`. Эти этапы создают domain/config/repository и durable
-filesystem foundations, но не изменяют observable production behaviour:
-production admission и agent-loop integration начинаются с IR-3.
+IR-1—IR-3 подтверждены code HEAD
+`4929b703d7f6e200392661b2b66205b8fa4ca034`, workflow #73 и #497 и targeted
+suite `181 passed`. IR-3 подключил production filesystem composition и общий
+admission boundary: initial batch запускает один exact admitted cycle, а batches,
+пришедшие во время `running`, durable сохраняются в FIFO `CycleInbox` того же
+cycle и возвращают acknowledgement без второго `process_query()`.
+
+Общий update остаётся partial. IR-3 ещё не применяет additions к LLM context:
+safe checkpoints, общий `CycleInputApplier`, context revisions и active snapshot
+integration начинаются с IR-4. `/stop`, `/continue`, emissions, finalization
+barrier и startup recovery lifecycle также остаются planned.
 
 Финальный IR-2 pass дополнительно подтвердил crash-recoverable global identity
 protocol: durable record записывается до indexes, missing/dangling relations
@@ -325,6 +332,28 @@ Race/crash tests:
 
 # IR-3 — Admission service и initial-cycle integration
 
+## Статус
+
+Implemented и подтверждён CI на code SHA
+`4929b703d7f6e200392661b2b66205b8fa4ca034`:
+
+- `Validate Input Runtime` #73 — success, `181 passed`;
+- `Validate v0.4 file artifacts PR` #497 — success;
+- production composition создаёт filesystem repositories и
+  `InputAdmissionService` без import-time lifecycle tasks;
+- `MessageProcessor` заменил unconditional post-commit run на
+  `admit → start/resume/acknowledge`;
+- second batch during running получает sequences `1, 2, 3...`, durable FIFO inbox
+  и тот же `target_cycle_id`, а deterministic test фиксирует один вызов
+  `process_query()`;
+- duplicate, capacity block, admission/inbox crash и runner-start retry покрыты
+  replay-safe tests;
+- `WAITING_USER` продолжает тот же cycle через compatibility adapter;
+- `interrupted` получает typed wake intent без unsafe automatic replay.
+
+IR-3 не создаёт safe checkpoints и не применяет queued additions к LLM context.
+Эта ответственность остаётся у IR-4.
+
 ## Цель
 
 Every committed batch проходит `InputAdmissionService`. New input during active
@@ -388,6 +417,10 @@ Admission `start_cycle`:
 
 No second runner can be created for same active session.
 
+Фактическая IR-3 compatibility boundary выполняет allocation, durable state и
+exact-cycle runner start, но intentionally откладывает initial context revision и
+active snapshot ownership до IR-4 вместе с общим checkpoint/applier path.
+
 ## Running addition
 
 - persist admission + inbox item;
@@ -399,6 +432,10 @@ No second runner can be created for same active session.
 
 At first keep existing continuation mixin behind admission outcome. Do not remove
 until IR-4 parity.
+
+В IR-3 compatibility execution подключён только для `WAITING_USER`.
+`resume_interrupted` остаётся durable typed outcome и controlled wake intent без
+automatic replay внешнего действия; полный recovery принадлежит IR-8.
 
 ## SessionExecutionCoordinator migration
 

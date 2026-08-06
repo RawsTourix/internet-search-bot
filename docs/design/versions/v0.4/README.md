@@ -29,7 +29,7 @@ Application/hosting profiles определены в
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | implemented | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
-| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1/IR-2 implemented; IR-3—IR-10 planned: production admission, active-cycle apply, `/stop`/`/continue`, emissions и finalization barrier |
+| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1/IR-2/IR-3 implemented; IR-4—IR-10 planned: active-cycle apply, `/stop`/`/continue`, emissions, finalization barrier и recovery lifecycle |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Reusable `AgentRuntime`, Service Application composition, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
 | 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и profile-aware transport admission |
 
@@ -79,24 +79,40 @@ suites. Точный последний head и результаты run фик�
 [`../../../../reports/v0.4-transport-artifact-roast.md`](../../../../reports/v0.4-transport-artifact-roast.md),
 тематических README и описании PR.
 
-`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1 и IR-2
-реализованы и подтверждены CI: domain/config/ports foundation, durable filesystem
+`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1, IR-2 и IR-3
+реализованы и подтверждены CI.
+
+IR-1/IR-2 предоставляют domain/config/ports foundation, durable filesystem
 repositories, bounded coordination, atomic writes, session-local sequence repair,
 claims, global identity fencing и crash-recoverable indexes. Global
 create/append/prepare использует record-first writes; missing/dangling stable,
 relation и cycle-authority indexes восстанавливаются до competing create, а
 ambiguous durable identity возвращает managed consistency error.
 
-Финальный IR-2 evidence:
+IR-3 подключает эти repositories в production composition и маршрутизирует каждый
+immutable `CommittedInputBatch` через `InputAdmissionService`. Initial batch
+получает service-owned `cycle_id` и запускает один runner. Running additions
+получают durable admission, monotonic session/cycle sequence и FIFO
+`CycleInboxItem` того же cycle, после чего transport возвращает structured
+acknowledgement без второго `MCPClient.process_query()`.
 
-- code HEAD `c7ed199deb0dfe042cff6055989a76e371537755`;
-- `Validate Input Runtime` #67 — success;
-- `Validate v0.4 file artifacts PR` #494 — success;
-- targeted suite: `164 passed`.
+Duplicate admission replay-safe; capacity block typed/retryable и не удаляет
+committed batch; admission/inbox/runner-start crash windows имеют idempotent retry.
+`WAITING_USER` сохраняет same-cycle compatibility adapter, а `interrupted` не
+выполняет unsafe automatic replay.
 
-Этапы IR-3—IR-10, включая production admission, checkpoints, controls,
-emissions, finalization и recovery lifecycle, остаются planned. Observable
-production runtime behaviour пока не изменён.
+IR-3 evidence:
+
+- code HEAD `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- `Validate Input Runtime` #73 — success;
+- `Validate v0.4 file artifacts PR` #497 — success;
+- targeted suite: `181 passed`;
+- deterministic no-parallel test: три additions, один `target_cycle_id`,
+  `process_query call count == 1`.
+
+Этапы IR-4—IR-10 остаются planned. Additions уже durable admitted и queued, но
+ещё не применяются к LLM context. Safe checkpoints, controls, emissions,
+finalization barrier и startup recovery lifecycle отсутствуют.
 
 Целевой package вводит durable admission, additions в один active AgentCycle,
 safe checkpoints, линейные context revisions, `/stop`/`/continue`, durable
@@ -142,6 +158,8 @@ v0.4-storage-foundation
   admission, `CycleInbox`, checkpoints, pause/resume, emissions и terminal
   barrier. Пошаговая реализация находится в
   [`implementation-sequence.md`](v0.4-input-runtime/implementation-sequence.md).
+- IR-1—IR-3 уже реализованы; при анализе текущего baseline не следует приписывать
+  IR-4+ применение additions к контексту, controls, emissions или finalization.
 - `v0.4-runtime-modularization` меняет ownership, вводит reusable AgentRuntime,
   generic ports, явный Service Application composition и `ConfigProvider`;
   `mcp.config` становится compatibility filename, а `agent.config` — canonical

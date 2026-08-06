@@ -150,19 +150,38 @@ v0.4-input-runtime
 → v0.4-mcp-registry-foundation
 ```
 
-В `v0.4-input-runtime` реализованы и подтверждены CI foundation-этапы IR-1 и
-IR-2: domain models, enums, configuration, repository ports и durable filesystem
-repositories с atomic writes, bounded coordination, session-local admission
-repair, claims и root-global identity fencing. Все globally fenced
-create/append/prepare paths используют record-first crash protocol, а missing или
-dangling stable/relation/cycle indexes восстанавливаются authoritative scan до
-competing create. Финальный evidence: code HEAD `c7ed199deb0dfe042cff6055989a76e371537755`,
-`Validate Input Runtime` #67, `Validate v0.4 file artifacts PR` #494 и
-`164 passed` targeted tests.
+В `v0.4-input-runtime` реализованы и подтверждены CI этапы IR-1, IR-2 и IR-3.
+Domain/config/ports и durable filesystem repositories теперь подключены в
+production composition через `InputAdmissionService`.
 
-Production admission, checkpoints, `/stop`/`/continue`, emissions и finalization
-ещё не подключены. Поэтому новое observable production behaviour этому update
-пока не приписывается.
+Каждый immutable `CommittedInputBatch` проходит общий admission boundary.
+Initial input получает exact cycle identity, назначенную service, и запускает
+один runner. Addition во время `running` получает durable admission, monotonic
+session/cycle sequence и FIFO `CycleInboxItem` того же cycle; transport сразу
+возвращает structured acknowledgement, а второй `MCPClient.process_query()` не
+запускается. `SessionExecutionCoordinator` остаётся defensive in-process lease,
+wakeup/generation cache и diagnostics, но не durable queue.
+
+Duplicate replay возвращает существующую admission/inbox relation. Count/byte
+capacity block является typed и retryable; committed batch сохраняется для
+повторного admission. Record-first crash windows восстанавливают missing inbox,
+не выделяя новую sequence или новый cycle. `WAITING_USER` продолжает тот же cycle
+через временный compatibility adapter; `interrupted` не запускает unsafe
+automatic replay.
+
+IR-3 evidence:
+
+- code SHA `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- `Validate Input Runtime` #73 — success, `181 passed`;
+- `Validate v0.4 file artifacts PR` #497 — success;
+- deterministic no-parallel test: три additions, один target cycle,
+  `process_query call count == 1`.
+
+Общий update остаётся partial. Additions уже durable admitted и queued, но ещё не
+применяются к LLM context. Safe checkpoints, `CycleInputApplier`, context
+revisions и active snapshot integration начинаются с IR-4. `/stop`, `/continue`,
+intermediate emissions, finalization barrier и startup recovery lifecycle также
+ещё отсутствуют.
 
 Принятый target включает:
 
@@ -180,7 +199,7 @@ Production admission, checkpoints, `/stop`/`/continue`, emissions и finalizatio
 
 Текущий in-process Telegram FIFO dispatcher не подменяет этот runtime и не
 переживает restart. Текущий специальный WAITING_USER continuation является
-переходным foundation, а не общим active-cycle admission.
+переходным compatibility path до общего IR-4 applier.
 
 Каноническая спецификация:
 [`versions/v0.4/v0.4-input-runtime/README.md`](versions/v0.4/v0.4-input-runtime/README.md).
@@ -242,11 +261,11 @@ test или migration evidence.
 2. применяйте отмеченные реализованные updates v0.4;
 3. учитывайте `AF-24`–`AF-26` как implemented и accepted;
 4. учитывайте `v0.4-batch-workflows` как implemented и accepted;
-5. считайте IR-1 и IR-2 `v0.4-input-runtime` реализованными foundations, включая
-   crash-recoverable global identity indexes, но не приписывайте runtime behaviour
-   этапов IR-3—IR-10;
-6. не приписывайте durable active-cycle additions, `/stop`/`/continue` и
-   intermediate emissions текущему `feature` до реализации;
+5. считайте IR-1—IR-3 `v0.4-input-runtime` реализованными: каждый committed batch
+   admitted, initial batch запускает один cycle, running additions durable queued
+   в том же cycle без второго runner;
+6. не приписывайте применение additions к LLM context, safe checkpoints,
+   `/stop`/`/continue`, emissions и finalization текущему baseline до IR-4+;
 7. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
 8. не приписывайте scopes, trusted presentation, admission и remote handle
    lifecycle до `v0.4-mcp-registry-foundation`;

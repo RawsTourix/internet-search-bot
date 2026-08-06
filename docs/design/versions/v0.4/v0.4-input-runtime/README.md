@@ -11,15 +11,32 @@ last_reviewed: 2026-08-06
 
 ## Статус реализации
 
-`IR-1` и `IR-2` реализованы и подтверждены CI. Этапы `IR-3`—`IR-10` остаются
-planned.
+`IR-1`, `IR-2` и `IR-3` реализованы и подтверждены CI. Этапы `IR-4`—`IR-10`
+остаются planned, поэтому общий update сохраняет статус `partial`.
 
-Evidence для завершённого filesystem foundation:
+Evidence для завершённого admission foundation:
 
-- code HEAD: `c7ed199deb0dfe042cff6055989a76e371537755`;
-- `Validate Input Runtime` run #67 — success;
-- `Validate v0.4 file artifacts PR` run #494 — success;
-- targeted input-runtime и общий configuration audit: `164 passed`.
+- code HEAD: `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- `Validate Input Runtime` run #73 — success;
+- `Validate v0.4 file artifacts PR` run #497 — success;
+- targeted input-runtime и общий configuration audit: `181 passed`.
+
+IR-3 подключил IR-1/IR-2 repositories в production composition и ввёл общий
+`InputAdmissionService` для каждого immutable `CommittedInputBatch`. Initial batch
+получает назначенный admission service `cycle_id` и запускает ровно один runner.
+Второй batch во время `running` получает durable admission, monotonic sequence и
+FIFO `CycleInboxItem` того же cycle, возвращает structured acknowledgement и не
+вызывает второй `MCPClient.process_query()`.
+
+Duplicate replay возвращает существующую relation, capacity block является typed
+и retryable, а record-first crash windows admission/inbox/runner-start покрыты
+reconciliation tests. `WAITING_USER` временно сохраняет compatibility adapter;
+`interrupted` не выполняет unsafe automatic replay.
+
+Queued additions на IR-3 ещё не применяются к работающему LLM context. Safe
+checkpoints, общий input applier, context revisions и snapshot ownership относятся
+к IR-4. `/stop`, `/continue`, intermediate emissions, finalization barrier и
+startup recovery lifecycle также ещё не реализованы.
 
 IR-2 добавил filesystem implementations repository ports, атомарные записи,
 bounded reference-counted coordination, authoritative session-local
@@ -34,11 +51,6 @@ Global create/append/prepare paths теперь используют crash-recov
 record очищает незавершённую reservation, а неоднозначность возвращает managed
 consistency error. Crash после durable record и до любого или части indexes не
 создаёт второй record после restart.
-
-Production runtime behaviour пока не изменён: filesystem repositories не
-подключены к `Api`, committed batches ещё не проходят новый admission service,
-safe checkpoints, `/stop`/`/continue`, emissions и finalization barrier не
-подключены к рабочему agent loop.
 
 ## Назначение
 
