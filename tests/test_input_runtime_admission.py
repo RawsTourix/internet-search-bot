@@ -341,7 +341,7 @@ async def test_session_mismatch_and_cycle_authority_conflict_are_managed(tmp_pat
         tmp_path / "authority",
         first,
         second,
-        cycle_ids=["shared-cycle"],
+        cycle_ids=["shared-cycle", "shared-cycle"],
         repository_bundle=repos,
     )
     await svc_a.admit_committed_batch("first", session_id="session-a")
