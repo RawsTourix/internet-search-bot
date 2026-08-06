@@ -6,7 +6,13 @@ import json
 from typing import Any
 
 from ..agent.protocol import AgentAction
-from ..input_runtime import CheckpointName, CycleStatus
+from ..input_runtime import (
+    CheckpointAction,
+    CheckpointName,
+    CheckpointOutcome,
+    CycleStatus,
+    get_input_runtime_binding,
+)
 from .input_runtime_checkpoints import (
     _SuppressStaleCandidate,
     _checkpoint_active_cycle,
@@ -14,7 +20,7 @@ from .input_runtime_checkpoints import (
 
 
 class InputRuntimeCheckpointHardeningMixin:
-    """Remove stale candidates even when updates trail them, then persist it."""
+    """Fence authority, suppress stale candidates, and order terminal sync."""
 
     @staticmethod
     def _is_input_batch_update(message: dict[str, Any]) -> bool:
@@ -75,6 +81,71 @@ class InputRuntimeCheckpointHardeningMixin:
             return
         active_cycle.messages_for_llm.pop(entry[0])
 
+    async def _run_input_checkpoint(
+        self,
+        checkpoint: CheckpointName,
+        *,
+        active_cycle: Any | None = None,
+        desired_status: CycleStatus | None = None,
+        waiting_question: str | None = None,
+        interruption_reason: str | None = None,
+        apply_input: bool = True,
+        terminal_sync: bool = False,
+    ):
+        service = self._checkpoint_service()
+        active_cycle = active_cycle or _checkpoint_active_cycle.get()
+        if service is None or active_cycle is None:
+            return None
+        binding = get_input_runtime_binding()
+        if binding is None:
+            return CheckpointOutcome(
+                checkpoint=checkpoint,
+                action=CheckpointAction.INTERRUPT,
+                reason_code="input_runtime_binding_missing",
+            )
+        state = await binding.repositories.sessions.get(active_cycle.session_id)
+        if state is None:
+            return CheckpointOutcome(
+                checkpoint=checkpoint,
+                action=CheckpointAction.INTERRUPT,
+                reason_code="checkpoint_session_state_missing",
+            )
+        if state.active_cycle_id != active_cycle.cycle_id:
+            return CheckpointOutcome(
+                checkpoint=checkpoint,
+                action=CheckpointAction.INTERRUPT,
+                reason_code="checkpoint_active_cycle_mismatch",
+            )
+        runner_generation = int(
+            getattr(active_cycle, "input_runtime_generation", -1)
+        )
+        if runner_generation != state.generation:
+            return CheckpointOutcome(
+                checkpoint=checkpoint,
+                action=CheckpointAction.INTERRUPT,
+                reason_code="checkpoint_runner_generation_stale",
+            )
+        if (
+            checkpoint == CheckpointName.BEFORE_TERMINAL_COMMIT
+            and desired_status in {CycleStatus.DONE, CycleStatus.ERROR}
+            and not terminal_sync
+        ):
+            desired_status = CycleStatus.RUNNING
+        self._drop_internal_resume_message(active_cycle)
+        outcome = await service.run_checkpoint(
+            checkpoint=checkpoint,
+            active_cycle=active_cycle,
+            desired_status=desired_status,
+            waiting_question=waiting_question,
+            interruption_reason=interruption_reason,
+            apply_input=apply_input,
+            terminal_sync=terminal_sync,
+        )
+        if outcome.action == CheckpointAction.INTERRUPT:
+            active_cycle.status = "interrupted"
+            active_cycle.interruption_reason = outcome.reason_code
+        return outcome
+
     async def _persist_suppressed_candidate(
         self,
         *,
@@ -102,19 +173,24 @@ class InputRuntimeCheckpointHardeningMixin:
             raise
 
     async def _emit_progress_event(self, *args: Any, **kwargs: Any):
-        checkpoint = None
         event_type = kwargs.get("event_type")
+        active_cycle = _checkpoint_active_cycle.get()
+        checkpoint = None
         if event_type == "waiting_user":
             checkpoint = CheckpointName.BEFORE_WAITING
         elif event_type in {"cycle_done", "cycle_error"}:
             checkpoint = CheckpointName.BEFORE_TERMINAL_COMMIT
+
         try:
-            return await super()._emit_progress_event(*args, **kwargs)
+            result = await super()._emit_progress_event(*args, **kwargs)
         except _SuppressStaleCandidate:
-            active_cycle = _checkpoint_active_cycle.get()
             if checkpoint is not None and active_cycle is not None:
                 await self._persist_suppressed_candidate(
                     checkpoint=checkpoint,
                     active_cycle=active_cycle,
                 )
             raise
+
+        # Terminal status is synchronized by InputAdmissionService only after
+        # the existing status/output compatibility operations have succeeded.
+        return result

@@ -6,8 +6,10 @@ from .admission import (
     InputAdmissionAction,
     InputAdmissionOutcome,
 )
-from .applier import CycleInputApplier
-from .checkpoints import InputRuntimeCheckpointService
+from .ir4_checkpoint_contracts import (
+    CancellationSafeCycleInputApplier as CycleInputApplier,
+    EntryWatermarkCheckpointService as InputRuntimeCheckpointService,
+)
 from .composition import (
     InputRuntimeApplicationBinding,
     clear_input_runtime_binding_for_tests,

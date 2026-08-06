@@ -4,12 +4,14 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .applier import CycleInputApplier
-from .checkpoint_hardening import DurableContextCheckpointService
 from .composition import register_input_runtime_binding
 from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
-from .models import AdmissionKind, AdmissionState
+from .ir4_checkpoint_contracts import (
+    CancellationSafeCycleInputApplier,
+    EntryWatermarkCheckpointService,
+)
+from .models import AdmissionKind, AdmissionState, CheckpointAction, CycleStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,13 +28,13 @@ class InputAdmissionService(_IR3InputAdmissionService):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.cycle_input_applier = CycleInputApplier(
+        self.cycle_input_applier = CancellationSafeCycleInputApplier(
             config=self.config,
             repositories=self.repositories,
             committed_batches=self.committed_batches,
             clock=self.clock,
         )
-        self.checkpoint_service = DurableContextCheckpointService(
+        self.checkpoint_service = EntryWatermarkCheckpointService(
             applier=self.cycle_input_applier
         )
         self.application_binding = register_input_runtime_binding(
@@ -40,6 +42,35 @@ class InputAdmissionService(_IR3InputAdmissionService):
             repositories=self.repositories,
             committed_batches=self.committed_batches,
             checkpoint_service=self.checkpoint_service,
+        )
+
+    async def complete_runtime_handoff(
+        self,
+        admission,
+        *,
+        handoff_token: str,
+    ):
+        """Sync terminal snapshot only after status/output compatibility."""
+        state = await self.repositories.sessions.get(admission.session_id)
+        if (
+            state is not None
+            and state.active_cycle_id == admission.target_cycle_id
+            and state.generation == admission.admitted_generation
+            and state.cycle_status in {CycleStatus.DONE, CycleStatus.ERROR}
+        ):
+            outcome = await self.checkpoint_service.sync_terminal_snapshot(
+                session_id=admission.session_id,
+                cycle_id=admission.target_cycle_id,
+                generation=admission.admitted_generation,
+                status=state.cycle_status,
+            )
+            if outcome.action == CheckpointAction.INTERRUPT:
+                raise InputRuntimeConflictError(
+                    outcome.reason_code or "terminal snapshot synchronization failed"
+                )
+        return await super().complete_runtime_handoff(
+            admission,
+            handoff_token=handoff_token,
         )
 
     async def mark_runtime_handoff_ambiguous(
@@ -52,7 +83,7 @@ class InputAdmissionService(_IR3InputAdmissionService):
         """Persist ambiguity and retain a bounded applying-range evidence.
 
         This is recovery evidence only: it never installs context or marks any
-        input applied.  A later checkpoint sees the ambiguous marker and stops
+        input applied. A later checkpoint sees the ambiguous marker and stops
         instead of blindly replaying the range.
         """
         marker = await super().mark_runtime_handoff_ambiguous(
