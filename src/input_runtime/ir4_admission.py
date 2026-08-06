@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .applier import CycleInputApplier
-from .checkpoints import InputRuntimeCheckpointService
+from .checkpoint_hardening import DurableContextCheckpointService
 from .composition import register_input_runtime_binding
 from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
@@ -32,7 +32,7 @@ class InputAdmissionService(_IR3InputAdmissionService):
             committed_batches=self.committed_batches,
             clock=self.clock,
         )
-        self.checkpoint_service = InputRuntimeCheckpointService(
+        self.checkpoint_service = DurableContextCheckpointService(
             applier=self.cycle_input_applier
         )
         self.application_binding = register_input_runtime_binding(
