@@ -1,9 +1,11 @@
-"""IR-4 admission facade: explicit composition and common FIFO waiting apply."""
+"""IR-4 admission facade and thin WAITING compatibility boundary."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from .applier import CycleInputApplier
+from .checkpoints import InputRuntimeCheckpointService
 from .composition import register_input_runtime_binding
 from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
@@ -24,14 +26,63 @@ class InputAdmissionService(_IR3InputAdmissionService):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        register_input_runtime_binding(
+        self.cycle_input_applier = CycleInputApplier(
             config=self.config,
             repositories=self.repositories,
             committed_batches=self.committed_batches,
+            clock=self.clock,
+        )
+        self.checkpoint_service = InputRuntimeCheckpointService(
+            applier=self.cycle_input_applier
+        )
+        self.application_binding = register_input_runtime_binding(
+            config=self.config,
+            repositories=self.repositories,
+            committed_batches=self.committed_batches,
+            checkpoint_service=self.checkpoint_service,
         )
 
+    async def mark_runtime_handoff_ambiguous(
+        self,
+        admission,
+        *,
+        handoff_token: str,
+        error_code: str,
+    ):
+        """Persist ambiguity and retain a bounded applying-range evidence.
+
+        This is recovery evidence only: it never installs context or marks any
+        input applied.  A later checkpoint sees the ambiguous marker and stops
+        instead of blindly replaying the range.
+        """
+        marker = await super().mark_runtime_handoff_ambiguous(
+            admission,
+            handoff_token=handoff_token,
+            error_code=error_code,
+        )
+        if admission.admission_kind != AdmissionKind.RESUME_WAITING:
+            return marker
+        state = await self.repositories.sessions.get(admission.session_id)
+        if (
+            state is None
+            or state.active_cycle_id != admission.target_cycle_id
+            or state.generation != admission.admitted_generation
+        ):
+            return marker
+        claim = await self.repositories.inbox.claim_contiguous_range(
+            admission.target_cycle_id,
+            generation=admission.admitted_generation,
+            after_sequence=state.active_cycle_applied_through_sequence,
+            max_items=self.config.max_batches_per_checkpoint,
+            max_bytes=self.config.max_batch_bytes_per_checkpoint,
+            lease_seconds=self.config.claim_lease_seconds,
+        )
+        if claim is not None:
+            await self.repositories.inbox.mark_applying(claim)
+        return marker
+
     async def begin_waiting_compatibility_apply(self, admission):
-        """Defer semantic apply to CP-RESUME instead of claiming reply alone."""
+        """Defer semantic ordering and mutation to the common CP-RESUME path."""
         if admission.admission_kind != AdmissionKind.RESUME_WAITING:
             raise InputRuntimeConflictError(
                 "only WAITING_USER admission may use compatibility resume"
@@ -56,7 +107,7 @@ class InputAdmissionService(_IR3InputAdmissionService):
         )
 
     async def complete_waiting_compatibility_apply(self, claim) -> None:
-        """The common checkpoint applier owns all durable apply transitions."""
+        """Require evidence that CP-RESUME applied the reply through FIFO."""
         if claim is None:
             return
         current = await self.repositories.admissions.get_by_input_batch_id(
@@ -73,5 +124,5 @@ class InputAdmissionService(_IR3InputAdmissionService):
         *,
         error_code: str,
     ) -> None:
-        """No claim exists before handoff; queued inbox remains authoritative."""
+        """No compatibility claim exists; durable inbox state is unchanged."""
         return None
