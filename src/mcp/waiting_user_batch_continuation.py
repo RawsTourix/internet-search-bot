@@ -20,13 +20,17 @@ _suspended_cycle_batch_continuation: ContextVar[str | None] = ContextVar(
 _RESUMABLE_CYCLE_STATUSES = frozenset({"waiting_user", "interrupted"})
 
 
+def is_suspended_batch_continuation() -> bool:
+    return _suspended_cycle_batch_continuation.get() is not None
+
+
 class WaitingUserBatchContinuationMixin:
     """Keep legacy callers working while IR-4 owns semantic FIFO apply.
 
     The compatibility layer only identifies a resume invocation.  It does not
-    choose ordering, append the reply, replace the initial batch identity, or
-    activate its artifacts directly.  CP-RESUME and CycleInputApplier own those
-    transitions for all queued additions.
+    choose ordering, append the reply semantically, replace the initial batch
+    identity, or activate its artifacts directly.  CP-RESUME removes the legacy
+    envelope and CycleInputApplier owns all queued additions.
     """
 
     async def process_query(self, *args: Any, **kwargs: Any):
@@ -69,9 +73,6 @@ class WaitingUserBatchContinuationMixin:
                 progress_callback=progress_callback,
             )
 
-        # Hide the continuation package from the legacy artifact activation
-        # path.  The common FIFO applier will activate every earlier batch and
-        # this reply in cycle_sequence order.
         batch_token = set_artifact_request_input_batch(None)
         try:
             return super()._activate_manager_context(
