@@ -58,9 +58,22 @@ class DurableContextCheckpointService(InputRuntimeCheckpointService):
                     and active_through
                     == snapshot.applied_through_cycle_sequence
                 ):
-                    validate_openai_tool_sequence(
-                        active_cycle.messages_for_llm
-                    )
+                    try:
+                        validate_openai_tool_sequence(
+                            active_cycle.messages_for_llm
+                        )
+                    except Exception:
+                        return CheckpointOutcome(
+                            checkpoint=checkpoint,
+                            action=CheckpointAction.INTERRUPT,
+                            context_revision_id=(
+                                snapshot.active_context_revision_id
+                            ),
+                            applied_through_cycle_sequence=(
+                                snapshot.applied_through_cycle_sequence
+                            ),
+                            reason_code="invalid_active_message_sequence",
+                        )
                     synced = await self._persist_checkpoint_snapshot(
                         checkpoint=checkpoint,
                         active_cycle=active_cycle,
