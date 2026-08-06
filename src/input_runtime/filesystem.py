@@ -47,7 +47,6 @@ class FileSystemInputRuntimeRepositories:
             root=root,
             locks=locks,
         )
-        self.sessions.runtime_handoffs = self.handoffs
         self.controls = FileSystemSessionControlRepository(
             root=root,
             locks=locks,

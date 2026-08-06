@@ -32,16 +32,9 @@ class InputRuntimeRepositories:
     context_revisions: ContextRevisionRepository
     emissions: AgentEmissionRepository
     finalizations: FinalizationRepository
-    handoffs: RuntimeHandoffRepository | None = None
+    handoffs: RuntimeHandoffRepository
     coordination_root: Path | None = None
     coordination_locks: SessionLockRegistry | None = None
-
-    def __post_init__(self) -> None:
-        if self.handoffs is not None:
-            return
-        inherited = getattr(self.sessions, "runtime_handoffs", None)
-        if inherited is not None:
-            object.__setattr__(self, "handoffs", inherited)
 
 
 # Preferred application-layer name; retain the IR-1 name for compatibility.

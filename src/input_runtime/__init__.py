@@ -6,6 +6,14 @@ from .admission import (
     InputAdmissionAction,
     InputAdmissionOutcome,
 )
+from .applier import CycleInputApplier
+from .checkpoints import InputRuntimeCheckpointService
+from .composition import (
+    InputRuntimeApplicationBinding,
+    clear_input_runtime_binding_for_tests,
+    get_input_runtime_binding,
+    register_input_runtime_binding,
+)
 from .config import (
     InputRuntimeConfigType,
     load_input_runtime_config,
@@ -38,6 +46,11 @@ from .models import (
     new_context_revision_id, new_control_id, new_emission_id,
     new_finalization_id, new_inbox_item_id,
 )
-from .hardened_service import InputAdmissionService
+from .ir4_admission import InputAdmissionService
+from .projection import (
+    build_input_batch_update,
+    build_input_batch_update_message,
+    project_committed_batch,
+)
 
 __all__ = [name for name in globals() if not name.startswith("_")]
