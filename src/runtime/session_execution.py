@@ -1,9 +1,9 @@
 """Strict in-process execution ordering for one agent session.
 
-This is deliberately smaller than the future CycleInbox. It provides the
-baseline guarantees needed by current transports: committed batches enter one
-FIFO lane per session, while a second lease immediately around the agent
-runtime protects callers which bypass that lane.
+The durable CycleInbox is authoritative for committed additions. This
+coordinator remains an in-process defensive runner lease, generation fence,
+wake-up mechanism and diagnostic cache. Its historical FIFO lane is retained
+for compatibility callers which have not yet migrated.
 """
 
 from __future__ import annotations
@@ -55,6 +55,8 @@ class _SessionLane:
     queue: deque[_QueuedRun] = field(default_factory=deque)
     worker: asyncio.Task[None] | None = None
     run_lease: asyncio.Lock = field(default_factory=asyncio.Lock)
+    wake_event: asyncio.Event = field(default_factory=asyncio.Event)
+    reserved_cycle_id: str | None = None
     active_cycle_id: str | None = None
     active_input_batch_id: str | None = None
     run_started_at_monotonic: float | None = None
@@ -63,7 +65,7 @@ class _SessionLane:
 
 
 class SessionExecutionCoordinator:
-    """Own a FIFO committed-batch lane and defensive run lease per session."""
+    """Own defensive runner leases and compatibility FIFO lanes per session."""
 
     def __init__(self) -> None:
         self._lanes: dict[str, _SessionLane] = {}
@@ -84,6 +86,7 @@ class SessionExecutionCoordinator:
         input_batch_id: str,
         operation: RunOperation,
     ) -> Any:
+        """Compatibility FIFO lane; not authoritative for IR-3 additions."""
         session_id = self._session_id(session_id)
         input_batch_id = input_batch_id.strip()
         if not input_batch_id:
@@ -152,6 +155,77 @@ class SessionExecutionCoordinator:
                         lane.runtime_status = "idle"
 
     @asynccontextmanager
+    async def admitted_run_lease(
+        self,
+        *,
+        session_id: str,
+        input_batch_id: str,
+        cycle_id: str,
+    ) -> AsyncIterator[bool]:
+        """Reserve one admitted cycle without waiting behind a duplicate runner.
+
+        The reservation is set under the coordinator guard before the asyncio
+        lock is awaited. A concurrent replay therefore receives ``False``
+        instead of waiting and launching the same AgentCycle after the first
+        runner exits.
+        """
+
+        session_id = self._session_id(session_id)
+        input_batch_id = input_batch_id.strip()
+        cycle_id = cycle_id.strip()
+        if not input_batch_id or not cycle_id:
+            raise ValueError("input_batch_id and cycle_id are required")
+
+        generation = 0
+        reserved = False
+        async with self._guard:
+            if self._closing:
+                raise RuntimeError("session execution coordinator is shutting down")
+            lane = self._lanes.setdefault(session_id, _SessionLane())
+            generation = lane.generation
+            if (
+                lane.reserved_cycle_id is None
+                and lane.active_cycle_id is None
+                and not lane.run_lease.locked()
+            ):
+                lane.reserved_cycle_id = cycle_id
+                lane.active_cycle_id = cycle_id
+                lane.active_input_batch_id = input_batch_id
+                lane.run_started_at_monotonic = time.monotonic()
+                lane.runtime_status = "starting"
+                lane.stop_requested = False
+                reserved = True
+
+        if not reserved:
+            yield False
+            return
+
+        try:
+            async with lane.run_lease:
+                async with self._guard:
+                    if generation != lane.generation:
+                        raise SessionExecutionReset(
+                            "admitted runner was invalidated before lease acquisition"
+                        )
+                    if lane.reserved_cycle_id != cycle_id:
+                        raise SessionExecutionReset(
+                            "admitted runner reservation was lost"
+                        )
+                    lane.runtime_status = "running"
+                    lane.run_started_at_monotonic = time.monotonic()
+                    lane.wake_event.clear()
+                yield True
+        finally:
+            async with self._guard:
+                if lane.reserved_cycle_id == cycle_id:
+                    lane.reserved_cycle_id = None
+                if lane.active_cycle_id == cycle_id:
+                    lane.active_cycle_id = None
+                    lane.active_input_batch_id = None
+                    lane.run_started_at_monotonic = None
+                    lane.runtime_status = "idle"
+
+    @asynccontextmanager
     async def run_lease(
         self,
         *,
@@ -159,7 +233,7 @@ class SessionExecutionCoordinator:
         input_batch_id: str | None = None,
         cycle_id: str | None = None,
     ) -> AsyncIterator[None]:
-        """Serialize the final call into the LLM/tool cycle runtime."""
+        """Serialize a compatibility call into the LLM/tool cycle runtime."""
 
         session_id = self._session_id(session_id)
         async with self._guard:
@@ -175,6 +249,7 @@ class SessionExecutionCoordinator:
                 lane.run_started_at_monotonic = time.monotonic()
                 lane.runtime_status = "running"
                 lane.active_cycle_id = cycle_id
+                lane.wake_event.clear()
             try:
                 yield
             finally:
@@ -184,6 +259,44 @@ class SessionExecutionCoordinator:
                         lane.active_input_batch_id = None
                         lane.run_started_at_monotonic = None
                         lane.runtime_status = "idle"
+
+    async def wake(self, session_id: str, *, cycle_id: str) -> bool:
+        """Signal the current in-process runner after durable inbox admission."""
+
+        session_id = self._session_id(session_id)
+        cycle_id = cycle_id.strip()
+        if not cycle_id:
+            raise ValueError("cycle_id must not be empty")
+        async with self._guard:
+            lane = self._lanes.setdefault(session_id, _SessionLane())
+            matches = cycle_id in {
+                lane.reserved_cycle_id,
+                lane.active_cycle_id,
+            }
+            lane.wake_event.set()
+            return matches
+
+    async def wait_for_wakeup(
+        self,
+        session_id: str,
+        *,
+        timeout: float | None = None,
+    ) -> bool:
+        """Future checkpoint seam; IR-3 only produces the wake signal."""
+
+        session_id = self._session_id(session_id)
+        async with self._guard:
+            lane = self._lanes.setdefault(session_id, _SessionLane())
+            event = lane.wake_event
+        try:
+            if timeout is None:
+                await event.wait()
+            else:
+                await asyncio.wait_for(event.wait(), timeout=timeout)
+        except asyncio.TimeoutError:
+            return False
+        event.clear()
+        return True
 
     async def snapshot(self, session_id: str) -> SessionExecutionSnapshot:
         session_id = self._session_id(session_id)
@@ -219,6 +332,7 @@ class SessionExecutionCoordinator:
             lane = self._lanes.setdefault(session_id, _SessionLane())
             changed = not lane.stop_requested
             lane.stop_requested = True
+            lane.wake_event.set()
             return changed
 
     async def reset_session(self, session_id: str) -> int:
@@ -229,6 +343,7 @@ class SessionExecutionCoordinator:
             lane = self._lanes.setdefault(session_id, _SessionLane())
             lane.generation += 1
             lane.stop_requested = True
+            lane.wake_event.set()
             cancelled = list(lane.queue)
             lane.queue.clear()
             generation = lane.generation
@@ -256,6 +371,7 @@ class SessionExecutionCoordinator:
             ]
             for lane in self._lanes.values():
                 lane.queue.clear()
+                lane.wake_event.set()
         for item in queued:
             if not item.future.done():
                 item.future.cancel()

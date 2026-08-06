@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from pathlib import Path
 
 from src.storage import StorageConfigType
 
 from .config import InputRuntimeConfigType
+from .coordination import SessionLockRegistry
 from .interfaces import (
     ActiveCycleSnapshotRepository,
     AgentEmissionRepository,
@@ -29,6 +31,12 @@ class InputRuntimeRepositories:
     context_revisions: ContextRevisionRepository
     emissions: AgentEmissionRepository
     finalizations: FinalizationRepository
+    coordination_root: Path | None = None
+    coordination_locks: SessionLockRegistry | None = None
+
+
+# Preferred application-layer name; retain the IR-1 name for compatibility.
+InputRuntimeRepositoryBundle = InputRuntimeRepositories
 
 
 @dataclass(frozen=True, slots=True)
@@ -50,7 +58,7 @@ def create_filesystem_input_runtime_repositories(
     *,
     storage_config: StorageConfigType,
 ) -> InputRuntimeRepositories:
-    """Build durable filesystem adapters without connecting them to the API."""
+    """Build durable filesystem adapters without module-level side effects."""
     from .filesystem import FileSystemInputRuntimeRepositories
 
     adapters = FileSystemInputRuntimeRepositories(storage_config)
@@ -63,4 +71,6 @@ def create_filesystem_input_runtime_repositories(
         context_revisions=adapters.context_revisions,
         emissions=adapters.emissions,
         finalizations=adapters.finalizations,
+        coordination_root=adapters.root,
+        coordination_locks=adapters.locks,
     )

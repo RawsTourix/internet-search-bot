@@ -11,6 +11,7 @@ from .session_ids import resolve_message_session_id
 from ..api.api import API
 from ..api.session_reset import reset_runtime_session
 from ..ingress import CommittedInputBatch, legacy_message_to_input_envelope
+from ..input_runtime import InputAdmissionAction, InputAdmissionOutcome
 from ..localization.models import LocalizationMessage
 
 
@@ -38,9 +39,9 @@ if not logger.handlers:
 class MessageProcessor:
     """Central compatibility boundary for messages and committed batches.
 
-    Legacy text messages are normalized into the same durable ingress contract
-    as files. Commands remain explicit control boundaries until the full
-    ``v0.4-input-runtime`` admission/control layer replaces this wrapper.
+    Every production committed batch now crosses the IR-3 admission boundary.
+    Collection commands remain explicit ingress controls; additions accepted
+    during a running cycle return immediately instead of starting a second one.
     """
 
     def __init__(self):
@@ -89,7 +90,7 @@ class MessageProcessor:
     ) -> UnifiedResponse:
         try:
             self._record_request(batch.client_type)
-            result = await API.call_agent_batch(
+            content, metadata = await self._admit_and_route_batch(
                 batch.input_batch_id,
                 session_id=batch.session_id,
                 progress_callback=progress_callback,
@@ -98,9 +99,9 @@ class MessageProcessor:
             return UnifiedResponse(
                 message_id=batch.input_batch_id,
                 client_type=batch.client_type,
-                content=result.content,
+                content=content,
                 response_type=MessageType.TEXT,
-                metadata=self._agent_result_metadata(result),
+                metadata=metadata,
             )
         except Exception as error:
             logger.error(
@@ -116,6 +117,110 @@ class MessageProcessor:
                 response_type=MessageType.TEXT,
                 metadata={"input_batch_id": batch.input_batch_id},
             )
+
+    async def _admit_and_route_batch(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+        progress_callback=None,
+        progress_locale: str = "ru",
+    ) -> tuple[str, dict[str, Any]]:
+        """Admit first, then start/resume only when the outcome permits it."""
+        input_runtime_config = getattr(API, "input_runtime_config", None)
+        if input_runtime_config is not None and not input_runtime_config.enabled:
+            result = await API.call_agent_batch(
+                input_batch_id,
+                session_id=session_id,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+            )
+            return result.content, self._agent_result_metadata(result)
+
+        outcome = await API.admit_committed_batch(
+            input_batch_id,
+            session_id=session_id,
+        )
+        outcome_metadata = outcome.model_dump(
+            mode="json",
+            exclude={"admission"},
+        )
+        metadata: dict[str, Any] = {
+            "input_batch_id": input_batch_id,
+            "admission_outcome": outcome_metadata,
+            **outcome_metadata,
+        }
+
+        result = None
+        if outcome.should_start_runner:
+            result = await API.start_admitted_cycle(
+                outcome,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+            )
+        elif outcome.action in {
+            InputAdmissionAction.RESUME_WAITING,
+            InputAdmissionAction.DUPLICATE,
+        } and outcome.should_wake_runner:
+            result = await API.resume_admitted_cycle(
+                outcome,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+            )
+
+        if result is not None:
+            metadata.update(self._agent_result_metadata(result))
+            return result.content, metadata
+        return self._render_admission_outcome(
+            outcome,
+            locale=progress_locale,
+        ), metadata
+
+    @staticmethod
+    def _render_admission_outcome(
+        outcome: InputAdmissionOutcome,
+        *,
+        locale: str,
+    ) -> str:
+        english = locale.lower().strip().startswith("en")
+        sequence = outcome.cycle_sequence or 0
+        if outcome.action == InputAdmissionAction.QUEUED_RUNNING:
+            return (
+                f"Addition #{sequence} was accepted and is waiting to be applied."
+                if english
+                else f"Дополнение №{sequence} принято и ожидает применения."
+            )
+        if outcome.action == InputAdmissionAction.RESUME_WAITING:
+            return (
+                "The reply was accepted; resuming the current cycle was requested."
+                if english
+                else "Ответ принят; запрошено возобновление текущего цикла."
+            )
+        if outcome.action == InputAdmissionAction.QUEUED_PAUSED:
+            return (
+                "The addition was accepted while the cycle is paused."
+                if english
+                else "Дополнение принято во время паузы."
+            )
+        if outcome.action == InputAdmissionAction.RESUME_INTERRUPTED:
+            return (
+                "The addition was accepted; controlled cycle recovery was requested."
+                if english
+                else "Дополнение принято; запрошено управляемое восстановление цикла."
+            )
+        if outcome.action == InputAdmissionAction.CAPACITY_BLOCKED:
+            return (
+                "The additions queue is temporarily full. Please retry this committed batch."
+                if english
+                else "Очередь дополнений временно заполнена. Пакет можно повторно принять позже."
+            )
+        if outcome.action == InputAdmissionAction.DUPLICATE:
+            return (
+                "This input batch has already been accepted."
+                if english
+                else "Этот входной пакет уже был принят."
+            )
+        return "Request accepted." if english else "Запрос принят."
 
     def _record_request(self, client_type: ClientType) -> None:
         self.stats["total_messages"] += 1
@@ -162,7 +267,6 @@ class MessageProcessor:
                 if presentation_text is not None and (
                     submission.state == "collecting"
                     or submission.committed_batch is None
-                    or submission.duplicate
                 ):
                     response_content = presentation_text
                 elif submission.state == "collecting":
@@ -175,20 +279,19 @@ class MessageProcessor:
                         "Сообщение принято, но входной пакет пока не готов к "
                         "обработке."
                     )
-                elif submission.duplicate:
-                    response_content = (
-                        "Это сообщение уже было принято ранее; повторный запуск "
-                        "агента пропущен."
-                    )
                 else:
-                    result = await API.call_agent_batch(
-                        submission.input_batch_id,
-                        session_id=session_id,
-                        progress_callback=progress_callback,
-                        progress_locale=metadata.get("progress_locale", "ru"),
+                    response_content, admission_metadata = (
+                        await self._admit_and_route_batch(
+                            submission.input_batch_id,
+                            session_id=session_id,
+                            progress_callback=progress_callback,
+                            progress_locale=metadata.get(
+                                "progress_locale",
+                                "ru",
+                            ),
+                        )
                     )
-                    response_content = result.content
-                    response_metadata.update(self._agent_result_metadata(result))
+                    response_metadata.update(admission_metadata)
             except Exception as error:
                 response_content = f"Сообщение не обработано: {error}"
 
@@ -300,6 +403,22 @@ class MessageProcessor:
                 "• Время текущего цикла: "
                 + self._format_duration(execution.run_seconds)
             )
+
+        input_state = None
+        input_repositories = getattr(API, "input_runtime_repositories", None)
+        if input_repositories is not None:
+            try:
+                input_state = await input_repositories.sessions.get(session_id)
+            except Exception:
+                input_state = None
+        if input_state is not None:
+            lines.extend([
+                f"• Input runtime: {input_state.cycle_status.value}",
+                "• Accepted sequence: "
+                f"{input_state.active_cycle_accepted_through_sequence}",
+                "• Applied sequence: "
+                f"{input_state.active_cycle_applied_through_sequence}",
+            ])
 
         state = getattr(API.mcp_client, "session_states", {}).get(session_id)
         memory = getattr(API.mcp_client, "sessions", {}).get(session_id)

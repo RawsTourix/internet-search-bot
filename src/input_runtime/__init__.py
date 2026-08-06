@@ -1,5 +1,11 @@
 """Public facade for v0.4 input-runtime contracts."""
 
+from .admission import (
+    AdmissionWakeCoordinator,
+    CommittedInputBatchReader,
+    InputAdmissionAction,
+    InputAdmissionOutcome,
+)
 from .config import (
     InputRuntimeConfigType,
     load_input_runtime_config,
@@ -16,6 +22,7 @@ from .errors import (
 from .factory import (
     InputRuntimeContracts,
     InputRuntimeRepositories,
+    InputRuntimeRepositoryBundle,
     create_filesystem_input_runtime_repositories,
     create_input_runtime_contracts,
 )
@@ -24,10 +31,11 @@ from .models import (
     CheckpointAction, CheckpointName, CheckpointOutcome, ClaimedInboxRange,
     ControlCommandType, ControlOutcome, ControlState, CycleContextRevision,
     CycleFinalizationRecord, CycleInboxItem, CycleStatus, EmissionState,
-    FinalizationState, InboxState, InputAdmissionOutcome, InputAdmissionRecord,
+    FinalizationState, InboxState, InputAdmissionRecord,
     SessionControlCommand, SessionInputRuntimeState, new_admission_id,
     new_context_revision_id, new_control_id, new_emission_id,
     new_finalization_id, new_inbox_item_id,
 )
+from .service import InputAdmissionService
 
 __all__ = [name for name in globals() if not name.startswith("_")]

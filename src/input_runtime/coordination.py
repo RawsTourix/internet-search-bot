@@ -21,10 +21,12 @@ class _Entry:
 
 
 class SessionLockRegistry:
-    """Bounded registry for root-identity and session coordination locks.
+    """Bounded registry for root identity and session coordination locks.
 
-    Lock ordering is always root identity first, then session. Callers must not
-    acquire them in the opposite order.
+    Repository lock ordering is always root identity first, then session.
+    Admission services use a distinct application lock key, so they may hold
+    one admission decision boundary while repositories acquire their normal
+    root/session locks without re-entering the same asyncio lock.
     """
 
     def __init__(self, *, max_entries: int = 1024) -> None:
@@ -39,6 +41,12 @@ class SessionLockRegistry:
 
     def _session_key(self, root: Path, session_id: str) -> tuple[str, str]:
         return (str(root.resolve()), f"session:{storage_key(session_id)}")
+
+    def _admission_key(self, root: Path, session_id: str) -> tuple[str, str]:
+        return (
+            str(root.resolve()),
+            f"admission-session:{storage_key(session_id)}",
+        )
 
     def _validate_entry_locked(self, entry: _Entry) -> None:
         if min(entry.references, entry.waiters, entry.owners) < 0:
@@ -146,6 +154,16 @@ class SessionLockRegistry:
     @asynccontextmanager
     async def hold(self, root: Path, session_id: str) -> AsyncIterator[None]:
         async with self._hold_key(self._session_key(root, session_id)):
+            yield
+
+    @asynccontextmanager
+    async def hold_admission(
+        self,
+        root: Path,
+        session_id: str,
+    ) -> AsyncIterator[None]:
+        """Serialize one complete capacity/allocate/inbox admission boundary."""
+        async with self._hold_key(self._admission_key(root, session_id)):
             yield
 
     @asynccontextmanager

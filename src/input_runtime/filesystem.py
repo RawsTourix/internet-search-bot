@@ -31,6 +31,8 @@ class FileSystemInputRuntimeRepositories:
         locks: SessionLockRegistry = GLOBAL_SESSION_LOCKS,
     ) -> None:
         root = Path(storage_config.root_dir)
+        self.root = root
+        self.locks = locks
         self.sessions = FileSystemSessionInputRuntimeRepository(
             root=root,
             locks=locks,
