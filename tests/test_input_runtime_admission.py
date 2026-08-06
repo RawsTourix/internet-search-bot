@@ -216,6 +216,7 @@ async def test_crash_after_admission_repairs_inbox_without_new_sequence(tmp_path
         sessions=base.sessions,
         admissions=base.admissions,
         inbox=FailOnceInbox(base.inbox),
+        handoffs=base.handoffs,
         controls=base.controls,
         snapshots=base.snapshots,
         context_revisions=base.context_revisions,
