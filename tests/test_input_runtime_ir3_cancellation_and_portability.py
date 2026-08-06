@@ -269,7 +269,7 @@ async def test_waiting_cancellation_after_claim_before_marker_requeues_claim(tmp
         "admitted-cycle"
     )
     assert len(inbox) == 1
-    assert inbox[0].state == InboxState.PENDING
+    assert inbox[0].state == InboxState.QUEUED
 
 
 @pytest.mark.asyncio
@@ -415,6 +415,7 @@ async def test_service_uses_in_memory_handoff_port_without_root_or_locks(tmp_pat
         config=InputRuntimeConfigType(),
         repositories=neutral_bundle,
         committed_batches=Reader(Batch("batch", "session")),
+        wake_coordinator=SessionExecutionCoordinator(),
         clock=lambda: NOW,
     )
     record = admission()
