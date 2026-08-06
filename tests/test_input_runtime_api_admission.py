@@ -13,9 +13,11 @@ import pytest
 from src.api.api import Api
 from src.core.models import AgentResult, AgentStatus, ClientType
 from src.input_runtime import (
+    CycleStatus,
     InputAdmissionAction,
     InputAdmissionService,
     InputRuntimeConfigType,
+    RuntimeHandoffState,
     create_filesystem_input_runtime_repositories,
 )
 from src.runtime import SessionExecutionCoordinator
@@ -45,8 +47,11 @@ class Batch:
 class Reader:
     def __init__(self, *items):
         self.items = {item.input_batch_id: item for item in items}
+        self.failure: Exception | None = None
 
     async def get_committed(self, input_batch_id):
+        if self.failure is not None:
+            raise self.failure
         return self.items[input_batch_id]
 
 
@@ -110,31 +115,96 @@ async def test_api_uses_admission_cycle_id_and_marks_initial_applied(tmp_path):
         "initial"
     )
     assert admission.state.value == "applied"
+    marker = await api.input_admission_service.get_runtime_handoff(admission)
+    assert marker is not None
+    assert marker.state == RuntimeHandoffState.COMPLETED
 
 
 @pytest.mark.asyncio
-async def test_runner_start_failure_keeps_admission_retryable(tmp_path):
+async def test_pre_handoff_resolution_failure_remains_retryable(tmp_path):
     batch = Batch("initial", "session")
     api = make_api(tmp_path, batch)
     outcome = await api.admit_committed_batch("initial", session_id="session")
+    api.ingress_services.batch_store.failure = RuntimeError("resolution failed")
 
-    async def fail(*args, **kwargs):
-        raise RuntimeError("runner failed before result")
-
-    api.mcp_client.process_query = fail
     with pytest.raises(Exception):
         await api.start_admitted_cycle(outcome)
     admission = await api.input_runtime_repositories.admissions.get_by_input_batch_id(
         "initial"
     )
     assert admission.state.value == "admitted"
+    assert await api.input_admission_service.get_runtime_handoff(admission) is None
+    assert len(api.mcp_client.calls) == 0
 
-    api.mcp_client = MCP()
+    api.ingress_services.batch_store.failure = None
     duplicate = await api.admit_committed_batch("initial", session_id="session")
     assert duplicate.action == InputAdmissionAction.DUPLICATE
     assert duplicate.should_start_runner is True
     result = await api.start_admitted_cycle(duplicate)
     assert result is not None
+    assert len(api.mcp_client.calls) == 1
+
+
+class SideEffectThenFailMCP:
+    def __init__(self):
+        self.call_count = 0
+        self.side_effect_count = 0
+
+    async def process_query(self, message, **kwargs):
+        self.call_count += 1
+        self.side_effect_count += 1
+        raise RuntimeError("ambiguous after side effect")
+
+
+@pytest.mark.asyncio
+async def test_post_handoff_side_effect_failure_is_not_replayed(tmp_path):
+    batch = Batch("initial", "session")
+    api = make_api(tmp_path, batch)
+    api.mcp_client = SideEffectThenFailMCP()
+    outcome = await api.admit_committed_batch("initial", session_id="session")
+
+    with pytest.raises(Exception):
+        await api.start_admitted_cycle(outcome)
+    admission = await api.input_runtime_repositories.admissions.get_by_input_batch_id(
+        "initial"
+    )
+    marker = await api.input_admission_service.get_runtime_handoff(admission)
+    assert marker is not None
+    assert marker.state == RuntimeHandoffState.AMBIGUOUS
+    state = await api.input_runtime_repositories.sessions.get("session")
+    assert state is not None
+    assert state.cycle_status == CycleStatus.INTERRUPTED
+
+    duplicate = await api.admit_committed_batch("initial", session_id="session")
+    assert duplicate.should_start_runner is False
+    assert await api.start_admitted_cycle(duplicate) is None
+    assert api.mcp_client.call_count == 1
+    assert api.mcp_client.side_effect_count == 1
+
+
+@pytest.mark.asyncio
+async def test_post_invocation_persistence_failure_is_not_replayed(tmp_path):
+    batch = Batch("initial", "session")
+    api = make_api(tmp_path, batch)
+    outcome = await api.admit_committed_batch("initial", session_id="session")
+
+    async def fail_persistence(_admission):
+        raise OSError("simulated admission persistence failure")
+
+    api.input_admission_service.mark_initial_batch_applied = fail_persistence
+    with pytest.raises(Exception):
+        await api.start_admitted_cycle(outcome)
+    assert len(api.mcp_client.calls) == 1
+
+    admission = await api.input_runtime_repositories.admissions.get_by_input_batch_id(
+        "initial"
+    )
+    marker = await api.input_admission_service.get_runtime_handoff(admission)
+    assert marker is not None
+    assert marker.state == RuntimeHandoffState.AMBIGUOUS
+    duplicate = await api.admit_committed_batch("initial", session_id="session")
+    assert duplicate.should_start_runner is False
+    assert await api.start_admitted_cycle(duplicate) is None
     assert len(api.mcp_client.calls) == 1
 
 
@@ -182,11 +252,61 @@ async def test_waiting_user_compatibility_resumes_same_cycle_once(tmp_path):
         "reply"
     )
     assert admission.state.value == "applied"
+    marker = await api.input_admission_service.get_runtime_handoff(admission)
+    assert marker is not None
+    assert marker.state == RuntimeHandoffState.COMPLETED
     inbox = await api.input_runtime_repositories.inbox.list_for_cycle(
         "admitted-cycle"
     )
     assert len(inbox) == 1
     assert inbox[0].state.value == "applied"
+
+
+class WaitingSideEffectThenFailMCP:
+    def __init__(self):
+        self.calls = 0
+
+    async def process_query(self, message, **kwargs):
+        self.calls += 1
+        if self.calls == 1:
+            return AgentResult(
+                content="question",
+                status=AgentStatus.WAITING_USER,
+                session_id=kwargs["session_id"],
+                cycle_id=kwargs["cycle_id_override"],
+            )
+        raise RuntimeError("ambiguous waiting continuation")
+
+
+@pytest.mark.asyncio
+async def test_waiting_ambiguous_handoff_is_not_requeued_for_blind_replay(tmp_path):
+    initial = Batch("initial", "session")
+    reply = Batch("reply", "session")
+    api = make_api(tmp_path, initial, reply)
+    api.mcp_client = WaitingSideEffectThenFailMCP()
+
+    first = await api.admit_committed_batch("initial", session_id="session")
+    await api.start_admitted_cycle(first)
+    continuation = await api.admit_committed_batch("reply", session_id="session")
+    with pytest.raises(Exception):
+        await api.resume_admitted_cycle(continuation)
+
+    admission = await api.input_runtime_repositories.admissions.get_by_input_batch_id(
+        "reply"
+    )
+    marker = await api.input_admission_service.get_runtime_handoff(admission)
+    assert marker is not None
+    assert marker.state == RuntimeHandoffState.AMBIGUOUS
+    inbox = await api.input_runtime_repositories.inbox.list_for_cycle(
+        "admitted-cycle"
+    )
+    assert len(inbox) == 1
+    assert inbox[0].state.value == "applying"
+
+    duplicate = await api.admit_committed_batch("reply", session_id="session")
+    assert duplicate.should_wake_runner is False
+    assert await api.resume_admitted_cycle(duplicate) is None
+    assert api.mcp_client.calls == 2
 
 
 @pytest.mark.asyncio

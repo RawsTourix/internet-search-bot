@@ -26,6 +26,7 @@ from .factory import (
     create_filesystem_input_runtime_repositories,
     create_input_runtime_contracts,
 )
+from .handoff import RuntimeHandoffRecord, RuntimeHandoffState
 from .models import (
     ActiveCycleSnapshot, AdmissionKind, AdmissionState, AgentEmission,
     CheckpointAction, CheckpointName, CheckpointOutcome, ClaimedInboxRange,
@@ -36,6 +37,6 @@ from .models import (
     new_context_revision_id, new_control_id, new_emission_id,
     new_finalization_id, new_inbox_item_id,
 )
-from .service import InputAdmissionService
+from .hardened_service import InputAdmissionService
 
 __all__ = [name for name in globals() if not name.startswith("_")]

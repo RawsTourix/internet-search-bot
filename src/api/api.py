@@ -39,6 +39,7 @@ from ..input_runtime import (
     InputAdmissionOutcome,
     InputAdmissionService,
     InputRuntimeConfigType,
+    RuntimeHandoffState,
     create_filesystem_input_runtime_repositories,
     load_input_runtime_config,
     safe_input_runtime_config_summary,
@@ -525,6 +526,43 @@ class Api:
         ):
             raise APIError("Admitted cycle authority is stale")
 
+    async def _runtime_handoff_marker(
+        self,
+        admission,
+        *,
+        handoff_token: str | None,
+    ):
+        if handoff_token is None:
+            return None
+        marker = await self.input_admission_service.get_runtime_handoff(
+            admission
+        )
+        if marker is None or marker.handoff_token != handoff_token:
+            return None
+        return marker
+
+    async def _record_runtime_handoff_ambiguity(
+        self,
+        admission,
+        *,
+        handoff_token: str | None,
+        error_code: str,
+    ) -> bool:
+        marker = await self._runtime_handoff_marker(
+            admission,
+            handoff_token=handoff_token,
+        )
+        if marker is None:
+            return False
+        marker = await (
+            self.input_admission_service.mark_runtime_handoff_ambiguous(
+                admission,
+                handoff_token=handoff_token,
+                error_code=error_code,
+            )
+        )
+        return marker is not None and marker.state != RuntimeHandoffState.COMPLETED
+
     async def start_admitted_cycle(
         self,
         outcome: InputAdmissionOutcome,
@@ -532,7 +570,7 @@ class Api:
         progress_callback=None,
         progress_locale: str = "ru",
     ) -> AgentResult | None:
-        """Start exactly the cycle identity allocated by admission."""
+        """Start exactly one cycle after a durable runtime handoff marker."""
         admission = outcome.admission
         if (
             admission is None
@@ -541,6 +579,7 @@ class Api:
         ):
             return None
         cycle_id = admission.target_cycle_id
+        handoff_token: str | None = None
         try:
             async with self.execution_coordinator.admitted_run_lease(
                 session_id=admission.session_id,
@@ -556,6 +595,15 @@ class Api:
                         session_id=admission.session_id,
                     )
                 )
+                handoff_token = uuid4().hex
+                owns_handoff = (
+                    await self.input_admission_service.begin_runtime_handoff(
+                        admission,
+                        handoff_token=handoff_token,
+                    )
+                )
+                if not owns_handoff:
+                    return None
                 result = await self.mcp_client.process_query(
                     "",
                     session_id=admission.session_id,
@@ -579,19 +627,51 @@ class Api:
                     capability_snapshot=capability_snapshot,
                     progress_locale=progress_locale,
                 )
+                await self.input_admission_service.complete_runtime_handoff(
+                    admission,
+                    handoff_token=handoff_token,
+                )
                 return result
         except APIError:
+            ambiguous = False
+            try:
+                ambiguous = await self._record_runtime_handoff_ambiguity(
+                    admission,
+                    handoff_token=handoff_token,
+                    error_code="initial_runtime_handoff_ambiguous",
+                )
+            except Exception:
+                logger.exception("Failed to persist admitted runner ambiguity")
+            if ambiguous:
+                try:
+                    await self.input_admission_service.record_cycle_status(
+                        session_id=admission.session_id,
+                        cycle_id=cycle_id,
+                        status=CycleStatus.INTERRUPTED,
+                    )
+                except Exception:
+                    logger.exception("Failed to record admitted runner interruption")
             raise
         except Exception as error:
             logger.error("Ошибка запуска admitted cycle: %r", error)
+            ambiguous = False
             try:
-                await self.input_admission_service.record_cycle_status(
-                    session_id=admission.session_id,
-                    cycle_id=cycle_id,
-                    status=CycleStatus.INTERRUPTED,
+                ambiguous = await self._record_runtime_handoff_ambiguity(
+                    admission,
+                    handoff_token=handoff_token,
+                    error_code="initial_runtime_handoff_ambiguous",
                 )
             except Exception:
-                logger.exception("Failed to record admitted runner interruption")
+                logger.exception("Failed to persist admitted runner ambiguity")
+            if ambiguous:
+                try:
+                    await self.input_admission_service.record_cycle_status(
+                        session_id=admission.session_id,
+                        cycle_id=cycle_id,
+                        status=CycleStatus.INTERRUPTED,
+                    )
+                except Exception:
+                    logger.exception("Failed to record admitted runner interruption")
             raise APIError(f"Ошибка запуска admitted cycle: {error}") from error
 
     async def resume_admitted_cycle(
@@ -611,6 +691,7 @@ class Api:
             return None
         cycle_id = admission.target_cycle_id
         claim = None
+        handoff_token: str | None = None
         try:
             async with self.execution_coordinator.admitted_run_lease(
                 session_id=admission.session_id,
@@ -632,8 +713,17 @@ class Api:
                         session_id=admission.session_id,
                     )
                 )
-                # TODO(IR-4): remove compatibility semantic ownership after
-                # CycleInputApplier applies every inbox item at safe checkpoints.
+                handoff_token = uuid4().hex
+                owns_handoff = (
+                    await self.input_admission_service.begin_runtime_handoff(
+                        admission,
+                        handoff_token=handoff_token,
+                    )
+                )
+                if not owns_handoff:
+                    return None
+                # TODO(IR-4): WAITING_USER reply must join every earlier queued
+                # addition through the common FIFO CycleInputApplier.
                 result = await self.mcp_client.process_query(
                     "",
                     session_id=admission.session_id,
@@ -659,29 +749,72 @@ class Api:
                     capability_snapshot=capability_snapshot,
                     progress_locale=progress_locale,
                 )
+                await self.input_admission_service.complete_runtime_handoff(
+                    admission,
+                    handoff_token=handoff_token,
+                )
                 return result
         except APIError:
-            raise
-        except Exception as error:
-            if claim is not None:
+            ambiguous = False
+            try:
+                ambiguous = await self._record_runtime_handoff_ambiguity(
+                    admission,
+                    handoff_token=handoff_token,
+                    error_code="waiting_runtime_handoff_ambiguous",
+                )
+            except Exception:
+                logger.exception("Failed to persist compatibility ambiguity")
+            if claim is not None and not ambiguous:
                 try:
                     await (
                         self.input_admission_service
                         .requeue_waiting_compatibility_apply(
                             claim,
-                            error_code="waiting_compatibility_failed",
+                            error_code="waiting_compatibility_pre_handoff_failed",
                         )
                     )
                 except Exception:
                     logger.exception("Failed to requeue compatibility claim")
+            if ambiguous:
+                try:
+                    await self.input_admission_service.record_cycle_status(
+                        session_id=admission.session_id,
+                        cycle_id=cycle_id,
+                        status=CycleStatus.INTERRUPTED,
+                    )
+                except Exception:
+                    logger.exception("Failed to record compatibility interruption")
+            raise
+        except Exception as error:
+            ambiguous = False
             try:
-                await self.input_admission_service.record_cycle_status(
-                    session_id=admission.session_id,
-                    cycle_id=cycle_id,
-                    status=CycleStatus.INTERRUPTED,
+                ambiguous = await self._record_runtime_handoff_ambiguity(
+                    admission,
+                    handoff_token=handoff_token,
+                    error_code="waiting_runtime_handoff_ambiguous",
                 )
             except Exception:
-                logger.exception("Failed to record compatibility interruption")
+                logger.exception("Failed to persist compatibility ambiguity")
+            if claim is not None and not ambiguous:
+                try:
+                    await (
+                        self.input_admission_service
+                        .requeue_waiting_compatibility_apply(
+                            claim,
+                            error_code="waiting_compatibility_pre_handoff_failed",
+                        )
+                    )
+                except Exception:
+                    logger.exception("Failed to requeue compatibility claim")
+            if ambiguous:
+                try:
+                    await self.input_admission_service.record_cycle_status(
+                        session_id=admission.session_id,
+                        cycle_id=cycle_id,
+                        status=CycleStatus.INTERRUPTED,
+                    )
+                except Exception:
+                    logger.exception("Failed to record compatibility interruption")
             raise APIError(f"Ошибка resume admitted cycle: {error}") from error
 
     async def _call_agent_batch_compatibility(

@@ -261,7 +261,7 @@ class SessionExecutionCoordinator:
                         lane.runtime_status = "idle"
 
     async def wake(self, session_id: str, *, cycle_id: str) -> bool:
-        """Signal the current in-process runner after durable inbox admission."""
+        """Signal only the matching reserved/active in-process cycle."""
 
         session_id = self._session_id(session_id)
         cycle_id = cycle_id.strip()
@@ -273,8 +273,10 @@ class SessionExecutionCoordinator:
                 lane.reserved_cycle_id,
                 lane.active_cycle_id,
             }
+            if not matches:
+                return False
             lane.wake_event.set()
-            return matches
+            return True
 
     async def wait_for_wakeup(
         self,
