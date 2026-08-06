@@ -16,18 +16,24 @@ planned.
 
 Evidence для завершённого filesystem foundation:
 
-- code HEAD: `0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`;
-- `Validate Input Runtime` run #61 — success;
-- `Validate v0.4 file artifacts PR` run #491 — success;
-- targeted input-runtime и общий configuration audit: `127 passed`.
+- code HEAD: `c7ed199deb0dfe042cff6055989a76e371537755`;
+- `Validate Input Runtime` run #67 — success;
+- `Validate v0.4 file artifacts PR` run #494 — success;
+- targeted input-runtime и общий configuration audit: `164 passed`.
 
 IR-2 добавил filesystem implementations repository ports, атомарные записи,
-bounded reference-counted coordination, cancellation-safe lock bookkeeping,
-authoritative session-local pre-allocation repair, coordinated sequence
-allocation, claim fencing/recovery, authoritative `payload_size_bytes`,
-recoverable hot-path indexes и root-global identity fencing с порядком
-`root identity → session` для admission, inbox, controls, snapshots, context
-revisions, emissions и finalizations.
+bounded reference-counted coordination, authoritative session-local
+pre-allocation repair, coordinated sequence allocation, claim fencing/recovery,
+authoritative `payload_size_bytes`, generation cancellation и root-global
+identity fencing с порядком `root identity → session`.
+
+Global create/append/prepare paths теперь используют crash-recoverable protocol
+`lookup/recovery → durable record write → index/cycle-authority writes`. Потерянные
+или dangling indexes перед competing create сверяются редким exact-identity scan:
+единственный authoritative record восстанавливает все relations, отсутствие
+record очищает незавершённую reservation, а неоднозначность возвращает managed
+consistency error. Crash после durable record и до любого или части indexes не
+создаёт второй record после restart.
 
 Production runtime behaviour пока не изменён: filesystem repositories не
 подключены к `Api`, committed batches ещё не проходят новый admission service,

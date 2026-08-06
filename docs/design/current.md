@@ -152,11 +152,13 @@ v0.4-input-runtime
 
 В `v0.4-input-runtime` реализованы и подтверждены CI foundation-этапы IR-1 и
 IR-2: domain models, enums, configuration, repository ports и durable filesystem
-repositories с atomic writes, bounded coordination, cancellation-safe lock
-bookkeeping, session-local sequence repair, claims, recoverable indexes и
-root-global identity fencing всех create/append/prepare paths. Финальный IR-2
-code evidence: `0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`, workflow #61 и #491,
-targeted suite `127 passed`.
+repositories с atomic writes, bounded coordination, session-local admission
+repair, claims и root-global identity fencing. Все globally fenced
+create/append/prepare paths используют record-first crash protocol, а missing или
+dangling stable/relation/cycle indexes восстанавливаются authoritative scan до
+competing create. Финальный evidence: code HEAD `c7ed199deb0dfe042cff6055989a76e371537755`,
+`Validate Input Runtime` #67, `Validate v0.4 file artifacts PR` #494 и
+`164 passed` targeted tests.
 
 Production admission, checkpoints, `/stop`/`/continue`, emissions и finalization
 ещё не подключены. Поэтому новое observable production behaviour этому update
@@ -240,8 +242,9 @@ test или migration evidence.
 2. применяйте отмеченные реализованные updates v0.4;
 3. учитывайте `AF-24`–`AF-26` как implemented и accepted;
 4. учитывайте `v0.4-batch-workflows` как implemented и accepted;
-5. считайте IR-1 и IR-2 `v0.4-input-runtime` реализованными foundations, но не
-   приписывайте runtime behaviour этапов IR-3—IR-10;
+5. считайте IR-1 и IR-2 `v0.4-input-runtime` реализованными foundations, включая
+   crash-recoverable global identity indexes, но не приписывайте runtime behaviour
+   этапов IR-3—IR-10;
 6. не приписывайте durable active-cycle additions, `/stop`/`/continue` и
    intermediate emissions текущему `feature` до реализации;
 7. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;

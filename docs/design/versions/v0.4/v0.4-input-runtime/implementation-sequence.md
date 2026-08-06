@@ -15,13 +15,16 @@ last_reviewed: 2026-08-06
 - `IR-2 — Filesystem repositories и coordination service`: implemented;
 - `IR-3`—`IR-10`: planned.
 
-IR-1 и IR-2 подтверждены final code HEAD
-`0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`, workflow #61 и #491 и targeted
-suite `127 passed`. IR-2 включает cancellation-safe bounded coordination,
-session-local reconciliation и root-global identity fencing repository
-create/append/prepare paths. Эти этапы создают domain/config/repository и durable
+IR-1 и IR-2 подтверждены code HEAD
+`c7ed199deb0dfe042cff6055989a76e371537755`, workflow #67 и #494 и targeted
+suite `164 passed`. Эти этапы создают domain/config/repository и durable
 filesystem foundations, но не изменяют observable production behaviour:
 production admission и agent-loop integration начинаются с IR-3.
+
+Финальный IR-2 pass дополнительно подтвердил crash-recoverable global identity
+protocol: durable record записывается до indexes, missing/dangling relations
+восстанавливаются exact-identity scan под `root identity → session`, а competing
+create после restart не создаёт скрытый duplicate.
 
 ## Назначение
 
@@ -212,10 +215,9 @@ tests/test_input_runtime_interfaces.py or type/contract tests
 ## Статус
 
 Implemented и подтверждён CI. Реализованы durable filesystem adapters,
-atomic-write/restart contracts, claims, session-local sequence repair, bounded
-cancellation-safe coordination и root-global identity fencing для repository
-create/append/prepare paths. Production admission/API integration в этот этап не
-входит.
+atomic-write/restart contracts, claims, sequence repair, bounded coordination,
+global identity fencing и crash-recoverable index rebuilding. Production
+admission/API integration в этот этап не входит.
 
 ## Цель
 
@@ -253,11 +255,18 @@ User-controlled IDs не используются как raw path segments бе�
 ## Coordination
 
 - one in-process lock per normalized session;
-- lock registry bounded/cleanup-capable;
+- lock registry bounded/cleanup-capable и cancellation-safe;
+- global identities используют fixed order `root identity → session`;
 - no await long LLM/tool/delivery operation inside lock;
 - compare-and-swap repository revision;
 - deterministic sequence allocation;
-- duplicate creation returns existing record.
+- duplicate creation returns existing record;
+- create/append/prepare protocol: lookup/recovery, durable record write, затем
+  index и cycle-authority writes;
+- missing или dangling index запускает редкий exact-identity scan до competing
+  create;
+- один authoritative record rebuilds indexes, отсутствие record очищает dangling
+  reservation, несколько records возвращают managed consistency error.
 
 ## Claim leases
 
@@ -278,23 +287,32 @@ reconcile applying by snapshot watermark
 tests/test_input_runtime_filesystem_repositories.py
 tests/test_input_runtime_coordination.py
 tests/test_input_runtime_claim_recovery.py
+tests/test_input_runtime_ir2_index_recovery.py
 ```
 
-Race tests:
+Race/crash tests:
 
 - concurrent sequence allocation;
 - duplicate admission creation;
 - claim conflict;
 - stale CAS revision;
 - atomic write interruption simulation;
+- crash после durable record до первого index;
+- crash после первого index до остальных indexes;
+- dangling pointer без durable record;
+- lost stable/relation index и competing create из другой session;
+- lost cycle authority и competing snapshot/context/emission create;
+- ambiguous durable identities возвращают consistency error;
 - path traversal/invalid IDs;
-- restart instantiate new repository over same root.
+- restart instantiate two repository bundles over same root.
 
 ## Done
 
 - repositories survive process recreation;
 - deterministic ordered list operations;
 - no duplicate IDs/sequences under race;
+- global indexes и cycle authority восстанавливаются после partial metadata write;
+- dangling reservation не блокирует identity навсегда;
 - no current API integration yet.
 
 ## Не делать

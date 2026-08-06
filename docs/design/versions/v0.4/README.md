@@ -81,11 +81,18 @@ suites. Точный последний head и результаты run фик�
 
 `v0.4-input-runtime` остаётся update со статусом `partial`. IR-1 и IR-2
 реализованы и подтверждены CI: domain/config/ports foundation, durable filesystem
-repositories, bounded cancellation-safe coordination, atomic writes,
-session-local sequence repair, claims, recoverable indexes и root-global
-identity fencing всех repository create/append/prepare paths. Финальное IR-2
-evidence: code HEAD `0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`, workflow #61
-и #491, targeted suite `127 passed`.
+repositories, bounded coordination, atomic writes, session-local sequence repair,
+claims, global identity fencing и crash-recoverable indexes. Global
+create/append/prepare использует record-first writes; missing/dangling stable,
+relation и cycle-authority indexes восстанавливаются до competing create, а
+ambiguous durable identity возвращает managed consistency error.
+
+Финальный IR-2 evidence:
+
+- code HEAD `c7ed199deb0dfe042cff6055989a76e371537755`;
+- `Validate Input Runtime` #67 — success;
+- `Validate v0.4 file artifacts PR` #494 — success;
+- targeted suite: `164 passed`.
 
 Этапы IR-3—IR-10, включая production admission, checkpoints, controls,
 emissions, finalization и recovery lifecycle, остаются planned. Observable
