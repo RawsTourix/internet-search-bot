@@ -13,47 +13,86 @@ last_reviewed: 2026-08-06
 
 - `IR-1 — Domain models, config и repository ports`: implemented;
 - `IR-2 — Filesystem repositories и coordination service`: implemented;
-- `IR-3 — Admission service и initial-cycle integration`: implemented;
+- `IR-3 — Admission service и initial-cycle integration`: implemented and hardened;
 - `IR-4`—`IR-10`: planned.
 
-IR-1—IR-3 подтверждены code HEAD
-`4929b703d7f6e200392661b2b66205b8fa4ca034`, workflow #73 и #497 и targeted
-suite `181 passed`. IR-3 подключил production filesystem composition и общий
-admission boundary: initial batch запускает один exact admitted cycle, а batches,
-пришедшие во время `running`, durable сохраняются в FIFO `CycleInbox` того же
-cycle и возвращают acknowledgement без второго `process_query()`.
+Финальный подтверждённый IR-3 code boundary:
 
-Общий update остаётся partial. IR-3 ещё не применяет additions к LLM context:
-safe checkpoints, общий `CycleInputApplier`, context revisions и active snapshot
-integration начинаются с IR-4. `/stop`, `/continue`, emissions, finalization
-barrier и startup recovery lifecycle также остаются planned.
+- основной admission implementation:
+  `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- crash-safe capacity и runner handoff hardening:
+  `d11db7f2a2f8caae900f3bc94ed91de020059231`;
+- cancellation-safe/storage-neutral handoff implementation:
+  `e8192380cc3104668ea9b0f3f017d3c962fd65e4`;
+- итоговый code HEAD после узкого test-fixture fix:
+  `c36e4cc38095e15f54f63ae81c29b4829defec1f`;
+- `Validate Input Runtime` #84 — success, `198 passed`;
+- `Validate v0.4 file artifacts PR` #503 — success.
 
-Финальный IR-2 pass дополнительно подтвердил crash-recoverable global identity
-protocol: durable record записывается до indexes, missing/dangling relations
-восстанавливаются exact-identity scan под `root identity → session`, а competing
-create после restart не создаёт скрытый duplicate.
+IR-3 production boundary теперь гарантирует:
 
-## Назначение
+```text
+CommittedInputBatch
+→ authoritative InputAdmission
+→ один exact active cycle либо FIFO CycleInbox
+→ pre-run setup
+→ durable RuntimeHandoffRecord
+→ process_query invocation
+```
 
-Документ предназначен как каноническая основа для будущей пошаговой инструкции
-ChatGPT/Codex. Каждый этап фиксирует:
+Running additions durable сохраняются в том же cycle без второго
+`process_query()`. Count/byte capacity определяется authoritative admissions, а
+не только наличием inbox file. Exact-cycle wake не позволяет позднему signal
+старого cycle будить новый.
 
-- цель и границу ответственности;
-- новые/изменяемые components;
-- точки интеграции с текущим кодом;
-- обязательные transitions/invariants;
-- tests и acceptance;
-- условие завершения этапа;
+Runtime handoff storage-neutral: application service зависит от
+`RuntimeHandoffRepository`, а concrete filesystem adapter создаётся только
+`create_filesystem_input_runtime_repositories(...)`.
+
+Cancellation contract:
+
+- initial cancellation до marker оставляет admission retryable;
+- initial cancellation после marker переводит marker в `AMBIGUOUS`, cycle — в
+  `interrupted`, duplicate не запускает runtime повторно;
+- WAITING cancellation после claim, но до marker, requeue-ит claim;
+- WAITING cancellation после marker не requeue-ит claim, оставляет его evidence,
+  переводит marker в `AMBIGUOUS`, cycle — в `interrupted`;
+- cleanup запускается отдельной task, ожидается через `asyncio.shield`, завершается
+  даже при повторной cancellation, затем исходный `CancelledError` re-raise-ится.
+
+Общий update остаётся partial. IR-3 не применяет queued additions к LLM context и
+не реализует startup recovery ambiguous handoff. Safe checkpoints, общий
+`CycleInputApplier`, context revisions и active snapshot начинаются с IR-4.
+
+Для следующих этапов зафиксированы обязательные contracts:
+
+- IR-4: `WAITING_USER` reply при наличии более ранних queued additions применяется
+  вместе с ними через общий FIFO `CycleInputApplier`;
+- IR-7: pending accepted input подавляет stale `DONE`, question и output до
+  terminal commit;
+- IR-8: ambiguous marker и post-handoff claim evidence reconciles explicit
+  recovery policy без blind replay внешних действий.
+
+## Назначение документа
+
+Документ является канонической последовательностью implementation patches. Каждый
+этап фиксирует:
+
+- цель и ownership boundary;
+- изменяемые components;
+- обязательные invariants и transitions;
+- deterministic tests и acceptance;
+- условие завершения;
 - запрещённое расширение scope.
 
-Реализация выполняется небольшими совместимыми patches. Большой rewrite
-`src/mcp/mcp_client.py`, преждевременная modularization и добавление PostgreSQL
-запрещены.
+Реализация выполняется небольшими fast-forward patches. Большой rewrite
+`src/mcp/mcp_client.py`, преждевременная modularization, PostgreSQL, Redis и
+scheduler в этот update не входят.
 
 ## Предварительная инвентаризация
 
-Перед IR-1 implementation agent обязан повторно прочитать актуальную branch и
-зафиксировать current owners:
+Перед каждым следующим этапом implementation agent повторно проверяет branch,
+HEAD, status и diff относительно target branch, затем читает current owners:
 
 ```text
 src/core/message_processor.py
@@ -67,22 +106,22 @@ src/agent/protocol.py
 src/interaction/*
 src/servers/telegram/*
 src/ingress/*
+src/input_runtime/*
 ```
 
-Обязательная characterization карта:
+Обязательно определить:
 
-- где committed batch запускает `API.call_agent_batch()`;
-- как создаётся/resumes `ActiveAgentCycle`;
-- точный main LLM/tool loop и все return paths;
+- где committed batch проходит admission;
+- где создаётся/resumes active cycle;
+- точный LLM/tool loop и terminal return paths;
 - где фиксируются `WAITING_USER`, `DONE`, interrupted/error;
 - где выполняются final audit и output assembly;
-- где хранятся session memory/pending cycle;
-- какие progress callbacks и Telegram status targets используются;
-- как `/reset` и shutdown ждут execution lease;
-- какие tests уже фиксируют FIFO, WAITING_USER continuation, progress и delivery.
+- где хранятся memory/pending cycle;
+- как `/reset` и shutdown взаимодействуют с execution lease;
+- какие tests фиксируют FIFO, continuation, progress и delivery.
 
-Результат инвентаризации — comments/tests либо отдельная implementation note в PR,
-не новый competing canonical design document.
+Результат инвентаризации — code comments/tests или PR evidence, а не новый
+competing canonical design document.
 
 ---
 
@@ -90,37 +129,28 @@ src/ingress/*
 
 ## Статус
 
-Implemented и подтверждён CI. Production runtime integration в этот этап не
-входит.
+Implemented и подтверждён CI. Production runtime integration не входит в IR-1.
 
 ## Цель
 
 Создать независимый package `src/input_runtime/` с pure models, errors, config и
-repository Protocols. На этом этапе observable behavior не меняется.
+command-oriented repository Protocols.
 
-## Target files
+## Основные файлы
 
 ```text
 src/input_runtime/__init__.py
 src/input_runtime/models.py
+src/input_runtime/handoff.py
 src/input_runtime/errors.py
 src/input_runtime/config.py
 src/input_runtime/interfaces.py
 src/input_runtime/factory.py
 ```
 
-Допустимые точечные изменения:
-
-```text
-src/runtime/cycle.py
-src/api/config.py or current config loader/models
-src/api/mcp.config.example
-.env.example only if environment settings are introduced
-```
-
 ## Models
 
-Минимум:
+Минимальный набор:
 
 ```text
 SessionInputRuntimeState
@@ -128,6 +158,7 @@ InputAdmissionRecord
 InputAdmissionOutcome
 CycleInboxItem
 ClaimedInboxRange
+RuntimeHandoffRecord
 SessionControlCommand
 ControlOutcome
 CycleContextRevision
@@ -136,7 +167,8 @@ CycleFinalizationRecord
 CheckpointOutcome
 ```
 
-Stable ID factories и enums определяются один раз.
+Stable ID factories и enums определяются один раз. Timestamp fields timezone-aware;
+terminal runtime handoff timestamp не может предшествовать `handed_off_at`.
 
 ## Ports
 
@@ -144,6 +176,7 @@ Stable ID factories и enums определяются один раз.
 class SessionInputRuntimeRepository(Protocol): ...
 class InputAdmissionRepository(Protocol): ...
 class CycleInboxRepository(Protocol): ...
+class RuntimeHandoffRepository(Protocol): ...
 class SessionControlRepository(Protocol): ...
 class ActiveCycleSnapshotRepository(Protocol): ...
 class ContextRevisionRepository(Protocol): ...
@@ -151,24 +184,19 @@ class AgentEmissionRepository(Protocol): ...
 class FinalizationRepository(Protocol): ...
 ```
 
-Methods должны быть command-oriented, а не generic `save(dict)`:
+`RuntimeHandoffRepository` имеет только command-oriented surface:
 
-```text
-get/create session state
-compare_and_swap state revision
-find admission by batch
-allocate/admit sequence
-claim contiguous inbox range
-mark applying/applied/requeue
-append/claim control
-persist active snapshot
-append context revision
-prepare/advance/abort finalization
+```python
+async def get(...)
+async def begin(...)
+async def complete(...)
+async def mark_ambiguous(...)
 ```
 
-## Config
+Generic `save(dict)`, filesystem paths, locks и serialization helpers в
+application-facing ports запрещены.
 
-Новая root section:
+## Config
 
 ```yaml
 input_runtime:
@@ -187,32 +215,25 @@ Defaults conservative и valid для current single-process mode.
 
 ## Tests
 
-```text
-tests/test_input_runtime_models.py
-tests/test_input_runtime_config.py
-tests/test_input_runtime_interfaces.py or type/contract tests
-```
-
-Проверить:
-
-- validation всех states/IDs/sequences;
-- invalid watermark/order rejected;
-- config examples cover every supported setting;
-- no import from Telegram/FastAPI/MCP concrete client in models/interfaces;
-- serialization round-trip.
+- model/state/ID validation;
+- invalid sequence/watermark rejected;
+- config examples cover all settings;
+- serialization round-trip;
+- Protocols command-oriented;
+- no Telegram/FastAPI/MCP concrete imports in domain/interfaces.
 
 ## Done
 
 - package импортируется без side effects;
-- текущий production behavior не изменён;
-- ports пригодны для filesystem и PostgreSQL implementations;
+- ports пригодны для filesystem и PostgreSQL adapters;
+- current production behavior не изменён;
 - full existing suite green.
 
 ## Не делать
 
 - не подключать stores к API;
 - не добавлять checkpoints;
-- не менять command handlers;
+- не менять transport command handlers;
 - не переносить agent loop.
 
 ---
@@ -222,111 +243,82 @@ tests/test_input_runtime_interfaces.py or type/contract tests
 ## Статус
 
 Implemented и подтверждён CI. Реализованы durable filesystem adapters,
-atomic-write/restart contracts, claims, sequence repair, bounded coordination,
-global identity fencing и crash-recoverable index rebuilding. Production
-admission/API integration в этот этап не входит.
+atomic-write/restart contracts, sequence repair, bounded coordination, global
+identity fencing и crash-recoverable indexes.
 
 ## Цель
 
-Реализовать durable local backend, atomic file replacement, per-session short
-coordination и startup-readable indexes.
+Реализовать local durable backend, atomic replacement, per-session short
+coordination и startup-readable indexes поверх `StorageConfigType.root_dir`.
 
-## Target files
+## Infrastructure files
 
 ```text
 src/input_runtime/filesystem.py
+src/input_runtime/_filesystem_*.py
 src/input_runtime/coordination.py
-src/input_runtime/serialization.py optional
+src/input_runtime/serialization.py
 src/input_runtime/factory.py
 ```
 
-Использовать существующий `StorageConfigType.root_dir` и atomic-write policy.
+Filesystem implementation `RuntimeHandoffRepository` также принадлежит
+infrastructure-модулю и подключается только composition factory.
 
-## Storage layout
+## Storage/coordination invariants
 
-Конкретный layout может быть оптимизирован, но должен поддерживать:
-
-```text
-input-runtime/sessions/{session_id}/state.json
-input-runtime/sessions/{session_id}/admissions/*.json
-input-runtime/sessions/{session_id}/inbox/*.json
-input-runtime/sessions/{session_id}/controls/*.json
-input-runtime/cycles/{cycle_id}/snapshot.json
-input-runtime/cycles/{cycle_id}/context-revisions/*.json
-input-runtime/cycles/{cycle_id}/emissions/*.json
-input-runtime/cycles/{cycle_id}/finalizations/*.json
-```
-
-User-controlled IDs не используются как raw path segments без safe encoding.
-
-## Coordination
-
-- one in-process lock per normalized session;
-- lock registry bounded/cleanup-capable и cancellation-safe;
-- global identities используют fixed order `root identity → session`;
-- no await long LLM/tool/delivery operation inside lock;
-- compare-and-swap repository revision;
-- deterministic sequence allocation;
-- duplicate creation returns existing record;
-- create/append/prepare protocol: lookup/recovery, durable record write, затем
-  index и cycle-authority writes;
-- missing или dangling index запускает редкий exact-identity scan до competing
-  create;
-- один authoritative record rebuilds indexes, отсутствие record очищает dangling
-  reservation, несколько records возвращают managed consistency error.
+- user-controlled IDs не используются raw path segments;
+- one short in-process lock per normalized session;
+- bounded/ref-counted lock registry cancellation-safe;
+- fixed lock order `root identity → session`;
+- no long LLM/tool/delivery await под coordination lock;
+- deterministic session/cycle sequence allocation;
+- compare-and-swap revisions;
+- durable record write предшествует indexes;
+- missing/dangling index запускает exact-identity recovery до competing create;
+- один authoritative record rebuilds relations;
+- отсутствие durable record очищает dangling reservation;
+- ambiguous durable identity возвращает managed consistency error.
 
 ## Claim leases
 
-Implement:
-
 ```text
-claim head range
-validate token
+claim contiguous head range
+validate generation/token
 mark applying
 mark applied
-requeue expired claim
-reconcile applying by snapshot watermark
+requeue retryable/expired claim
+cancel generation
+reconcile by authoritative watermark in later stages
 ```
 
 ## Tests
 
-```text
-tests/test_input_runtime_filesystem_repositories.py
-tests/test_input_runtime_coordination.py
-tests/test_input_runtime_claim_recovery.py
-tests/test_input_runtime_ir2_index_recovery.py
-```
-
-Race/crash tests:
-
 - concurrent sequence allocation;
 - duplicate admission creation;
-- claim conflict;
+- claim conflict/expiry;
 - stale CAS revision;
-- atomic write interruption simulation;
-- crash после durable record до первого index;
-- crash после первого index до остальных indexes;
+- partial atomic-write/index failures;
 - dangling pointer без durable record;
-- lost stable/relation index и competing create из другой session;
-- lost cycle authority и competing snapshot/context/emission create;
-- ambiguous durable identities возвращают consistency error;
-- path traversal/invalid IDs;
-- restart instantiate two repository bundles over same root.
+- lost identity/cycle-authority indexes;
+- ambiguous duplicate records;
+- path traversal rejection;
+- recreation two repository bundles over same root;
+- filesystem handoff marker survives recreation;
+- stale handoff token cannot complete another attempt.
 
 ## Done
 
 - repositories survive process recreation;
-- deterministic ordered list operations;
-- no duplicate IDs/sequences under race;
-- global indexes и cycle authority восстанавливаются после partial metadata write;
-- dangling reservation не блокирует identity навсегда;
-- no current API integration yet.
+- ordered list operations deterministic;
+- no duplicate identities/sequences under race;
+- partial metadata writes recover safely;
+- application service does not import filesystem adapter details.
 
 ## Не делать
 
-- не emulate SQL transaction through global lock across long operations;
-- не add Redis;
-- не scan whole repository on every hot-path operation if index can be bounded.
+- не emulate distributed transaction длинным global lock;
+- не добавлять Redis/PostgreSQL;
+- не выполнять whole-repository scan на каждом hot path.
 
 ---
 
@@ -334,55 +326,54 @@ Race/crash tests:
 
 ## Статус
 
-Implemented и подтверждён CI на code SHA
-`4929b703d7f6e200392661b2b66205b8fa4ca034`:
+Implemented, hardened и подтверждён CI на итоговом code HEAD
+`c36e4cc38095e15f54f63ae81c29b4829defec1f`:
 
-- `Validate Input Runtime` #73 — success, `181 passed`;
-- `Validate v0.4 file artifacts PR` #497 — success;
-- production composition создаёт filesystem repositories и
-  `InputAdmissionService` без import-time lifecycle tasks;
-- `MessageProcessor` заменил unconditional post-commit run на
-  `admit → start/resume/acknowledge`;
-- second batch during running получает sequences `1, 2, 3...`, durable FIFO inbox
-  и тот же `target_cycle_id`, а deterministic test фиксирует один вызов
-  `process_query()`;
-- duplicate, capacity block, admission/inbox crash и runner-start retry покрыты
-  replay-safe tests;
-- `WAITING_USER` продолжает тот же cycle через compatibility adapter;
-- `interrupted` получает typed wake intent без unsafe automatic replay.
-
-IR-3 не создаёт safe checkpoints и не применяет queued additions к LLM context.
-Эта ответственность остаётся у IR-4.
+- `Validate Input Runtime` #84 — success, `198 passed`;
+- `Validate v0.4 file artifacts PR` #503 — success;
+- production composition создаёт filesystem repository bundle и injects готовый
+  `RuntimeHandoffRepository` в `InputAdmissionService`;
+- каждый `CommittedInputBatch` проходит `admit → start/resume/acknowledge`;
+- second batch during running получает durable admission/FIFO inbox того же cycle
+  без второго `process_query()`;
+- duplicate, count/byte capacity, crash windows, runner handoff, cancellation и
+  exact-cycle wake покрыты deterministic tests;
+- `WAITING_USER` остаётся временным same-cycle compatibility adapter;
+- `interrupted` и `AMBIGUOUS` не запускают automatic replay.
 
 ## Цель
 
-Every committed batch проходит `InputAdmissionService`. New input during active
-cycle no longer starts second run operation.
+Every committed batch проходит transport-neutral `InputAdmissionService`. New
+input во время active cycle не создаёт second run operation.
 
-## Target files
+## Основные файлы
 
 ```text
 src/input_runtime/admission.py
 src/input_runtime/service.py
+src/input_runtime/hardened_service.py
+src/input_runtime/handoff.py
+src/input_runtime/interfaces.py
+src/input_runtime/factory.py
+src/input_runtime/_filesystem_handoff.py
 src/api/api.py
 src/core/message_processor.py
-src/api/artifact_transport.py or current run_committed facade
 src/runtime/session_execution.py
 ```
 
-## Composition
+## Composition boundary
 
-`Api.__init__` создаёт `InputRuntimeServices` через factory и injects:
+`Api.__init__` создаёт filesystem adapters через factory и injects:
 
-- committed batch store;
-- runtime repositories;
+- committed batch reader;
+- `InputRuntimeRepositories`, включая `handoffs` port;
 - execution coordinator/wakeup port;
-- cycle runner callback/facade;
-- capability/interaction projection dependencies later.
+- config и deterministic identity/time policies.
 
-## API changes
+`InputAdmissionService` не импортирует `Path`, `SessionLockRegistry`, concrete
+filesystem handoff store или serialization helpers.
 
-Добавить service-neutral method:
+## Admission API
 
 ```python
 async def admit_committed_batch(
@@ -392,63 +383,104 @@ async def admit_committed_batch(
 ) -> InputAdmissionOutcome
 ```
 
-Existing `call_agent_batch()` становится internal start/resume runner path, а не
-безусловным post-commit action.
-
-Callers:
+Call flow:
 
 ```text
 submit/commit
 → admit
-→ start_cycle: launch runner
-→ queued/resume: return acknowledgement/wakeup
+→ start_cycle: reserve exact runner
+→ queued_running: durable enqueue + wake intent
+→ resume_waiting: compatibility claim + same-cycle runner
+→ duplicate: return existing relation
+→ capacity_blocked: retryable response, committed input retained
 ```
 
 ## Initial cycle
 
-Admission `start_cycle`:
-
-1. allocate cycle ID and sequence 0;
+1. allocate service-owned cycle ID and sequence `0`;
 2. persist admission/session state;
-3. create initial context revision;
-4. acquire execution lease;
-5. call current agent runtime with exact initial batch/cycle ID;
-6. bind active snapshot in later IR stage or compatibility representation now.
+3. acquire exact admitted execution lease;
+4. resolve authoritative batch and capabilities;
+5. persist runtime handoff marker;
+6. invoke current agent runtime with exact batch/cycle identity;
+7. persist applied/status/output compatibility steps;
+8. complete handoff marker.
 
-No second runner can be created for same active session.
+Initial context revision и active snapshot ownership intentionally deferred to IR-4.
 
-Фактическая IR-3 compatibility boundary выполняет allocation, durable state и
-exact-cycle runner start, но intentionally откладывает initial context revision и
-active snapshot ownership до IR-4 вместе с общим checkpoint/applier path.
+## Running addition и capacity authority
 
-## Running addition
+- addition получает `cycle_sequence > 0`;
+- persist admission, accepted watermark и inbox relation;
+- signal exact active runner;
+- return acknowledgement without awaiting final result.
 
-- persist admission + inbox item;
-- advance accepted watermark;
-- signal runner;
-- return immediately without awaiting final AgentResult.
+Capacity reservation определяется authoritative admissions текущего generation и
+cycle, для которых:
 
-## Waiting/interrupted compatibility
+```text
+cycle_sequence > 0
+cycle_sequence > active_cycle_applied_through_sequence
+state == admitted/pending
+payload_size_bytes contributes to byte limit
+```
 
-At first keep existing continuation mixin behind admission outcome. Do not remove
-until IR-4 parity.
+Initial sequence `0` и terminal applied/cancelled/failed records capacity не
+занимают. Missing inbox после crash не освобождает reservation. Retry exact batch
+восстанавливает ровно один inbox relation с исходной sequence.
 
-В IR-3 compatibility execution подключён только для `WAITING_USER`.
-`resume_interrupted` остаётся durable typed outcome и controlled wake intent без
-automatic replay внешнего действия; полный recovery принадлежит IR-8.
+## Runtime handoff contract
 
-## SessionExecutionCoordinator migration
+```text
+pre-run resolution
+→ RuntimeHandoffRepository.begin(HANDED_OFF)
+→ process_query()
+→ complete(COMPLETED) or mark_ambiguous(AMBIGUOUS)
+```
 
-Keep:
+- failure до marker retryable;
+- после marker duplicate не вызывает runtime повторно;
+- exception/crash/cancellation после marker становится ambiguous/interrupted;
+- successful runtime result + subsequent persistence failure также не rerun-ится;
+- stale token не завершает marker другой attempt.
 
-- run lease;
-- worker/wakeup event;
-- generation defensive cache;
-- diagnostics.
+## Cancellation contract
 
-Stop treating its in-memory queue as source of truth for committed additions.
-Existing FIFO batch runner can remain compatibility for initial start only until
-callers migrated.
+Оба paths имеют отдельный:
+
+```python
+except asyncio.CancelledError:
+    ...
+    raise
+```
+
+Durable cleanup:
+
+```text
+create cleanup task
+→ await through asyncio.shield
+→ if repeated cancellation: continue waiting cleanup task
+→ inspect cleanup result/log failure
+→ re-raise original CancelledError
+```
+
+Initial:
+
+- cancellation до marker: marker отсутствует, admission retryable;
+- cancellation после marker, включая окно до фактического invocation: marker
+  `AMBIGUOUS`, cycle `interrupted`, duplicate no-rerun.
+
+WAITING compatibility:
+
+- cancellation после claim, до marker: requeue claim;
+- cancellation после marker: не requeue claim, сохранить claim evidence,
+  `AMBIGUOUS` + `interrupted`, duplicate no-rerun.
+
+## SessionExecutionCoordinator
+
+Coordinator остаётся in-process execution lease/wakeup foundation, но не durable
+queue. `wake(session_id, cycle_id=...)` выставляет event только при exact match
+reserved/active cycle; mismatch возвращает `False` и event не меняет.
 
 ## Tests
 
@@ -456,40 +488,61 @@ callers migrated.
 tests/test_input_runtime_admission.py
 tests/test_input_runtime_api_admission.py
 tests/test_input_runtime_no_parallel_cycle.py
+tests/test_input_runtime_ir3_contract_gaps.py
+tests/test_input_runtime_ir3_cancellation_and_portability.py
 ```
 
-Scenarios:
+Mandatory scenarios:
 
 - idle batch starts one cycle;
-- second batch while running returns queued and does not invoke process_query;
-- duplicate batch returns existing outcome;
-- finalizing batch advances watermark;
-- paused/waiting decisions correct;
-- session mismatch rejected;
-- commit/admission crash recovery hook registered.
+- running additions never create parallel runner;
+- missing inbox admission reserves count and byte capacity;
+- retry missing inbox creates exactly one relation;
+- pre-handoff resolution failure/cancellation retryable;
+- cancellation during `process_query()` ambiguous/interrupted;
+- cancellation after marker before invocation ambiguous/interrupted;
+- repeated cancellation cannot interrupt durable cleanup;
+- WAITING pre-marker cancellation requeues claim;
+- WAITING post-marker cancellation preserves applying claim evidence;
+- every post-handoff duplicate no-rerun;
+- durable session status after post-handoff cancellation is interrupted;
+- in-memory fake handoff port works without root/locks;
+- filesystem bundle provides `handoffs` and reads marker after recreation;
+- stale token rejected;
+- terminal timestamp ordering validated;
+- late wake old cycle does not wake new cycle.
 
 ## Done
 
-- every production committed batch goes through admission;
-- no behavior regression for ordinary initial request;
-- one active cycle invariant enforced durably and in-process;
-- additional batch no longer waits as a separate conflicting cycle.
+- every production committed batch проходит admission;
+- ordinary initial request remains compatible;
+- one active cycle enforced durably and in-process;
+- additions no longer wait as separate conflicting cycles;
+- handoff cancellation-safe and storage-neutral;
+- no blind replay after ambiguous runtime boundary.
 
 ## Не делать
 
-- не inject addition into loop yet;
-- не expose raw repository objects to transport;
-- не delete WAITING_USER compatibility before common applier exists.
+- не применять additions к LLM context;
+- не добавлять safe checkpoints/snapshots;
+- не реализовывать startup recovery policy;
+- не удалять WAITING compatibility before common applier;
+- не начинать IR-4.
 
 ---
 
 # IR-4 — Active snapshot, checkpoints и CycleInputApplier
 
+## Статус
+
+Planned. Не реализован в IR-3 hardening.
+
 ## Цель
 
-Apply admitted additions to same running cycle at protocol-safe boundaries.
+Apply admitted additions к тому же active cycle только в protocol-safe
+checkpoints.
 
-## Target files
+## Основные файлы
 
 ```text
 src/input_runtime/checkpoints.py
@@ -498,12 +551,9 @@ src/input_runtime/context_revisions.py
 src/runtime/cycle.py
 src/mcp/mcp_client.py
 src/mcp/waiting_user_batch_continuation.py
-artifact runtime integration modules as narrowly required
 ```
 
-## Active cycle fields
-
-Add bounded fields:
+## Active snapshot
 
 ```text
 generation
@@ -514,12 +564,7 @@ safe_checkpoint
 pause/interruption metadata
 ```
 
-Persistence uses `ActiveCycleSnapshotRepository`; Python object may keep caches
-not serialized directly.
-
 ## Hooks
-
-Add delegated hooks:
 
 ```text
 after create/resume
@@ -530,68 +575,53 @@ before final processing
 before terminal return
 ```
 
-One service method:
+No filesystem logic inside `mcp_client.py`.
 
-```python
-await checkpoint_service.run(
-    active_cycle=...,
-    checkpoint=...,
-    runtime_context=...,
-)
-```
+## Apply protocol
 
-No filesystem logic in `mcp_client.py`.
-
-## Apply
-
-- claim contiguous range;
-- load exact batches;
+- claim contiguous FIFO range;
+- load exact committed batches;
+- validate generation/order;
 - build one `input_batch_update`;
-- activate refs through artifact service;
-- append user message;
-- persist context revision/snapshot/watermark;
-- mark applied;
-- emit canonical lifecycle events.
+- activate artifact refs;
+- append protocol-valid user message;
+- persist context revision + active snapshot + watermark;
+- mark inbox/admissions applied;
+- emit lifecycle/projection events.
 
-## Migration WAITING_USER
+Crash between snapshot persistence and item marking reconciles by snapshot
+watermark without duplicate append.
 
-Route waiting reply through common admission/inbox/applier. Remove
-`WaitingUserBatchContinuationMixin` only after equivalent tests pass. No mutation
-of `original_input_batch_id` for additions.
+## Mandatory WAITING contract
+
+Если перед `WAITING_USER` reply существуют более ранние queued additions, reply
+не может обойти их через compatibility path. Общий `CycleInputApplier` применяет
+contiguous range строго в cycle-sequence order.
 
 ## Tests
-
-```text
-tests/test_input_runtime_checkpoints.py
-tests/test_input_runtime_applier.py
-tests/test_input_runtime_context_revisions.py
-tests/test_input_runtime_tool_sequence.py
-tests/test_input_runtime_waiting_resume.py
-```
-
-Mandatory races:
 
 - addition during LLM;
 - addition during tool block;
 - addition immediately before WAITING_USER;
 - two additions between checkpoints;
-- snapshot persisted/mark applied fails;
+- snapshot persisted / mark applied fails;
 - expired applying claim reconciliation;
+- ambiguous IR-3 claim reconciliation without blind runtime replay;
 - compaction before/after update;
-- active plan/artifact refs preserved.
+- plan/artifact refs preserved.
 
 ## Done
 
-- active cycle consumes new input without second cycle;
-- protocol sequence always valid;
-- stale WAITING_USER suppressed;
-- additions applied exactly once/order preserved;
-- compatibility mixin removed or reduced to no semantic ownership.
+- same active cycle consumes new input;
+- protocol sequence valid;
+- stale WAITING suppressed;
+- additions exactly-once/FIFO;
+- compatibility mixin loses semantic ownership.
 
 ## Не делать
 
 - не classify additions semantically;
-- не create parallel branch/task;
+- не create parallel task/branch;
 - не reset plan automatically.
 
 ---
@@ -600,72 +630,31 @@ Mandatory races:
 
 ## Цель
 
-Добавить pause/resume without state loss и перевести reset на общий durable
-control/generation contract.
+Добавить pause/resume без state loss и перевести reset на общий durable
+generation contract.
 
-## Target files
+## Поведение
 
-```text
-src/input_runtime/controls.py
-src/input_runtime/checkpoints.py
-src/api/api.py
-src/api/session_reset.py
-src/core/message_processor.py
-src/servers/telegram/runtime_commands.py new
-src/servers/telegram/telegram_server.py or handler registration
-localization catalogs
-```
-
-`batch_commands.py` сохраняет только collection commands.
-
-## Runtime behavior
-
-- `/stop` persists pause command and sets `pause_requested`;
-- checkpoint completes current atomic block and persists `paused_by_user`;
-- ordinary input during pause queues without runner wakeup;
-- `/continue` resumes same cycle and drains pre-continue additions;
-- `/reset` advances generation and invalidates old work/finalization/delivery.
-
-## Telegram
-
-- high-priority exact handler;
-- idempotency key from bot/chat/thread/update/message;
-- initial acknowledgement and applied completion projection;
-- `ApplicationHandlerStop` prevents lower command handling;
-- `/help` and `/status` updated.
+- `/stop` persists pause command и `pause_requested`;
+- checkpoint завершает текущий atomic block и сохраняет `paused_by_user`;
+- ordinary input during pause queues without auto-resume;
+- `/continue` resumes same cycle и drains additions;
+- `/reset` advances generation и invalidates stale work/finalization/delivery.
 
 ## Tests
 
-```text
-tests/test_input_runtime_controls.py
-tests/test_input_runtime_pause_resume.py
-tests/test_input_runtime_reset_generation.py
-tests/test_artifact_telegram_runtime_commands.py
-```
-
-Live/synthetic:
-
-- stop during LLM;
-- stop during multi-tool block;
+- stop during LLM/tool block;
 - additions during pause;
 - continue after several batches;
-- duplicate stop/continue;
+- duplicate controls;
 - reset racing finalization;
-- existing `/collect|/send|/cancel` unchanged.
-
-## Done
-
-- pause survives restart;
-- no next LLM/tool block after applied stop;
-- state/messages preserved;
-- same cycle resumes;
-- reset prevents stale output delivery.
+- existing collection commands unchanged.
 
 ## Не делать
 
-- не implement destructive conversation rewind;
+- не implement conversation rewind;
 - не reinterpret `/cancel` as runtime stop;
-- не promise force cancellation of external side effects.
+- не promise force cancellation confirmed external side effects.
 
 ---
 
@@ -673,63 +662,23 @@ Live/synthetic:
 
 ## Цель
 
-Создать durable semantic intermediate messages independent from progress/final.
+Durable semantic intermediate messages independent from transient progress и
+terminal output.
 
-## Target files
+## Контракт
 
-```text
-src/input_runtime/emissions.py
-src/input_runtime/filesystem.py
-src/mcp/mcp_client.py manager tool registration/handler adapter
-src/agent/protocol.py only canonical event additions if required
-src/interaction/* emission output/delivery integration
-src/api/api.py composition
-Telegram/Web delivery facades/routes as required
-localization catalogs for runtime notices/addendum lifecycle
-```
-
-## Manager tool
-
-`send_user_message(message, kind=intermediate, importance=normal)`.
-
-Policy validates:
-
-- length;
-- allowed kind;
-- per-cycle count/rate;
-- user visibility;
-- trusted response route from runtime.
-
-Handler persists emission before returning success to model.
-
-## Delivery
-
-Prefer reuse of output/delivery lifecycle primitives without pretending emission
-is terminal `OutputBatch`. If separate store/outbox is introduced, receipts and
-unknown semantics mirror existing interaction contracts.
+`send_user_message(...)` validates kind/length/rate, persists emission before tool
+success and uses trusted runtime-owned route. Delivery state independent from
+cycle execution result.
 
 ## Tests
-
-```text
-tests/test_input_runtime_emissions.py
-tests/test_input_runtime_emission_delivery.py
-tests/test_input_runtime_emission_policy.py
-```
-
-Check:
 
 - persistence before tool success;
 - duplicate idempotency;
 - delivery failure independent from cycle;
-- no late emission after terminal commit;
-- progress event remains transient;
-- reply relation safe/optional.
-
-## Done
-
-- agent can send meaningful message and continue;
-- emission visible in diagnostics/history;
-- client-specific renderer not in agent loop.
+- no emission after terminal commit;
+- progress remains transient;
+- safe optional reply relation.
 
 ## Не делать
 
@@ -743,48 +692,30 @@ Check:
 
 ## Цель
 
-Guarantee no stale final/waiting response ignores accepted input/control.
+Не допустить stale final/waiting response, игнорирующий accepted input/control.
 
-## Target files
+## Mandatory contract
 
-```text
-src/input_runtime/finalization.py
-src/input_runtime/checkpoints.py
-src/mcp finalization/derived mixins narrow integration
-src/api/api.py
-src/interaction/output_assembly/completion/store as required
-```
+Pending accepted input подавляет stale `DONE`, question и output до terminal
+commit, даже если inbox/application ещё не завершились.
 
-## Integration
-
-- final candidate remains non-terminal;
-- pre-final processing checkpoint;
-- prepared finalization record;
-- short recheck expected watermarks;
-- persist result/output;
-- second terminal recheck;
-- terminal commit enables delivery.
-
-Output metadata adds:
+## Protocol
 
 ```text
-context_revision_id
-consumed_through_cycle_sequence
-consumed_through_control_sequence
+candidate remains non-terminal
+→ pre-final checkpoint
+→ prepare finalization
+→ short watermark recheck
+→ persist result/output
+→ second terminal recheck
+→ terminal commit enables delivery
 ```
 
 ## Tests
 
-```text
-tests/test_input_runtime_finalization.py
-tests/test_input_runtime_finalization_races.py
-tests/test_input_runtime_waiting_barrier.py
-```
+Inject input/control:
 
-Deterministic barriers inject input/control:
-
-- before final processing;
-- during final processing;
+- before/during final processing;
 - after result persistence;
 - after output ready;
 - immediately before terminal commit.
@@ -794,12 +725,7 @@ Deterministic barriers inject input/control:
 - all pre-terminal events abort stale finalization;
 - post-terminal input creates new cycle;
 - output not claimable before terminal commit;
-- no duplicate cycle after restart.
-
-## Не делать
-
-- не couple delivery success to execution success;
-- не resend unknown client delivery blindly.
+- restart does not duplicate cycle/output.
 
 ---
 
@@ -807,49 +733,40 @@ Deterministic barriers inject input/control:
 
 ## Цель
 
-Recover durable input runtime before accepting new work and shut it down without
-leaving orphan claims/runners.
+Recover durable runtime before accepting new work and shutdown without orphan
+claims/runners.
 
-## Target files
+## Startup
 
-```text
-src/input_runtime/recovery.py
-src/input_runtime/service.py
-src/api/api.py start/stop
-src/gateway.py readiness/lifecycle if required
-src/runtime/session_execution.py shutdown/wakeup integration
-```
+- reconcile sessions/admissions/inbox;
+- repair committed-but-unadmitted inputs;
+- inspect runtime handoff markers;
+- keep ambiguous external operation non-replayable;
+- reconcile post-handoff claim evidence by explicit policy;
+- restore resumable/paused/waiting runners only when safe;
+- enable new admission after mandatory recovery.
 
-## Startup order
-
-Implement order from `finalization-and-recovery.md`. New admission disabled until
-mandatory reconciliation complete.
+IR-3 marker не является готовой startup recovery implementation.
 
 ## Shutdown
 
-- stop accepting new runner starts;
-- persist interrupted/paused snapshots at safe boundary where possible;
-- cancel in-process wakeup tasks;
-- do not cancel durable inbox/admission records;
+- stop new runner starts;
+- persist resumable/interrupted state where possible;
+- cancel in-process wakeups;
+- retain durable admissions/inbox/claims;
 - leave ambiguous external operations unknown;
-- close repositories after agent/tool lifecycle.
+- close runtime after agent/tool lifecycle.
 
 ## Tests
 
-```text
-tests/test_input_runtime_startup_recovery.py
-tests/test_input_runtime_shutdown.py
-tests/test_input_runtime_restart_matrix.py
-```
+Two service instances over same temporary root:
 
-Use two service instances over same temporary root to simulate restart.
-
-## Done
-
-- pause/wait/inbox/finalization survive recreation;
-- committed unadmitted batches repaired;
+- pause/wait/inbox survive recreation;
+- committed unadmitted repaired;
+- ambiguous marker does not rerun runtime;
+- post-handoff claim evidence preserved/reconciled;
 - no new work before recovery ready;
-- shutdown leaves deterministic resumable state.
+- shutdown deterministic.
 
 ---
 
@@ -857,65 +774,36 @@ Use two service instances over same temporary root to simulate restart.
 
 ## Цель
 
-Expose coherent user/admin status without leaking raw content and preserve
-client independence.
+Expose coherent safe status without raw-content leakage and preserve client
+independence.
 
-## Target files
-
-```text
-src/core/message_processor.py
-src/api routes/facades
-src/servers/telegram/*
-src/interaction/*
-src/localization/catalogs/ru.json
-src/localization/catalogs/en.json
-.env.example
-src/api/mcp.config.example
-docs/configuration-contract.md if config surface changes
-```
-
-## `/status`
-
-Add:
+## Diagnostics
 
 ```text
 runtime status/generation
 active cycle
 accepted/applied sequences
 queued/claimed/applying additions
+runtime handoff state
 oldest queued age
 pending/applied controls
-emission states
-finalization state
+emission/finalization states
+last error code
 ```
 
-No raw user text/filenames beyond existing bounded safe policies.
+## Projections
 
-## User-facing projections
-
-- initial request: existing status/final behavior;
-- running addition: accepted/current-task acknowledgement;
-- paused addition: accepted but paused;
-- applied addition: optional/coalesced completion;
-- stop pending/applied;
-- continue outcome;
-- recovery/interrupted notices.
-
-## Tests
-
-```text
-tests/test_input_runtime_localization.py
-tests/test_input_runtime_status_projection.py
-tests/test_input_runtime_client_capabilities.py
-```
-
-Examples audit must pass.
+- initial request status;
+- running/paused addition acknowledgement;
+- applied addition completion;
+- stop/continue outcome;
+- interrupted/ambiguous recovery notice.
 
 ## Done
 
 - RU/EN keys complete;
-- Telegram without editing has safe fallback;
-- Web/CLI can consume structured outcome;
+- Telegram editing fallback safe;
+- Web/CLI consume structured outcomes;
 - config examples/documentation synchronized.
 
 ---
@@ -924,34 +812,32 @@ Examples audit must pass.
 
 ## Цель
 
-Prove contracts under unit, race, restart and real transport behavior.
+Prove contracts под unit, race, restart, synthetic и real transport behavior.
 
 ## Automated suites
 
-At minimum:
-
 ```text
 input-runtime focused suite
-artifact/storage/plans/planning/API regression suites
+artifact/storage/plans/planning/API regressions
 Telegram transport/audit suite
 full repository baseline
-compile/config examples audit
+compile/config example audit
 ```
 
 ## Race/randomized matrix
 
 - concurrent commit/admission;
 - addition at every checkpoint/finalization boundary;
-- stop/continue/reset order randomization;
+- stop/continue/reset ordering;
 - claim expiry/restart;
 - lost wakeup;
 - output ready vs new input;
-- duplicate transport requests;
-- multiple additions with files;
-- pause with active collection in same session;
-- shutdown while queued/claimed/applying.
+- duplicate requests;
+- additions with files;
+- shutdown while queued/claimed/applying;
+- cancellation before/after handoff and during cleanup.
 
-Every randomized run records seed and exact scenario selector.
+Every randomized run records seed and selector.
 
 ## Synthetic no-network roast
 
@@ -960,49 +846,39 @@ transport sinks.
 
 ## Maintainer live Telegram acceptance
 
-Mandatory scenarios:
-
-1. long agent run, send one text addition;
-2. send several additions and files while tools execute;
+1. long run + text addition;
+2. several additions/files during tools;
 3. `/stop` during visible work;
-4. several additions while paused;
-5. `/continue` and verify same cycle uses all additions;
-6. intermediate agent message delivered while work continues;
-7. addition immediately before final answer;
+4. additions while paused;
+5. `/continue` and same-cycle apply;
+6. intermediate message while work continues;
+7. addition immediately before final;
 8. `/reset` while active;
 9. restart while paused/waiting/queued;
-10. existing `/collect`/`/send`/`/cancel` and artifact delivery regressions.
-
-Live evidence records IDs/statuses without secrets or raw private payload.
+10. regression collection/artifact delivery commands.
 
 ## Completion gate
 
 - zero deterministic failures;
 - no unexplained flaky race;
 - full baseline green;
-- no production code bypasses admission for committed batches;
-- no unresolved canonical documentation conflict;
-- implementation status/current/roadmap/PR description updated;
-- draft PR marked ready only after acceptance evidence.
+- no production bypass of admission;
+- no canonical documentation conflicts;
+- current/roadmap/PR evidence synchronized;
+- PR remains draft until all IR-1—IR-10 and live acceptance complete.
 
 ---
 
 # Допустимая параллельность patches
 
-После IR-1:
-
-- filesystem repositories;
-- emission policy/model tests;
-- localization drafts;
-- synthetic test harness foundation
-
-могут разрабатываться параллельно в независимых files.
+После IR-1 независимые filesystem adapters, emission policy drafts,
+localization и synthetic harness могут разрабатываться параллельно.
 
 Admission, checkpoint integration, controls и finalization выполняются
-последовательно, потому что разделяют session state/watermarks.
+последовательно, поскольку разделяют session state/watermarks.
 
-IR-6 emissions можно интегрировать после stable cycle identity/context revision,
-но до finalization barrier completion.
+IR-6 может интегрироваться после stable cycle/context identity и до завершения
+finalization barrier.
 
 ---
 
@@ -1012,6 +888,8 @@ IR-6 emissions можно интегрировать после stable cycle ide
 feat(input-runtime): add domain contracts and config
 feat(input-runtime): add filesystem repositories and claims
 feat(input-runtime): route committed batches through admission
+fix(input-runtime): close IR-3 capacity and runner handoff gaps
+fix(input-runtime): make IR-3 handoff cancellation-safe and portable
 feat(input-runtime): apply additions at safe checkpoints
 feat(input-runtime): add durable stop and continue controls
 feat(input-runtime): add intermediate agent emissions
@@ -1021,6 +899,5 @@ test(input-runtime): add race restart and transport coverage
 docs(input-runtime): finalize acceptance and current baseline
 ```
 
-Названия могут уточняться, но один commit не должен одновременно вводить новый
-state contract, переписывать agent loop и менять Telegram presentation без
-характеризационных tests.
+Один commit не должен одновременно вводить новый state contract, переписывать
+agent loop и менять transport presentation без characterization tests.

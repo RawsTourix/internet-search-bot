@@ -151,8 +151,8 @@ v0.4-input-runtime
 ```
 
 В `v0.4-input-runtime` реализованы и подтверждены CI этапы IR-1, IR-2 и IR-3.
-Domain/config/ports и durable filesystem repositories теперь подключены в
-production composition через `InputAdmissionService`.
+Domain/config/ports и durable filesystem repositories подключены в production
+composition через `InputAdmissionService`.
 
 Каждый immutable `CommittedInputBatch` проходит общий admission boundary.
 Initial input получает exact cycle identity, назначенную service, и запускает
@@ -162,26 +162,54 @@ session/cycle sequence и FIFO `CycleInboxItem` того же cycle; transport �
 запускается. `SessionExecutionCoordinator` остаётся defensive in-process lease,
 wakeup/generation cache и diagnostics, но не durable queue.
 
-Duplicate replay возвращает существующую admission/inbox relation. Count/byte
-capacity block является typed и retryable; committed batch сохраняется для
-повторного admission. Record-first crash windows восстанавливают missing inbox,
-не выделяя новую sequence или новый cycle. `WAITING_USER` продолжает тот же cycle
-через временный compatibility adapter; `interrupted` не запускает unsafe
-automatic replay.
+IR-3 hardening дополнительно закрепляет:
 
-IR-3 evidence:
+- authoritative count/byte reservation по pending/admitted admissions активного
+  cycle даже при crash между admission и inbox publication;
+- exact-cycle wake fencing: late wake старого cycle не изменяет event нового;
+- durable runtime handoff boundary
+  `pre-run setup → RuntimeHandoffRecord → process_query()` без blind replay;
+- явную обработку `asyncio.CancelledError` для initial runner и временного
+  `WAITING_USER` compatibility path;
+- отдельную cleanup task, ожидание через `asyncio.shield` и завершение durable
+  cleanup даже при повторной cancellation;
+- pre-handoff cancellation остаётся retryable, post-handoff cancellation
+  переводит marker в `AMBIGUOUS`, а session cycle — в `interrupted`;
+- WAITING claim до marker requeue-ится, после marker остаётся durable evidence и
+  не requeue-ится для автоматического повторного runtime invocation;
+- storage-neutral `RuntimeHandoffRepository` port. Application service получает
+  готовый repository; filesystem adapter собирается только infrastructure
+  factory/bundle и переживает recreation поверх того же storage root;
+- stale handoff token не завершает другую attempt, terminal timestamps не могут
+  предшествовать `handed_off_at`.
 
-- code SHA `4929b703d7f6e200392661b2b66205b8fa4ca034`;
-- `Validate Input Runtime` #73 — success, `181 passed`;
-- `Validate v0.4 file artifacts PR` #497 — success;
-- deterministic no-parallel test: три additions, один target cycle,
+Duplicate replay возвращает существующую admission/inbox relation и после
+handoff не запускает runner повторно. Count/byte capacity block является typed и
+retryable; committed batch сохраняется для повторного admission. Record-first
+crash windows восстанавливают missing inbox без новой sequence или нового cycle.
+`interrupted` не запускает unsafe automatic replay.
+
+IR-3 final code evidence:
+
+- основной cancellation-safe/storage-neutral commit:
+  `e8192380cc3104668ea9b0f3f017d3c962fd65e4`;
+- узкий CI fixture fix:
+  `c36e4cc38095e15f54f63ae81c29b4829defec1f`;
+- `Validate Input Runtime` #84 — success, `198 passed`;
+- `Validate v0.4 file artifacts PR` #503 — success;
+- deterministic no-parallel contract: три additions, один target cycle,
   `process_query call count == 1`.
 
 Общий update остаётся partial. Additions уже durable admitted и queued, но ещё не
 применяются к LLM context. Safe checkpoints, `CycleInputApplier`, context
-revisions и active snapshot integration начинаются с IR-4. `/stop`, `/continue`,
-intermediate emissions, finalization barrier и startup recovery lifecycle также
-ещё отсутствуют.
+revisions и active snapshot integration начинаются с IR-4. Для IR-4 зафиксировано,
+что `WAITING_USER` reply не обходит более ранние queued additions и применяется
+через общий FIFO applier. `/stop`, `/continue`, intermediate emissions,
+finalization barrier и startup recovery lifecycle также ещё отсутствуют.
+
+Для IR-7 отдельно зафиксировано: pending accepted input подавляет stale `DONE`,
+question и output до terminal commit. Это требование документировано, но не
+реализовано в IR-3.
 
 Принятый target включает:
 
@@ -263,14 +291,17 @@ test или migration evidence.
 4. учитывайте `v0.4-batch-workflows` как implemented и accepted;
 5. считайте IR-1—IR-3 `v0.4-input-runtime` реализованными: каждый committed batch
    admitted, initial batch запускает один cycle, running additions durable queued
-   в том же cycle без второго runner;
+   в том же cycle без второго runner, а runtime handoff cancellation-safe и
+   storage-neutral;
 6. не приписывайте применение additions к LLM context, safe checkpoints,
    `/stop`/`/continue`, emissions и finalization текущему baseline до IR-4+;
-7. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
-8. не приписывайте scopes, trusted presentation, admission и remote handle
+7. не приписывайте startup reconciliation ambiguous handoff/claim к IR-3 — это
+   будущая ответственность IR-8;
+8. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
+9. не приписывайте scopes, trusted presentation, admission и remote handle
    lifecycle до `v0.4-mcp-registry-foundation`;
-9. не называйте текущий self-hosted Service Application Future Local Agent;
-10. проверяйте затронутый код и tests для точного implementation status;
-11. используйте v0.5–v0.10 только как будущие ограничения;
-12. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`;
-13. не смешивайте sandbox execution backend и Future Local Agent Application.
+10. не называйте текущий self-hosted Service Application Future Local Agent;
+11. проверяйте затронутый код и tests для точного implementation status;
+12. используйте v0.5–v0.10 только как будущие ограничения;
+13. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`;
+14. не смешивайте sandbox execution backend и Future Local Agent Application.

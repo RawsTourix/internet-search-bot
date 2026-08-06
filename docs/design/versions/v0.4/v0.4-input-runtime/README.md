@@ -14,13 +14,18 @@ last_reviewed: 2026-08-06
 `IR-1`, `IR-2` и `IR-3` реализованы и подтверждены CI. Этапы `IR-4`—`IR-10`
 остаются planned, поэтому общий update сохраняет статус `partial`.
 
-Evidence для завершённого и hardened admission foundation:
+Финальный IR-3 evidence:
 
-- основной IR-3 code SHA: `4929b703d7f6e200392661b2b66205b8fa4ca034`;
-- IR-3 hardening commit: `d11db7f2a2f8caae900f3bc94ed91de020059231`;
-- итоговый hardened code HEAD: `5441250069c0b2984461e8dd63429f3928c7918c`;
-- `Validate Input Runtime` run #79 — success, `187 passed`;
-- `Validate v0.4 file artifacts PR` run #500 — success.
+- основной admission implementation:
+  `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- crash-safe capacity/runner handoff hardening:
+  `d11db7f2a2f8caae900f3bc94ed91de020059231`;
+- cancellation-safe/storage-neutral handoff commit:
+  `e8192380cc3104668ea9b0f3f017d3c962fd65e4`;
+- итоговый code HEAD после узкого test-fixture fix:
+  `c36e4cc38095e15f54f63ae81c29b4829defec1f`;
+- `Validate Input Runtime` #84 — success, `198 passed`;
+- `Validate v0.4 file artifacts PR` #503 — success.
 
 IR-3 подключил IR-1/IR-2 repositories в production composition и ввёл общий
 `InputAdmissionService` для каждого immutable `CommittedInputBatch`. Initial batch
@@ -29,23 +34,40 @@ IR-3 подключил IR-1/IR-2 repositories в production composition и вв
 FIFO `CycleInboxItem` того же cycle, возвращает structured acknowledgement и не
 вызывает второй `MCPClient.process_query()`.
 
-Финальный hardening закрыл три admission/runner contract gap:
+Hardened IR-3 закрывает admission/runner boundary:
 
-- count/byte capacity authority теперь определяется pending/admitted admissions
-  активного cycle, поэтому admission с ещё не восстановленным inbox уже занимает
+- count/byte capacity authority определяется pending/admitted admissions активного
+  cycle, поэтому admission с ещё не восстановленным inbox уже занимает
   reservation и не позволяет обойти limit после crash;
 - между pre-run setup и `process_query()` записывается durable runtime handoff
   marker: ошибка до handoff остаётся retryable, а неоднозначность после handoff
   переводит cycle в `interrupted` и запрещает blind replay LLM/tool side effects;
 - `SessionExecutionCoordinator.wake()` выставляет event только для exact
-  reserved/active `cycle_id`; поздний wake старого cycle не будит новый cycle.
+  reserved/active `cycle_id`; поздний wake старого cycle не будит новый cycle;
+- `start_admitted_cycle()` и временный `resume_admitted_cycle()` отдельно
+  обрабатывают `asyncio.CancelledError`, выполняют durable cleanup в отдельной
+  task, ожидают её через `asyncio.shield`, переживают повторную cancellation и
+  затем повторно выбрасывают исходный `CancelledError`;
+- initial cancellation до marker оставляет admission retryable; cancellation
+  после marker переводит marker в `AMBIGUOUS`, session cycle в `interrupted`, а
+  duplicate не вызывает второй `process_query()`;
+- WAITING cancellation после claim, но до marker, requeue-ит claim; после marker
+  claim не requeue-ится, остаётся durable evidence для будущего IR-4/IR-8
+  reconciliation, marker становится `AMBIGUOUS`, cycle — `interrupted`;
+- handoff persistence вынесен за application boundary: нейтральный
+  `RuntimeHandoffRepository` предоставляет command-oriented
+  `get/begin/complete/mark_ambiguous`, а concrete filesystem adapter создаётся
+  только в `create_filesystem_input_runtime_repositories(...)`;
+- stale handoff token не завершает другую attempt; terminal timestamps не могут
+  предшествовать `handed_off_at`; recreation filesystem bundle читает прежний
+  marker.
 
 Duplicate replay возвращает существующую relation, capacity block является typed
 и retryable, а record-first crash windows admission/inbox/runner-start покрыты
 reconciliation tests. `WAITING_USER` временно сохраняет compatibility adapter,
-но после durable runtime handoff неоднозначный failure больше не requeue-ит input
-для автоматического повторного `process_query()`. `interrupted` не выполняет
-unsafe automatic replay.
+но после durable runtime handoff неоднозначный failure или cancellation больше не
+requeue-ит input для автоматического повторного `process_query()`. `interrupted`
+не выполняет unsafe automatic replay.
 
 Queued additions на IR-3 ещё не применяются к работающему LLM context. Safe
 checkpoints, общий input applier, context revisions и snapshot ownership относятся
@@ -54,8 +76,10 @@ checkpoints, общий input applier, context revisions и snapshot ownership �
 `CycleInputApplier`, а не обходить очередь через compatibility path.
 
 Для IR-7 зафиксировано: любой pending accepted input должен подавлять stale
-`DONE`, question или output до terminal commit. `/stop`, `/continue`, intermediate
-emissions, finalization barrier и startup recovery lifecycle ещё не реализованы.
+`DONE`, question или output до terminal commit. Для IR-8 зафиксировано, что
+ambiguous marker и post-handoff claim evidence требуют explicit reconciliation
+policy без automatic replay. `/stop`, `/continue`, intermediate emissions,
+finalization barrier и startup recovery lifecycle ещё не реализованы.
 
 IR-2 добавил filesystem implementations repository ports, атомарные записи,
 bounded reference-counted coordination, authoritative session-local
@@ -63,7 +87,7 @@ pre-allocation repair, coordinated sequence allocation, claim fencing/recovery,
 authoritative `payload_size_bytes`, generation cancellation и root-global
 identity fencing с порядком `root identity → session`.
 
-Global create/append/prepare paths теперь используют crash-recoverable protocol
+Global create/append/prepare paths используют crash-recoverable protocol
 `lookup/recovery → durable record write → index/cycle-authority writes`. Потерянные
 или dangling indexes перед competing create сверяются редким exact-identity scan:
 единственный authoritative record восстанавливает все relations, отсутствие
@@ -193,9 +217,12 @@ payloads или client delivery.
     разными состояниями.
 12. Filesystem backend может иметь crash windows, но recovery всегда
     идемпотентен и не теряет committed input.
-13. Неоднозначный внешний side effect после crash не повторяется автоматически.
+13. Неоднозначный внешний side effect после crash или cancellation не повторяется
+    автоматически.
 14. Domain IDs не зависят от Telegram/Web/CLI message IDs.
-15. В `v0.4` context revisions линейны, но identity допускает будущие multiple
+15. Application services зависят от repository ports, а не от filesystem root,
+    locks или serialization helpers.
+16. В `v0.4` context revisions линейны, но identity допускает будущие multiple
     parents без реализации merge semantics.
 
 ## Состав обновления
@@ -253,8 +280,10 @@ payloads или client delivery.
 Все authoritative stores оформляются как ports:
 
 ```text
+SessionInputRuntimeRepository
 InputAdmissionRepository
 CycleInboxRepository
+RuntimeHandoffRepository
 SessionControlRepository
 ActiveCycleSnapshotRepository
 ContextRevisionRepository
