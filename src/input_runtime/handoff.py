@@ -57,9 +57,19 @@ class RuntimeHandoffRecord(BaseModel):
         mode="before",
     )
     @classmethod
-    def normalize_timestamp(cls, value: datetime | None) -> datetime | None:
+    def normalize_timestamp(
+        cls,
+        value: datetime | str | None,
+    ) -> datetime | None:
         if value is None:
             return None
+        if isinstance(value, str):
+            try:
+                value = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            except ValueError as error:
+                raise ValueError("invalid handoff timestamp") from error
+        if not isinstance(value, datetime):
+            raise ValueError("invalid handoff timestamp type")
         if value.tzinfo is None or value.utcoffset() is None:
             raise ValueError("handoff timestamps must be timezone-aware")
         return value.astimezone(timezone.utc)
