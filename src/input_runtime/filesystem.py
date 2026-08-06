@@ -6,22 +6,16 @@ from pathlib import Path
 
 from src.storage import StorageConfigType
 
-from ._filesystem_cycle import (
-    FileSystemActiveCycleSnapshotRepository,
-    FileSystemContextRevisionRepository,
-)
-from ._filesystem_delivery import (
-    FileSystemAgentEmissionRepository,
-    FileSystemFinalizationRepository,
-)
 from ._filesystem_identity import (
+    FileSystemActiveCycleSnapshotRepository,
+    FileSystemAgentEmissionRepository,
+    FileSystemContextRevisionRepository,
     FileSystemCycleInboxRepository,
+    FileSystemFinalizationRepository,
     FileSystemInputAdmissionRepository,
-)
-from ._filesystem_session import (
     FileSystemSessionControlRepository,
-    FileSystemSessionInputRuntimeRepository,
 )
+from ._filesystem_session import FileSystemSessionInputRuntimeRepository
 from .coordination import GLOBAL_SESSION_LOCKS, SessionLockRegistry
 
 
@@ -41,7 +35,10 @@ class FileSystemInputRuntimeRepositories:
             root=root,
             locks=locks,
         )
-        self.inbox = FileSystemCycleInboxRepository(root=root, locks=locks)
+        self.inbox = FileSystemCycleInboxRepository(
+            root=root,
+            locks=locks,
+        )
         self.controls = FileSystemSessionControlRepository(
             root=root,
             locks=locks,

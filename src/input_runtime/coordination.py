@@ -40,12 +40,21 @@ class SessionLockRegistry:
     def _session_key(self, root: Path, session_id: str) -> tuple[str, str]:
         return (str(root.resolve()), f"session:{storage_key(session_id)}")
 
+    def _validate_entry_locked(self, entry: _Entry) -> None:
+        if min(entry.references, entry.waiters, entry.owners) < 0:
+            raise RuntimeError("lock registry counters became negative")
+        if entry.owners > 1:
+            raise RuntimeError("session lock has more than one owner")
+        if entry.owners and not entry.lock.locked():
+            raise RuntimeError("owned registry entry must hold its lock")
+
     def _prune_locked(self) -> None:
         if len(self._entries) <= self._max_entries:
             return
         for key, entry in list(self._entries.items()):
             if len(self._entries) <= self._max_entries:
                 break
+            self._validate_entry_locked(entry)
             if (
                 entry.references == 0
                 and entry.waiters == 0
@@ -64,6 +73,36 @@ class SessionLockRegistry:
     def size(self) -> int:
         return len(self._entries)
 
+    async def _after_lock_acquired(
+        self,
+        key: tuple[str, str],
+        entry: _Entry,
+    ) -> None:
+        """Test seam after lock acquisition but before registry bookkeeping."""
+
+    async def _finish_hold(
+        self,
+        *,
+        key: tuple[str, str],
+        entry: _Entry,
+        acquired: bool,
+        owner_bookkept: bool,
+    ) -> None:
+        async with self._guard:
+            if acquired:
+                if owner_bookkept:
+                    entry.owners -= 1
+                else:
+                    entry.waiters -= 1
+                entry.lock.release()
+            else:
+                entry.waiters -= 1
+            entry.references -= 1
+            self._validate_entry_locked(entry)
+            if key in self._entries:
+                self._entries.move_to_end(key, last=True)
+            self._prune_locked()
+
     @asynccontextmanager
     async def _hold_key(self, key: tuple[str, str]) -> AsyncIterator[None]:
         async with self._guard:
@@ -75,26 +114,34 @@ class SessionLockRegistry:
                 self._entries.move_to_end(key)
             entry.references += 1
             entry.waiters += 1
+            self._validate_entry_locked(entry)
             self._prune_locked()
 
         acquired = False
+        owner_bookkept = False
         try:
             await entry.lock.acquire()
             acquired = True
+            await self._after_lock_acquired(key, entry)
             async with self._guard:
                 entry.waiters -= 1
                 entry.owners += 1
+                owner_bookkept = True
+                self._validate_entry_locked(entry)
             yield
         finally:
-            async with self._guard:
-                if acquired:
-                    entry.lock.release()
-                    entry.owners -= 1
-                else:
-                    entry.waiters -= 1
-                entry.references -= 1
-                self._entries.move_to_end(key, last=True)
-                self._prune_locked()
+            cleanup_task = asyncio.create_task(
+                self._finish_hold(
+                    key=key,
+                    entry=entry,
+                    acquired=acquired,
+                    owner_bookkept=owner_bookkept,
+                )
+            )
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                await cleanup_task
 
     @asynccontextmanager
     async def hold(self, root: Path, session_id: str) -> AsyncIterator[None]:
