@@ -7,10 +7,9 @@ from dataclasses import dataclass
 from .composition import register_input_runtime_binding
 from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
-from .ir4_checkpoint_contracts import (
-    CancellationSafeCycleInputApplier,
-    EntryWatermarkCheckpointService,
-)
+from .handoff import RuntimeHandoffState
+from .ir4_checkpoint_contracts import EntryWatermarkCheckpointService
+from .ir4_persistence_windows import DurableClaimCycleInputApplier
 from .models import AdmissionKind, AdmissionState, CheckpointAction, CycleStatus
 
 
@@ -28,7 +27,7 @@ class InputAdmissionService(_IR3InputAdmissionService):
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
-        self.cycle_input_applier = CancellationSafeCycleInputApplier(
+        self.cycle_input_applier = DurableClaimCycleInputApplier(
             config=self.config,
             repositories=self.repositories,
             committed_batches=self.committed_batches,
@@ -50,7 +49,15 @@ class InputAdmissionService(_IR3InputAdmissionService):
         *,
         handoff_token: str,
     ):
-        """Sync terminal snapshot only after status/output compatibility."""
+        """Complete handoff first, then synchronize terminal snapshot evidence."""
+
+        marker = await super().complete_runtime_handoff(
+            admission,
+            handoff_token=handoff_token,
+        )
+        if marker.state != RuntimeHandoffState.COMPLETED:
+            return marker
+
         state = await self.repositories.sessions.get(admission.session_id)
         if (
             state is not None
@@ -66,12 +73,10 @@ class InputAdmissionService(_IR3InputAdmissionService):
             )
             if outcome.action == CheckpointAction.INTERRUPT:
                 raise InputRuntimeConflictError(
-                    outcome.reason_code or "terminal snapshot synchronization failed"
+                    outcome.reason_code
+                    or "terminal snapshot synchronization failed"
                 )
-        return await super().complete_runtime_handoff(
-            admission,
-            handoff_token=handoff_token,
-        )
+        return marker
 
     async def mark_runtime_handoff_ambiguous(
         self,
