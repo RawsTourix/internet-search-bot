@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-05
+last_reviewed: 2026-08-06
 ---
 
 # v0.4-input-runtime
@@ -16,16 +16,18 @@ planned.
 
 Evidence для завершённого filesystem foundation:
 
-- code HEAD: `0795eac762e96818c4b777b9aea5f4e9b855e2c0`;
-- `Validate Input Runtime` run #55 — success;
-- `Validate v0.4 file artifacts PR` run #488 — success;
-- targeted input-runtime и общий configuration audit: `117 passed`.
+- code HEAD: `0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`;
+- `Validate Input Runtime` run #61 — success;
+- `Validate v0.4 file artifacts PR` run #491 — success;
+- targeted input-runtime и общий configuration audit: `127 passed`.
 
 IR-2 добавил filesystem implementations repository ports, атомарные записи,
-bounded reference-counted coordination, authoritative pre-allocation repair по
-persisted admissions, coordinated sequence allocation, claim fencing/recovery,
-authoritative `payload_size_bytes`, recoverable hot-path indexes, generation
-cancellation и root-global identity fencing с порядком `root → session`.
+bounded reference-counted coordination, cancellation-safe lock bookkeeping,
+authoritative session-local pre-allocation repair, coordinated sequence
+allocation, claim fencing/recovery, authoritative `payload_size_bytes`,
+recoverable hot-path indexes и root-global identity fencing с порядком
+`root identity → session` для admission, inbox, controls, snapshots, context
+revisions, emissions и finalizations.
 
 Production runtime behaviour пока не изменён: filesystem repositories не
 подключены к `Api`, committed batches ещё не проходят новый admission service,

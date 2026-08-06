@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-05
+last_reviewed: 2026-08-06
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -81,11 +81,15 @@ suites. Точный последний head и результаты run фик�
 
 `v0.4-input-runtime` остаётся update со статусом `partial`. IR-1 и IR-2
 реализованы и подтверждены CI: domain/config/ports foundation, durable filesystem
-repositories, bounded coordination, atomic writes, sequence repair, claims,
-recoverable indexes и global identity fencing. Этапы IR-3—IR-10, включая
-production admission, checkpoints, controls, emissions, finalization и recovery
-lifecycle, остаются planned. Observable production runtime behaviour пока не
-изменён.
+repositories, bounded cancellation-safe coordination, atomic writes,
+session-local sequence repair, claims, recoverable indexes и root-global
+identity fencing всех repository create/append/prepare paths. Финальное IR-2
+evidence: code HEAD `0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`, workflow #61
+и #491, targeted suite `127 passed`.
+
+Этапы IR-3—IR-10, включая production admission, checkpoints, controls,
+emissions, finalization и recovery lifecycle, остаются planned. Observable
+production runtime behaviour пока не изменён.
 
 Целевой package вводит durable admission, additions в один active AgentCycle,
 safe checkpoints, линейные context revisions, `/stop`/`/continue`, durable

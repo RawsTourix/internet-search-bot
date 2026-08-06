@@ -3,7 +3,7 @@ id: design.current
 version: cross-version
 spec_status: accepted
 implementation_status: mixed
-last_reviewed: 2026-08-05
+last_reviewed: 2026-08-06
 ---
 
 # Текущий архитектурный baseline
@@ -152,11 +152,15 @@ v0.4-input-runtime
 
 В `v0.4-input-runtime` реализованы и подтверждены CI foundation-этапы IR-1 и
 IR-2: domain models, enums, configuration, repository ports и durable filesystem
-repositories с atomic writes, bounded coordination, sequence repair, claims,
-recoverable indexes и root-global identity fencing. Production admission,
-checkpoints, `/stop`/`/continue`, emissions и finalization ещё не подключены.
-Поэтому новое observable production behaviour этому update пока не
-приписывается.
+repositories с atomic writes, bounded coordination, cancellation-safe lock
+bookkeeping, session-local sequence repair, claims, recoverable indexes и
+root-global identity fencing всех create/append/prepare paths. Финальный IR-2
+code evidence: `0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`, workflow #61 и #491,
+targeted suite `127 passed`.
+
+Production admission, checkpoints, `/stop`/`/continue`, emissions и finalization
+ещё не подключены. Поэтому новое observable production behaviour этому update
+пока не приписывается.
 
 Принятый target включает:
 

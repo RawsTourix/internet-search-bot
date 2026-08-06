@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-05
+last_reviewed: 2026-08-06
 ---
 
 # Последовательность реализации v0.4-input-runtime
@@ -15,9 +15,11 @@ last_reviewed: 2026-08-05
 - `IR-2 — Filesystem repositories и coordination service`: implemented;
 - `IR-3`—`IR-10`: planned.
 
-IR-1 и IR-2 подтверждены code HEAD
-`0795eac762e96818c4b777b9aea5f4e9b855e2c0`, workflow #55 и #488 и targeted
-suite `117 passed`. Эти этапы создают domain/config/repository и durable
+IR-1 и IR-2 подтверждены final code HEAD
+`0cc98196fcc671c6c6a1c98a6cf75add8715b1fd`, workflow #61 и #491 и targeted
+suite `127 passed`. IR-2 включает cancellation-safe bounded coordination,
+session-local reconciliation и root-global identity fencing repository
+create/append/prepare paths. Эти этапы создают domain/config/repository и durable
 filesystem foundations, но не изменяют observable production behaviour:
 production admission и agent-loop integration начинаются с IR-3.
 
@@ -210,8 +212,9 @@ tests/test_input_runtime_interfaces.py or type/contract tests
 ## Статус
 
 Implemented и подтверждён CI. Реализованы durable filesystem adapters,
-atomic-write/restart contracts, claims, sequence repair, bounded coordination и
-global identity fencing. Production admission/API integration в этот этап не
+atomic-write/restart contracts, claims, session-local sequence repair, bounded
+cancellation-safe coordination и root-global identity fencing для repository
+create/append/prepare paths. Production admission/API integration в этот этап не
 входит.
 
 ## Цель
