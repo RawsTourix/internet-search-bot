@@ -5,11 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from .composition import register_input_runtime_binding
-from .emissions import (
-    AgentEmissionOutboxService,
-    AgentEmissionService,
-    ReplyAwareCommittedBatchReader,
-)
+from .emissions import AgentEmissionService, ReplyAwareCommittedBatchReader
 from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
 from .handoff import RuntimeHandoffState
@@ -18,6 +14,7 @@ from .ir5_hardening import (
     HardenedControlAwareCheckpointService,
     HardenedInputRuntimeControlService,
 )
+from .ir6_outbox import AgentEmissionOutboxService
 from .models import AdmissionKind, AdmissionState, CheckpointAction, CycleStatus
 
 
