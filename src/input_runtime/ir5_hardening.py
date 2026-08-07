@@ -36,19 +36,9 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
         existing = await super()._existing(**kwargs)
         if existing is None:
             return None
-        # A crash may have persisted the immutable control record but failed the
-        # session pending-watermark write. Re-enter the repository allocation
-        # protocol before any semantic retry; it reuses the same control ID and
-        # sequence and repairs only missing acceptance metadata.
         return await self.repositories.controls.allocate(existing)  # type: ignore[attr-defined]
 
     async def _has_effective_pending_pause(self, state: Any) -> bool:
-        """Reduce durable un-applied controls for continue classification.
-
-        Session cycle_status can lag a just-persisted pause record. Continue must
-        therefore observe durable sequence order rather than classify solely
-        from that lagging projection.
-        """
         if state.pending_control_sequence <= state.applied_control_sequence:
             return False
         rows = await self.repositories.controls.list_range(  # type: ignore[attr-defined]
@@ -164,9 +154,6 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
         if snapshot is None or snapshot.generation != generation:
             return outcome
 
-        # A paused WAITING cycle with real input accepted before /continue must
-        # drain that input before re-entering waiting/running semantics. The
-        # continue command itself is never projected as a user answer.
         rows = await self.repositories.controls.list_range(  # type: ignore[attr-defined]
             str(active_cycle.session_id),
             after_sequence=0,
@@ -266,10 +253,6 @@ class HardenedControlAwareCheckpointService(ControlAwareCheckpointService):
             str(active_cycle.cycle_id)
         )
         if snapshot is not None and snapshot.status == CycleStatus.PAUSED_BY_USER:
-            # A genuinely paused cycle has not executed a new atomic block yet.
-            # Its durable context is already the closed pause snapshot. Calling
-            # the IR-4 closed-context sync here would derive status from stale
-            # in-memory RUNNING and erase waiting metadata before reduction.
             return None
         return await super()._persist_closed_context(
             checkpoint=checkpoint,
@@ -285,19 +268,31 @@ class HardenedControlAwareCheckpointService(ControlAwareCheckpointService):
             return outcome
 
         active_cycle = kwargs["active_cycle"]
+        session_id = str(active_cycle.session_id)
         cycle_id = str(active_cycle.cycle_id)
         generation = int(getattr(active_cycle, "input_runtime_generation", 0))
         snapshot = await self.applier.repositories.snapshots.get(cycle_id)
-        if snapshot is None or snapshot.generation != generation:
+        state = await self.applier.repositories.sessions.get(session_id)
+        if (
+            snapshot is None
+            or state is None
+            or snapshot.generation != generation
+            or state.generation != generation
+            or state.active_cycle_id != cycle_id
+        ):
             return outcome
-        if snapshot.status != CycleStatus.WAITING_USER:
+        if (
+            snapshot.status != CycleStatus.WAITING_USER
+            and state.cycle_status != CycleStatus.WAITING_USER
+            and snapshot.waiting_question is None
+        ):
             return outcome
 
-        # Real queued input, not /continue, satisfies the active waiting boundary.
-        # Promotion happens only after the entire captured resume target was
-        # drained by the base bounded loop.
+        # A real applied input, not /continue itself, resolves the active WAITING
+        # boundary. This happens only after the base service drains the captured
+        # continue target completely, including multiple bounded ranges.
         persisted = await self.control_service._persist_snapshot_status(
-            session_id=str(active_cycle.session_id),
+            session_id=session_id,
             cycle_id=cycle_id,
             generation=generation,
             status=CycleStatus.RUNNING,
