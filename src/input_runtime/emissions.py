@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from .config import InputRuntimeConfigType
 from .errors import InputRuntimeConflictError
@@ -47,9 +47,9 @@ class AgentEmissionDeliveryReceipt(BaseModel):
     emission_id: str
     session_id: str
     cycle_id: str
-    generation: int
+    generation: int = Field(ge=0)
     claim_token: str
-    attempt_number: int
+    attempt_number: int = Field(ge=1)
     client_type: str
     client_instance_id: str
     conversation_id: str
@@ -77,6 +77,14 @@ class AgentEmissionDeliveryReceipt(BaseModel):
 
             if re.fullmatch(r"emit_[0-9a-f]{32}", normalized) is None:
                 raise ValueError("invalid emission_id")
+        return normalized
+
+    @field_validator("client_type")
+    @classmethod
+    def normalized_client_type(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if not normalized:
+            raise ValueError("client_type must not be empty")
         return normalized
 
     @field_validator("thread_id")
@@ -134,6 +142,18 @@ class AgentEmissionCommandRepository(Protocol):
     async def record_delivery_receipt(
         self,
         receipt: AgentEmissionDeliveryReceipt,
+    ) -> AgentEmission: ...
+
+    async def fail_for_client(
+        self,
+        emission_id: str,
+        *,
+        session_id: str,
+        client_type: str,
+        client_instance_id: str,
+        claim_token: str,
+        state: str,
+        error_code: str,
     ) -> AgentEmission: ...
 
     async def fail_delivery(
@@ -223,15 +243,15 @@ class AgentEmissionService:
         capability = getattr(batch, "capability_snapshot", None)
         if route is None or capability is None:
             return None
-        client_type = self._string(getattr(capability, "client_type", ""))
+        client_type = self._string(getattr(capability, "client_type", "")).lower()
         client_instance_id = self._string(
             getattr(capability, "client_instance_id", "")
         )
         conversation_id = self._string(getattr(route, "conversation_id", ""))
         if not client_type or not client_instance_id or not conversation_id:
             return None
-        route_type = self._string(getattr(route, "route_type", ""))
-        if route_type and route_type.lower() != client_type.lower():
+        route_type = self._string(getattr(route, "route_type", "")).lower()
+        if route_type and route_type != client_type:
             return None
         thread_id = self._string(getattr(route, "thread_id", "")) or None
         anchor = getattr(batch, "response_anchor", None)
@@ -247,8 +267,19 @@ class AgentEmissionService:
         )
         if not capability_snapshot_id:
             return None
-        result: dict[str, Any] = {
-            "client_type": client_type.lower(),
+        values = (
+            client_type,
+            client_instance_id,
+            conversation_id,
+            thread_id or "",
+            reply_to or "",
+            anchor_id or "",
+            capability_snapshot_id,
+        )
+        if any(len(value) > 512 for value in values):
+            return None
+        return {
+            "client_type": client_type,
             "client_instance_id": client_instance_id,
             "conversation_id": conversation_id,
             "thread_id": thread_id,
@@ -256,9 +287,27 @@ class AgentEmissionService:
             "response_anchor_id": anchor_id,
             "capability_snapshot_id": capability_snapshot_id,
         }
-        # Deliberately omit response_route.metadata: callback auth/tokens and other
-        # transport-only data must never become durable emission authority.
-        return result
+
+    @staticmethod
+    def _same_replay_semantics(
+        emission: AgentEmission,
+        *,
+        context: ManagerToolExecutionContext,
+        text: str,
+        importance: str,
+        idempotency_key: str,
+    ) -> bool:
+        return (
+            emission.session_id == context.session_id
+            and emission.cycle_id == context.cycle_id
+            and emission.generation == context.generation
+            and emission.context_revision_id == context.context_revision_id
+            and emission.kind == "intermediate"
+            and emission.text == text
+            and emission.visibility == "user"
+            and emission.importance == importance
+            and emission.idempotency_key == idempotency_key
+        )
 
     async def emit_intermediate(
         self,
@@ -282,6 +331,22 @@ class AgentEmissionService:
         if len(text) > self.config.max_intermediate_message_chars:
             return self._rejected("message_too_long")
 
+        idempotency_key = self.idempotency_key(context)
+        existing = await self.repository.get_by_idempotency_key(
+            context.cycle_id,
+            idempotency_key,
+        )
+        if existing is not None:
+            if not self._same_replay_semantics(
+                existing,
+                context=context,
+                text=text,
+                importance=normalized_importance,
+                idempotency_key=idempotency_key,
+            ):
+                return self._rejected("idempotency_conflict")
+            return self._accepted(existing, duplicate=True)
+
         route = await self._trusted_route(context)
         if route is None:
             return self._rejected("route_unavailable")
@@ -298,7 +363,7 @@ class AgentEmissionService:
             importance=normalized_importance,
             response_route=route,
             state=EmissionState.READY,
-            idempotency_key=self.idempotency_key(context),
+            idempotency_key=idempotency_key,
             created_at=self._now(),
         )
         try:
@@ -319,16 +384,18 @@ class AgentEmissionService:
             try:
                 await self.delivery_wake(emission.session_id, emission.emission_id)
             except Exception:
-                # READY is already durable. A failed wake is only an optimization
-                # failure; later outbox polling must still see the intent.
                 pass
+        return self._accepted(emission, duplicate=accepted.duplicate)
+
+    @staticmethod
+    def _accepted(emission: AgentEmission, *, duplicate: bool) -> dict[str, Any]:
         return {
             "type": "agent_emission_result",
             "emission_id": emission.emission_id,
             "accepted": True,
             "persistence_state": emission.state.value,
             "delivery_required_for_cycle": False,
-            "duplicate": accepted.duplicate,
+            "duplicate": duplicate,
         }
 
     @staticmethod
@@ -430,12 +497,18 @@ class AgentEmissionOutboxService:
         self,
         emission_id: str,
         *,
+        session_id: str,
+        client_type: str,
+        client_instance_id: str,
         claim_token: str,
         error_code: str,
         ambiguous: bool,
     ) -> AgentEmission:
-        return await self.repository.fail_delivery(
+        return await self.repository.fail_for_client(
             emission_id,
+            session_id=session_id,
+            client_type=client_type.strip().lower(),
+            client_instance_id=client_instance_id.strip(),
             claim_token=claim_token,
             state=(EmissionState.UNKNOWN.value if ambiguous else EmissionState.FAILED.value),
             error_code=error_code,
@@ -475,9 +548,10 @@ class ReplyAwareCommittedBatchReader:
                 break
         if external_id is None:
             return _ReplyAwareBatch(batch, None)
-        client_type = str(getattr(capability, "client_type", "") or "").lower()
-        if "." in client_type:
-            client_type = client_type.rsplit(".", 1)[-1]
+        client_type_value = getattr(capability, "client_type", "")
+        client_type = str(
+            getattr(client_type_value, "value", client_type_value) or ""
+        ).strip().lower()
         client_instance_id = str(
             getattr(capability, "client_instance_id", "") or ""
         ).strip()
