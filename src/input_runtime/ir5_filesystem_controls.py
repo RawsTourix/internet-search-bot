@@ -8,10 +8,7 @@ from __future__ import annotations
 
 from ._filesystem_common import validated_copy
 from ._filesystem_identity_recovery_common import recover_cycle_authority
-from ._filesystem_identity_recovery_session import (
-    FileSystemSessionControlRepository as _BaseControlRepository,
-    atomic_write_model,
-)
+from . import _filesystem_identity_recovery_session as _session_control_module
 from ._filesystem_session import _same_control_relation
 from .errors import InputRuntimeConflictError, InputRuntimeNotFoundError
 from .models import (
@@ -21,6 +18,9 @@ from .models import (
     SessionInputRuntimeState,
 )
 from .serialization import read_model
+
+
+_BaseControlRepository = _session_control_module.FileSystemSessionControlRepository
 
 
 class FileSystemSessionControlRepository(_BaseControlRepository):
@@ -90,7 +90,7 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
             revision=state.revision + 1,
             updated_at=frontier_time,
         )
-        atomic_write_model(state_path, repaired)
+        _session_control_module.atomic_write_model(state_path, repaired)
         return repaired
 
     async def allocate(
@@ -139,13 +139,16 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                 await self._repair_existing_pending(state_path, state, by_id)
                 return by_id
 
-            if allocated.target_cycle_id is not None and allocated.state != ControlState.REJECTED:
+            if (
+                allocated.target_cycle_id is not None
+                and allocated.state != ControlState.REJECTED
+            ):
                 recover_cycle_authority(
                     self,
                     allocated.target_cycle_id,
                     allocated.session_id,
                 )
-            atomic_write_model(
+            _session_control_module.atomic_write_model(
                 self.layout.control(
                     allocated.session_id,
                     allocated.control_id,
@@ -153,12 +156,15 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                 allocated,
             )
             self._index(allocated)
-            if allocated.target_cycle_id is not None and allocated.state != ControlState.REJECTED:
+            if (
+                allocated.target_cycle_id is not None
+                and allocated.state != ControlState.REJECTED
+            ):
                 self._ensure_cycle_authority(
                     allocated.target_cycle_id,
                     allocated.session_id,
                 )
-            atomic_write_model(
+            _session_control_module.atomic_write_model(
                 state_path,
                 self._state_after_control(state, allocated),
             )
@@ -208,7 +214,7 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                         revision=state.revision + 1,
                         updated_at=max(state.updated_at, existing.created_at),
                     )
-                    atomic_write_model(state_path, next_state)
+                    _session_control_module.atomic_write_model(state_path, next_state)
                     return existing, next_state
                 if state.generation >= existing.generation + 1:
                     repaired = await self._repair_existing_pending(
@@ -241,7 +247,7 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                     allocated.target_cycle_id,
                     allocated.session_id,
                 )
-            atomic_write_model(
+            _session_control_module.atomic_write_model(
                 self.layout.control(
                     allocated.session_id,
                     allocated.control_id,
@@ -267,5 +273,5 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                 revision=state.revision + 1,
                 updated_at=max(state.updated_at, allocated.created_at),
             )
-            atomic_write_model(state_path, next_state)
+            _session_control_module.atomic_write_model(state_path, next_state)
             return allocated, next_state
