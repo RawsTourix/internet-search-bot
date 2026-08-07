@@ -9,8 +9,10 @@ from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
 from .handoff import RuntimeHandoffState
 from .ir4_persistence_windows import DurableClaimCycleInputApplier
-from .ir5_checkpoints import ControlAwareCheckpointService
-from .ir5_controls import InputRuntimeControlService
+from .ir5_hardening import (
+    HardenedControlAwareCheckpointService,
+    HardenedInputRuntimeControlService,
+)
 from .models import AdmissionKind, AdmissionState, CheckpointAction, CycleStatus
 
 
@@ -34,12 +36,12 @@ class InputAdmissionService(_IR3InputAdmissionService):
             committed_batches=self.committed_batches,
             clock=self.clock,
         )
-        self.control_service = InputRuntimeControlService(
+        self.control_service = HardenedInputRuntimeControlService(
             repositories=self.repositories,
             wake_coordinator=self.wake_coordinator,
             clock=self.clock,
         )
-        self.checkpoint_service = ControlAwareCheckpointService(
+        self.checkpoint_service = HardenedControlAwareCheckpointService(
             applier=self.cycle_input_applier,
             control_service=self.control_service,
         )
