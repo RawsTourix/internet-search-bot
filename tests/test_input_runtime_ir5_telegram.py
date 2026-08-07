@@ -123,6 +123,28 @@ def test_runtime_state_composition_seam_installs_into_real_host_shape(monkeypatc
     assert application.handlers[0][1] == -10
 
 
+def test_canonical_telegram_app_registers_ir5_and_collection_handlers_once():
+    """Exercise real production composition without invoking the compatibility installer."""
+    from src.servers.telegram import app as canonical_app
+
+    handlers = canonical_app.server.application.handlers
+    runtime_controls = [
+        handler
+        for handler in handlers.get(-10, [])
+        if set(getattr(handler, "commands", set())) == {"stop", "continue"}
+    ]
+    collection_controls = [
+        handler
+        for handler in handlers.get(-1, [])
+        if set(getattr(handler, "commands", set())) == {"collect", "send", "cancel"}
+    ]
+
+    assert len(runtime_controls) == 1
+    assert len(collection_controls) == 1
+    assert "reset" not in runtime_controls[0].commands
+    assert set(runtime_controls[0].commands).isdisjoint({"collect", "send", "cancel"})
+
+
 def test_telegram_control_idempotency_key_is_stable_and_source_message_specific():
     processor = MessageProcessor()
 
