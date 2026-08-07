@@ -41,6 +41,15 @@ class InputAdmissionOutcome(BaseModel):
     reason_code: str
     admission: InputAdmissionRecord | None = None
 
+    @property
+    def admitted_generation(self) -> int | None:
+        """Generation accepted by durable admission authority, when accepted."""
+        return (
+            self.admission.admitted_generation
+            if self.admission is not None
+            else None
+        )
+
     @model_validator(mode="after")
     def validate_relation(self) -> "InputAdmissionOutcome":
         if self.action == InputAdmissionAction.CAPACITY_BLOCKED:
