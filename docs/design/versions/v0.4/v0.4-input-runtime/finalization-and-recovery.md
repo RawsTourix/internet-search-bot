@@ -4,10 +4,38 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: planned
-last_reviewed: 2026-08-05
+last_reviewed: 2026-08-08
 ---
 
 # Finalization и recovery
+
+## Current boundary after IR-6
+
+Этот документ остаётся `planned`, потому что durable finalization barrier и
+startup recovery принадлежат следующим stages.
+
+IR-6 уже реализует только sequential emission fencing вокруг terminal state:
+
+- если cycle уже terminal, новый `send_user_message` rejected;
+- если semantic emission уже `READY`, но terminal state стал authoritative до
+  начала claim, новая client delivery не начинается и record отменяется;
+- reset переводит old-generation `READY → CANCELLED`, а already claimed
+  `DELIVERING → UNKNOWN`, потому что transport side effect мог произойти;
+- expired/ambiguous emission delivery также сохраняется `UNKNOWN` и не
+  blind-retry-ится.
+
+IR-6 **не** закрывает атомарный race:
+
+```text
+AgentEmission claim begins
+↔ finalization/terminal commit
+```
+
+Если closure требует общей durable finalization authority, он принадлежит IR-7
+вместе с late input/control-vs-terminal races. Startup reconstruction и
+reconciliation retained `READY/UNKNOWN`, interrupted/paused/waiting runtime и
+ambiguous side effects принадлежат IR-8. Поэтому IR-6 sequential terminal fencing
+не должно интерпретироваться как готовый finalization barrier/recovery pipeline.
 
 ## Назначение
 
@@ -26,6 +54,10 @@ agent сформировал DONE
 ```
 
 То же относится к `WAITING_USER`, `/stop` и `/reset`.
+
+После IR-6 к terminal race matrix добавляется ещё одна граница: READY semantic
+intermediate не должен начинать новую delivery после уже-known terminal state, но
+claim, начавшийся concurrently с terminal commit, требует IR-7 coordination.
 
 ## Watermarks
 
@@ -125,6 +157,11 @@ output delivery_allowed=true
 Filesystem records могут записываться последовательно, поэтому recovery record
 обязателен.
 
+IR-7 должен также определить shared ordering с началом `AgentEmission` delivery,
+если linearizable closure race `claim ↔ terminal commit` требует той же boundary.
+IR-6 не удерживает network delivery под session lock и не создаёт temporary
+finalization record ради этого race.
+
 ### Phase 8: delivery
 
 Delivery выполняется вне session lock. Execution success и delivery success
@@ -152,10 +189,15 @@ Input может прийти:
 | `/stop` | pause | abort/pause | abort/pause | no active cycle |
 | `/reset` | reset | invalidate generation | invalidate, cancel output | new generation |
 | duplicate input | no change | no change | no change | idempotent/new decision |
-| delivery retry | n/a | n/a | forbidden | delivery subsystem |
+| final output delivery retry | n/a | n/a | forbidden | delivery subsystem |
+| intermediate emission create | allowed while running | policy/finalization-specific | must not bypass terminal authority | rejected/new-cycle decision |
+| intermediate emission claim | delivery subsystem | delivery subsystem | IR-7 shared race fence if required | no new claim for old cycle |
 
 Persisted stale result после abort не считается final answer и не доставляется.
 Он может быть retained как diagnostic content с relation `superseded`/`cancelled`.
+
+IR-6 гарантирует только уже-visible terminal decision для intermediate emission;
+таблица не означает, что concurrent claim/finalization race уже атомарно закрыт.
 
 ## WAITING_USER commit
 
@@ -174,6 +216,9 @@ candidate question
 Если input приходит после waiting commit, admission `resume_waiting` продолжает
 тот же cycle.
 
+IR-6 не мигрирует question в `send_user_message` и не создаёт второй durable
+question path. Полная waiting/finalization ordering остаётся IR-7.
+
 ## Pause commit
 
 ```text
@@ -189,6 +234,10 @@ Additions accepted до pause commit остаются queued unless checkpoint p
 успела применить их до pause. Default: pause имеет priority; input сохраняется на
 resume.
 
+IR-6 READY semantic intent, persisted до safe pause, не отменяется только из-за
+pause и может быть доставлен отдельно. Paused runner сам не генерирует новые
+emissions до resume.
+
 ## Restart classification
 
 После process restart runtime не делает вид, что in-flight operation завершена.
@@ -202,6 +251,13 @@ resume.
 | `finalizing` + prepared | reconcile finalization record |
 | terminal committed | do not rerun cycle |
 | inbox claim expired | reconcile/requeue |
+| AgentEmission `READY` | retain durable pending intent; startup scheduling/reconcile policy is IR-8 |
+| AgentEmission `DELIVERING` lease expired | `UNKNOWN`, never automatic `READY` |
+| AgentEmission `UNKNOWN` | retain ambiguity; no blind client resend |
+
+IR-6 repository recreation уже сохраняет READY/UNKNOWN/DELIVERED records и
+classifies expired in-flight claim as UNKNOWN. Он не выполняет startup-wide
+runner/outbox reconstruction; это IR-8.
 
 ## Startup recovery sequence
 
@@ -214,14 +270,17 @@ Recommended order:
 4. expire/reconcile inbox claims
 5. reconcile control commands/generation
 6. reconcile active-cycle snapshots
-7. reconcile finalization records/results/outputs
-8. list resumable cycles and pending deliveries
-9. connect MCP/tool runtime
-10. allow new admission/runners
+7. reconcile emission claims/UNKNOWN receipts without blind resend
+8. reconcile finalization records/results/outputs
+9. list resumable cycles and pending deliveries
+10. connect MCP/tool runtime
+11. allow new admission/runners
 ```
 
 Admission should not race startup reconciliation. Gateway reports degraded/not
 ready until mandatory runtime recovery complete.
+
+Эта startup sequence остаётся specification IR-8, а не выполненной частью IR-6.
 
 ## Active cycle recovery
 
@@ -251,6 +310,7 @@ using partial state.
 
 - mutating MCP/tool call с потерянным response;
 - client delivery со state `unknown`;
+- AgentEmission delivery с expired/ambiguous attempt;
 - external operation, начатая после last safe snapshot;
 - final output delivery без reliable receipt.
 
@@ -258,6 +318,9 @@ Recovery marks outcome unknown and requires agent/user reconciliation according 
 existing tool/delivery policies.
 
 Read-only/idempotent operations могут быть retried только при declared policy.
+
+IR-6 уже реализует no-blind-retry правило для AgentEmission UNKNOWN, но
+startup-specific reconciliation UX/decision остаётся IR-8.
 
 ## Inbox recovery
 
@@ -319,6 +382,10 @@ In `v0.5` admission, watermarks, finalization and output intent can be committed
 one or several explicit SQL transactions with row locks. Recovery semantics and
 states remain the same; filesystem repair paths become migration/import tools.
 
+IR-6 command-oriented emission acceptance/claim/receipt semantics естественно
+маппятся на `INSERT ... ON CONFLICT`, row locking, fenced claim token и indexed
+READY query без application dependency on filesystem layout.
+
 ## Distributed preparation
 
 In `v0.6` add:
@@ -331,13 +398,18 @@ durable queue/event signal
 ```
 
 PostgreSQL remains source of truth; Redis signal loss does not lose input.
+AgentEmission semantic identity уже сохраняет session/cycle/generation/context
+revision и не зависит от Telegram external message ID.
 
 ## Acceptance
+
+IR-7/IR-8 finalization/recovery acceptance остаётся:
 
 - input accepted at every finalization phase either aborts stale result or starts
   new cycle only after terminal commit;
 - `/stop`/`/reset` accepted before terminal commit prevents success delivery;
 - output is never delivered before terminal commit;
+- concurrent AgentEmission claim-vs-terminal commit имеет explicit atomic ordering;
 - restart after result persistence does not rerun whole AgentCycle;
 - restart after terminal commit never creates duplicate AgentCycle;
 - expired applying claim reconciles without duplicate LLM update;
@@ -345,3 +417,7 @@ PostgreSQL remains source of truth; Redis signal loss does not lose input.
 - invalid snapshot fails controlled and preserves evidence;
 - ambiguous side effect is never blindly repeated;
 - startup recovery completes before new admission is enabled.
+
+IR-6 уже подтверждает subset: sequential terminal emission fence, reset
+READY/DELIVERING conservative semantics, expiry→UNKNOWN and no blind resend. Этот
+subset не переводит данный document из `planned` в `implemented`.
