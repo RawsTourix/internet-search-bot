@@ -1,4 +1,4 @@
-"""IR-4 admission facade and thin WAITING compatibility boundary."""
+"""IR-4/IR-5 admission facade and runtime compatibility boundary."""
 
 from __future__ import annotations
 
@@ -8,8 +8,9 @@ from .composition import register_input_runtime_binding
 from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
 from .handoff import RuntimeHandoffState
-from .ir4_checkpoint_contracts import EntryWatermarkCheckpointService
 from .ir4_persistence_windows import DurableClaimCycleInputApplier
+from .ir5_checkpoints import ControlAwareCheckpointService
+from .ir5_controls import InputRuntimeControlService
 from .models import AdmissionKind, AdmissionState, CheckpointAction, CycleStatus
 
 
@@ -23,7 +24,7 @@ class DeferredWaitingApply:
 
 
 class InputAdmissionService(_IR3InputAdmissionService):
-    """Expose IR-4 services while preserving the admitted runtime boundary."""
+    """Expose the IR-4 FIFO and IR-5 durable control services as one boundary."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -33,14 +34,69 @@ class InputAdmissionService(_IR3InputAdmissionService):
             committed_batches=self.committed_batches,
             clock=self.clock,
         )
-        self.checkpoint_service = EntryWatermarkCheckpointService(
-            applier=self.cycle_input_applier
+        self.control_service = InputRuntimeControlService(
+            repositories=self.repositories,
+            wake_coordinator=self.wake_coordinator,
+            clock=self.clock,
+        )
+        self.checkpoint_service = ControlAwareCheckpointService(
+            applier=self.cycle_input_applier,
+            control_service=self.control_service,
         )
         self.application_binding = register_input_runtime_binding(
             config=self.config,
             repositories=self.repositories,
             committed_batches=self.committed_batches,
             checkpoint_service=self.checkpoint_service,
+        )
+
+    async def mark_initial_batch_applied(self, admission):
+        """Never resurrect an old-generation initial admission after reset."""
+        state = await self.repositories.sessions.get(admission.session_id)
+        current = await self.repositories.admissions.get_by_input_batch_id(
+            admission.input_batch_id
+        )
+        if current is None:
+            raise InputRuntimeConflictError("admission disappeared")
+        if (
+            state is None
+            or state.generation != admission.admitted_generation
+            or (
+                state.active_cycle_id is not None
+                and state.active_cycle_id != admission.target_cycle_id
+            )
+        ):
+            return current
+        return await super().mark_initial_batch_applied(admission)
+
+    async def record_cycle_status(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+        status: CycleStatus,
+    ):
+        """Compatibility result mapping may not overwrite IR-5 authority.
+
+        A paused cycle deliberately unwinds through an AgentResult shape which
+        predates a PAUSED status.  Reset can also leave an old runner returning
+        after the durable generation has advanced.  In both cases durable input
+        runtime state wins over the compatibility result.
+        """
+        state = await self.repositories.sessions.get(session_id)
+        if state is None:
+            raise InputRuntimeConflictError("session state disappeared")
+        if state.active_cycle_id != cycle_id:
+            return state
+        if state.cycle_status in {
+            CycleStatus.PAUSE_REQUESTED,
+            CycleStatus.PAUSED_BY_USER,
+        }:
+            return state
+        return await super().record_cycle_status(
+            session_id=session_id,
+            cycle_id=cycle_id,
+            status=status,
         )
 
     async def complete_runtime_handoff(
