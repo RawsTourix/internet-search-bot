@@ -3,11 +3,36 @@ id: design.v0.4.input-runtime.control-plane
 version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
-implementation_status: planned
-last_reviewed: 2026-08-05
+implementation_status: implemented
+last_reviewed: 2026-08-07
 ---
 
 # Control plane: `/stop`, `/continue`, `/reset`
+
+## Implementation evidence
+
+IR-5 control-plane slice реализован и подтверждён на code/test HEAD
+`85c52d4b60a60786bdb10732eb0a52893a422eee`:
+
+- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #547 — success;
+- deterministic tests покрывают concurrent sequence allocation, duplicate
+  deliveries, record-first publication repair, pause/continue marker crash
+  windows, blocked LLM, complete multi-tool block, rapid stop/continue, paused
+  FIFO additions, same-cycle resume, reset generation/cleanup fencing,
+  reset/pause vs `CP-BEFORE-TERMINAL-COMMIT` и Telegram source identity.
+
+`SessionInputRuntimeState + SessionControlCommand + ActiveCycleSnapshot` являются
+durable semantic authority. `SessionExecutionCoordinator` остаётся defensive
+in-process lease/wake/generation cache и diagnostics; coordinator generation не
+определяет reset semantics.
+
+Граница implementation намеренно не включает IR-7/IR-8: checkpoint-level
+control suppression реализовано, но late race `последний checkpoint/recheck →
+новый control/input → terminal commit` остаётся IR-7. Startup reconstruction
+paused/interrupted runner после process restart и общий reconciliation остаются
+IR-8. Полная `recover_cycle_authority()` corruption matrix остаётся IR-8/IR-10.
 
 ## Назначение
 
@@ -35,8 +60,9 @@ input collection control
 /reset     invalidate generation and clear session runtime
 ```
 
-Команды должны быть доступны через общий API, а Telegram/Web/CLI adapters лишь
-создают idempotent control request.
+Команды доступны через общий application API, а Telegram adapter создаёт
+idempotent control request. Surface остаётся transport-neutral и пригоден для
+будущих Web/CLI adapters.
 
 ## `/stop` semantics
 
@@ -48,9 +74,11 @@ input collection control
 - tool results и result refs;
 - artifact refs/activations;
 - already admitted/applied additions;
-- intermediate agent emissions;
-- trace/progress evidence;
+- durable snapshot context/trace evidence;
 - resumability metadata.
+
+Durable semantic intermediate emissions как отдельная IR-6 lifecycle ещё не
+реализованы; IR-5 не добавляет их ради pause.
 
 Он не:
 
@@ -74,32 +102,34 @@ running
 
 Если cycle уже:
 
-- `paused_by_user` — вернуть idempotent `already_paused`;
+- `paused_by_user` — вернуть idempotent semantic `already_paused`;
 - `pause_requested` — вернуть `pause_pending`;
-- `waiting_user` — перевести в `paused_by_user`, сохранив waiting question как
-  historical context, либо сохранить composite reason; default: pause wins;
+- `waiting_user` — перевести в `paused_by_user`, сохранив waiting question и
+  context; pause wins;
 - `interrupted` — зафиксировать user pause поверх resumable snapshot;
 - terminal — вернуть `no_active_cycle`;
 - `idle` — вернуть `no_active_cycle`.
 
+Duplicate transport delivery с тем же stable idempotency key возвращает тот же
+durable command/control ID/sequence; semantic already-paused/pause-pending — это
+отдельные deterministic outcomes для независимых commands.
+
 ## Atomic stop boundary
 
-Initial implementation не пытается безопасно прервать произвольный Python await
-или внешний side effect.
+IR-5 не пытается прервать произвольный Python await или внешний side effect.
 
 ### Во время LLM request
-
-Default:
 
 ```text
 record pause
 → дождаться bounded LLM attempt outcome
+→ control checkpoint
 → не начинать следующий tool/LLM block
-→ pause checkpoint
+→ pause
 ```
 
-Optional transport cancellation допустима только если provider adapter гарантирует
-controlled cancellation и не меняет semantic outcome. Это не обязательный gate.
+Production runner наблюдает control после bounded main LLM attempt и до первого
+tool/следующего LLM semantic block.
 
 ### Во время tool call
 
@@ -107,29 +137,31 @@ controlled cancellation и не меняет semantic outcome. Это не об�
 record pause
 → текущий tool call завершается
 → complete remaining calls of same assistant tool block
-→ persist all role=tool results
+→ persist all matching role=tool results
+→ CP-AFTER-TOOL-BLOCK
 → pause
 ```
 
 Почему завершается весь block: сохранение OpenAI-compatible sequence и отсутствие
 частично исполненного assistant message важнее минимальной latency остановки.
-
-В будущем dispatcher с side-effect classes сможет останавливать между calls и
-создавать synthetic cancelled results. Это не входит в первый scope.
+Deterministic barrier test удерживает выполнение внутри multi-tool block,
+принимает pause, затем проверяет полный `assistant → tool → tool` history и
+отсутствие следующего LLM.
 
 ### Во время compaction/final processing
 
-Операция завершается либо даёт controlled failure. Перед terminal commit pause
-имеет приоритет и aborts finalization.
+Операция завершается либо даёт controlled failure. Перед следующим semantic или
+terminal шагом checkpoint получает возможность применить control. IR-5 не
+force-cancel эти операции.
 
 ## `/continue` semantics
 
 ```text
 paused_by_user
-→ continue command applied
+→ durable continue command
+→ reacquire same-cycle in-process lease if previous runner unwound
 → CP-RESUME
-→ apply queued additions in FIFO
-→ new context revision if needed
+→ apply queued additions in FIFO up to continue acceptance target
 → running same cycle
 ```
 
@@ -138,21 +170,24 @@ runner.
 
 ### Continue without additions
 
-Разрешён. AgentCycle продолжает со snapshot/checkpoint, где был остановлен.
+Разрешён. AgentCycle продолжает с того же durable snapshot/checkpoint. Новый
+`input_batch_update`, новый user reply и новая context revision только ради
+continue не создаются.
 
 ### Continue states
 
 | State | Outcome |
 |---|---|
 | `paused_by_user` | resume same cycle |
-| `pause_requested` | cancel pending pause only if atomic block ещё идёт; затем continue |
+| `pause_requested` | pending pause может быть neutralized reducer-ом; same cycle continues |
 | `waiting_user` | reject `still_waiting_for_input`, если ответа нет |
-| `interrupted` resumable | controlled resume same cycle |
+| `interrupted` resumable | controlled same-cycle resume в доступном current-process state |
 | `running` | `already_running` |
 | terminal/idle | `nothing_to_continue` |
 
 Новый ordinary input в `waiting_user` остаётся основным способом resume. Команда
-`/continue` не подменяет отсутствующий пользовательский ответ.
+`/continue` не подменяет отсутствующий пользовательский ответ. Process-restart
+runner reconstruction для interrupted/paused cycle остаётся IR-8.
 
 ## Additions во время паузы
 
@@ -166,59 +201,87 @@ CommittedInputBatch
 → no runner wakeup
 ```
 
-Пользовательская projection:
+Несколько batches сохраняют FIFO order. Continue command durable metadata
+фиксирует accepted input target на coordination boundary. `CP-RESUME` применяет
+все additions до этого target в bounded chunks по существующим
+`max_batches_per_checkpoint`/`max_batch_bytes_per_checkpoint`; между chunks нет
+LLM request.
 
-```text
-Дополнение №N принято. Задача остаётся приостановленной.
-Для продолжения отправьте /continue.
-```
-
-Несколько batches сохраняют порядок. `/continue` применяет bounded range; если
-очередь превышает checkpoint limit, cycle может сделать несколько resume
-checkpoints до первого LLM request, пока required initial drain policy не
-выполнена. Рекомендуемый default: перед первым post-resume LLM request применить
-все additions, уже accepted до `/continue`, в bounded chunks без промежуточного
-LLM вызова.
-
-Additions, пришедшие после `/continue`, обрабатываются обычными running
-checkpoints.
+Additions, admitted после `/continue` boundary, не затягиваются в initial resume
+drain и обрабатываются обычным running checkpoint.
 
 ## `/reset` semantics
 
 `/reset` — destructive session operation и имеет высший приоритет.
 
 ```text
-reset command
-→ advance session generation
-→ reject old runner ownership
-→ cancel queued inbox/control of old generation
-→ wait current atomic block/safe lease boundary
-→ terminalize active cycle as cancelled/reset
-→ clear session memory/runtime handoff
+durable reset command
+→ advance durable SessionInputRuntimeState.generation exactly once
+→ fence old runner/work
+→ cancel old-generation admissions/inbox/pending controls
+→ cancel old active snapshot and dormant finalization/emission records
+→ synchronize in-process coordinator to durable generation
+→ wait old execution lease boundary before shared mutable memory clear
 → cancel open drafts/collections
-→ preserve immutable audit records by retention policy
+→ preserve immutable audit evidence
 → session idle in new generation
 ```
 
 `/reset` не обязан физически удалять immutable content/artifact/audit files
-немедленно. Он удаляет их из active session access/projection; cleanup выполняется
-отдельной retention policy.
+немедленно. Old-generation records получают explicit cancellation/fencing
+semantics и не становятся authority новой generation.
 
-Current `reset_runtime_session()` уже повышает execution generation, отменяет open
-drafts и ждёт run lease. Новый runtime должен перенести ownership на durable
-control/finalization services, сохранив observable behavior.
+Durable generation является source of truth. Coordinator после durable
+transition лишь инвалидирует локальную очередь/lease cache и не может сам сделать
+process-local generation canonical.
+
+Same reset delivery с тем же stable idempotency key не повышает generation
+повторно. Если durable generation уже продвинута, а old-generation cleanup упал,
+retry того же reset продолжает reconciliation старых records без второго
+semantic reset effect.
 
 ## Command idempotency
 
-Client adapter формирует stable idempotency key:
+Client adapter формирует stable idempotency identity из фактической source command
+identity:
 
 ```text
-client_type + client_instance_id + conversation/thread + source command message
+client_type
++ client instance/bot instance
++ conversation/thread
++ source command message/update
++ resolved session
++ command
 ```
 
-Повторная доставка одной команды возвращает прежний outcome.
+Повторная доставка одной команды возвращает прежний durable command/outcome.
+Один key не может молча изменить command/source relation.
 
 Для Web/first-party API рекомендуется explicit `Idempotency-Key`.
+
+## Command publication и watermarks
+
+Control sequence выделяется под короткой session coordination boundary — не через
+unsafe `read max → await → max+1`.
+
+Filesystem IR-5 publication:
+
+```text
+allocate monotonic sequence
+→ persist SessionControlCommand
+→ persist/index identity
+→ advance SessionInputRuntimeState.pending_control_sequence
+→ semantic acknowledgement/application
+```
+
+Если record уже durable, а pending-watermark write упал, retry того же key
+находит тот же record/sequence и repair-ит missing watermark. Control application
+сначала сохраняет state/snapshot effect, затем marking; retry не дублирует
+pause/resume/reset effect.
+
+`applied_control_sequence <= pending_control_sequence`. Applied watermark
+продвигается только через contiguous terminal control records (`applied`,
+`rejected`, `cancelled`) и не перепрыгивает head gap.
 
 ## Command acknowledgement и application
 
@@ -232,41 +295,59 @@ applied
 → active cycle достиг safe checkpoint и state изменено
 ```
 
-Для `/stop` пользователь может получить:
+Для running `/stop` acknowledgement соответствует `pause_requested`, а application
+фиксирует `paused_by_user`. Waiting/interrupted pause может быть применён сразу на
+уже safe resumable snapshot.
+
+## Checkpoint reducer
+
+Каждый checkpoint имеет deterministic control boundary:
 
 ```text
-Останавливаю задачу после текущего безопасного шага…
+checkpoint entry
+→ capture pending control watermark at entry
+→ persist closed protocol-valid atomic block context
+→ reduce/process controls through captured watermark
+→ decide whether ordinary input may apply
+→ only then enter next atomic semantic block
 ```
 
-После application:
+Control, accepted после checkpoint entry, не меняет уже начатый atomic block.
+Priority effective semantics:
 
 ```text
-Задача приостановлена.
+reset > pause > continue > ordinary input
 ```
 
-Если transport не поддерживает edit, это могут быть два сообщения либо одно
-terminal acknowledgement по capability policy.
+Audit sequence не теряется. Rapid `pause → continue` может дать effective
+`running` без промежуточного user-visible `paused_by_user`, если pause ещё не был
+применён; обе durable commands остаются в audit и получают terminal outcomes.
 
 ## Control priority и races
 
 ### Stop vs input
 
-Оба durable сохраняются. Pause применяется первым; additions остаются queued.
+Оба durable сохраняются. Pause применяется первым; additions остаются queued и
+не отменяют explicit user pause.
 
 ### Continue vs new input
 
 Input admitted до coordination snapshot `/continue` применяется в initial resume
-drain. Поздний input попадёт в running checkpoint.
+drain. Поздний input остаётся running checkpoint.
 
 ### Stop vs finalization
 
-Pause command, accepted до terminal commit, aborts finalization.
+Если pause уже виден control checkpoint на `CP-BEFORE-TERMINAL-COMMIT`, stale
+terminal candidate подавляется и cycle pauses. Это checkpoint-level IR-5
+suppression, а не полный IR-7 terminal barrier.
 
 ### Reset vs finalization
 
-Reset generation invalidates finalization record и запрещает delivery old result.
-Persisted result/output may remain diagnostic/cancelled, но не доставляется как
-успешный terminal response.
+Если reset принят до заблокированного/выполняемого
+`CP-BEFORE-TERMINAL-COMMIT`, checkpoint видит generation/cycle fencing, old
+candidate не становится current successful terminal state, old snapshot
+cancelled. Окно после последнего checkpoint и до terminal persistence остаётся
+IR-7.
 
 ### Stop and continue arrive rapidly
 
@@ -276,51 +357,68 @@ state. Если `continue` следует за ещё не применённы�
 
 ## API contract
 
-Service-neutral commands:
+Service-neutral surface реализован через application-layer control service:
 
 ```python
-request_pause(session_id, idempotency_key, source_ref) -> ControlOutcome
-request_continue(session_id, idempotency_key, source_ref) -> ControlOutcome
-request_reset(session_id, idempotency_key, source_ref) -> ControlOutcome
+request_pause(...)
+request_continue(...)
+request_reset(...)
 ```
 
-```python
-class ControlOutcome(BaseModel):
-    control_id: str
-    command: str
-    state: Literal["acknowledged", "applied", "rejected"]
-    runtime_status: str
-    target_cycle_id: str | None
-    reason_code: str
-```
+Каждая команда принимает `session_id`, stable `idempotency_key`,
+`source_client_type`, safe `source_message_ref` и optional reason metadata и
+возвращает structured `ControlOutcome` с durable `SessionControlCommand`.
 
-Adapters не читают `MCPClient.session_states` напрямую для принятия решения.
+Adapters не читают `MCPClient.session_states` напрямую для принятия semantic
+решения.
 
 ## Telegram integration
 
-- `/stop` и `/continue` получают отдельные high-priority command handlers;
-- handlers не смешиваются с `batch_commands.py` `/collect|/send|/cancel`;
+- `/stop` и `/continue` зарегистрированы отдельным high-priority command handler
+  group;
+- handler не включает `/collect`, `/send`, `/cancel`; `/cancel` остаётся ingress
+  collection control;
 - exact session/thread resolution используется тот же, что ordinary input;
-- handler прекращает lower-priority processing через transport mechanism;
-- messages локализованы и capability-aware;
-- live tests включают command во время LLM, tool block, finalization и pause.
+- source metadata включает bot/chat/thread/source message/update identity;
+- команда forward-ится через существующий Gateway/application boundary, где
+  вызывается общий control service;
+- localizable projection выбирается вне domain/application semantic service;
+- deterministic tests проверяют handler priority, exact session/source identity и
+  stable message-specific idempotency.
+
+Maintainer live Telegram acceptance остаётся IR-10 и не заявляется как IR-5
+evidence.
 
 ## Web/CLI preparation
 
-Web/CLI используют те же control endpoints. UI может показывать кнопку
-Stop/Continue, но domain command остаётся тем же.
+Web/CLI используют тот же transport-neutral application contract. Полноценные
+новые UI/handlers в IR-5 не обязательны и не реализовывались.
 
 Собственный Web chat branch editing не входит в этот update.
 
 ## Acceptance
 
-- `/stop` не удаляет и не переписывает cycle messages;
+IR-5 deterministic acceptance подтверждает:
+
+- `/stop` не удаляет и не переписывает cycle messages/context identity;
 - текущий complete tool block остаётся protocol-valid;
-- после pause не начинается новый LLM/tool block;
-- additions during pause admitted without auto-resume;
-- `/continue` resumes same cycle and applies queued additions;
-- duplicate `/stop`/`/continue` idempotent;
+- после applied pause не начинается новый LLM/tool block;
+- additions during pause admitted FIFO without auto-resume/wake;
+- `/continue` resumes same cycle and applies pre-continue queued additions;
+- continue without additions не создаёт fake semantic revision;
+- duplicate `/stop`/`/continue`/`/reset` сохраняют logical identity;
 - `/continue` не заменяет missing answer в `waiting_user`;
-- `/reset` fencing blocks old cycle/final delivery;
-- command accepted before terminal commit wins over stale finalization;
-- Telegram command handlers не ломают existing collection commands.
+- `/reset` durable generation fencing blocks old cycle authority;
+- partial reset cleanup repair не повышает generation второй раз;
+- pause/reset visible at terminal checkpoint suppress stale candidate;
+- compatibility AgentResult mapping не перезаписывает pause/reset durable state;
+- Telegram runtime handlers не ломают ownership `/collect|/send|/cancel`.
+
+Deferred acceptance:
+
+- IR-6 durable semantic `AgentEmission`;
+- IR-7 final atomic accepted/control-vs-terminal persistence barrier;
+- IR-8 startup reconstruction/reconciliation;
+- IR-9 complete diagnostics/client projections;
+- IR-10 randomized/restart/synthetic/live roast;
+- Telegram history rewind.
