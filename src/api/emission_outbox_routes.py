@@ -110,9 +110,7 @@ def add_emission_outbox_routes(
                 client_instance_id=normalized_instance,
                 limit=limit,
             )
-            return {
-                "emissions": [row.model_dump(mode="json") for row in rows]
-            }
+            return {"emissions": [row.model_dump(mode="json") for row in rows]}
         except ValueError as error:
             raise HTTPException(status_code=422, detail=str(error)) from error
         except InputRuntimeError as error:
@@ -188,6 +186,9 @@ def add_emission_outbox_routes(
                     raise ValueError("failure receipt requires error_code")
                 updated = await service.failed(
                     emission_id,
+                    session_id=body.session_id,
+                    client_type=normalized_client,
+                    client_instance_id=normalized_instance,
                     claim_token=body.claim_token,
                     error_code=body.error_code,
                     ambiguous=(outcome == "unknown"),
