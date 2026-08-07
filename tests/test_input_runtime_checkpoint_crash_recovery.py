@@ -18,6 +18,7 @@ from src.input_runtime import (
 from src.runtime import ActiveAgentCycle
 from src.storage import StorageConfigType
 NOW = datetime(2026, 8, 6, 12, 0, tzinfo=timezone.utc)
+USER_REQUEST = '{"type":"user_request","user_request":"initial"}'
 
 @dataclass
 class Batch:
@@ -58,7 +59,7 @@ class FailOnceAdmissionMark:
         return getattr(self.delegate, name)
 
 def cycle(cycle_id):
-    return ActiveAgentCycle(cycle_id=cycle_id, session_id='session', original_user_request='initial', messages_for_llm=[{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'initial'}], cycle_trace=[], original_user_message_index=1, original_input_batch_id='initial', input_runtime_generation=0)
+    return ActiveAgentCycle(cycle_id=cycle_id, session_id='session', original_user_request='initial', messages_for_llm=[{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': USER_REQUEST}], cycle_trace=[], original_user_message_index=1, original_input_batch_id='initial', input_runtime_generation=0)
 
 @pytest.mark.asyncio
 async def test_initial_snapshot_repairs_failed_admission_mark_without_second_r1(tmp_path):
@@ -76,7 +77,7 @@ async def test_initial_snapshot_repairs_failed_admission_mark_without_second_r1(
     admission = await base.admissions.get_by_input_batch_id('initial')
     assert admission.state.value == 'applied'
     assert len(await base.context_revisions.list_for_cycle('cycle-a')) == 1
-    assert active.messages_for_llm == [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': 'initial'}]
+    assert active.messages_for_llm == [{'role': 'system', 'content': 'system'}, {'role': 'user', 'content': USER_REQUEST}]
 
 @pytest.mark.asyncio
 async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_update(tmp_path):
