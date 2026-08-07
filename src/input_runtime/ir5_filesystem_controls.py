@@ -210,11 +210,16 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
             command.session_id,
         ):
             state_path = self.layout.state(command.session_id)
-            if not state_path.exists():
-                raise InputRuntimeNotFoundError(
-                    "session runtime state required for continue acceptance"
+            if state_path.exists():
+                state = read_model(state_path, SessionInputRuntimeState)
+            else:
+                state = SessionInputRuntimeState(
+                    session_id=command.session_id,
+                    generation=0,
+                    created_at=command.created_at,
+                    updated_at=command.created_at,
                 )
-            state = read_model(state_path, SessionInputRuntimeState)
+                atomic_write_model(state_path, state)
             state = await self._repair_control_frontier_locked(state_path, state)
 
             existing = await self.get_by_idempotency_key(
