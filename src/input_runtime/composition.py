@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from .admission import CommittedInputBatchReader
 from .checkpoints import InputRuntimeCheckpointService
 from .config import InputRuntimeConfigType
+from .emissions import AgentEmissionOutboxService, AgentEmissionService
 from .factory import InputRuntimeRepositories
 
 
@@ -16,6 +17,8 @@ class InputRuntimeApplicationBinding:
     repositories: InputRuntimeRepositories
     committed_batches: CommittedInputBatchReader
     checkpoint_service: InputRuntimeCheckpointService
+    emission_service: AgentEmissionService
+    emission_outbox_service: AgentEmissionOutboxService
 
 
 _binding: InputRuntimeApplicationBinding | None = None
@@ -27,6 +30,8 @@ def register_input_runtime_binding(
     repositories: InputRuntimeRepositories,
     committed_batches: CommittedInputBatchReader,
     checkpoint_service: InputRuntimeCheckpointService,
+    emission_service: AgentEmissionService,
+    emission_outbox_service: AgentEmissionOutboxService,
 ) -> InputRuntimeApplicationBinding:
     global _binding
     candidate = InputRuntimeApplicationBinding(
@@ -34,6 +39,8 @@ def register_input_runtime_binding(
         repositories=repositories,
         committed_batches=committed_batches,
         checkpoint_service=checkpoint_service,
+        emission_service=emission_service,
+        emission_outbox_service=emission_outbox_service,
     )
     _binding = candidate
     return candidate
