@@ -56,7 +56,7 @@ environment = development
 - `v0.4-file-artifacts`;
 - `v0.4-file-artifacts-advanced`;
 - `v0.4-batch-workflows`;
-- `v0.4-input-runtime` — partial update, в котором IR-1—IR-4 уже implemented.
+- `v0.4-input-runtime` — partial update, в котором IR-1—IR-5 уже implemented.
 
 `v0.4-file-artifacts-advanced` завершил automated и maintainer live acceptance.
 Durable reservation, recovery, forwarded sequencing, native Telegram document
@@ -152,8 +152,8 @@ v0.4-input-runtime
 → v0.4-mcp-registry-foundation
 ```
 
-В `v0.4-input-runtime` реализованы и подтверждены CI этапы IR-1—IR-4.
-Общий update остаётся `partial`: IR-5—IR-10 planned.
+В `v0.4-input-runtime` реализованы и подтверждены CI этапы IR-1—IR-5.
+Общий update остаётся `partial`: IR-6—IR-10 planned.
 
 Domain/config/ports и durable filesystem repositories подключены в production
 composition через `InputAdmissionService`.
@@ -237,20 +237,54 @@ IR-4 final code evidence:
 - regression-fix проход после `224911a…` был test-only; production code не
   менялся.
 
-Граница current implementation остаётся точной. Checkpoint-level stale candidate
-suppression не закрывает late terminal race после последнего recheck и до durable
-terminal commit — это IR-7. Ambiguous runtime handoff/startup reconciliation —
-IR-8. Полная `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
+IR-5 добавил durable control plane поверх IR-1/IR-4 foundation:
+
+- transport-neutral `InputRuntimeControlService` принимает pause/continue/reset и
+  возвращает structured `ControlOutcome`;
+- control sequence выделяется под короткой session coordination, stable
+  idempotency сохраняет один logical command/sequence и repair-ит record-first
+  publication crash window;
+- `pending_control_sequence` и `applied_control_sequence` стали real monotonic
+  authority: applied watermark продвигается только contiguous terminal records;
+- control-aware checkpoint фиксирует pending-control watermark на entry и reduce-ит
+  commands до ordinary input;
+- `/stop` cooperative: bounded LLM attempt завершается, а multi-tool assistant
+  block сохраняет все matching tool results до pause; durable snapshot становится
+  `paused_by_user` и compatibility result mapping не стирает pause;
+- `pause_requested/paused_by_user` additions admitted FIFO как `QUEUE_PAUSED`
+  без runner start/wake;
+- `/continue` возобновляет тот же cycle; pre-continue accepted additions
+  drain-ятся bounded chunks через `CP-RESUME` до первого meaningful post-resume
+  LLM, поздний input остаётся future checkpoint;
+- continue without additions сохраняет original input/context revision;
+- `WAITING_USER` без нового ответа не превращает `/continue` в fake user reply;
+- rapid pause/continue reducer не создаёт phantom pause/second runner;
+- `/reset` использует durable generation как authority, повышает её ровно один
+  раз на logical command, fences/cancels old-generation work и clear-ит shared
+  memory только после execution lease boundary;
+- Telegram `/stop`/`/continue` используют exact existing session/thread identity,
+  stable source command identity и общий Gateway/application control service;
+  `/cancel` остаётся ingress-only.
+
+IR-5 final code evidence:
+
+- code/test HEAD:
+  `85c52d4b60a60786bdb10732eb0a52893a422eee`;
+- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #547 — success.
+
+Граница current implementation остаётся точной. IR-5 checkpoint-level
+pause/reset suppression не закрывает late terminal race после последнего recheck
+и до durable terminal commit — это IR-7. Startup reconstruction/reconciliation
+paused/interrupted/ambiguous runtime state — IR-8. Полная
+`recover_cycle_authority()` corruption matrix — IR-8/IR-10.
 
 Пока **не реализованы**:
 
-- IR-5 durable controls;
-- `/stop`;
-- `/continue`;
-- `/reset` redesign на общий durable generation/control contract;
 - IR-6 durable `AgentEmission`;
 - IR-7 durable finalization barrier;
-- IR-8 startup recovery;
+- IR-8 startup recovery/reconstruction;
 - IR-9 complete client projections/diagnostics/config examples;
 - IR-10 full race/restart/synthetic/live acceptance;
 - scheduler и parallel branches/fork-join semantics;
@@ -271,8 +305,11 @@ IR-8. Полная `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
 - identity/relations для interventions, task branches и scheduler v0.6.
 
 Текущий in-process Telegram FIFO dispatcher не подменяет input runtime и не
-переживает restart. Специальный IR-3 WAITING continuation больше не владеет
-semantic reply path: IR-4 применяет WAITING reply через общий FIFO `CP-RESUME`.
+переживает restart. Telegram runtime-control handler использует тот же exact
+session/thread resolution и Gateway boundary, но startup reconstruction active
+cycle всё равно остаётся IR-8. Специальный IR-3 WAITING continuation больше не
+владеет semantic reply path: IR-4 применяет WAITING reply через общий FIFO
+`CP-RESUME`.
 
 Каноническая спецификация:
 [`versions/v0.4/v0.4-input-runtime/README.md`](versions/v0.4/v0.4-input-runtime/README.md).
@@ -334,28 +371,32 @@ test или migration evidence.
 2. применяйте отмеченные реализованные updates v0.4;
 3. учитывайте `AF-24`–`AF-26` как implemented и accepted;
 4. учитывайте `v0.4-batch-workflows` как implemented и accepted;
-5. считайте IR-1—IR-4 `v0.4-input-runtime` реализованными: каждый committed batch
+5. считайте IR-1—IR-5 `v0.4-input-runtime` реализованными: каждый committed batch
    admitted, initial batch запускает один cycle, running additions durable queued
    и применяются в том же cycle через protocol-safe bounded FIFO checkpoints,
-   initial `R1`/snapshot authoritative, а runtime handoff cancellation-safe и
-   storage-neutral;
+   initial `R1`/snapshot authoritative, runtime handoff cancellation-safe и
+   storage-neutral, а durable control plane управляет pause/continue/reset через
+   control watermarks и generation fencing;
 6. учитывайте WAITING reply как common FIFO `CP-RESUME` continuation без legacy
-   semantic ownership и без подмены initial input identity;
-7. не приписывайте `/stop`/`/continue`, durable control plane, `/reset` redesign,
-   durable emissions, IR-7 finalization barrier или IR-8 startup recovery
-   текущему baseline — это IR-5+;
-8. не считайте checkpoint-level final candidate suppression закрытием late
-   terminal race: durable barrier остаётся IR-7;
-9. не приписывайте startup reconciliation ambiguous handoff/claim к IR-4 — это
-   ответственность IR-8; `recover_cycle_authority()` corruption matrix остаётся
-   IR-8/IR-10;
-10. не приписывайте scheduler/parallel branches текущему input runtime;
-11. не приписывайте Telegram history rewind текущему baseline;
-12. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
-13. не приписывайте scopes, trusted presentation, admission и remote handle
-   lifecycle до `v0.4-mcp-registry-foundation`;
-14. не называйте текущий self-hosted Service Application Future Local Agent;
-15. проверяйте затронутый код и tests для точного implementation status;
-16. используйте v0.5–v0.10 только как будущие ограничения;
-17. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`;
-18. не смешивайте sandbox execution backend и Future Local Agent Application.
+   semantic ownership и без подмены initial input identity; `/continue` без
+   ответа не является WAITING reply;
+7. считайте `/stop` cooperative safe-checkpoint pause, paused additions — durable
+   FIFO без auto-resume, `/continue` — same-cycle resume с pre-continue drain
+   target, а `/reset` — durable-generation authority;
+8. не приписывайте durable `AgentEmission`, IR-7 finalization barrier, IR-8
+   startup reconstruction, IR-9 completion или IR-10 roast текущему baseline;
+9. не считайте checkpoint-level input/control suppression закрытием late terminal
+   race: durable barrier остаётся IR-7;
+10. не приписывайте startup reconciliation ambiguous handoff/claim/control к
+    IR-5 — это ответственность IR-8; `recover_cycle_authority()` corruption
+    matrix остаётся IR-8/IR-10;
+11. не приписывайте scheduler/parallel branches текущему input runtime;
+12. не приписывайте Telegram history rewind текущему baseline;
+13. не приписывайте `AgentRuntime`/Dispatcher/Service composition до modularization;
+14. не приписывайте scopes, trusted presentation, admission и remote handle
+    lifecycle до `v0.4-mcp-registry-foundation`;
+15. не называйте текущий self-hosted Service Application Future Local Agent;
+16. проверяйте затронутый код и tests для точного implementation status;
+17. используйте v0.5–v0.10 только как будущие ограничения;
+18. не смешивайте `AgentCycle`, будущий `AgentRun` и `TaskRun`;
+19. не смешивайте sandbox execution backend и Future Local Agent Application.
