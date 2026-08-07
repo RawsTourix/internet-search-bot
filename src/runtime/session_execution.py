@@ -1,7 +1,7 @@
 """Strict in-process execution ordering for one agent session.
 
-The durable CycleInbox is authoritative for committed additions. This
-coordinator remains an in-process defensive runner lease, generation fence,
+The durable CycleInbox and SessionInputRuntimeState are authoritative. This
+coordinator remains an in-process defensive runner lease, generation cache,
 wake-up mechanism and diagnostic cache. Its historical FIFO lane is retained
 for compatibility callers which have not yet migrated.
 """
@@ -161,14 +161,9 @@ class SessionExecutionCoordinator:
         session_id: str,
         input_batch_id: str,
         cycle_id: str,
+        expected_generation: int | None = None,
     ) -> AsyncIterator[bool]:
-        """Reserve one admitted cycle without waiting behind a duplicate runner.
-
-        The reservation is set under the coordinator guard before the asyncio
-        lock is awaited. A concurrent replay therefore receives ``False``
-        instead of waiting and launching the same AgentCycle after the first
-        runner exits.
-        """
+        """Reserve one admitted cycle without launching a duplicate runner."""
 
         session_id = self._session_id(session_id)
         input_batch_id = input_batch_id.strip()
@@ -183,6 +178,9 @@ class SessionExecutionCoordinator:
                 raise RuntimeError("session execution coordinator is shutting down")
             lane = self._lanes.setdefault(session_id, _SessionLane())
             generation = lane.generation
+            if expected_generation is not None and generation != expected_generation:
+                yield False
+                return
             if (
                 lane.reserved_cycle_id is None
                 and lane.active_cycle_id is None
@@ -260,8 +258,14 @@ class SessionExecutionCoordinator:
                         lane.run_started_at_monotonic = None
                         lane.runtime_status = "idle"
 
-    async def wake(self, session_id: str, *, cycle_id: str) -> bool:
-        """Signal only the matching reserved/active in-process cycle."""
+    async def wake(
+        self,
+        session_id: str,
+        *,
+        cycle_id: str,
+        generation: int | None = None,
+    ) -> bool:
+        """Signal only the matching cycle and, when supplied, generation."""
 
         session_id = self._session_id(session_id)
         cycle_id = cycle_id.strip()
@@ -269,6 +273,8 @@ class SessionExecutionCoordinator:
             raise ValueError("cycle_id must not be empty")
         async with self._guard:
             lane = self._lanes.setdefault(session_id, _SessionLane())
+            if generation is not None and lane.generation != generation:
+                return False
             matches = cycle_id in {
                 lane.reserved_cycle_id,
                 lane.active_cycle_id,
@@ -284,8 +290,6 @@ class SessionExecutionCoordinator:
         *,
         timeout: float | None = None,
     ) -> bool:
-        """Future checkpoint seam; IR-3 only produces the wake signal."""
-
         session_id = self._session_id(session_id)
         async with self._guard:
             lane = self._lanes.setdefault(session_id, _SessionLane())
@@ -327,7 +331,7 @@ class SessionExecutionCoordinator:
             )
 
     async def request_stop(self, session_id: str) -> bool:
-        """Set the cooperative stop flag; cycle cancellation is future work."""
+        """Compatibility wake flag only; durable IR-5 controls are authority."""
 
         session_id = self._session_id(session_id)
         async with self._guard:
@@ -337,26 +341,42 @@ class SessionExecutionCoordinator:
             lane.wake_event.set()
             return changed
 
-    async def reset_session(self, session_id: str) -> int:
-        """Invalidate queued work and advance the session generation."""
+    async def synchronize_generation(self, session_id: str, *, generation: int) -> int:
+        """Mirror an already-durable generation transition into this process.
 
+        This method never decides semantic reset. It invalidates queued local
+        work after SessionInputRuntimeState has become authoritative.
+        """
         session_id = self._session_id(session_id)
+        if generation < 0:
+            raise ValueError("generation must be non-negative")
         async with self._guard:
             lane = self._lanes.setdefault(session_id, _SessionLane())
-            lane.generation += 1
+            lane.generation = generation
             lane.stop_requested = True
             lane.wake_event.set()
             cancelled = list(lane.queue)
             lane.queue.clear()
-            generation = lane.generation
         for item in cancelled:
             if not item.future.done():
                 item.future.set_exception(
                     SessionExecutionReset(
-                        "queued batch was invalidated by session reset"
+                        "queued batch was invalidated by durable session reset"
                     )
                 )
         return generation
+
+    async def reset_session(self, session_id: str) -> int:
+        """Legacy compatibility reset; IR-5 callers use durable generation."""
+
+        session_id = self._session_id(session_id)
+        async with self._guard:
+            lane = self._lanes.setdefault(session_id, _SessionLane())
+            next_generation = lane.generation + 1
+        return await self.synchronize_generation(
+            session_id,
+            generation=next_generation,
+        )
 
     async def shutdown(self) -> None:
         async with self._guard:
