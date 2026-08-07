@@ -7,7 +7,8 @@ from .admission import (
     InputAdmissionOutcome,
 )
 from .ir4_persistence_windows import DurableClaimCycleInputApplier as CycleInputApplier
-from .ir4_checkpoint_contracts import EntryWatermarkCheckpointService as InputRuntimeCheckpointService
+from .ir5_checkpoints import ControlAwareCheckpointService as InputRuntimeCheckpointService
+from .ir5_controls import InputRuntimeControlService
 from .composition import (
     InputRuntimeApplicationBinding,
     clear_input_runtime_binding_for_tests,
