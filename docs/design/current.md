@@ -248,14 +248,18 @@ IR-5 добавил durable control plane поверх IR-1/IR-4 foundation:
   authority: applied watermark продвигается только contiguous terminal records;
 - control-aware checkpoint фиксирует pending-control watermark на entry и reduce-ит
   commands до ordinary input;
-- `/stop` cooperative: bounded LLM attempt завершается, а multi-tool assistant
-  block сохраняет все matching tool results до pause; durable snapshot становится
-  `paused_by_user` и compatibility result mapping не стирает pause;
+- `/stop` cooperative: bounded LLM attempt завершается, а production multi-tool
+  assistant block сохраняет все matching tool results до pause; durable snapshot
+  становится `paused_by_user` и compatibility result mapping не стирает pause;
 - `pause_requested/paused_by_user` additions admitted FIFO как `QUEUE_PAUSED`
   без runner start/wake;
-- `/continue` возобновляет тот же cycle; pre-continue accepted additions
-  drain-ятся bounded chunks через `CP-RESUME` до первого meaningful post-resume
-  LLM, поздний input остаётся future checkpoint;
+- `/continue` возобновляет тот же cycle; accepted input target замораживается
+  атомарно внутри shared durable `root identity → session` coordination. Input,
+  coordinated раньше continue, входит в initial `CP-RESUME` drain; input,
+  coordinated позже, остаётся future running checkpoint;
+- duplicate continue сохраняет тот же control ID/sequence/frozen target, а
+  record-first continue publication crash repair-ит pending watermark без
+  пересчёта target или duplicate sequence;
 - continue without additions сохраняет original input/context revision;
 - `WAITING_USER` без нового ответа не превращает `/continue` в fake user reply;
 - rapid pause/continue reducer не создаёт phantom pause/second runner;
@@ -268,11 +272,11 @@ IR-5 добавил durable control plane поверх IR-1/IR-4 foundation:
 
 IR-5 final code evidence:
 
-- code/test HEAD:
-  `85c52d4b60a60786bdb10732eb0a52893a422eee`;
-- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
-  `0 failed`;
-- `Validate v0.4 file artifacts PR` #547 — success.
+- corrected code/test HEAD:
+  `0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`;
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
 
 Граница current implementation остаётся точной. IR-5 checkpoint-level
 pause/reset suppression не закрывает late terminal race после последнего recheck
@@ -381,8 +385,8 @@ test или migration evidence.
    semantic ownership и без подмены initial input identity; `/continue` без
    ответа не является WAITING reply;
 7. считайте `/stop` cooperative safe-checkpoint pause, paused additions — durable
-   FIFO без auto-resume, `/continue` — same-cycle resume с pre-continue drain
-   target, а `/reset` — durable-generation authority;
+   FIFO без auto-resume, `/continue` — same-cycle resume с atomically frozen
+   durable coordination target, а `/reset` — durable-generation authority;
 8. не приписывайте durable `AgentEmission`, IR-7 finalization barrier, IR-8
    startup reconstruction, IR-9 completion или IR-10 roast текущему baseline;
 9. не считайте checkpoint-level input/control suppression закрытием late terminal
