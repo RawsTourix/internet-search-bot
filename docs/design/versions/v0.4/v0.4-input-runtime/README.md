@@ -4,16 +4,101 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-07
+last_reviewed: 2026-08-08
 ---
 
 # v0.4-input-runtime
 
 ## Статус реализации
 
-`IR-1`, `IR-2`, `IR-3`, `IR-4` и `IR-5` реализованы и подтверждены CI. Этапы
-`IR-6`—`IR-10` остаются planned, поэтому общий update сохраняет статус
+`IR-1`, `IR-2`, `IR-3`, `IR-4`, `IR-5` и `IR-6` реализованы и подтверждены CI.
+Этапы `IR-7`—`IR-10` остаются planned, поэтому общий update сохраняет статус
 `partial`.
+
+Финальный IR-6 code/test evidence:
+
+- code/test boundary:
+  `4447d1bfe487bfd764829e701f274655aa8c3c50`;
+- `Validate Input Runtime` #297 — success, compile success, `350 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #609 — success.
+
+IR-6 активировал dormant `AgentEmission` foundation как отдельный durable
+semantic lifecycle. Builtin manager tool `send_user_message` принимает только
+semantic `message`, `kind=intermediate` и `importance`; LLM не передаёт
+session/cycle/generation/context revision, route, client instance, reply target,
+emission ID или idempotency key. Runtime-owned `ManagerToolExecutionContext`
+связывает native assistant `tool_call_id` с exact
+`session_id + cycle_id + generation + context_revision_id + original_input_batch_id`.
+
+Stable logical idempotency выводится из manager tool namespace, cycle/generation и
+assistant tool-call identity. Replay того же logical call возвращает тот же
+`emission_id`; same key с иными semantic arguments даёт managed conflict.
+Проверка max-count/min-interval и persistence выполняются одним command-oriented
+repository operation под короткой exact-session coordination, поэтому
+concurrent calls не обходят policy. Length, per-cycle count и interval используют
+реальные `max_intermediate_messages_per_cycle`,
+`min_intermediate_message_interval_seconds` и
+`max_intermediate_message_chars`; delivery failure не освобождает spam budget.
+
+User-visible route snapshot строится только из authoritative original
+`CommittedInputBatch`, response anchor и capability snapshot. Transport metadata,
+callback auth, bot/API tokens не сохраняются. Persistence `READY` обязана
+завершиться до manager-tool success; delivery wake остаётся best-effort. Agent
+loop после persistence продолжает обычный tool block и не ждёт Telegram/Web
+receipt. Emission persistence сама не создаёт `CycleContextRevision`, не меняет
+input/control watermarks и не переводит cycle в `WAITING_USER`.
+
+Delivery lifecycle теперь production-active:
+
+```text
+READY
+→ DELIVERING
+→ DELIVERED | FAILED | UNKNOWN
+```
+
+Claim хранит durable token/attempt. Повтор same token после потерянного claim
+response возвращает тот же `DELIVERING` attempt; competing token конфликтует.
+Durable generic receipt сохраняет attempt identity, client type/instance,
+conversation/thread, external message ID и `delivered_at`. Повтор того же receipt
+идемпотентен и не инициирует второй client send. `DELIVERED` требует reliable
+receipt. Deterministic preflight/client rejection может стать `FAILED`; timeout,
+connection ambiguity, expired in-flight claim или reset во время уже начатой
+доставки становятся `UNKNOWN`. `UNKNOWN` не возвращается автоматически в READY и
+не blind-retry-ится.
+
+Telegram consumer получает route-filtered READY records через authenticated
+internal outbox, повторно проходит exact client-instance authority на claim и
+receipt и отправляет intermediate как отдельное plain-text message, а не progress
+edit. External Telegram message ID сохраняется в durable receipt. Если пользователь
+отвечает именно на delivered intermediate, server-owned Telegram reply metadata
+может быть сопоставлена с exact emission только по session/client
+instance/conversation/thread/external message ID. Тогда input projection получает
+optional `reply_to: {emission_id, kind}` без branch semantics, изменения FIFO или
+admission policy. Произвольный user-supplied `reply_to_emission_id` authority не
+существует.
+
+`ProgressEvent` остаётся transient/coalescible UI lifecycle. Existing
+`AgentAction.agent_request` продолжает публиковаться как progress
+`agent_message`; IR-6 не мигрирует его автоматически в durable semantic message.
+Question/`WAITING_USER` и final `OutputBatch` также остаются отдельными
+lifecycles. Native sequence
+`assistant tool_call(send_user_message) → role=tool agent_emission_result`
+является достаточным evidence в LLM history; runtime не вставляет второй
+assistant message с тем же text.
+
+Pause не отменяет уже durable READY emission. Reset fences old generation:
+`READY → CANCELLED`, а `DELIVERING → UNKNOWN`, потому что начатый transport
+attempt мог достичь клиента; stale old-generation claim writer больше не может
+завершить record. Sequential terminal fencing отвергает новый
+`send_user_message`, если exact cycle уже terminal, и отменяет READY emission до
+claim, если terminal state уже виден worker. Concurrent race
+`claim begins ↔ terminal/finalization commit`, которому нужна общая durable
+finalization authority, намеренно остаётся IR-7.
+
+Детерминированные IR-6 tests используют fake clock, explicit asyncio barriers,
+controlled record/index and cancellation faults, repository recreation и fake
+Telegram/http transport. Real Agent/LLM/MCP/Telegram/Web/internet calls не нужны.
 
 Финальный IR-5 code/test evidence:
 
@@ -168,7 +253,6 @@ IR-4 добавил active-context ownership поверх этой admission bou
 
 Явно **не реализованы** на текущем baseline:
 
-- IR-6 durable `AgentEmission` и delivery lifecycle;
 - IR-7 durable finalization barrier и полный terminal phase machine;
 - IR-8 startup recovery/reconciliation и process-restart cycle reconstruction;
 - IR-9 complete diagnostics/client projection completion;
@@ -226,7 +310,7 @@ workflow revisions и scheduler поверх той же admission boundary.
 
 ## Текущий baseline
 
-В рабочей ветке уже существуют важные foundations и IR-1—IR-5 implementation:
+В рабочей ветке уже существуют важные foundations и IR-1—IR-6 implementation:
 
 - immutable `CommittedInputBatch` и durable ingress;
 - `SessionExecutionCoordinator` с defensive in-process run lease/wake/generation
@@ -241,17 +325,22 @@ workflow revisions и scheduler поверх той же admission boundary.
 - paused additions без auto-resume и same-cycle continue с atomically frozen
   durable resume target;
 - Telegram `/stop`/`/continue` через transport-neutral Gateway boundary;
-- `ProgressEvent`, durable `OutputBatch`, client capabilities и delivery receipts.
+- explicit durable `send_user_message` → `AgentEmission` lifecycle with trusted
+  route, policy, claim/receipt fencing and optional reply binding;
+- transient `ProgressEvent`, separate question/WAITING lifecycle, durable final
+  `OutputBatch`, client capabilities и final delivery receipts.
 
 Эти foundations всё ещё не являются полным input runtime:
 
-- durable intermediate agent message пока не является отдельной completed
-  interaction lifecycle (IR-6);
+- IR-6 durable intermediate semantic lifecycle реализован, но atomic
+  claim-vs-terminal/finalization race ещё не закрыт общей finalization authority
+  (IR-7);
 - checkpoint-level stale candidate/control suppression ещё не является durable
   finalization barrier (IR-7);
-- startup recovery ambiguous handoff/claim/control authority ещё не реализован
-  (IR-8);
-- full diagnostics/randomized/restart/live acceptance остаются IR-9/IR-10.
+- startup recovery ambiguous handoff/claim/control/emission authority ещё не
+  реализован (IR-8);
+- full diagnostics/client timeline/randomized/restart/live acceptance остаются
+  IR-9/IR-10.
 
 Обновление должно мигрировать существующее поведение постепенно, без большого
 rewrite `src/mcp/mcp_client.py`. Полная декомпозиция ownership выполняется в
@@ -294,6 +383,7 @@ Interaction / Delivery
 - назначения session/cycle sequence;
 - admission committed batch;
 - записи `/stop`, `/continue`, `/reset`;
+- linearizable acceptance semantic intermediate emissions;
 - final input/control recheck;
 - terminal commit.
 
@@ -306,7 +396,9 @@ boundary. Для `/continue` она атомарно выполняет
 watermark freeze → unique control sequence allocation → command/index publication
 → pending-control watermark advance`. Поэтому input, coordinated до continue,
 включён в resume target, а input, coordinated после continue, исключён из него.
-LLM/tool/Telegram delivery и ожидание atomic block выполняются вне этой boundary.
+IR-6 использует ту же infrastructure coordination только для короткой
+idempotency/policy/persistence boundary semantic emission; LLM/tool/Telegram
+network delivery выполняются вне неё.
 
 ## Основные инварианты
 
@@ -336,6 +428,11 @@ LLM/tool/Telegram delivery и ожидание atomic block выполняютс
     parents без реализации merge semantics.
 17. `/continue` resume target определяется только durable session coordination
     order и после публикации не расширяется более новым session state.
+18. AgentEmission route/idempotency/provenance authority принадлежит runtime, а
+    не LLM/client arguments.
+19. `UNKNOWN` external delivery не blind-retry-ится.
+20. Durable semantic emission не меняет WAITING/input revision и не является
+    mini-final `OutputBatch`.
 
 ## Состав обновления
 
@@ -369,8 +466,8 @@ LLM/tool/Telegram delivery и ожидание atomic block выполняютс
 - startup recovery и diagnostics;
 - unit, race, randomized, restart, synthetic и live acceptance.
 
-IR-1—IR-5 уже покрывают первые control/input runtime slices этого scope;
-оставшиеся пункты реализуются IR-6—IR-10.
+IR-1—IR-6 уже покрывают input/control runtime и durable semantic emission slices
+этого scope; оставшиеся пункты реализуются IR-7—IR-10.
 
 ## Non-goals
 
@@ -409,9 +506,9 @@ FinalizationRepository
 Filesystem implementations принадлежат `v0.4`. PostgreSQL implementations
 `v0.5` сохраняют те же IDs, transitions, idempotency keys и ownership relations,
 но заменяют короткую filesystem coordination boundary транзакцией/row locking.
-IR-5 application control/checkpoint layers не зависят от `Path`, filesystem
-layout, Telegram types или concrete lock registry. Command-oriented
-`SessionControlRepository.accept_continue(...)` выражает атомарную continue
+IR-5 application control/checkpoint layers и IR-6 emission service/outbox не
+зависят от `Path`, filesystem layout, Telegram types или concrete lock registry.
+Command-oriented repository methods выражают атомарную continue/emission
 acceptance semantics без утечки filesystem details в application layer.
 
 ## Подготовка v0.6
@@ -430,7 +527,10 @@ intervention_id
 Новый `UserIntervention` будет решать, применять input непосредственно, создать
 параллельную task, пересмотреть workflow, отложить или отменить устаревшую
 работу. Scheduler не меняет факта, что каждый committed batch сначала durable и
-идемпотентно admitted.
+идемпотентно admitted. AgentEmission уже сохраняет
+`session_id/cycle_id/generation/context_revision_id` и не связывает semantic
+identity с Telegram external message ID, поэтому остаётся пригодным для будущих
+task branches без реализации branches в IR-6.
 
 ## Зависимости
 
@@ -452,5 +552,5 @@ Update считается завершённым только после:
 - подтверждения отсутствия regression в batch/artifact/output flows;
 - актуализации v0.4/current/roadmap documentation.
 
-IR-5 implementation не меняет эту release boundary: общий update остаётся
-`partial` до IR-6—IR-10.
+IR-6 implementation не меняет эту release boundary: общий update остаётся
+`partial` до IR-7—IR-10.
