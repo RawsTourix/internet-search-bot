@@ -46,22 +46,17 @@ class FailOnceAdmissionMark:
     def __getattr__(self, name):
         return getattr(self.delegate, name)
 
-class FailOnceInboxMarkAfterSnapshot:
-    """Fail only after the durable snapshot already owns the claim range."""
-    def __init__(self, delegate, snapshots):
+class FailOnceAfterAppliedSnapshotPersist:
+    """Persist the applied snapshot, then simulate a crash before later marking."""
+    def __init__(self, delegate):
         self.delegate = delegate
-        self.snapshots = snapshots
         self.failed = False
-    async def mark_applied(self, claim, *args, **kwargs):
-        snapshot = await self.snapshots.get(claim.cycle_id)
-        if (
-            not self.failed
-            and snapshot is not None
-            and snapshot.applied_through_cycle_sequence >= claim.last_cycle_sequence
-        ):
+    async def compare_and_swap(self, expected_revision, snapshot):
+        persisted = await self.delegate.compare_and_swap(expected_revision, snapshot)
+        if not self.failed and snapshot.applied_through_cycle_sequence > 0:
             self.failed = True
-            raise OSError('simulated post-snapshot inbox mark failure')
-        return await self.delegate.mark_applied(claim, *args, **kwargs)
+            raise OSError('simulated crash after snapshot persistence')
+        return persisted
     def __getattr__(self, name):
         return getattr(self.delegate, name)
 
@@ -89,15 +84,15 @@ async def test_initial_snapshot_repairs_failed_admission_mark_without_second_r1(
 @pytest.mark.asyncio
 async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_update(tmp_path):
     base = create_filesystem_input_runtime_repositories(storage_config=StorageConfigType(root_dir=str(tmp_path)))
-    wrapped_inbox = FailOnceInboxMarkAfterSnapshot(base.inbox, base.snapshots)
-    bundle = InputRuntimeRepositories(sessions=base.sessions, admissions=base.admissions, inbox=wrapped_inbox, controls=base.controls, snapshots=base.snapshots, context_revisions=base.context_revisions, emissions=base.emissions, finalizations=base.finalizations, handoffs=base.handoffs, coordination_root=base.coordination_root, coordination_locks=base.coordination_locks)
+    wrapped_snapshots = FailOnceAfterAppliedSnapshotPersist(base.snapshots)
+    bundle = InputRuntimeRepositories(sessions=base.sessions, admissions=base.admissions, inbox=base.inbox, controls=base.controls, snapshots=wrapped_snapshots, context_revisions=base.context_revisions, emissions=base.emissions, finalizations=base.finalizations, handoffs=base.handoffs, coordination_root=base.coordination_root, coordination_locks=base.coordination_locks)
     runtime = InputAdmissionService(config=InputRuntimeConfigType(), repositories=bundle, committed_batches=Reader(Batch('initial'), Batch('addition')), wake_coordinator=Wake(), cycle_id_factory=lambda: 'cycle-a', clock=lambda: NOW, payload_size_resolver=lambda batch: batch.payload_size)
     initial = await runtime.admit_committed_batch('initial', session_id='session')
     active = cycle(initial.target_cycle_id)
     await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.RESUME, active_cycle=active, desired_status=CycleStatus.RUNNING)
     await runtime.admit_committed_batch('addition', session_id='session')
 
-    try:
+    with pytest.raises(OSError, match='after snapshot persistence'):
         await runtime.cycle_input_applier.apply_pending_input(
             session_id='session',
             cycle_id='cycle-a',
@@ -106,14 +101,23 @@ async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_up
             active_cycle=active,
             through_sequence=1,
         )
-    except OSError:
-        pass
 
-    assert wrapped_inbox.failed is True
+    assert wrapped_snapshots.failed is True
     snapshot = await base.snapshots.get('cycle-a')
     assert snapshot.applied_through_cycle_sequence == 1
     revisions = await base.context_revisions.list_for_cycle('cycle-a')
     assert [item.revision_number for item in revisions] == [1, 2]
+    inbox = await base.inbox.list_for_cycle('cycle-a')
+    assert inbox[0].state.value == 'applying'
+    addition = await base.admissions.get_by_input_batch_id('addition')
+    assert addition.state.value == 'admitted'
+    assert all('input_batch_update' not in str(message.get('content')) for message in active.messages_for_llm)
+
+    await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
+    inbox = await base.inbox.list_for_cycle('cycle-a')
+    assert inbox[0].state.value == 'applied'
+    addition = await base.admissions.get_by_input_batch_id('addition')
+    assert addition.state.value == 'applied'
     updates = [
         message for message in active.messages_for_llm
         if message.get('role') == 'user'
@@ -121,12 +125,6 @@ async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_up
         and 'input_batch_update' in message['content']
     ]
     assert len(updates) == 1
-
-    await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
-    inbox = await base.inbox.list_for_cycle('cycle-a')
-    assert inbox[0].state.value == 'applied'
-    addition = await base.admissions.get_by_input_batch_id('addition')
-    assert addition.state.value == 'applied'
 
     message_count = len(active.messages_for_llm)
     await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
