@@ -193,6 +193,11 @@ class SessionControlRepository(Protocol):
         idempotency_key: str,
     ) -> SessionControlCommand | None: ...
 
+    async def accept_continue(
+        self,
+        command: SessionControlCommand,
+    ) -> SessionControlCommand: ...
+
     async def acknowledge(
         self,
         control_id: str,
