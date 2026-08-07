@@ -3,11 +3,32 @@ id: design.v0.4.input-runtime.contracts-acceptance
 version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
-implementation_status: planned
-last_reviewed: 2026-08-05
+implementation_status: partial
+last_reviewed: 2026-08-07
 ---
 
 # Contracts и acceptance
+
+## Статус реализации
+
+Observable contracts IR-1—IR-5 реализованы. IR-6—IR-10 остаются planned, поэтому
+общий `v0.4-input-runtime` остаётся `partial`.
+
+Финальный IR-5 code/test boundary:
+
+- code/test HEAD: `85c52d4b60a60786bdb10732eb0a52893a422eee`;
+- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #547 — success.
+
+IR-5 реализует durable control acceptance/idempotency/sequence и watermarks,
+cooperative `/stop`, same-cycle `/continue`, paused admission без auto-resume,
+generation-authoritative `/reset`, checkpoint control reduction и Telegram
+`/stop`/`/continue` через общий application service. Checkpoint-level control
+suppression перед terminal transition реализовано, но это **не** IR-7 durable
+finalization barrier: late race `последний checkpoint → новый control/input →
+terminal commit` остаётся IR-7. Startup reconstruction/reconciliation остаётся
+IR-8; полная `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
 
 ## Назначение
 
@@ -77,6 +98,11 @@ paused + additions
 → /continue applies and resumes same cycle
 ```
 
+Этот slice реализован IR-5. `/continue` без additions сохраняет тот же cycle и не
+создаёт фиктивный user input/context revision. Все additions, accepted до
+continue coordination boundary, drain-ятся bounded chunks до первого meaningful
+post-resume LLM; более поздний input остаётся следующему running checkpoint.
+
 ### Intermediate agent message
 
 ```text
@@ -85,6 +111,8 @@ send_user_message
 → client delivery intent
 → cycle remains running
 ```
+
+Этот contract остаётся IR-6 и не считается реализованным IR-5.
 
 ### Finalization
 
@@ -99,6 +127,10 @@ terminal commit completed
 → later input starts new cycle
 ```
 
+IR-4/IR-5 реализуют checkpoint-level suppression для уже наблюдаемого input/control.
+Полный durable terminal commit contract, включая late race после последнего
+checkpoint recheck, остаётся IR-7.
+
 ## Protocol integrity
 
 For every prompt-bearing history:
@@ -111,6 +143,11 @@ For every prompt-bearing history:
 - compaction output passes existing tool-sequence validation;
 - manager emission call/result sequence remains valid.
 
+IR-5 stop не force-cancel arbitrary LLM/tool await. Stop during LLM применяется
+после завершения bounded attempt и до следующего tool/LLM block. Stop внутри
+assistant multi-tool block применяется только после всех matching `role=tool`
+results, сохраняя protocol-valid history.
+
 ## Persistence contract
 
 - committed input is never deleted because admission temporarily failed;
@@ -122,6 +159,10 @@ For every prompt-bearing history:
 - result/output persistence can recover without rerunning full cycle;
 - repository writes are atomic per record;
 - cross-record crash windows have deterministic reconciliation.
+
+IR-5 реализует retry/idempotent repair для control publication/application
+crash windows. Startup-wide reconstruction/reconciliation этого durable evidence
+остаётся IR-8.
 
 ## Idempotency contract
 
@@ -146,6 +187,10 @@ At-least-once signals/callbacks/claims must not duplicate:
 - final output intent;
 - external mutating side effect.
 
+Control idempotency IR-5 связывает stable key ровно с одной command delivery;
+повтор возвращает тот же control ID/sequence/outcome, а повтор reset не повышает
+generation второй раз.
+
 ## Ordering contract
 
 Authoritative order within session/cycle is admission sequence, not client
@@ -156,6 +201,12 @@ message timestamp or arrival completion.
 - bounded drain preserves remaining order;
 - controls have explicit priority but preserve audit sequence;
 - terminalization observes all accepted sequences up to current watermark.
+
+IR-5 control sequence выделяется под короткой session coordination boundary.
+`pending_control_sequence` продвигается durable acceptance, а
+`applied_control_sequence` — только contiguous terminal control records без
+пропуска head command. Effective priority: `reset > pause > continue > input`,
+при сохранении всех durable audit records и их sequence.
 
 ## Backpressure contract
 
@@ -185,22 +236,35 @@ Behavior:
 - does not delete messages/state;
 - does not promise rollback;
 - applies at safe boundary;
-- wins before terminal commit.
+- wins before terminal commit when visible to that checkpoint;
+- running cycle проходит `pause_requested → paused_by_user`;
+- waiting/interrupted resumable cycle может быть явно paused без потери вопроса
+  или resumability metadata;
+- terminal/idle возвращает `no_active_cycle` и не создаёт cycle.
 
 ### `/continue`
 
 - resumes same cycle only;
 - does not create missing answer for waiting question;
 - applies pre-existing paused additions before next meaningful LLM step;
-- idempotent when already running.
+- idempotent when already running;
+- не создаёт fake `input_batch_update` или новый context revision без input;
+- после настоящей pause может reacquire in-process execution lease того же
+  durable cycle; process-restart reconstruction при этом остаётся IR-8.
 
 ### `/reset`
 
 - highest priority;
-- advances generation;
+- advances **durable** session generation exactly once per logical reset command;
 - invalidates old queued/control/finalization work;
-- prevents stale final delivery;
-- preserves immutable audit/retention evidence according to policy.
+- prevents old-generation checkpoint writer from regaining current authority;
+- preserves immutable audit/retention evidence according to policy;
+- mutable session memory очищается только после safe in-process execution lease
+  boundary, не под выполняющимся old runner.
+
+IR-5 подавляет stale terminal candidate, если reset/pause уже наблюдаем на
+`CP-BEFORE-TERMINAL-COMMIT`. Гарантия не распространяется на IR-7 late window
+после последнего checkpoint и до durable terminal persistence.
 
 ### `/cancel`
 
@@ -216,6 +280,9 @@ Remains InputBatch collection command and is not accepted as AgentCycle stop.
 - unknown delivery not blind-retried where duplication possible;
 - LLM cannot select arbitrary client route;
 - client adapters escape/render content safely.
+
+Durable semantic `AgentEmission`/delivery lifecycle остаётся IR-6. IR-5 не
+объявляет этот раздел implemented.
 
 ## Recovery contract
 
@@ -240,6 +307,10 @@ waiting_user → waiting_user
 terminal_committed → terminal, no rerun
 ```
 
+Этот startup-wide contract остаётся IR-8. IR-5 реализует только retry/idempotent
+repair, необходимый текущей command delivery/application, и не выполняет startup
+reconstruction после process death.
+
 ## Compatibility contract
 
 Existing flows remain valid:
@@ -254,6 +325,10 @@ Existing flows remain valid:
 - session reset observable behavior;
 - Web message compatibility endpoint;
 - no mandatory PostgreSQL/Redis/new service.
+
+Telegram `/stop` и `/continue` используют exact existing session/thread resolution
+и общий Gateway/application control contract. Transport не читает MCP session
+state для semantic decision; `/cancel` остаётся ingress collection command.
 
 ## Configuration and examples
 
@@ -305,6 +380,9 @@ Metrics/diagnostics distinguish:
 - emission/output persistence;
 - client delivery.
 
+IR-5 добавил control watermarks/generation в current runtime status projection;
+полный IR-9 diagnostics/client projection completion остаётся planned.
+
 ## Unit test matrix
 
 ### Models/config
@@ -341,10 +419,20 @@ Metrics/diagnostics distinguish:
 
 ### Controls
 
-- stop/continue/reset transitions;
-- rapid command order;
-- idempotency;
-- finalization races.
+IR-5 deterministic tests cover:
+
+- concurrent monotonic sequence allocation;
+- duplicate pause/continue/reset;
+- record-first command publication and pending-watermark repair;
+- pause/continue state/snapshot effect with later control-marker failure;
+- stop during blocked LLM and complete multi-tool block;
+- rapid pause/continue reducer;
+- paused input FIFO/no wake;
+- same-cycle continue with/without additions and late-input boundary;
+- WAITING/interrupted control matrix;
+- reset generation/cancellation/stale-writer fencing;
+- reset vs terminal checkpoint;
+- Telegram stable source identity and high-priority runtime handlers.
 
 ### Emissions
 
@@ -354,6 +442,8 @@ Metrics/diagnostics distinguish:
 - reply relation;
 - no terminal state change.
 
+Planned for IR-6.
+
 ### Finalization/recovery
 
 - phase matrix;
@@ -361,6 +451,9 @@ Metrics/diagnostics distinguish:
 - stale output cancellation;
 - startup order/readiness;
 - ambiguous side-effect policy.
+
+Planned for IR-7/IR-8 except checkpoint-level stale candidate suppression already
+covered by IR-4/IR-5.
 
 ## Race test matrix
 
@@ -384,6 +477,9 @@ shutdown vs queued/claimed/applying
 
 Race tests assert state/IDs, not only absence of exception.
 
+IR-5 закрывает control races на доступной checkpoint boundary. Late
+input/control-vs-terminal-commit race после последнего checkpoint остаётся IR-7.
+
 ## Randomized tests
 
 Random operations:
@@ -406,6 +502,8 @@ Each seed must verify global invariants:
 - no delivery before terminal commit;
 - no protocol-invalid history;
 - reset generation fences old work.
+
+Full randomized/restart roast остаётся IR-10 и не является IR-5 evidence.
 
 ## Synthetic roast
 
@@ -433,6 +531,8 @@ flaky classification
 external call count (must be zero)
 ```
 
+Полная synthetic roast acceptance остаётся IR-10.
+
 ## Live Telegram acceptance
 
 Required maintainer evidence:
@@ -450,6 +550,9 @@ Required maintainer evidence:
 
 Live checks verify user-visible messages and backend IDs/statuses. Private content
 is not committed to reports.
+
+IR-5 содержит deterministic Telegram adapter tests, но maintainer live Telegram
+acceptance остаётся IR-10.
 
 ## Performance/safety gates
 
@@ -486,5 +589,6 @@ mandatory IR-1..IR-10 complete
 + no unresolved severity-blocking gap
 ```
 
+IR-5 completion alone не переводит общий update из `partial` в `implemented`.
 Optional client UX refinements may remain follow-up only if domain contracts,
 state consistency and stale-finalization protection are complete.
