@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-07
+last_reviewed: 2026-08-08
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -29,7 +29,7 @@ Application/hosting profiles определены в
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | implemented | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
-| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1—IR-5 implemented; IR-6—IR-10 planned: emissions, durable finalization barrier, startup recovery и full acceptance |
+| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1—IR-6 implemented; IR-7—IR-10 planned: durable finalization barrier, startup recovery, complete projections и full acceptance |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Reusable `AgentRuntime`, Service Application composition, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
 | 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и profile-aware transport admission |
 
@@ -79,8 +79,8 @@ suites. Точный последний head и результаты run фик�
 [`../../../../reports/v0.4-transport-artifact-roast.md`](../../../../reports/v0.4-transport-artifact-roast.md),
 тематических README и описании PR.
 
-`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1—IR-5
-реализованы и подтверждены CI; IR-6—IR-10 остаются planned.
+`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1—IR-6
+реализованы и подтверждены CI; IR-7—IR-10 остаются planned.
 
 IR-5 final code evidence:
 
@@ -99,19 +99,68 @@ continue, входит в initial resume drain; input, coordinated позже, �
 следующему running checkpoint. Telegram `/stop`/`/continue` используют общий
 Gateway/application contract, а `/cancel` остаётся ingress collection command.
 
-IR-5 checkpoint-level pause/reset suppression перед terminal transition не
-является полным IR-7 barrier. Late race после последнего checkpoint/recheck и до
-durable terminal commit остаётся IR-7. Startup-wide paused/interrupted/ambiguous
-reconstruction/reconciliation остаётся IR-8; полная corruption/restart matrix
-`recover_cycle_authority()` остаётся IR-8/IR-10.
+IR-6 добавляет отдельный durable semantic output lifecycle поверх active cycle,
+не превращая его ни в progress UI, ни в question, ни в final `OutputBatch`:
 
-IR-1—IR-4 implementation evidence и исторические boundary подробно сохранены в
+- builtin manager tool `send_user_message` принимает только semantic
+  `message/kind/importance`; session/cycle/generation/context revision, route,
+  client instance, reply target и idempotency принадлежат runtime;
+- exact `ManagerToolExecutionContext` связывает native assistant `tool_call_id` с
+  exact `cycle_id + generation + context_revision_id + original_input_batch_id`;
+- stable idempotency строится от logical tool-call identity; replay того же call
+  возвращает тот же `emission_id`, а changed semantic arguments дают controlled
+  conflict;
+- policy limits `max_intermediate_messages_per_cycle`,
+  `min_intermediate_message_interval_seconds` и
+  `max_intermediate_message_chars` реально применяются; count/interval acceptance
+  linearizable под exact session coordination;
+- trusted route snapshot берётся только из authoritative committed input/capability
+  state и не сохраняет transport secrets/route metadata;
+- persistence `READY` завершается до manager-tool success; optional wake остаётся
+  best-effort и не является delivery acknowledgement;
+- delivery lifecycle: `READY → DELIVERING → DELIVERED | FAILED | UNKNOWN`, с
+  same-token claim retry, competing-token fence, durable generic receipt и
+  idempotent receipt replay;
+- expired/ambiguous in-flight delivery становится `UNKNOWN`, а не `READY`; blind
+  external replay запрещён;
+- deterministic preflight/client rejection может стать `FAILED`, а timeout/
+  connection ambiguity — только `UNKNOWN`;
+- Telegram доставляет semantic intermediate как отдельное plain-text message, не
+  progress edit; внешний message ID сохраняется как receipt evidence;
+- server-owned Telegram reply metadata может безопасно связать external reply с
+  exact delivered emission по session/client instance/conversation/thread и
+  добавить optional `reply_to.emission_id` в input projection без branch/FIFO
+  semantics;
+- delivery failure не меняет `AgentCycle`, WAITING state, context revision или
+  input/control watermarks и не блокирует будущий final answer;
+- reset переводит old-generation `READY → CANCELLED`, а уже claimed
+  `DELIVERING → UNKNOWN`; stale claim writer больше не может завершить его;
+- sequential terminal fencing не позволяет создать emission после terminal state
+  и не начинает новую delivery для `READY`, если cycle уже terminal.
+
+IR-6 final code evidence:
+
+- code/test boundary `4447d1bfe487bfd764829e701f274655aa8c3c50`;
+- `Validate Input Runtime` #297 — success, compile success, `350 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #609 — success;
+- tests используют fake clock, repository recreation, controlled persistence/
+  cancellation faults и fake Telegram/HTTP transport; real LLM/MCP/Telegram/Web/
+  internet calls не требуются.
+
+IR-6 sequential terminal fencing не является полным IR-7 barrier. Concurrent
+`delivery claim ↔ terminal/finalization commit` остаётся IR-7, если для closure
+нужна общая durable finalization authority. Startup-wide reconstruction/reconcile
+`READY/UNKNOWN`, paused/interrupted/ambiguous runtime state остаётся IR-8. Полный
+client timeline, `/status`, Web/CLI projections и addendum UX остаются IR-9;
+randomized/full-system/live roast — IR-10.
+
+IR-1—IR-5 implementation evidence и исторические boundary подробно сохранены в
 [`v0.4-input-runtime/README.md`](v0.4-input-runtime/README.md) и
 [`v0.4-input-runtime/implementation-sequence.md`](v0.4-input-runtime/implementation-sequence.md).
 
-Этапы IR-6—IR-10 planned. Явно пока не реализованы:
+Этапы IR-7—IR-10 planned. Явно пока не реализованы:
 
-- IR-6 durable `AgentEmission`;
 - IR-7 durable finalization barrier;
 - IR-8 startup recovery/reconstruction;
 - IR-9 complete client projections/diagnostics/config examples;
@@ -158,13 +207,16 @@ v0.4-storage-foundation
   admission, `CycleInbox`, checkpoints, pause/resume, emissions и terminal
   barrier. Пошаговая реализация находится в
   [`implementation-sequence.md`](v0.4-input-runtime/implementation-sequence.md).
-- IR-1—IR-5 уже реализованы; durable semantic emissions, IR-7 barrier, IR-8
-  startup recovery, IR-9 completion и IR-10 full acceptance ещё planned.
+- IR-1—IR-6 уже реализованы; IR-7 barrier, IR-8 startup recovery, IR-9 completion
+  и IR-10 full acceptance ещё planned.
+- `AgentEmission` — отдельное durable semantic intermediate message; transient
+  `ProgressEvent`, `Question/WAITING_USER` и final `OutputBatch` остаются иными
+  semantic lifecycles.
 - `/stop` является cooperative safe-checkpoint pause, paused additions не
   auto-resume runner, `/continue` возобновляет тот же cycle, а `/reset` использует
   durable generation как authority.
-- Checkpoint-level stale input/control candidate suppression не является IR-7
-  durable finalization barrier; late terminal race остаётся IR-7.
+- IR-6 sequential terminal fence не закрывает concurrent claim-vs-terminal race;
+  durable atomic finalization barrier остаётся IR-7.
 - Ambiguous/startup reconstruction/reconciliation остаётся IR-8; полная
   `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
 - Scheduler/parallel branches и Telegram history rewind не реализованы текущим
