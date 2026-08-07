@@ -501,9 +501,11 @@ class WrongCommittedReader(Reader):
 @pytest.mark.asyncio
 async def test_invalid_committed_relation_returns_managed_interruption(tmp_path):
     repositories = create_filesystem_input_runtime_repositories(storage_config=StorageConfigType(root_dir=str(tmp_path)))
-    service = InputAdmissionService(config=InputRuntimeConfigType(), repositories=repositories, committed_batches=WrongCommittedReader(Batch('initial'), Batch('addition')), wake_coordinator=Wake(), cycle_id_factory=lambda: 'cycle-a', clock=lambda: NOW, payload_size_resolver=lambda batch: batch.payload_size)
+    valid_reader = Reader(Batch('initial'), Batch('addition'))
+    service = InputAdmissionService(config=InputRuntimeConfigType(), repositories=repositories, committed_batches=valid_reader, wake_coordinator=Wake(), cycle_id_factory=lambda: 'cycle-a', clock=lambda: NOW, payload_size_resolver=lambda batch: batch.payload_size)
     active = await initialize(service)
     await service.admit_committed_batch('addition', session_id='session')
+    service.cycle_input_applier.committed_batches = WrongCommittedReader(Batch('initial'), Batch('addition'))
     outcome = await service.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
     assert outcome.action == CheckpointAction.INTERRUPT
     assert outcome.reason_code == 'invalid_committed_relation'

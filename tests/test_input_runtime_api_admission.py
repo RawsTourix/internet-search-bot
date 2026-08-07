@@ -7,8 +7,8 @@ from types import SimpleNamespace
 import pytest
 from src.api.api import Api
 from src.core.models import AgentResult, AgentStatus, ClientType
-from src.input_runtime import CycleStatus, InputAdmissionAction, InputAdmissionService, InputRuntimeConfigType, RuntimeHandoffState, create_filesystem_input_runtime_repositories
-from src.runtime import SessionExecutionCoordinator
+from src.input_runtime import CheckpointAction, CheckpointName, CycleStatus, InputAdmissionAction, InputAdmissionService, InputRuntimeConfigType, RuntimeHandoffState, create_filesystem_input_runtime_repositories
+from src.runtime import ActiveAgentCycle, SessionExecutionCoordinator
 from src.storage import StorageConfigType
 NOW = datetime(2026, 8, 6, tzinfo=timezone.utc)
 
@@ -36,11 +36,46 @@ class Reader:
             raise self.failure
         return self.items[input_batch_id]
 
+async def apply_ir4_fake_checkpoint(api, active_cycles, kwargs):
+    session_id = kwargs['session_id']
+    cycle_id = kwargs['cycle_id_override']
+    state = await api.input_runtime_repositories.sessions.get(session_id)
+    assert state is not None
+    assert state.active_cycle_id == cycle_id
+    active = active_cycles.get(cycle_id)
+    if active is None:
+        batch = kwargs['input_batch']
+        active = ActiveAgentCycle(
+            cycle_id=cycle_id,
+            session_id=session_id,
+            original_user_request='initial',
+            messages_for_llm=[
+                {'role': 'system', 'content': 'system'},
+                {'role': 'user', 'content': '{"type":"user_request"}'},
+            ],
+            cycle_trace=[],
+            original_user_message_index=1,
+            original_input_batch_id=batch.input_batch_id,
+            artifact_refs=list(getattr(batch, 'artifact_refs', ()) or ()),
+            input_runtime_generation=state.generation,
+        )
+        active_cycles[cycle_id] = active
+    outcome = await api.input_admission_service.checkpoint_service.run_checkpoint(
+        checkpoint=CheckpointName.RESUME,
+        active_cycle=active,
+        desired_status=CycleStatus.RUNNING,
+    )
+    assert outcome.action != CheckpointAction.INTERRUPT, outcome.reason_code
+    return active
+
 class MCP:
-    def __init__(self):
+    def __init__(self, api):
+        self.api = api
         self.calls = []
+        self.active_cycles = {}
     async def process_query(self, message, **kwargs):
         self.calls.append(kwargs)
+        await apply_ir4_fake_checkpoint(self.api, self.active_cycles, kwargs)
         return AgentResult(content='done', status=AgentStatus.DONE, session_id=kwargs['session_id'], cycle_id=kwargs['cycle_id_override'])
 
 def make_api(tmp_path, *batches):
@@ -51,7 +86,7 @@ def make_api(tmp_path, *batches):
     reader = Reader(*batches)
     api.input_admission_service = InputAdmissionService(config=api.input_runtime_config, repositories=api.input_runtime_repositories, committed_batches=reader, wake_coordinator=api.execution_coordinator, cycle_id_factory=lambda: 'admitted-cycle', clock=lambda: NOW, payload_size_resolver=lambda _batch: 10)
     api.ingress_services = SimpleNamespace(batch_store=reader)
-    api.mcp_client = MCP()
+    api.mcp_client = MCP(api)
     api.interaction_config = SimpleNamespace(output_runtime=SimpleNamespace(enabled=False), telegram_output=SimpleNamespace(prefer_document_groups=False, status_message_editing=False))
     api.output_assembler = SimpleNamespace()
     return api
@@ -73,6 +108,12 @@ async def test_api_uses_admission_cycle_id_and_marks_initial_applied(tmp_path):
     marker = await api.input_admission_service.get_runtime_handoff(admission)
     assert marker is not None
     assert marker.state == RuntimeHandoffState.COMPLETED
+    revisions = await api.input_runtime_repositories.context_revisions.list_for_cycle('admitted-cycle')
+    snapshot = await api.input_runtime_repositories.snapshots.get('admitted-cycle')
+    assert len(revisions) == 1
+    assert revisions[0].revision_number == 1
+    assert snapshot is not None
+    assert snapshot.original_input_batch_id == 'initial'
 
 @pytest.mark.asyncio
 async def test_pre_handoff_resolution_failure_remains_retryable(tmp_path):
@@ -145,39 +186,26 @@ async def test_post_invocation_persistence_failure_is_not_replayed(tmp_path):
     assert len(api.mcp_client.calls) == 1
 
 class SequenceMCP:
-    def __init__(self, results, *, before_result=None):
+    def __init__(self, api, results, *, before_result=None):
+        self.api = api
         self.results = list(results)
         self.calls = []
         self.before_result = before_result
+        self.active_cycles = {}
     async def process_query(self, message, **kwargs):
         self.calls.append(kwargs)
+        await apply_ir4_fake_checkpoint(self.api, self.active_cycles, kwargs)
         if self.before_result is not None:
             await self.before_result(len(self.calls), message, kwargs)
         status, content, can_resume = self.results.pop(0)
         return AgentResult(content=content, status=status, session_id=kwargs['session_id'], cycle_id=kwargs['cycle_id_override'], can_resume=can_resume)
-
-async def apply_fake_checkpoint(api, *, cycle_id: str) -> None:
-    state = await api.input_runtime_repositories.sessions.get('session')
-    claim = await api.input_runtime_repositories.inbox.claim_contiguous_range(cycle_id, generation=state.generation, after_sequence=state.active_cycle_applied_through_sequence, max_items=100, max_bytes=100000, lease_seconds=60)
-    assert claim is not None
-    claim = await api.input_runtime_repositories.inbox.mark_applying(claim)
-    items = await api.input_runtime_repositories.inbox.mark_applied(claim, applied_at=NOW)
-    for item in items:
-        admission = await api.input_runtime_repositories.admissions.get_by_input_batch_id(item.input_batch_id)
-        await api.input_runtime_repositories.admissions.mark_applied(admission.admission_id, applied_at=NOW)
-    refreshed = await api.input_runtime_repositories.sessions.get('session')
-    updated = refreshed.model_copy(update={'active_cycle_applied_through_sequence': claim.last_cycle_sequence, 'revision': refreshed.revision + 1, 'updated_at': NOW})
-    await api.input_runtime_repositories.sessions.compare_and_swap(refreshed.revision, updated)
 
 @pytest.mark.asyncio
 async def test_waiting_user_compatibility_resumes_same_cycle_once(tmp_path):
     initial = Batch('initial', 'session')
     reply = Batch('reply', 'session')
     api = make_api(tmp_path, initial, reply)
-    async def checkpoint(call_number, _message, _kwargs):
-        if call_number == 2:
-            await apply_fake_checkpoint(api, cycle_id='admitted-cycle')
-    api.mcp_client = SequenceMCP([(AgentStatus.WAITING_USER, 'question', False), (AgentStatus.DONE, 'continued', False)], before_result=checkpoint)
+    api.mcp_client = SequenceMCP(api, [(AgentStatus.WAITING_USER, 'question', False), (AgentStatus.DONE, 'continued', False)])
     first = await api.admit_committed_batch('initial', session_id='session')
     waiting_result = await api.start_admitted_cycle(first)
     assert waiting_result.status == AgentStatus.WAITING_USER
@@ -233,7 +261,7 @@ async def test_interrupted_outcome_does_not_automatically_replay_runner(tmp_path
     initial = Batch('initial', 'session')
     addition = Batch('addition', 'session')
     api = make_api(tmp_path, initial, addition)
-    api.mcp_client = SequenceMCP([(AgentStatus.ERROR, 'interrupted', True)])
+    api.mcp_client = SequenceMCP(api, [(AgentStatus.ERROR, 'interrupted', True)])
     first = await api.admit_committed_batch('initial', session_id='session')
     result = await api.start_admitted_cycle(first)
     assert result.can_resume is True

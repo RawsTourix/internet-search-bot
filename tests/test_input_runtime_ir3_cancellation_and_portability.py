@@ -238,6 +238,36 @@ async def test_initial_cancellation_before_marker_remains_retryable(tmp_path):
     assert admission.state.value == "admitted"
 
     api._resolve_batch_and_capability = original_resolve
+    original_process_query = api.mcp_client.process_query
+
+    async def checkpointing_process_query(message, **kwargs):
+        from src.input_runtime import CheckpointAction, CheckpointName
+        from src.runtime import ActiveAgentCycle
+
+        state = await api.input_runtime_repositories.sessions.get(kwargs["session_id"])
+        assert state is not None
+        active = ActiveAgentCycle(
+            cycle_id=kwargs["cycle_id_override"],
+            session_id=kwargs["session_id"],
+            original_user_request="initial",
+            messages_for_llm=[
+                {"role": "system", "content": "system"},
+                {"role": "user", "content": '{"type":"user_request"}'},
+            ],
+            cycle_trace=[],
+            original_user_message_index=1,
+            original_input_batch_id=kwargs["input_batch"].input_batch_id,
+            input_runtime_generation=state.generation,
+        )
+        checkpoint = await api.input_admission_service.checkpoint_service.run_checkpoint(
+            checkpoint=CheckpointName.RESUME,
+            active_cycle=active,
+            desired_status=CycleStatus.RUNNING,
+        )
+        assert checkpoint.action != CheckpointAction.INTERRUPT, checkpoint.reason_code
+        return await original_process_query(message, **kwargs)
+
+    api.mcp_client.process_query = checkpointing_process_query
     duplicate = await api.admit_committed_batch("initial", session_id="session")
     assert duplicate.should_start_runner is True
     assert await api.start_admitted_cycle(duplicate) is not None

@@ -89,14 +89,29 @@ async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_up
     active = cycle(initial.target_cycle_id)
     await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.RESUME, active_cycle=active, desired_status=CycleStatus.RUNNING)
     await runtime.admit_committed_batch('addition', session_id='session')
-    with pytest.raises(OSError):
-        await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
-    assert (await base.snapshots.get('cycle-a')).applied_through_cycle_sequence == 1
-    message_count = len(active.messages_for_llm)
     await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
-    assert len(active.messages_for_llm) == message_count
+
+    snapshot = await base.snapshots.get('cycle-a')
+    assert snapshot.applied_through_cycle_sequence == 1
     inbox = await base.inbox.list_for_cycle('cycle-a')
     assert inbox[0].state.value == 'applied'
     addition = await base.admissions.get_by_input_batch_id('addition')
     assert addition.state.value == 'applied'
+    revisions = await base.context_revisions.list_for_cycle('cycle-a')
+    assert [item.revision_number for item in revisions] == [1, 2]
+    updates = [
+        message for message in active.messages_for_llm
+        if message.get('role') == 'user'
+        and isinstance(message.get('content'), str)
+        and 'input_batch_update' in message['content']
+    ]
+    assert len(updates) == 1
+
+    message_count = len(active.messages_for_llm)
+    await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
+    assert len(active.messages_for_llm) == message_count
     assert len(await base.context_revisions.list_for_cycle('cycle-a')) == 2
+    inbox = await base.inbox.list_for_cycle('cycle-a')
+    assert inbox[0].state.value == 'applied'
+    addition = await base.admissions.get_by_input_batch_id('addition')
+    assert addition.state.value == 'applied'
