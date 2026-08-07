@@ -17,11 +17,11 @@ last_reviewed: 2026-08-07
 
 Финальный IR-5 code/test evidence:
 
-- итоговый code/test HEAD:
-  `85c52d4b60a60786bdb10732eb0a52893a422eee`;
-- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
-  `0 failed`;
-- `Validate v0.4 file artifacts PR` #547 — success.
+- corrected code/test HEAD:
+  `0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`;
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
 
 IR-5 добавил transport-neutral durable control service и сделал
 `SessionInputRuntimeState + SessionControlCommand + ActiveCycleSnapshot`
@@ -29,6 +29,8 @@ semantic authority для `/stop`, `/continue` и `/reset`. Control sequence
 выделяется под короткой session coordination boundary, stable idempotency не
 создаёт второй logical command, а `pending_control_sequence` и
 `applied_control_sequence` работают как monotonic contiguous watermarks.
+Record-first control publication repair восстанавливает exact-session frontier
+перед следующей allocation и не допускает duplicate control sequence.
 
 Checkpoint reducer фиксирует pending-control watermark на входе и применяет
 controls до ordinary input. Cooperative `/stop` не force-cancel LLM/tool await:
@@ -38,12 +40,20 @@ messages, context lineage, plan/artifact/result refs. Input во время
 `pause_requested/paused_by_user` получает `QUEUE_PAUSED`, durable FIFO admission
 и не будит runner.
 
-`/continue` возобновляет **тот же** cycle. Continue boundary сохраняет accepted
-input target; все paused additions, accepted до этой boundary, drain-ятся bounded
-chunks через `CP-RESUME` до первого meaningful post-resume LLM. Более поздний
-input остаётся следующему running checkpoint. Continue без additions не создаёт
-фиктивный input update или лишнюю context revision. `WAITING_USER` без нового
-ответа возвращает `still_waiting_for_input`.
+`/continue` возобновляет **тот же** cycle. Accepted input target теперь
+замораживается атомарно внутри той же durable `root identity → session`
+coordination boundary, которая упорядочивает input admission и control
+publication. Если input coordinated раньше continue, его watermark входит в
+resume target и он drain-ится bounded chunks через `CP-RESUME` до первого
+meaningful post-resume LLM. Если continue coordinated раньше input, поздний batch
+не расширяет уже durable target и остаётся следующему ordinary running
+checkpoint. Transport arrival time, wall clock, порядок создания `asyncio` tasks,
+pre-lock state read и post-persistence reread не являются authority этого
+tie-break. Duplicate continue сохраняет original control ID/sequence/frozen
+target; record-first continue publication crash сохраняет тот же target и
+repair-ит pending watermark. Continue без additions не создаёт фиктивный input
+update или лишнюю context revision. `WAITING_USER` без нового ответа возвращает
+`still_waiting_for_input`.
 
 `/reset` повышает durable session generation ровно один раз на logical reset,
 fences old-generation writer/wake, отменяет старые queued admissions/inbox/
@@ -228,7 +238,8 @@ workflow revisions и scheduler поверх той же admission boundary.
 - protocol-safe checkpoints и common FIFO apply для running/WAITING additions;
 - durable `SessionControlCommand`, control watermarks и generation fencing;
 - cooperative pause/resume/reset через общий application control service;
-- paused additions без auto-resume и same-cycle continue;
+- paused additions без auto-resume и same-cycle continue с atomically frozen
+  durable resume target;
 - Telegram `/stop`/`/continue` через transport-neutral Gateway boundary;
 - `ProgressEvent`, durable `OutputBatch`, client capabilities и delivery receipts.
 
@@ -290,7 +301,12 @@ Interaction / Delivery
 payloads или client delivery.
 
 IR-5 реализует control acceptance/reset generation transition под этой короткой
-boundary. LLM/tool/Telegram delivery и ожидание atomic block выполняются вне неё.
+boundary. Для `/continue` она атомарно выполняет
+`authoritative state read → exact-session control-frontier repair → accepted input
+watermark freeze → unique control sequence allocation → command/index publication
+→ pending-control watermark advance`. Поэтому input, coordinated до continue,
+включён в resume target, а input, coordinated после continue, исключён из него.
+LLM/tool/Telegram delivery и ожидание atomic block выполняются вне этой boundary.
 
 ## Основные инварианты
 
@@ -318,6 +334,8 @@ boundary. LLM/tool/Telegram delivery и ожидание atomic block выпол
     locks или serialization helpers.
 16. В `v0.4` context revisions линейны, но identity допускает будущие multiple
     parents без реализации merge semantics.
+17. `/continue` resume target определяется только durable session coordination
+    order и после публикации не расширяется более новым session state.
 
 ## Состав обновления
 
@@ -392,7 +410,9 @@ Filesystem implementations принадлежат `v0.4`. PostgreSQL implementat
 `v0.5` сохраняют те же IDs, transitions, idempotency keys и ownership relations,
 но заменяют короткую filesystem coordination boundary транзакцией/row locking.
 IR-5 application control/checkpoint layers не зависят от `Path`, filesystem
-layout, Telegram types или concrete lock registry.
+layout, Telegram types или concrete lock registry. Command-oriented
+`SessionControlRepository.accept_continue(...)` выражает атомарную continue
+acceptance semantics без утечки filesystem details в application layer.
 
 ## Подготовка v0.6
 
