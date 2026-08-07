@@ -7,8 +7,9 @@ from dataclasses import dataclass
 from .admission import CommittedInputBatchReader
 from .checkpoints import InputRuntimeCheckpointService
 from .config import InputRuntimeConfigType
-from .emissions import AgentEmissionOutboxService, AgentEmissionService
+from .emissions import AgentEmissionService
 from .factory import InputRuntimeRepositories
+from .ir6_outbox import AgentEmissionOutboxService
 
 
 @dataclass(frozen=True, slots=True)
