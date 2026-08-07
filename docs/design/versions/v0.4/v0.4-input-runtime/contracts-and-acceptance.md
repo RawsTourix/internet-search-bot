@@ -16,19 +16,21 @@ Observable contracts IR-1—IR-5 реализованы. IR-6—IR-10 остаю
 
 Финальный IR-5 code/test boundary:
 
-- code/test HEAD: `85c52d4b60a60786bdb10732eb0a52893a422eee`;
-- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
-  `0 failed`;
-- `Validate v0.4 file artifacts PR` #547 — success.
+- corrected code/test HEAD: `0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`;
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
 
 IR-5 реализует durable control acceptance/idempotency/sequence и watermarks,
 cooperative `/stop`, same-cycle `/continue`, paused admission без auto-resume,
 generation-authoritative `/reset`, checkpoint control reduction и Telegram
-`/stop`/`/continue` через общий application service. Checkpoint-level control
-suppression перед terminal transition реализовано, но это **не** IR-7 durable
-finalization barrier: late race `последний checkpoint → новый control/input →
-terminal commit` остаётся IR-7. Startup reconstruction/reconciliation остаётся
-IR-8; полная `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
+`/stop`/`/continue` через общий application service. Continue resume target
+фиксируется атомарно внутри shared durable session coordination, а не из state,
+прочитанного до lock. Checkpoint-level control suppression перед terminal
+transition реализовано, но это **не** IR-7 durable finalization barrier: late race
+`последний checkpoint → новый control/input → terminal commit` остаётся IR-7.
+Startup reconstruction/reconciliation остаётся IR-8; полная
+`recover_cycle_authority()` corruption matrix — IR-8/IR-10.
 
 ## Назначение
 
@@ -99,9 +101,27 @@ paused + additions
 ```
 
 Этот slice реализован IR-5. `/continue` без additions сохраняет тот же cycle и не
-создаёт фиктивный user input/context revision. Все additions, accepted до
-continue coordination boundary, drain-ятся bounded chunks до первого meaningful
-post-resume LLM; более поздний input остаётся следующему running checkpoint.
+создаёт фиктивный user input/context revision. Continue target фиксируется внутри
+той же short durable `root identity → session` coordination, которая упорядочивает
+input admission и control publication:
+
+```text
+input coordinated before continue
+→ included in frozen resume target
+→ drained before first meaningful post-resume LLM
+
+continue coordinated before input
+→ late input excluded from frozen target
+→ stays queued for next ordinary running checkpoint
+```
+
+Transport/Telegram arrival time, wall clock, порядок создания `asyncio` tasks,
+pre-lock state read и post-persistence state reread не определяют эту boundary.
+
+WAITING contract сохраняет то же правило: real input, coordinated до continue,
+drain-ится через `CP-RESUME` и после полного target drain снимает active waiting
+state; `/continue` без real input остаётся `WAIT/still_waiting_for_input` и не
+создаёт fake answer.
 
 ### Intermediate agent message
 
@@ -146,7 +166,9 @@ For every prompt-bearing history:
 IR-5 stop не force-cancel arbitrary LLM/tool await. Stop during LLM применяется
 после завершения bounded attempt и до следующего tool/LLM block. Stop внутри
 assistant multi-tool block применяется только после всех matching `role=tool`
-results, сохраняя protocol-valid history.
+results, сохраняя protocol-valid history. Production-loop test удерживает второй
+tool call, принимает pause, завершает весь assistant block и подтверждает pause на
+`CP-AFTER-TOOL-BLOCK` до следующего LLM.
 
 ## Persistence contract
 
@@ -161,8 +183,12 @@ results, сохраняя protocol-valid history.
 - cross-record crash windows have deterministic reconciliation.
 
 IR-5 реализует retry/idempotent repair для control publication/application
-crash windows. Startup-wide reconstruction/reconciliation этого durable evidence
-остаётся IR-8.
+crash windows. Before any new control allocation exact-session durable records
+repair authoritative pending frontier; different durable records with one
+sequence are a managed consistency conflict, not a silent winner. For continue,
+frozen input target is part of the already durable command and survives a crash
+between record publication and pending-watermark state write. Startup-wide
+reconstruction/reconciliation этого durable evidence остаётся IR-8.
 
 ## Idempotency contract
 
@@ -189,12 +215,14 @@ At-least-once signals/callbacks/claims must not duplicate:
 
 Control idempotency IR-5 связывает stable key ровно с одной command delivery;
 повтор возвращает тот же control ID/sequence/outcome, а повтор reset не повышает
-generation второй раз.
+generation второй раз. Duplicate continue additionally возвращает тот же frozen
+resume target, даже если session accepted watermark уже вырос из-за позднего
+input; старую boundary нельзя расширить ретроактивно.
 
 ## Ordering contract
 
-Authoritative order within session/cycle is admission sequence, not client
-message timestamp or arrival completion.
+Authoritative order within session/cycle is durable coordination/sequence, not
+client message timestamp or arrival completion.
 
 - contiguous FIFO apply;
 - no skip over missing sequence;
@@ -207,6 +235,10 @@ IR-5 control sequence выделяется под короткой session coord
 `applied_control_sequence` — только contiguous terminal control records без
 пропуска head command. Effective priority: `reset > pause > continue > input`,
 при сохранении всех durable audit records и их sequence.
+
+Continue/input tie-break использует ту же coordination authority: кто первым
+получил durable session coordination, тот раньше находится относительно frozen
+continue target. State, прочитанный вне этой boundary, не определяет ordering.
 
 ## Backpressure contract
 
@@ -246,8 +278,16 @@ Behavior:
 
 - resumes same cycle only;
 - does not create missing answer for waiting question;
-- applies pre-existing paused additions before next meaningful LLM step;
-- idempotent when already running;
+- atomic repository acceptance freezes current accepted input watermark together
+  with durable control publication;
+- input coordinated before continue is part of initial resume drain;
+- input coordinated after continue is not captured by later state reread and waits
+  for the next running checkpoint;
+- applies every paused addition through frozen target before next meaningful LLM;
+- duplicate same source/key preserves original control ID/sequence/frozen target;
+- record-first crash retry preserves frozen target and repairs pending watermark;
+- rapid preceding durable pause remains visible to reducer even if session status
+  projection lagged when continue request began;
 - не создаёт fake `input_batch_update` или новый context revision без input;
 - после настоящей pause может reacquire in-process execution lease того же
   durable cycle; process-restart reconstruction при этом остаётся IR-8.
@@ -309,7 +349,9 @@ terminal_committed → terminal, no rerun
 
 Этот startup-wide contract остаётся IR-8. IR-5 реализует только retry/idempotent
 repair, необходимый текущей command delivery/application, и не выполняет startup
-reconstruction после process death.
+reconstruction после process death. Exact-session control frontier repair,
+необходимый для record-first IR-5 publication windows, не считается полной IR-8
+corruption/startup matrix.
 
 ## Compatibility contract
 
@@ -423,16 +465,24 @@ IR-5 deterministic tests cover:
 
 - concurrent monotonic sequence allocation;
 - duplicate pause/continue/reset;
-- record-first command publication and pending-watermark repair;
+- record-first command publication and exact-session pending-watermark repair;
+- independent control after record-first crash gets next unique sequence;
 - pause/continue state/snapshot effect with later control-marker failure;
-- stop during blocked LLM and complete multi-tool block;
-- rapid pause/continue reducer;
+- stop during blocked LLM and production complete multi-tool block;
+- rapid pause/continue reducer and pause-allocation/continue classification race;
 - paused input FIFO/no wake;
-- same-cycle continue with/without additions and late-input boundary;
-- WAITING/interrupted control matrix;
+- WAITING pause + real queued input + continue drain and no-input WAIT;
+- same-cycle continue with several bounded additions;
+- deterministic input-before-continue barrier includes input in frozen target;
+- deterministic continue-before-input barrier excludes late input until ordinary
+  running checkpoint;
+- duplicate continue after late input preserves original target;
+- continue publication crash/recreation preserves target and sequence and repairs
+  pending watermark;
 - reset generation/cancellation/stale-writer fencing;
 - reset vs terminal checkpoint;
-- Telegram stable source identity and high-priority runtime handlers.
+- Telegram production composition, stable source identity and high-priority
+  runtime handlers.
 
 ### Emissions
 
@@ -470,15 +520,18 @@ input vs output ready
 input vs terminal commit
 stop vs LLM/tool/finalization
 continue vs pause application
+input admission vs continue durable acceptance
 reset vs any active/final state
 claim expiry vs apply persist
 shutdown vs queued/claimed/applying
 ```
 
-Race tests assert state/IDs, not only absence of exception.
+Race tests assert state/IDs and authoritative ordering, not only absence of
+exception.
 
-IR-5 закрывает control races на доступной checkpoint boundary. Late
-input/control-vs-terminal-commit race после последнего checkpoint остаётся IR-7.
+IR-5 закрывает control races на доступной checkpoint/acceptance boundary,
+включая atomic continue target ordering. Late input/control-vs-terminal-commit
+race после последнего checkpoint остаётся IR-7.
 
 ## Randomized tests
 
@@ -551,8 +604,8 @@ Required maintainer evidence:
 Live checks verify user-visible messages and backend IDs/statuses. Private content
 is not committed to reports.
 
-IR-5 содержит deterministic Telegram adapter tests, но maintainer live Telegram
-acceptance остаётся IR-10.
+IR-5 содержит deterministic Telegram adapter/composition tests, но maintainer live
+Telegram acceptance остаётся IR-10.
 
 ## Performance/safety gates
 
