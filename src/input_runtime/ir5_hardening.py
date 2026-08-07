@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from .errors import InputRuntimeConflictError
 from .ir5_checkpoints import ControlAwareCheckpointService
 from .ir5_controls import InputRuntimeControlService
 from .models import (
@@ -38,24 +39,27 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
             return None
         return await self.repositories.controls.allocate(existing)  # type: ignore[attr-defined]
 
-    async def _has_effective_pending_pause(self, state: Any) -> bool:
-        if state.pending_control_sequence <= state.applied_control_sequence:
+    async def _pending_pause_before(
+        self,
+        *,
+        session_id: str,
+        generation: int,
+        cycle_id: str,
+        after_sequence: int,
+        before_sequence: int,
+    ) -> bool:
+        if before_sequence <= after_sequence + 1:
             return False
         rows = await self.repositories.controls.list_range(  # type: ignore[attr-defined]
-            state.session_id,
-            after_sequence=state.applied_control_sequence,
-            through_sequence=state.pending_control_sequence,
+            session_id,
+            after_sequence=after_sequence,
+            through_sequence=before_sequence - 1,
         )
         pending_pause = False
         for row in rows:
             if row.state in _TERMINAL_CONTROL_STATES:
                 continue
-            if row.generation != state.generation:
-                continue
-            if (
-                state.active_cycle_id is not None
-                and row.target_cycle_id != state.active_cycle_id
-            ):
+            if row.generation != generation or row.target_cycle_id != cycle_id:
                 continue
             if row.command == ControlCommandType.RESET:
                 return False
@@ -92,18 +96,7 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
             )
 
         state = await self._state(session_id)
-        pending_pause = await self._has_effective_pending_pause(state)
-        rejection = None
-        if state.cycle_status in _TERMINAL_OR_IDLE or state.active_cycle_id is None:
-            rejection = "nothing_to_continue"
-        elif (
-            state.cycle_status in {CycleStatus.RUNNING, CycleStatus.FINALIZING}
-            and not pending_pause
-        ):
-            rejection = "already_running"
-        elif state.cycle_status == CycleStatus.WAITING_USER:
-            rejection = "still_waiting_for_input"
-
+        inactive = state.cycle_status in _TERMINAL_OR_IDLE or state.active_cycle_id is None
         target = state.active_cycle_id or self._inactive_target(session_id)
         command = SessionControlCommand(
             control_id=self.control_id_factory(),
@@ -112,30 +105,100 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
             generation=state.generation,
             sequence_number=1,
             command=ControlCommandType.CONTINUE,
-            state=ControlState.REJECTED if rejection else ControlState.QUEUED,
+            # Active-cycle classification happens only after allocation, when
+            # durable sequence order is fixed. Inactive sessions are stable no-op.
+            state=ControlState.REJECTED if inactive else ControlState.QUEUED,
             idempotency_key=idempotency_key,
             source_client_type=source_client_type,
             source_message_ref=self._source_ref(
                 source_message_ref,
                 accepted_input_through_sequence=(
                     state.active_cycle_accepted_through_sequence
-                    if rejection is None
+                    if not inactive
                     else None
                 ),
             ),
             reason=reason,
             created_at=self._now(),
-            rejection_code=rejection,
+            rejection_code="nothing_to_continue" if inactive else None,
         )
         allocated = await self.repositories.controls.allocate(command)  # type: ignore[attr-defined]
         if allocated.state == ControlState.REJECTED:
             await self._advance_applied_watermark(session_id)
+            latest = await self._state(session_id)
             return ControlOutcome(
                 outcome=allocated.state,
                 command=allocated,
-                effective_cycle_status=state.cycle_status,
+                effective_cycle_status=latest.cycle_status,
             )
         return await self._repair_continue(allocated)
+
+    async def _repair_continue(self, command: SessionControlCommand) -> ControlOutcome:
+        state = await self._state(command.session_id)
+        if (
+            state.generation != command.generation
+            or state.active_cycle_id != command.target_cycle_id
+        ):
+            current = await self.repositories.controls.reject(
+                command.control_id,
+                rejection_code="stale_cycle",
+            )
+            await self._advance_applied_watermark(command.session_id)
+            return ControlOutcome(
+                outcome=current.state,
+                command=current,
+                effective_cycle_status=state.cycle_status,
+            )
+
+        pending_pause = await self._pending_pause_before(
+            session_id=command.session_id,
+            generation=command.generation,
+            cycle_id=command.target_cycle_id or "",
+            after_sequence=state.applied_control_sequence,
+            before_sequence=command.sequence_number,
+        )
+        rejection: str | None = None
+        if state.cycle_status in {CycleStatus.RUNNING, CycleStatus.FINALIZING}:
+            if not pending_pause:
+                rejection = "already_running"
+        elif state.cycle_status == CycleStatus.WAITING_USER:
+            if not pending_pause:
+                rejection = "still_waiting_for_input"
+        elif state.cycle_status in _TERMINAL_OR_IDLE:
+            rejection = "nothing_to_continue"
+
+        if rejection is not None:
+            current = await self.repositories.controls.reject(
+                command.control_id,
+                rejection_code=rejection,
+            )
+            await self._advance_applied_watermark(command.session_id)
+            return ControlOutcome(
+                outcome=current.state,
+                command=current,
+                effective_cycle_status=state.cycle_status,
+            )
+
+        if state.cycle_status == CycleStatus.PAUSE_REQUESTED:
+            await self._set_cycle_status(
+                session_id=command.session_id,
+                cycle_id=command.target_cycle_id or "",
+                generation=command.generation,
+                status=CycleStatus.RUNNING,
+            )
+        current = await self.repositories.controls.acknowledge(
+            command.control_id,
+            acknowledged_at=self._now(),
+        )
+        return ControlOutcome(
+            outcome=current.state,
+            command=current,
+            effective_cycle_status=(
+                CycleStatus.RUNNING
+                if state.cycle_status == CycleStatus.PAUSE_REQUESTED
+                else state.cycle_status
+            ),
+        )
 
     async def reduce_at_checkpoint(self, **kwargs: Any):
         outcome = await super().reduce_at_checkpoint(**kwargs)
@@ -288,9 +351,6 @@ class HardenedControlAwareCheckpointService(ControlAwareCheckpointService):
         ):
             return outcome
 
-        # A real applied input, not /continue itself, resolves the active WAITING
-        # boundary. This happens only after the base service drains the captured
-        # continue target completely, including multiple bounded ranges.
         persisted = await self.control_service._persist_snapshot_status(
             session_id=session_id,
             cycle_id=cycle_id,
