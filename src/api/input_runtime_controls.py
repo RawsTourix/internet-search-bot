@@ -67,10 +67,8 @@ async def request_runtime_continue(
     # In a rapid pause/continue race the original runner still owns its lease.
     # The reducer neutralizes the pending pause and that runner continues; a
     # failed reacquisition here is therefore correct and prevents runner #2.
-    await api.execution_coordinator.synchronize_generation(
-        session_id,
-        generation=state.generation,
-    )
+    # Do not synchronize the coordinator here: continue does not advance the
+    # durable generation and the process-local cache must not become authority.
     async with api.execution_coordinator.admitted_run_lease(
         session_id=session_id,
         input_batch_id=f"control:{command.control_id}",
