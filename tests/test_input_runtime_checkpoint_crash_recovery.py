@@ -93,13 +93,10 @@ async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_up
     await runtime.admit_committed_batch('addition', session_id='session')
 
     with pytest.raises(OSError, match='after snapshot persistence'):
-        await runtime.cycle_input_applier.apply_pending_input(
-            session_id='session',
-            cycle_id='cycle-a',
-            generation=0,
+        await runtime.checkpoint_service.run_checkpoint(
             checkpoint=CheckpointName.BEFORE_LLM,
             active_cycle=active,
-            through_sequence=1,
+            desired_status=CycleStatus.RUNNING,
         )
 
     assert wrapped_snapshots.failed is True
