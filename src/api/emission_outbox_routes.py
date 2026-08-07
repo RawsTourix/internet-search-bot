@@ -187,8 +187,12 @@ def add_emission_outbox_routes(
                 updated = await service.failed(
                     emission_id,
                     session_id=body.session_id,
+                    cycle_id=body.cycle_id,
+                    generation=body.generation,
                     client_type=normalized_client,
                     client_instance_id=normalized_instance,
+                    conversation_id=body.conversation_id,
+                    thread_id=body.thread_id,
                     claim_token=body.claim_token,
                     error_code=body.error_code,
                     ambiguous=(outcome == "unknown"),
