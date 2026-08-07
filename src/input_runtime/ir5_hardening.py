@@ -5,11 +5,32 @@ from typing import Any
 
 from .ir5_checkpoints import ControlAwareCheckpointService
 from .ir5_controls import InputRuntimeControlService
-from .models import CheckpointName, ControlState, CycleStatus, SessionControlCommand
+from .models import (
+    CheckpointAction,
+    CheckpointName,
+    ControlCommandType,
+    ControlOutcome,
+    ControlState,
+    CycleStatus,
+    SessionControlCommand,
+)
+
+
+_TERMINAL_CONTROL_STATES = {
+    ControlState.APPLIED,
+    ControlState.REJECTED,
+    ControlState.CANCELLED,
+}
+_TERMINAL_OR_IDLE = {
+    CycleStatus.IDLE,
+    CycleStatus.DONE,
+    CycleStatus.ERROR,
+    CycleStatus.CANCELLED,
+}
 
 
 class HardenedInputRuntimeControlService(InputRuntimeControlService):
-    """Repair record-first publication and pass canonical cancellation time."""
+    """Repair publication gaps and classify controls from durable order."""
 
     async def _existing(self, **kwargs: Any) -> SessionControlCommand | None:
         existing = await super()._existing(**kwargs)
@@ -20,6 +41,153 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
         # protocol before any semantic retry; it reuses the same control ID and
         # sequence and repairs only missing acceptance metadata.
         return await self.repositories.controls.allocate(existing)  # type: ignore[attr-defined]
+
+    async def _has_effective_pending_pause(self, state: Any) -> bool:
+        """Reduce durable un-applied controls for continue classification.
+
+        Session cycle_status can lag a just-persisted pause record. Continue must
+        therefore observe durable sequence order rather than classify solely
+        from that lagging projection.
+        """
+        if state.pending_control_sequence <= state.applied_control_sequence:
+            return False
+        rows = await self.repositories.controls.list_range(  # type: ignore[attr-defined]
+            state.session_id,
+            after_sequence=state.applied_control_sequence,
+            through_sequence=state.pending_control_sequence,
+        )
+        pending_pause = False
+        for row in rows:
+            if row.state in _TERMINAL_CONTROL_STATES:
+                continue
+            if row.generation != state.generation:
+                continue
+            if (
+                state.active_cycle_id is not None
+                and row.target_cycle_id != state.active_cycle_id
+            ):
+                continue
+            if row.command == ControlCommandType.RESET:
+                return False
+            if row.command == ControlCommandType.PAUSE:
+                pending_pause = True
+            elif row.command == ControlCommandType.CONTINUE:
+                pending_pause = False
+        return pending_pause
+
+    async def request_continue(
+        self,
+        *,
+        session_id: str,
+        idempotency_key: str,
+        source_client_type: str,
+        source_message_ref: dict[str, Any] | None = None,
+        reason: str | None = None,
+    ) -> ControlOutcome:
+        existing = await self._existing(
+            session_id=session_id,
+            idempotency_key=idempotency_key,
+            command=ControlCommandType.CONTINUE,
+            source_client_type=source_client_type,
+            source_message_ref=source_message_ref,
+        )
+        if existing is not None:
+            if existing.state == ControlState.QUEUED:
+                return await self._repair_continue(existing)
+            state = await self._state(session_id)
+            return ControlOutcome(
+                outcome=existing.state,
+                command=existing,
+                effective_cycle_status=state.cycle_status,
+            )
+
+        state = await self._state(session_id)
+        pending_pause = await self._has_effective_pending_pause(state)
+        rejection = None
+        if state.cycle_status in _TERMINAL_OR_IDLE or state.active_cycle_id is None:
+            rejection = "nothing_to_continue"
+        elif (
+            state.cycle_status in {CycleStatus.RUNNING, CycleStatus.FINALIZING}
+            and not pending_pause
+        ):
+            rejection = "already_running"
+        elif state.cycle_status == CycleStatus.WAITING_USER:
+            rejection = "still_waiting_for_input"
+
+        target = state.active_cycle_id or self._inactive_target(session_id)
+        command = SessionControlCommand(
+            control_id=self.control_id_factory(),
+            session_id=session_id,
+            target_cycle_id=target,
+            generation=state.generation,
+            sequence_number=1,
+            command=ControlCommandType.CONTINUE,
+            state=ControlState.REJECTED if rejection else ControlState.QUEUED,
+            idempotency_key=idempotency_key,
+            source_client_type=source_client_type,
+            source_message_ref=self._source_ref(
+                source_message_ref,
+                accepted_input_through_sequence=(
+                    state.active_cycle_accepted_through_sequence
+                    if rejection is None
+                    else None
+                ),
+            ),
+            reason=reason,
+            created_at=self._now(),
+            rejection_code=rejection,
+        )
+        allocated = await self.repositories.controls.allocate(command)  # type: ignore[attr-defined]
+        if allocated.state == ControlState.REJECTED:
+            await self._advance_applied_watermark(session_id)
+            return ControlOutcome(
+                outcome=allocated.state,
+                command=allocated,
+                effective_cycle_status=state.cycle_status,
+            )
+        return await self._repair_continue(allocated)
+
+    async def reduce_at_checkpoint(self, **kwargs: Any):
+        outcome = await super().reduce_at_checkpoint(**kwargs)
+        if (
+            outcome is None
+            or outcome.action != CheckpointAction.WAIT
+            or kwargs.get("checkpoint") != CheckpointName.RESUME
+        ):
+            return outcome
+
+        active_cycle = kwargs["active_cycle"]
+        cycle_id = str(active_cycle.cycle_id)
+        generation = int(getattr(active_cycle, "input_runtime_generation", 0))
+        through = int(kwargs["through_control_sequence"])
+        snapshot = await self.repositories.snapshots.get(cycle_id)
+        if snapshot is None or snapshot.generation != generation:
+            return outcome
+
+        # A paused WAITING cycle with real input accepted before /continue must
+        # drain that input before re-entering waiting/running semantics. The
+        # continue command itself is never projected as a user answer.
+        rows = await self.repositories.controls.list_range(  # type: ignore[attr-defined]
+            str(active_cycle.session_id),
+            after_sequence=0,
+            through_sequence=through,
+        )
+        resume_target: int | None = None
+        for row in rows:
+            if (
+                row.command == ControlCommandType.CONTINUE
+                and row.generation == generation
+                and row.target_cycle_id == cycle_id
+            ):
+                candidate = self.resume_input_target(row)
+                if candidate is not None:
+                    resume_target = candidate
+        if (
+            resume_target is not None
+            and resume_target > snapshot.applied_through_cycle_sequence
+        ):
+            return None
+        return outcome
 
     async def _reconcile_reset(self, command: SessionControlCommand):
         controls = self.repositories.controls
@@ -78,8 +246,6 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
 
     @staticmethod
     def _control_outcome(*, current: SessionControlCommand, effective_cycle_status):
-        from .models import ControlOutcome
-
         return ControlOutcome(
             outcome=current.state,
             command=current,
@@ -88,7 +254,7 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
 
 
 class HardenedControlAwareCheckpointService(ControlAwareCheckpointService):
-    """Do not let CP-RESUME overwrite a durable pause before reduction."""
+    """Preserve pause authority and resolve WAITING only after real input."""
 
     async def _persist_closed_context(
         self,
@@ -101,12 +267,41 @@ class HardenedControlAwareCheckpointService(ControlAwareCheckpointService):
         )
         if snapshot is not None and snapshot.status == CycleStatus.PAUSED_BY_USER:
             # A genuinely paused cycle has not executed a new atomic block yet.
-            # Its durable context is already the closed pause snapshot.  Calling
+            # Its durable context is already the closed pause snapshot. Calling
             # the IR-4 closed-context sync here would derive status from stale
-            # in-memory RUNNING and would erase waiting-question metadata before
-            # the continue reducer gets to inspect it.
+            # in-memory RUNNING and erase waiting metadata before reduction.
             return None
         return await super()._persist_closed_context(
             checkpoint=checkpoint,
             active_cycle=active_cycle,
         )
+
+    async def run_checkpoint(self, **kwargs: Any):
+        outcome = await super().run_checkpoint(**kwargs)
+        if (
+            kwargs.get("checkpoint") != CheckpointName.RESUME
+            or outcome.action != CheckpointAction.INPUT_APPLIED
+        ):
+            return outcome
+
+        active_cycle = kwargs["active_cycle"]
+        cycle_id = str(active_cycle.cycle_id)
+        generation = int(getattr(active_cycle, "input_runtime_generation", 0))
+        snapshot = await self.applier.repositories.snapshots.get(cycle_id)
+        if snapshot is None or snapshot.generation != generation:
+            return outcome
+        if snapshot.status != CycleStatus.WAITING_USER:
+            return outcome
+
+        # Real queued input, not /continue, satisfies the active waiting boundary.
+        # Promotion happens only after the entire captured resume target was
+        # drained by the base bounded loop.
+        persisted = await self.control_service._persist_snapshot_status(
+            session_id=str(active_cycle.session_id),
+            cycle_id=cycle_id,
+            generation=generation,
+            status=CycleStatus.RUNNING,
+            checkpoint=CheckpointName.RESUME,
+        )
+        self.applier._install_snapshot(active_cycle, persisted)
+        return outcome
