@@ -84,16 +84,20 @@ suites. Точный последний head и результаты run фик�
 
 IR-5 final code evidence:
 
-- code/test HEAD `85c52d4b60a60786bdb10732eb0a52893a422eee`;
-- `Validate Input Runtime` #173 — success, compile success, `278 passed`, `0 failed`;
-- `Validate v0.4 file artifacts PR` #547 — success.
+- corrected code/test HEAD `0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`;
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
 
 IR-5 реализует transport-neutral durable control service, monotonic control
 sequence/idempotency, real pending/applied control watermarks, cooperative
 safe-checkpoint `/stop`, paused FIFO input без auto-resume, same-cycle
-`/continue` с pre-continue drain target и durable-generation `/reset` с old-work
-fencing. Telegram `/stop`/`/continue` используют общий Gateway/application
-contract, а `/cancel` остаётся ingress collection command.
+`/continue` и durable-generation `/reset` с old-work fencing. Resume input target
+для `/continue` замораживается атомарно внутри той же durable session coordination
+boundary, которая упорядочивает input admission: input, coordinated раньше
+continue, входит в initial resume drain; input, coordinated позже, остаётся
+следующему running checkpoint. Telegram `/stop`/`/continue` используют общий
+Gateway/application contract, а `/cancel` остаётся ingress collection command.
 
 IR-5 checkpoint-level pause/reset suppression перед terminal transition не
 является полным IR-7 barrier. Late race после последнего checkpoint/recheck и до
