@@ -94,8 +94,12 @@ def test_missing_native_tool_call_identity_is_controlled_context_failure():
 
 def test_two_concurrent_sessions_do_not_bleed_context():
     probe = Probe()
+    release = asyncio.Event()
+    entered = 0
+    entered_lock = asyncio.Lock()
 
     async def one(session, cycle, marker):
+        nonlocal entered
         token = _checkpoint_active_cycle.set(
             active_cycle(
                 session,
@@ -106,7 +110,11 @@ def test_two_concurrent_sessions_do_not_bleed_context():
             )
         )
         try:
-            await asyncio.Event().wait() if False else asyncio.sleep(0)
+            async with entered_lock:
+                entered += 1
+                if entered == 2:
+                    release.set()
+            await release.wait()
             return probe._manager_tool_execution_context()
         finally:
             _checkpoint_active_cycle.reset(token)
