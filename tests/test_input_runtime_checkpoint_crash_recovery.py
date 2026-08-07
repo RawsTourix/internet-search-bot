@@ -93,6 +93,11 @@ async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_up
     r1 = await base.context_revisions.get_latest('cycle-a')
     assert snapshot is not None
     assert r1 is not None
+    active.active_context_revision_id = r1.context_revision_id
+    active.applied_input_batch_ids = ['initial']
+    active.applied_through_cycle_sequence = 0
+    active.input_runtime_snapshot_revision = snapshot.snapshot_revision
+
     claim = await base.inbox.claim_contiguous_range(
         'cycle-a',
         generation=0,
@@ -144,6 +149,7 @@ async def test_snapshot_watermark_repairs_failed_inbox_mark_without_duplicate_up
     addition = await base.admissions.get_by_input_batch_id('addition')
     assert inbox[0].state.value == 'applying'
     assert addition.state.value == 'admitted'
+    assert active.active_context_revision_id == r1.context_revision_id
     assert all('input_batch_update' not in str(message.get('content')) for message in active.messages_for_llm)
 
     outcome = await runtime.checkpoint_service.run_checkpoint(checkpoint=CheckpointName.BEFORE_LLM, active_cycle=active, desired_status=CycleStatus.RUNNING)
