@@ -23,6 +23,11 @@ from .serialization import read_model
 _BaseControlRepository = _session_control_module.FileSystemSessionControlRepository
 
 
+def atomic_write_model(path, model):
+    """Preserve both legacy and IR-5 deterministic fault-injection seams."""
+    return _session_control_module.atomic_write_model(path, model)
+
+
 class FileSystemSessionControlRepository(_BaseControlRepository):
     async def get(self, control_id: str) -> SessionControlCommand | None:
         return self._recover_by_id(control_id)
@@ -34,8 +39,6 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
         return await self._all(session_id)
 
     def _restore_indexes(self, command: SessionControlCommand) -> None:
-        # Rejected no-op pause/continue records may carry a synthetic target to
-        # satisfy the IR-1 schema. They are audit evidence, never cycle authority.
         if (
             command.target_cycle_id is not None
             and command.state != ControlState.REJECTED
@@ -60,13 +63,6 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
         state_path,
         state: SessionInputRuntimeState,
     ) -> SessionInputRuntimeState:
-        """Repair pending sequence from exact-session durable control records.
-
-        This is intentionally bounded to ``sessions/<session>/controls`` and is
-        executed under the existing root-identity -> session coordination lock.
-        A record-first publication may therefore be followed by an unrelated
-        command without reusing the durable sequence whose state write failed.
-        """
         rows = await self._all(state.session_id)
         by_sequence: dict[int, str] = {}
         frontier = state.pending_control_sequence
@@ -78,10 +74,8 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                     "duplicate durable control sequence for session"
                 )
             by_sequence[row.sequence_number] = row.control_id
-            if row.sequence_number > frontier:
-                frontier = row.sequence_number
-            if row.created_at > frontier_time:
-                frontier_time = row.created_at
+            frontier = max(frontier, row.sequence_number)
+            frontier_time = max(frontier_time, row.created_at)
         if frontier <= state.pending_control_sequence:
             return state
         repaired = validated_copy(
@@ -90,14 +84,13 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
             revision=state.revision + 1,
             updated_at=frontier_time,
         )
-        _session_control_module.atomic_write_model(state_path, repaired)
+        atomic_write_model(state_path, repaired)
         return repaired
 
     async def allocate(
         self,
         command: SessionControlCommand,
     ) -> SessionControlCommand:
-        """Allocate after repairing the authoritative exact-session frontier."""
         async with self.locks.hold_identity_then_session(
             self.root,
             command.session_id,
@@ -148,7 +141,7 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                     allocated.target_cycle_id,
                     allocated.session_id,
                 )
-            _session_control_module.atomic_write_model(
+            atomic_write_model(
                 self.layout.control(
                     allocated.session_id,
                     allocated.control_id,
@@ -164,7 +157,7 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                     allocated.target_cycle_id,
                     allocated.session_id,
                 )
-            _session_control_module.atomic_write_model(
+            atomic_write_model(
                 state_path,
                 self._state_after_control(state, allocated),
             )
@@ -174,7 +167,6 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
         self,
         command: SessionControlCommand,
     ) -> tuple[SessionControlCommand, SessionInputRuntimeState]:
-        """Publish reset after exact-session frontier repair, then advance generation."""
         async with self.locks.hold_identity_then_session(
             self.root,
             command.session_id,
@@ -214,7 +206,7 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                         revision=state.revision + 1,
                         updated_at=max(state.updated_at, existing.created_at),
                     )
-                    _session_control_module.atomic_write_model(state_path, next_state)
+                    atomic_write_model(state_path, next_state)
                     return existing, next_state
                 if state.generation >= existing.generation + 1:
                     repaired = await self._repair_existing_pending(
@@ -247,7 +239,7 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                     allocated.target_cycle_id,
                     allocated.session_id,
                 )
-            _session_control_module.atomic_write_model(
+            atomic_write_model(
                 self.layout.control(
                     allocated.session_id,
                     allocated.control_id,
@@ -273,5 +265,5 @@ class FileSystemSessionControlRepository(_BaseControlRepository):
                 revision=state.revision + 1,
                 updated_at=max(state.updated_at, allocated.created_at),
             )
-            _session_control_module.atomic_write_model(state_path, next_state)
+            atomic_write_model(state_path, next_state)
             return allocated, next_state
