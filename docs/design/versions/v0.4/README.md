@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-06
+last_reviewed: 2026-08-07
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -29,7 +29,7 @@ Application/hosting profiles определены в
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | implemented | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
-| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1/IR-2/IR-3 implemented and hardened; IR-4—IR-10 planned: active-cycle apply, `/stop`/`/continue`, emissions, finalization barrier и recovery lifecycle |
+| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1—IR-4 implemented; IR-5—IR-10 planned: controls, emissions, durable finalization barrier, startup recovery и full acceptance |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Reusable `AgentRuntime`, Service Application composition, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
 | 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и profile-aware transport admission |
 
@@ -79,8 +79,8 @@ suites. Точный последний head и результаты run фик�
 [`../../../../reports/v0.4-transport-artifact-roast.md`](../../../../reports/v0.4-transport-artifact-roast.md),
 тематических README и описании PR.
 
-`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1, IR-2 и IR-3
-реализованы, hardened и подтверждены CI.
+`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1—IR-4
+реализованы и подтверждены CI; IR-5—IR-10 остаются planned.
 
 IR-1/IR-2 предоставляют domain/config/ports foundation, durable filesystem
 repositories, bounded coordination, atomic writes, session-local sequence repair,
@@ -96,7 +96,7 @@ immutable `CommittedInputBatch` через `InputAdmissionService`. Initial batc
 `CycleInboxItem` того же cycle, после чего transport возвращает structured
 acknowledgement без второго `MCPClient.process_query()`.
 
-Финальный IR-3 hardening закрепляет четыре boundary:
+Финальный IR-3 hardening закрепил четыре boundary:
 
 1. **Crash-safe capacity authority.** Count/byte reservation определяется
    authoritative pending/admitted admissions активного cycle. Missing inbox после
@@ -114,11 +114,12 @@ acknowledgement без второго `MCPClient.process_query()`.
    создаёт filesystem adapter и не зависит от root/locks/serialization;
    filesystem composition выполняется infrastructure factory.
 
-Pre-handoff cancellation оставляет initial admission retryable. В WAITING path
-claim после захвата, но до marker, requeue-ится. После marker claim не requeue-ится
-для blind replay, marker становится `AMBIGUOUS`, cycle — `interrupted`, а claim
-остаётся evidence для будущего IR-4/IR-8 reconciliation. Duplicate после любого
-post-handoff cancellation не запускает второй runtime invocation.
+Pre-handoff cancellation оставляет initial admission retryable. В IR-3 WAITING
+path claim после захвата, но до marker, requeue-ится. После marker claim не
+requeue-ится для blind replay, marker становится `AMBIGUOUS`, cycle —
+`interrupted`, а claim остаётся evidence для будущего IR-8 reconciliation.
+Duplicate после любого post-handoff cancellation не запускает второй runtime
+invocation.
 
 Exact-cycle wake fencing также сохраняется: late wake старого cycle возвращает
 `False` и не изменяет event нового cycle. Stale handoff token не завершает другую
@@ -129,31 +130,81 @@ IR-3 final code evidence:
 - основной commit:
   `e8192380cc3104668ea9b0f3f017d3c962fd65e4` —
   `fix(input-runtime): make IR-3 handoff cancellation-safe and portable`;
-- узкий test-fixture fix:
+- узкий IR-3 test-fixture fix:
   `c36e4cc38095e15f54f63ae81c29b4829defec1f`;
 - `Validate Input Runtime` #84 — success, `198 passed`;
 - `Validate v0.4 file artifacts PR` #503 — success;
 - deterministic no-parallel test: три additions, один `target_cycle_id`,
   `process_query call count == 1`.
 
-Этапы IR-4—IR-10 остаются planned. Additions уже durable admitted и queued, но
-ещё не применяются к LLM context. Safe checkpoints, controls, emissions,
-finalization barrier и startup recovery lifecycle отсутствуют.
+IR-4 реализует active-context apply поверх admission/handoff boundary:
 
-Для следующих этапов сохранены обязательные contracts, но они не реализованы в
-этом patch:
+1. **Initial context authority.** Initial cycle проходит `CP-RESUME` до первого
+   main LLM/result; создаются initial `R1` и durable `ActiveCycleSnapshot`.
+2. **Linear context revisions.** Каждый successful applied range создаёт ровно
+   следующую `CycleContextRevision`; no-op checkpoint revision не создаёт.
+3. **Bounded contiguous FIFO.** `CycleInputApplier` применяет contiguous ranges в
+   `cycle_sequence` order с configured count/byte bounds.
+4. **Accepted-at-entry watermark.** Checkpoint фиксирует accepted watermark при
+   входе и drain-ит только input, относящийся к этой boundary; более поздний input
+   ждёт следующего checkpoint.
+5. **One update per range.** Несколько contiguous batches внутри одного applied
+   range представлены одним runtime-owned `input_batch_update`.
+6. **Protocol-safe checkpoint matrix.** Apply встроен в resume/create,
+   before-LLM, after-complete-tool-block, before-WAITING,
+   before-final-processing, before-terminal-commit и interruption boundaries без
+   разрыва OpenAI tool-call sequence.
+7. **WAITING common FIFO path.** WAITING reply проходит общий FIFO `CP-RESUME`,
+   не обходит более ранние additions, не владеет legacy semantic path и не
+   подменяет initial `original_input_batch_id`.
+8. **Snapshot-first reconciliation.** Persisted snapshot watermark является
+   authority после crash между snapshot persistence и inbox/admission marking;
+   reconciliation завершает marking без duplicate update/revision.
+9. **Cancellation-safe claim/apply.** Cancellation во время claim acquisition или
+   apply сохраняет recoverable durable state и не создаёт duplicate semantic
+   application.
+10. **Terminal ordering.** Successful runtime handoff completion предшествует
+    terminal snapshot synchronization.
+11. **Checkpoint stale-candidate suppression.** Accepted input, замеченный до
+    WAITING/final checkpoint, подавляет stale candidate и продолжает cycle после
+    apply.
 
-- IR-4: `WAITING_USER` reply при наличии более ранних queued additions проходит
-  через общий FIFO `CycleInputApplier` в cycle-sequence order;
-- IR-7: pending accepted input подавляет stale `DONE`, question и output до
-  terminal commit;
-- IR-8: ambiguous marker и post-handoff claim evidence reconciles startup/recovery
-  policy без automatic replay внешних side effects.
+IR-4 final code evidence:
 
-Целевой package вводит durable admission, additions в один active AgentCycle,
-safe checkpoints, линейные context revisions, `/stop`/`/continue`, durable
-intermediate messages, stale-finalization barrier и filesystem recovery ports с
-заделом на PostgreSQL `v0.5` и scheduler/interventions `v0.6`.
+- code/test HEAD:
+  `1d31b6fbd1d5e88966d3964dc35cf4680f32f522`;
+- `Validate Input Runtime` #115 — success, compile success, `241 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #518 — success, validation suites и status
+  enforcement success;
+- regression-fix проход после `224911a…` затронул только tests; production code
+  не менялся.
+
+IR-4 не расширяет ownership следующих stages. Stale WAITING/final suppression
+пока существует только на checkpoint-level. Late terminal race после последнего
+checkpoint recheck и до durable terminal commit остаётся IR-7. Ambiguous runtime
+handoff/startup reconciliation остаётся IR-8. Полная corruption/restart matrix
+`recover_cycle_authority()` остаётся IR-8/IR-10.
+
+Этапы IR-5—IR-10 planned. Явно пока не реализованы:
+
+- IR-5 durable controls;
+- `/stop`;
+- `/continue`;
+- `/reset` redesign на общий durable generation/control contract;
+- IR-6 durable `AgentEmission`;
+- IR-7 durable finalization barrier;
+- IR-8 startup recovery;
+- IR-9 complete client projections/diagnostics/config examples;
+- IR-10 full race/restart/synthetic/live acceptance;
+- scheduler/parallel branches/fork-join semantics;
+- Telegram history rewind по edited message.
+
+Целевой package при этом по accepted specification по-прежнему вводит durable
+admission, additions в один active AgentCycle, safe checkpoints, линейные context
+revisions, `/stop`/`/continue`, durable intermediate messages,
+stale-finalization barrier и filesystem recovery ports с заделом на PostgreSQL
+`v0.5` и scheduler/interventions `v0.6`.
 
 Общий статус `v0.4` остаётся `partial`, поскольку `v0.4-input-runtime`,
 `v0.4-runtime-modularization` и `v0.4-mcp-registry-foundation` ещё не завершены.
@@ -194,9 +245,19 @@ v0.4-storage-foundation
   admission, `CycleInbox`, checkpoints, pause/resume, emissions и terminal
   barrier. Пошаговая реализация находится в
   [`implementation-sequence.md`](v0.4-input-runtime/implementation-sequence.md).
-- IR-1—IR-3 уже реализованы; при анализе текущего baseline следует учитывать
-  cancellation-safe/storage-neutral handoff, но не приписывать IR-4+ применение
-  additions к context, controls, emissions, finalization или startup recovery.
+- IR-1—IR-4 уже реализованы; при анализе текущего baseline следует учитывать
+  cancellation-safe/storage-neutral handoff, initial `R1`/snapshot,
+  accepted-at-entry bounded FIFO apply, linear revisions, snapshot-first
+  reconciliation и common FIFO WAITING continuation.
+- Не приписывайте IR-5+ текущему baseline: `/stop`, `/continue`, durable control
+  plane, `/reset` redesign, durable emissions, finalization barrier и startup
+  recovery ещё planned.
+- Checkpoint-level stale final candidate suppression не является IR-7 durable
+  finalization barrier; late terminal race остаётся IR-7.
+- Ambiguous/startup reconciliation остаётся IR-8; полная
+  `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
+- Scheduler/parallel branches и Telegram history rewind не реализованы текущим
+  input-runtime stage.
 - `v0.4-runtime-modularization` меняет ownership, вводит reusable AgentRuntime,
   generic ports, явный Service Application composition и `ConfigProvider`;
   `mcp.config` становится compatibility filename, а `agent.config` — canonical

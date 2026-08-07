@@ -3,11 +3,51 @@ id: design.v0.4.input-runtime.checkpoints
 version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
-implementation_status: planned
-last_reviewed: 2026-08-05
+implementation_status: implemented
+last_reviewed: 2026-08-07
 ---
 
 # Safe checkpoints и context revisions
+
+## Статус реализации IR-4
+
+IR-4 реализован на code/test HEAD
+`1d31b6fbd1d5e88966d3964dc35cf4680f32f522` и подтверждён:
+
+- `Validate Input Runtime` #115 — success, compile success, `241 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #518 — success, validation suites и status
+  enforcement success.
+
+Regression-fix проход после `224911a…` менял только tests; production code на
+этом проходе не менялся.
+
+Реализованный IR-4 checkpoint/context contract:
+
+- до первого main LLM/result initial cycle проходит `CP-RESUME`; создаются initial
+  `R1` и durable `ActiveCycleSnapshot`;
+- context revisions линейны: каждый applied range создаёт ровно одну следующую
+  `CycleContextRevision`;
+- additions применяются bounded contiguous FIFO ranges в `cycle_sequence` order;
+- checkpoint использует accepted-at-entry watermark: input, admitted после входа
+  в checkpoint, остаётся для следующего checkpoint;
+- каждый applied range создаёт один `input_batch_update`, независимо от числа
+  contiguous batches внутри range;
+- checkpoint matrix не вставляет input внутрь незакрытого LLM/tool atomic block;
+- WAITING reply проходит общий FIFO `CP-RESUME`, не владеет legacy semantic path
+  и не подменяет `original_input_batch_id`;
+- snapshot-first persistence делает durable snapshot watermark authority для
+  crash reconciliation: незавершённые inbox/admission marks домаркировываются без
+  второго update/revision;
+- claim acquisition и apply cancellation-safe;
+- successful runtime handoff завершается до terminal snapshot synchronization;
+- stale WAITING/final candidates подавляются на checkpoint-level, когда accepted
+  watermark уже опережает applied watermark.
+
+IR-4 не является durable finalization/recovery completion. Late terminal race
+между последним checkpoint-level recheck и durable terminal commit остаётся IR-7.
+Ambiguous handoff/startup reconciliation остаётся IR-8. Полная corruption matrix
+`recover_cycle_authority()` остаётся IR-8/IR-10.
 
 ## Назначение
 
@@ -36,13 +76,16 @@ one final-processing LLM operation
 потребовала бы synthetic cancellation results и отдельной durable незавершённой
 tool-block state machine.
 
+`/stop` и durable control application из этого абзаца относятся к accepted IR-5
+contract и на IR-4 ещё не реализованы.
+
 ## Обязательные checkpoints
 
 ### `CP-RESUME`
 
 После восстановления/`/continue`, до первой новой main iteration.
 
-Порядок:
+Порядок accepted full contract:
 
 ```text
 validate generation/snapshot
@@ -51,6 +94,10 @@ validate generation/snapshot
 → rebuild runtime projections
 → continue
 ```
+
+На IR-4 реализованы generation/snapshot validation, initial context
+initialization и common FIFO input drain. `/continue` и effective durable controls
+остаются IR-5.
 
 ### `CP-BEFORE-LLM`
 
@@ -78,6 +125,9 @@ suppress candidate question
 → continue cycle
 ```
 
+Это suppression реализовано на checkpoint-level. Durable delivery/finalization
+barrier для более поздних races не входит в IR-4.
+
 ### `CP-BEFORE-FINAL-PROCESSING`
 
 Перед final audit/formatting/grounding. Позволяет не тратить дополнительный LLM
@@ -85,8 +135,13 @@ suppress candidate question
 
 ### `CP-BEFORE-TERMINAL-COMMIT`
 
-После final processing, перед durable result/outbox/terminal state. Выполняется
-под finalization protocol из `finalization-and-recovery.md`.
+После final processing, перед durable result/outbox/terminal state. Полный
+terminal commit выполняется под finalization protocol из
+`finalization-and-recovery.md`.
+
+IR-4 реализует checkpoint-level input recheck/suppression на этой boundary, но не
+IR-7 durable finalization barrier. Поэтому input, пришедший после последнего
+checkpoint recheck в late terminal window, остаётся явным IR-7 race.
 
 ### `CP-AFTER-INTERRUPTION`
 
@@ -96,7 +151,7 @@ block уже закрыт.
 
 ## Checkpoint order
 
-Каждый checkpoint выполняет единый deterministic pipeline:
+Полный accepted pipeline для `v0.4-input-runtime` остаётся:
 
 ```text
 1. load SessionInputRuntimeState
@@ -115,6 +170,13 @@ block уже закрыт.
 14. return CheckpointOutcome
 ```
 
+IR-4 реализует input/context slice этого pipeline: cycle/generation authority,
+accepted-at-entry watermark, bounded contiguous claim/apply, committed-batch
+validation/projection, context revision, snapshot-first persistence,
+mark-applied reconciliation и typed checkpoint outcome. Steps 3—5 принадлежат
+IR-5 durable controls; durable `AgentEmission` в step 13 принадлежит IR-6;
+durable terminal/finalization ownership относится к IR-7.
+
 ```python
 class CheckpointOutcome(BaseModel):
     checkpoint: str
@@ -131,8 +193,30 @@ class CheckpointOutcome(BaseModel):
     applied_through_sequence: int
 ```
 
+Accepted outcome surface сохраняет будущие pause/reset decisions. Их наличие в
+specification не означает, что IR-5 controls уже реализованы.
+
 Checkpoint не вызывает client delivery синхронно внутри session coordination
-lock. Он только сохраняет canonical event/emission intent.
+lock. Он только сохраняет canonical runtime state/outcome; durable emission intent
+будет принадлежать IR-6.
+
+## Accepted-at-entry watermark
+
+Checkpoint фиксирует accepted watermark при входе. Drain может выполнить несколько
+bounded FIFO apply operations, чтобы дойти именно до этого watermark, но не
+расширяет текущую semantic boundary за счёт additions, admitted позже.
+
+```text
+entry accepted = 5
+current applied = 2
+→ apply 3..4 bounded range
+→ apply 5 bounded range
+→ stop at 5
+```
+
+Input с sequence `6`, admitted во время checkpoint, остаётся queued для следующего
+safe checkpoint. Это сохраняет deterministic relation между atomic runtime block и
+использованной context revision.
 
 ## `input_batch_update` projection
 
@@ -166,11 +250,15 @@ lock. Он только сохраняет canonical event/emission intent.
 - route/client metadata не выдаётся модели без необходимости;
 - runtime marker защищает сообщение от трактовки как transport-generated system
   instruction;
-- prompt-injection policy для пользовательских файлов сохраняется.
+- prompt-injection policy для пользовательских файлов сохраняется;
+- один applied contiguous range создаёт ровно один `input_batch_update`; retry
+  persisted snapshot range не создаёт второй message.
 
 ## Context revision creation
 
-Initial batch создаёт `R1`.
+Initial batch создаёт `R1` на `CP-RESUME` до первого main LLM/result. Вместе с
+`R1` durable создаётся initial `ActiveCycleSnapshot`, который становится authority
+для последующих applied watermarks и context identity.
 
 Каждый успешный apply range создаёт ровно одну следующую revision:
 
@@ -178,12 +266,17 @@ Initial batch создаёт `R1`.
 R1 --apply ibat_2,ibat_3--> R2
 ```
 
+Context revisions в IR-4 линейны: next revision имеет ровно предыдущую active
+revision как parent. Identity сохраняет возможность multiple parents для будущей
+архитектуры, но branch/merge semantics здесь не реализованы.
+
 Если checkpoint не применил input и не выполнил semantic resume/recovery change,
 новая revision не создаётся.
 
 `/continue` без input может создать revision с reason `resumed`, если это нужно
-для audit. Эта revision не добавляет LLM message автоматически; runtime notice
-может быть trace-only.
+для audit. Эта accepted возможность относится к IR-5; durable `/continue` на IR-4
+ещё не реализован. Такая revision не добавляет LLM message автоматически;
+runtime notice может быть trace-only.
 
 ## Physical prompt и semantic revision
 
@@ -206,6 +299,10 @@ active_context_revision_id
 working_memory generation/reference
 applied_through_cycle_sequence
 ```
+
+Durable `ActiveCycleSnapshot` сохраняет ту же semantic authority вместе с
+messages/runtime refs, generation, applied batch IDs, safe checkpoint и snapshot
+revision.
 
 ## Compaction integration
 
@@ -255,7 +352,8 @@ active_plan_id/revision/node
 input admission IDs
 ```
 
-Scheduler/workflow revision появятся отдельно.
+Scheduler/workflow revision и parallel branches появятся отдельно; IR-4 их не
+реализует.
 
 ## Artifact integration
 
@@ -269,8 +367,10 @@ Scheduler/workflow revision появятся отдельно.
 - duplicate apply не создаёт повторную activation/version;
 - blocked signature/side-effect policies проверяются как для initial input.
 
-Текущий WAITING_USER compatibility path, временно заменяющий
-`original_input_batch_id`, должен быть удалён после перехода на общий applier.
+Legacy WAITING compatibility adapter больше не владеет semantic continuation.
+`WAITING_USER` reply admitted в тот же cycle и проходит общий FIFO `CP-RESUME`;
+более ранние queued additions применяются сначала по cycle sequence, а initial
+`original_input_batch_id` сохраняется.
 
 ## Result и tool sequence integrity
 
@@ -297,7 +397,8 @@ LLM request uses R2
 ```
 
 Уже выбранное действие не отменяется автоматически. Исключение — отдельная
-control command policy; initial `/stop` также ждёт конца atomic block.
+control command policy; `/stop` относится к IR-5 и также должен ждать конца
+atomic block.
 
 ## Input перед final candidate
 
@@ -310,8 +411,12 @@ model returned DONE based on R4
 → continue
 ```
 
-Если input приходит после final processing, тот же guard выполняется в
-`CP-BEFORE-TERMINAL-COMMIT`.
+Если input приходит после final processing, тот же checkpoint-level guard
+выполняется в `CP-BEFORE-TERMINAL-COMMIT`.
+
+Это не заменяет IR-7 durable finalization barrier. Input, accepted после
+последнего checkpoint observation, но до durable terminal commit, должен быть
+закрыт отдельным IR-7 short recheck/commit protocol.
 
 ## Error handling
 
@@ -329,12 +434,36 @@ Inbox items не отмечаются applied. Retry/recovery сверяет rep
 
 ### Mark-applied failed после snapshot
 
-Recovery видит applied watermark и завершает marking без повторного LLM append.
+Persisted snapshot watermark является authority. Reconciliation завершает
+inbox/admission marking без повторного LLM append, без новой context revision и
+без второго `input_batch_update`. Повторный checkpoint после repair является
+no-op относительно уже applied range.
+
+### Cancellation во время claim/apply
+
+Claim acquisition и apply имеют cancellation-safe cleanup. До durable snapshot
+claim может быть безопасно requeued/reconciled по состоянию; после snapshot
+watermark retry завершает marking из snapshot authority. Cancellation не должна
+создавать duplicate update/revision.
 
 ### Progress/emission failure
 
 Не откатывает уже применённый input. Projection/delivery retry выполняется
-отдельно.
+отдельно. Durable semantic `AgentEmission` относится к IR-6 и ещё не реализован.
+
+## Runtime handoff и terminal snapshot
+
+IR-3 `RuntimeHandoffRecord` остаётся authority side-effecting runtime invocation.
+На успешном path порядок IR-4:
+
+```text
+runtime result
+→ complete RuntimeHandoffRecord
+→ synchronize terminal ActiveCycleSnapshot
+```
+
+Terminal snapshot synchronization не выполняется вместо handoff completion и не
+ослабляет post-handoff ambiguity contract.
 
 ## Current-code integration points
 
@@ -356,14 +485,37 @@ Hooks делегируют `InputRuntimeCheckpointService`. Они не полу
 `ActiveAgentCycle` получает только bounded runtime fields и service-facing
 identity. Concrete repositories создаются composition root `Api`.
 
+## Deferred после IR-4
+
+Пока не реализованы:
+
+- IR-5 controls, `/stop`, `/continue` и `/reset` redesign;
+- IR-6 durable emissions;
+- IR-7 durable finalization barrier и late terminal race closure;
+- IR-8 startup recovery, ambiguous handoff/startup reconciliation;
+- `recover_cycle_authority()` corruption matrix — IR-8/IR-10;
+- scheduler/parallel context branches;
+- Telegram history rewind.
+
 ## Acceptance
+
+IR-4 подтверждает:
 
 - update никогда не появляется между assistant tool call и tool result;
 - input во время LLM применяется после завершённого tool block;
-- multiple additions создают один ordered update/revision;
+- multiple additions в одном applied range создают один ordered update/revision;
+- accepted-at-entry watermark ограничивает текущий checkpoint drain;
+- initial `R1` и durable `ActiveCycleSnapshot` существуют до first main execution;
 - fresh update не compact-ится до первого meaningful response;
 - compaction не уничтожает replay identity;
 - plan state не сбрасывается неявно;
 - artifact refs прежних/new batches остаются доступными по policy;
-- snapshot-write/mark-applied crash не дублирует user message;
-- stale DONE/WAITING_USER подавляется на обоих final checkpoints.
+- snapshot-write/mark-applied crash не дублирует user message/revision;
+- WAITING reply использует общий FIFO `CP-RESUME` и сохраняет initial identity;
+- stale DONE/WAITING_USER подавляется на checkpoint-level final boundaries;
+- handoff completion предшествует terminal snapshot synchronization;
+- claim/apply cancellation не создаёт duplicate application.
+
+IR-4 acceptance **не** утверждает, что закрыт late terminal race, durable
+finalization, startup/ambiguous recovery или corruption recovery matrix; эти
+contracts остаются соответственно IR-7, IR-8 и IR-8/IR-10.

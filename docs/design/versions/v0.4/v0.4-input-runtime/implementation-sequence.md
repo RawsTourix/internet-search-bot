@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-06
+last_reviewed: 2026-08-07
 ---
 
 # Последовательность реализации v0.4-input-runtime
@@ -14,9 +14,48 @@ last_reviewed: 2026-08-06
 - `IR-1 — Domain models, config и repository ports`: implemented;
 - `IR-2 — Filesystem repositories и coordination service`: implemented;
 - `IR-3 — Admission service и initial-cycle integration`: implemented and hardened;
-- `IR-4`—`IR-10`: planned.
+- `IR-4 — Active snapshot, checkpoints и CycleInputApplier`: implemented;
+- `IR-5`—`IR-10`: planned.
 
-Финальный подтверждённый IR-3 code boundary:
+Общий `v0.4-input-runtime` остаётся `partial`.
+
+Финальный подтверждённый IR-4 code/test boundary:
+
+- итоговый code/test HEAD:
+  `1d31b6fbd1d5e88966d3964dc35cf4680f32f522`;
+- `Validate Input Runtime` #115 — success, compile success, `241 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #518 — success, validation suites и status
+  enforcement success;
+- regression-fix проход после `224911a…` затронул только tests; production code
+  не менялся.
+
+IR-4 production boundary теперь гарантирует:
+
+```text
+admitted active cycle
+→ CP-RESUME
+→ initial R1 + durable ActiveCycleSnapshot
+→ protocol-safe checkpoint entry watermark
+→ bounded contiguous FIFO apply
+→ one input_batch_update per applied range
+→ next linear CycleContextRevision
+→ snapshot-first applied watermark
+→ inbox/admission marking reconciliation
+```
+
+WAITING reply проходит тот же common FIFO `CP-RESUME`, не обходит более ранние
+queued additions и не владеет legacy semantic continuation path. Claim acquisition
+и apply cancellation-safe. Runtime handoff completion предшествует terminal
+snapshot synchronization.
+
+Checkpoint-level stale WAITING/final candidate suppression реализовано, но late
+terminal race после последнего checkpoint recheck остаётся IR-7. Ambiguous
+handoff/startup reconciliation остаётся IR-8. Полная corruption matrix
+`recover_cycle_authority()` остаётся IR-8/IR-10.
+
+Финальный подтверждённый IR-3 code boundary сохраняется как предыдущий stage
+evidence:
 
 - основной admission implementation:
   `4929b703d7f6e200392661b2b66205b8fa4ca034`;
@@ -24,12 +63,12 @@ last_reviewed: 2026-08-06
   `d11db7f2a2f8caae900f3bc94ed91de020059231`;
 - cancellation-safe/storage-neutral handoff implementation:
   `e8192380cc3104668ea9b0f3f017d3c962fd65e4`;
-- итоговый code HEAD после узкого test-fixture fix:
+- итоговый IR-3 code HEAD после узкого test-fixture fix:
   `c36e4cc38095e15f54f63ae81c29b4829defec1f`;
 - `Validate Input Runtime` #84 — success, `198 passed`;
 - `Validate v0.4 file artifacts PR` #503 — success.
 
-IR-3 production boundary теперь гарантирует:
+IR-3 production boundary гарантирует:
 
 ```text
 CommittedInputBatch
@@ -49,7 +88,7 @@ Runtime handoff storage-neutral: application service зависит от
 `RuntimeHandoffRepository`, а concrete filesystem adapter создаётся только
 `create_filesystem_input_runtime_repositories(...)`.
 
-Cancellation contract:
+Cancellation contract IR-3:
 
 - initial cancellation до marker оставляет admission retryable;
 - initial cancellation после marker переводит marker в `AMBIGUOUS`, cycle — в
@@ -60,18 +99,18 @@ Cancellation contract:
 - cleanup запускается отдельной task, ожидается через `asyncio.shield`, завершается
   даже при повторной cancellation, затем исходный `CancelledError` re-raise-ится.
 
-Общий update остаётся partial. IR-3 не применяет queued additions к LLM context и
-не реализует startup recovery ambiguous handoff. Safe checkpoints, общий
-`CycleInputApplier`, context revisions и active snapshot начинаются с IR-4.
+После IR-4 queued additions уже применяются к active LLM context на safe
+checkpoints. Следующие mandatory contracts остаются:
 
-Для следующих этапов зафиксированы обязательные contracts:
+- IR-5: durable controls, `/stop`, `/continue`, `/reset` redesign;
+- IR-6: durable semantic `AgentEmission`;
+- IR-7: durable finalization barrier, закрывающий late terminal race;
+- IR-8: ambiguous/startup recovery policy без blind replay;
+- IR-9: client projections/diagnostics/config examples;
+- IR-10: full race/restart/synthetic/live acceptance, включая corruption matrix.
 
-- IR-4: `WAITING_USER` reply при наличии более ранних queued additions применяется
-  вместе с ними через общий FIFO `CycleInputApplier`;
-- IR-7: pending accepted input подавляет stale `DONE`, question и output до
-  terminal commit;
-- IR-8: ambiguous marker и post-handoff claim evidence reconciles explicit
-  recovery policy без blind replay внешних действий.
+Scheduler/parallel branches и Telegram history rewind в текущий implemented
+baseline не входят.
 
 ## Назначение документа
 
@@ -291,6 +330,9 @@ cancel generation
 reconcile by authoritative watermark in later stages
 ```
 
+IR-4 реализовал snapshot-watermark reconciliation для applied active-cycle
+ranges. Startup-wide ambiguous/corruption reconciliation остаётся IR-8/IR-10.
+
 ## Tests
 
 - concurrent sequence allocation;
@@ -326,7 +368,7 @@ reconcile by authoritative watermark in later stages
 
 ## Статус
 
-Implemented, hardened и подтверждён CI на итоговом code HEAD
+Implemented, hardened и подтверждён CI на итоговом IR-3 code HEAD
 `c36e4cc38095e15f54f63ae81c29b4829defec1f`:
 
 - `Validate Input Runtime` #84 — success, `198 passed`;
@@ -338,7 +380,7 @@ Implemented, hardened и подтверждён CI на итоговом code HE
   без второго `process_query()`;
 - duplicate, count/byte capacity, crash windows, runner handoff, cancellation и
   exact-cycle wake покрыты deterministic tests;
-- `WAITING_USER` остаётся временным same-cycle compatibility adapter;
+- IR-3 сохранял временный same-cycle WAITING compatibility adapter до IR-4;
 - `interrupted` и `AMBIGUOUS` не запускают automatic replay.
 
 ## Цель
@@ -383,7 +425,7 @@ async def admit_committed_batch(
 ) -> InputAdmissionOutcome
 ```
 
-Call flow:
+Call flow IR-3:
 
 ```text
 submit/commit
@@ -394,6 +436,9 @@ submit/commit
 → duplicate: return existing relation
 → capacity_blocked: retryable response, committed input retained
 ```
+
+На IR-4 WAITING semantic continuation переведён на common FIFO checkpoint path;
+историческое `resume_waiting` описание выше фиксирует именно IR-3 boundary.
 
 ## Initial cycle
 
@@ -406,7 +451,9 @@ submit/commit
 7. persist applied/status/output compatibility steps;
 8. complete handoff marker.
 
-Initial context revision и active snapshot ownership intentionally deferred to IR-4.
+Initial context revision и active snapshot ownership были intentionally deferred
+из IR-3 в IR-4; теперь IR-4 реализует initial `R1` + durable snapshot до first main
+LLM/result.
 
 ## Running addition и capacity authority
 
@@ -444,9 +491,12 @@ pre-run resolution
 - successful runtime result + subsequent persistence failure также не rerun-ится;
 - stale token не завершает marker другой attempt.
 
+IR-4 сохраняет этот ownership: successful handoff completion выполняется раньше
+terminal snapshot synchronization.
+
 ## Cancellation contract
 
-Оба paths имеют отдельный:
+Оба IR-3 paths имеют отдельный:
 
 ```python
 except asyncio.CancelledError:
@@ -470,11 +520,14 @@ Initial:
 - cancellation после marker, включая окно до фактического invocation: marker
   `AMBIGUOUS`, cycle `interrupted`, duplicate no-rerun.
 
-WAITING compatibility:
+WAITING compatibility на IR-3:
 
 - cancellation после claim, до marker: requeue claim;
 - cancellation после marker: не requeue claim, сохранить claim evidence,
   `AMBIGUOUS` + `interrupted`, duplicate no-rerun.
+
+IR-4 дополнительно делает cancellation-safe common claim acquisition/apply на
+checkpoint path.
 
 ## SessionExecutionCoordinator
 
@@ -492,7 +545,7 @@ tests/test_input_runtime_ir3_contract_gaps.py
 tests/test_input_runtime_ir3_cancellation_and_portability.py
 ```
 
-Mandatory scenarios:
+Mandatory scenarios IR-3:
 
 - idle batch starts one cycle;
 - running additions never create parallel runner;
@@ -521,13 +574,15 @@ Mandatory scenarios:
 - handoff cancellation-safe and storage-neutral;
 - no blind replay after ambiguous runtime boundary.
 
-## Не делать
+## Не делать на этапе IR-3
 
 - не применять additions к LLM context;
 - не добавлять safe checkpoints/snapshots;
 - не реализовывать startup recovery policy;
 - не удалять WAITING compatibility before common applier;
-- не начинать IR-4.
+- не начинать IR-4 внутри IR-3 patch.
+
+Эти пункты фиксируют историческую stage boundary; IR-4 теперь реализован отдельно.
 
 ---
 
@@ -535,7 +590,13 @@ Mandatory scenarios:
 
 ## Статус
 
-Planned. Не реализован в IR-3 hardening.
+Implemented и закрыт по code gate на
+`1d31b6fbd1d5e88966d3964dc35cf4680f32f522`:
+
+- `Validate Input Runtime` #115 — success, compile success, `241 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #518 — success;
+- regression fixes после `224911a…` — test-only, production code unchanged.
 
 ## Цель
 
@@ -553,6 +614,10 @@ src/mcp/mcp_client.py
 src/mcp/waiting_user_batch_continuation.py
 ```
 
+Фактическая implementation может быть разделена дополнительными IR-4 modules,
+но ownership остаётся `src/input_runtime` + thin agent-loop hooks; filesystem logic
+в `mcp_client.py` не переносится.
+
 ## Active snapshot
 
 ```text
@@ -564,6 +629,10 @@ safe_checkpoint
 pause/interruption metadata
 ```
 
+Initial `CP-RESUME` создаёт `R1` и durable `ActiveCycleSnapshot` до первого main
+LLM/result. Snapshot сохраняет semantic context authority, applied IDs/watermark,
+runtime refs и safe checkpoint.
+
 ## Hooks
 
 ```text
@@ -573,11 +642,46 @@ after complete tool block
 before WAITING_USER
 before final processing
 before terminal return
+after controlled interruption
 ```
 
 No filesystem logic inside `mcp_client.py`.
 
+## Protocol-safe checkpoint matrix
+
+IR-4 использует общую checkpoint service boundary:
+
+```text
+CP-RESUME
+CP-BEFORE-LLM
+CP-AFTER-TOOL-BLOCK
+CP-BEFORE-WAITING
+CP-BEFORE-FINAL-PROCESSING
+CP-BEFORE-TERMINAL-COMMIT
+CP-AFTER-INTERRUPTION
+```
+
+Checkpoint не вставляет user update между `assistant.tool_calls` и matching
+`role=tool` results и не меняет context revision уже начатого atomic block.
+
+## Accepted-at-entry watermark
+
+На входе checkpoint фиксируется `active_cycle_accepted_through_sequence`.
+Checkpoint может выполнить несколько bounded contiguous apply ranges, чтобы
+догнать именно этот target, но input, admitted позже, не расширяет текущий drain.
+
+```text
+entry accepted = N
+apply from current watermark through N
+late admission N+1
+→ N+1 waits for next safe checkpoint
+```
+
+Это делает next LLM/tool block привязанным к deterministic context revision.
+
 ## Apply protocol
+
+Accepted IR-4 protocol сохраняется:
 
 - claim contiguous FIFO range;
 - load exact committed batches;
@@ -589,8 +693,51 @@ No filesystem logic inside `mcp_client.py`.
 - mark inbox/admissions applied;
 - emit lifecycle/projection events.
 
-Crash between snapshot persistence and item marking reconciles by snapshot
-watermark without duplicate append.
+Реализованная semantic ownership уточняет:
+
+- каждый bounded applied range создаёт один `input_batch_update` и одну следующую
+  linear context revision;
+- несколько contiguous batches внутри range сохраняют batch boundaries и ordered
+  `cycle_sequence`;
+- durable `AgentEmission` не считается реализованным этим пунктом и остаётся IR-6;
+- checkpoint outcomes/runtime traces не подменяют IR-6 semantic emissions.
+
+## Linear context revisions
+
+```text
+initial batch → R1
+range A → R2(parent=R1)
+range B → R3(parent=R2)
+```
+
+No-op checkpoint не создаёт новую revision. Multiple-parent identity остаётся
+future-compatible, но scheduler/parallel branches/merge semantics не реализованы.
+
+## Snapshot-first crash reconciliation
+
+Порядок authority:
+
+```text
+append next context revision
+→ persist ActiveCycleSnapshot with new watermark
+→ mark inbox/admission applied
+```
+
+Если crash/failure происходит после snapshot persistence и до marking, snapshot
+watermark является authority. Следующий checkpoint/reconciliation домаркировывает
+inbox/admission без duplicate `input_batch_update`, без второй revision и без
+повторного semantic apply. Retry после repair — no-op для уже applied range.
+
+## Cancellation-safe claim/apply
+
+Claim acquisition и apply обрабатывают cancellation так, чтобы durable state
+оставался recoverable:
+
+- до persisted snapshot claim может быть безопасно requeued/reconciled;
+- после persisted snapshot watermark marking завершается из snapshot authority;
+- cancellation не создаёт duplicate update/revision;
+- repeated cleanup/cancellation не ослабляет existing IR-3 no-blind-replay
+  contract.
 
 ## Mandatory WAITING contract
 
@@ -598,35 +745,88 @@ watermark without duplicate append.
 не может обойти их через compatibility path. Общий `CycleInputApplier` применяет
 contiguous range строго в cycle-sequence order.
 
+На реализованном IR-4 WAITING reply проходит common FIFO `CP-RESUME`. Legacy
+adapter больше не владеет semantic continuation и не подменяет
+`original_input_batch_id`; initial batch identity сохраняется.
+
+## Terminal snapshot ordering
+
+Successful runtime handoff завершается до terminal snapshot synchronization:
+
+```text
+RuntimeHandoffRecord.complete
+→ terminal ActiveCycleSnapshot sync
+```
+
+IR-4 не ослабляет handoff authority ради terminal persistence.
+
+## Checkpoint-level stale candidate suppression
+
+`CP-BEFORE-WAITING`, `CP-BEFORE-FINAL-PROCESSING` и
+`CP-BEFORE-TERMINAL-COMMIT` видят accepted-at-entry watermark. Если accepted input
+опережает applied context, stale candidate подавляется, input применяется и cycle
+продолжается.
+
+Это **не** durable IR-7 finalization barrier. Late input после последнего
+checkpoint observation и до terminal commit остаётся IR-7 race.
+
 ## Tests
+
+Реализованный IR-4 deterministic coverage включает:
 
 - addition during LLM;
 - addition during tool block;
 - addition immediately before WAITING_USER;
-- two additions between checkpoints;
+- two/multiple additions between checkpoints;
+- initial `R1` + durable snapshot lifecycle;
+- accepted-at-entry watermark;
+- bounded contiguous FIFO application;
+- exactly one update/revision per applied range;
 - snapshot persisted / mark applied fails;
-- expired applying claim reconciliation;
-- ambiguous IR-3 claim reconciliation without blind runtime replay;
+- snapshot watermark marking repair + retry no-op;
+- expired/aborted claim handling на безопасной IR-4 boundary;
+- cancellation during claim acquisition/apply;
+- WAITING reply common FIFO `CP-RESUME`;
 - compaction before/after update;
-- plan/artifact refs preserved.
+- plan/artifact refs preserved;
+- protocol-valid tool sequence;
+- handoff completion before terminal snapshot sync.
+
+Cross-stage scenarios, которые accepted specification сохраняет, но IR-4 не
+объявляет закрытыми:
+
+- ambiguous IR-3 handoff/startup claim reconciliation — IR-8;
+- late terminal race/durable output barrier — IR-7;
+- `recover_cycle_authority()` corruption/restart matrix — IR-8/IR-10.
 
 ## Done
 
 - same active cycle consumes new input;
 - protocol sequence valid;
-- stale WAITING suppressed;
-- additions exactly-once/FIFO;
-- compatibility mixin loses semantic ownership.
+- initial `R1` и durable active snapshot authoritative;
+- stale WAITING/final candidate suppressed на checkpoint-level;
+- additions exactly-once/FIFO в пределах snapshot-first apply contract;
+- accepted-at-entry watermark deterministic;
+- compatibility adapter loses semantic ownership;
+- handoff completion precedes terminal snapshot;
+- cancellation-safe claim/apply подтверждён tests.
 
 ## Не делать
 
 - не classify additions semantically;
 - не create parallel task/branch;
-- не reset plan automatically.
+- не reset plan automatically;
+- не реализовывать IR-5 controls в IR-4;
+- не считать checkpoint suppression IR-7 finalization barrier;
+- не притягивать IR-8 startup/ambiguous recovery в IR-4.
 
 ---
 
 # IR-5 — Durable control plane `/stop`, `/continue`, `/reset`
+
+## Статус
+
+Planned. Не реализован в IR-4.
 
 ## Цель
 
@@ -660,6 +860,10 @@ generation contract.
 
 # IR-6 — AgentEmission и intermediate messages
 
+## Статус
+
+Planned. Durable semantic emissions не реализованы в IR-4.
+
 ## Цель
 
 Durable semantic intermediate messages independent from transient progress и
@@ -690,6 +894,11 @@ cycle execution result.
 
 # IR-7 — Finalization barrier
 
+## Статус
+
+Planned. IR-4 реализует только checkpoint-level stale candidate suppression.
+Durable finalization barrier и late terminal race closure отсутствуют.
+
 ## Цель
 
 Не допустить stale final/waiting response, игнорирующий accepted input/control.
@@ -711,6 +920,10 @@ candidate remains non-terminal
 → terminal commit enables delivery
 ```
 
+IR-4 checkpoint recheck покрывает только pre-final/checkpoint observation.
+Short durable watermark recheck, output fencing и terminal commit ownership будут
+реализованы здесь.
+
 ## Tests
 
 Inject input/control:
@@ -731,6 +944,10 @@ Inject input/control:
 
 # IR-8 — Startup recovery и lifecycle
 
+## Статус
+
+Planned. Snapshot-first local marking repair IR-4 не является startup recovery.
+
 ## Цель
 
 Recover durable runtime before accepting new work and shutdown without orphan
@@ -746,7 +963,12 @@ claims/runners.
 - restore resumable/paused/waiting runners only when safe;
 - enable new admission after mandatory recovery.
 
-IR-3 marker не является готовой startup recovery implementation.
+IR-3 marker и IR-4 snapshot-first marking repair не являются готовой startup
+recovery implementation.
+
+`recover_cycle_authority()` corruption matrix также не считается закрытой IR-4:
+её authoritative corruption/restart policy и negative cases относятся к IR-8, а
+полная randomized/restart acceptance — к IR-10.
 
 ## Shutdown
 
@@ -765,12 +987,17 @@ Two service instances over same temporary root:
 - committed unadmitted repaired;
 - ambiguous marker does not rerun runtime;
 - post-handoff claim evidence preserved/reconciled;
+- `recover_cycle_authority()` corrupted/missing/divergent authority cases;
 - no new work before recovery ready;
 - shutdown deterministic.
 
 ---
 
 # IR-9 — Client projections, diagnostics и configuration examples
+
+## Статус
+
+Planned.
 
 ## Цель
 
@@ -810,6 +1037,10 @@ last error code
 
 # IR-10 — Full acceptance, roast и live validation
 
+## Статус
+
+Planned. IR-4 focused CI не заменяет full IR-10 acceptance.
+
 ## Цель
 
 Prove contracts под unit, race, restart, synthetic и real transport behavior.
@@ -835,7 +1066,8 @@ compile/config example audit
 - duplicate requests;
 - additions with files;
 - shutdown while queued/claimed/applying;
-- cancellation before/after handoff and during cleanup.
+- cancellation before/after handoff and during cleanup;
+- `recover_cycle_authority()` corruption/restart matrix.
 
 Every randomized run records seed and selector.
 
@@ -856,6 +1088,9 @@ transport sinks.
 8. `/reset` while active;
 9. restart while paused/waiting/queued;
 10. regression collection/artifact delivery commands.
+
+Telegram history rewind по edited message остаётся deferred client-specific
+follow-up и не входит в этот release gate.
 
 ## Completion gate
 
@@ -880,6 +1115,9 @@ Admission, checkpoint integration, controls и finalization выполняютс
 IR-6 может интегрироваться после stable cycle/context identity и до завершения
 finalization barrier.
 
+Scheduler/parallel branches не реализуются этим update stage sequence; future
+scheduler остаётся отдельной orchestration layer.
+
 ---
 
 # Рекомендуемые commit boundaries
@@ -898,6 +1136,9 @@ feat(input-runtime): recover durable active runtime state
 test(input-runtime): add race restart and transport coverage
 docs(input-runtime): finalize acceptance and current baseline
 ```
+
+IR-4 documentation evidence фиксируется отдельным documentation-only commit после
+зелёных code gates; этот commit не начинает IR-5.
 
 Один commit не должен одновременно вводить новый state contract, переписывать
 agent loop и менять transport presentation без characterization tests.

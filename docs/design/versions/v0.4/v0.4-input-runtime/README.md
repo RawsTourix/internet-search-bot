@@ -4,17 +4,29 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-06
+last_reviewed: 2026-08-07
 ---
 
 # v0.4-input-runtime
 
 ## Статус реализации
 
-`IR-1`, `IR-2` и `IR-3` реализованы и подтверждены CI. Этапы `IR-4`—`IR-10`
-остаются planned, поэтому общий update сохраняет статус `partial`.
+`IR-1`, `IR-2`, `IR-3` и `IR-4` реализованы и подтверждены CI. Этапы
+`IR-5`—`IR-10` остаются planned, поэтому общий update сохраняет статус
+`partial`.
 
-Финальный IR-3 evidence:
+Финальный IR-4 code/test evidence:
+
+- итоговый code/test HEAD:
+  `1d31b6fbd1d5e88966d3964dc35cf4680f32f522`;
+- `Validate Input Runtime` #115 — success, compile success, `241 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #518 — success, validation suites и status
+  enforcement success;
+- regression-fix проход после `224911a…` изменял только tests; production code
+  на этом проходе не менялся.
+
+Финальный IR-3 evidence сохраняется как предыдущая implementation boundary:
 
 - основной admission implementation:
   `4929b703d7f6e200392661b2b66205b8fa4ca034`;
@@ -22,7 +34,7 @@ last_reviewed: 2026-08-06
   `d11db7f2a2f8caae900f3bc94ed91de020059231`;
 - cancellation-safe/storage-neutral handoff commit:
   `e8192380cc3104668ea9b0f3f017d3c962fd65e4`;
-- итоговый code HEAD после узкого test-fixture fix:
+- итоговый IR-3 code HEAD после узкого test-fixture fix:
   `c36e4cc38095e15f54f63ae81c29b4829defec1f`;
 - `Validate Input Runtime` #84 — success, `198 passed`;
 - `Validate v0.4 file artifacts PR` #503 — success.
@@ -52,7 +64,7 @@ Hardened IR-3 закрывает admission/runner boundary:
   после marker переводит marker в `AMBIGUOUS`, session cycle в `interrupted`, а
   duplicate не вызывает второй `process_query()`;
 - WAITING cancellation после claim, но до marker, requeue-ит claim; после marker
-  claim не requeue-ится, остаётся durable evidence для будущего IR-4/IR-8
+  claim не requeue-ится, остаётся durable evidence для будущего IR-8
   reconciliation, marker становится `AMBIGUOUS`, cycle — `interrupted`;
 - handoff persistence вынесен за application boundary: нейтральный
   `RuntimeHandoffRepository` предоставляет command-oriented
@@ -64,22 +76,55 @@ Hardened IR-3 закрывает admission/runner boundary:
 
 Duplicate replay возвращает существующую relation, capacity block является typed
 и retryable, а record-first crash windows admission/inbox/runner-start покрыты
-reconciliation tests. `WAITING_USER` временно сохраняет compatibility adapter,
-но после durable runtime handoff неоднозначный failure или cancellation больше не
-requeue-ит input для автоматического повторного `process_query()`. `interrupted`
-не выполняет unsafe automatic replay.
+reconciliation tests. После durable runtime handoff неоднозначный failure или
+cancellation не requeue-ит input для автоматического повторного
+`process_query()`. `interrupted` не выполняет unsafe automatic replay.
 
-Queued additions на IR-3 ещё не применяются к работающему LLM context. Safe
-checkpoints, общий input applier, context revisions и snapshot ownership относятся
-к IR-4. Для IR-4 отдельно зафиксировано: `WAITING_USER` reply при наличии более
-ранних queued additions должен применяться вместе с ними через общий FIFO
-`CycleInputApplier`, а не обходить очередь через compatibility path.
+IR-4 добавил active-context ownership поверх этой admission boundary:
 
-Для IR-7 зафиксировано: любой pending accepted input должен подавлять stale
-`DONE`, question или output до terminal commit. Для IR-8 зафиксировано, что
-ambiguous marker и post-handoff claim evidence требуют explicit reconciliation
-policy без automatic replay. `/stop`, `/continue`, intermediate emissions,
-finalization barrier и startup recovery lifecycle ещё не реализованы.
+- initial execution до первого main LLM/result проходит `CP-RESUME`, создаёт
+  initial linear context revision `R1` и durable `ActiveCycleSnapshot`;
+- каждый successful apply создаёт следующую linear `CycleContextRevision`;
+- additions применяются bounded contiguous FIFO ranges в `cycle_sequence` order;
+- checkpoint фиксирует accepted-at-entry watermark и не затягивает в текущий
+  drain input, admitted уже после входа в checkpoint;
+- на один applied range создаётся ровно один runtime-owned
+  `input_batch_update` и ровно одна новая context revision;
+- protocol-safe checkpoint matrix встроена в create/resume, main LLM, завершённый
+  tool block, WAITING, final-processing, terminal-candidate и interruption
+  boundaries без вставки input внутрь незакрытого tool-call block;
+- `WAITING_USER` reply больше не владеет отдельным legacy semantic path: он
+  проходит общий FIFO `CP-RESUME`, не обходит более ранние queued additions и не
+  подменяет initial `original_input_batch_id`;
+- snapshot-first crash protocol делает persisted snapshot watermark authority:
+  если snapshot уже сохранён, а inbox/admission marking не завершился, retry
+  домаркировывает records без второго update/revision;
+- claim acquisition и apply cancellation-safe: cancellation не теряет durable
+  claim authority и не создаёт duplicate application;
+- runtime handoff сначала durable завершается, и только затем выполняется
+  terminal snapshot synchronization; terminal snapshot не используется как
+  замена handoff completion;
+- stale `WAITING_USER`/final candidate suppression уже существует на
+  checkpoint-level: accepted-at-entry mismatch заставляет применить input и
+  продолжить cycle вместо публикации устаревшего candidate.
+
+Граница IR-4 намеренно не расширяется до следующих stages. Late input в окне
+после checkpoint-level final recheck и перед durable terminal commit остаётся
+race IR-7 и требует durable finalization barrier. Ambiguous handoff/startup
+reconciliation остаётся IR-8. Полная corruption/recovery matrix вокруг
+`recover_cycle_authority()` остаётся IR-8/IR-10 и не считается закрытой IR-4.
+
+Явно **не реализованы** на текущем baseline:
+
+- IR-5 durable controls;
+- `/stop`;
+- `/continue`;
+- redesign `/reset` на общий durable generation/control contract;
+- IR-6 durable `AgentEmission`;
+- IR-7 durable finalization barrier;
+- IR-8 startup recovery/reconciliation;
+- scheduler и parallel branches/fork-join semantics;
+- Telegram history rewind по edited message.
 
 IR-2 добавил filesystem implementations repository ports, атомарные записи,
 bounded reference-counted coordination, authoritative session-local
@@ -136,20 +181,23 @@ workflow revisions и scheduler поверх той же admission boundary.
 - immutable `CommittedInputBatch` и durable ingress;
 - `SessionExecutionCoordinator` с in-process FIFO lane, run lease и generation;
 - один active cycle на session на уровне текущего API orchestration;
-- continuation suspended `WAITING_USER`/`interrupted` cycle новым committed batch;
+- durable admission/FIFO `CycleInbox` для additions активного cycle;
+- initial `R1`, linear context revisions, durable active-cycle snapshot и applied
+  input watermarks;
+- protocol-safe checkpoints и common FIFO apply для running/WAITING additions;
 - `ProgressEvent`, durable `OutputBatch`, client capabilities и delivery receipts;
-- `/reset`, который инвалидирует queued work и ждёт runtime boundary перед
-  очисткой памяти.
+- существующий compatibility `/reset`, который инвалидирует queued work и ждёт
+  runtime boundary перед очисткой памяти.
 
-Эти foundations не являются полным input runtime:
+Эти foundations всё ещё не являются полным input runtime:
 
-- очередь `SessionExecutionCoordinator` живёт только в памяти;
-- committed batch обычно запускает отдельную run operation, а не дополняет уже
-  работающий cycle;
-- `stop_requested` не является durable control state;
-- active-cycle snapshot не хранит applied input watermarks;
+- `SessionExecutionCoordinator` остаётся in-process lease/wakeup layer, а durable
+  input authority принадлежит admission/inbox/snapshot repositories;
+- durable control plane для pause/resume/reset ещё не реализован;
 - intermediate agent message пока не является отдельной durable interaction;
-- finalization не имеет общего input/control barrier.
+- checkpoint-level stale candidate suppression ещё не является durable
+  finalization barrier;
+- startup recovery ambiguous handoff/claim authority ещё не реализован.
 
 Обновление должно мигрировать существующее поведение постепенно, без большого
 rewrite `src/mcp/mcp_client.py`. Полная декомпозиция ownership выполняется в
