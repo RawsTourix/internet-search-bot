@@ -12,12 +12,14 @@ from .input_runtime_checkpoint_hardening import (
     InputRuntimeCheckpointHardeningMixin,
 )
 from .input_runtime_checkpoints import InputRuntimeCheckpointMixin
+from .input_runtime_controls import InputRuntimeControlMixin
 from .llm_response_recovery import LLMResponseRecoveryMixin
 from .planning_runtime import FinalizingPlanningMCPClient
 from .waiting_user_batch_continuation import WaitingUserBatchContinuationMixin
 
 
 class FinalizingArtifactDeliveryPlanningMCPClient(
+    InputRuntimeControlMixin,
     InputRuntimeCheckpointHardeningMixin,
     InputRuntimeCheckpointMixin,
     WaitingUserBatchContinuationMixin,
@@ -32,4 +34,4 @@ class FinalizingArtifactDeliveryPlanningMCPClient(
     ArtifactAccessScopeMixin,
     FinalizingPlanningMCPClient,
 ):
-    """Production agent with durable FIFO checkpoint application."""
+    """Production agent with durable FIFO checkpoints and cooperative controls."""
