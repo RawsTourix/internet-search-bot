@@ -123,8 +123,13 @@ def test_runtime_state_composition_seam_installs_into_real_host_shape(monkeypatc
     assert application.handlers[0][1] == -10
 
 
-def test_canonical_telegram_app_registers_ir5_and_collection_handlers_once():
+def test_canonical_telegram_app_registers_ir5_and_collection_handlers_once(monkeypatch):
     """Exercise real production composition without invoking the compatibility installer."""
+    synthetic_token = "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi"
+    monkeypatch.setenv("BOT_TOKEN", synthetic_token)
+    from src.servers.telegram import config as telegram_config
+
+    monkeypatch.setattr(telegram_config, "BOT_TOKEN", synthetic_token)
     from src.servers.telegram import app as canonical_app
 
     handlers = canonical_app.server.application.handlers
