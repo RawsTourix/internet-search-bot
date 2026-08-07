@@ -34,6 +34,7 @@ from .presentation_relocation import (
 )
 from .ready_outbox import TelegramReadyOutboxWorker
 from .run_progress_bridge import RunScopedProgressTelegramGatewayClient
+from .runtime_control_handlers import install_runtime_control_handlers
 from .runtime_state import TelegramSessionDispatcher
 from .scoped_output_executor import InstanceScopedTelegramOutputPlanExecutor
 
@@ -99,6 +100,7 @@ async def _retrying_initial_status_message(update, text: str):
 server.send_initial_status_message = _retrying_initial_status_message
 
 
+install_runtime_control_handlers(server.application)
 server.application.add_handler(
     CommandHandler(
         ["collect", "send", "cancel"],
@@ -750,6 +752,8 @@ async def lifespan(app):
         await server.application.bot.set_my_commands([
             BotCommand("start", "Приветствие"),
             BotCommand("status", "Статус системы"),
+            BotCommand("stop", "Приостановить текущую задачу"),
+            BotCommand("continue", "Продолжить текущую задачу"),
             BotCommand("collect", "Начать сбор пакета"),
             BotCommand("send", "Отправить собранный пакет"),
             BotCommand("cancel", "Отменить сбор пакета"),
