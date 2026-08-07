@@ -173,15 +173,17 @@ class SessionExecutionCoordinator:
 
         generation = 0
         reserved = False
+        generation_matches = True
         async with self._guard:
             if self._closing:
                 raise RuntimeError("session execution coordinator is shutting down")
             lane = self._lanes.setdefault(session_id, _SessionLane())
             generation = lane.generation
-            if expected_generation is not None and generation != expected_generation:
-                yield False
-                return
-            if (
+            generation_matches = (
+                expected_generation is None
+                or generation == expected_generation
+            )
+            if generation_matches and (
                 lane.reserved_cycle_id is None
                 and lane.active_cycle_id is None
                 and not lane.run_lease.locked()
@@ -194,7 +196,7 @@ class SessionExecutionCoordinator:
                 lane.stop_requested = False
                 reserved = True
 
-        if not reserved:
+        if not generation_matches or not reserved:
             yield False
             return
 
@@ -342,11 +344,7 @@ class SessionExecutionCoordinator:
             return changed
 
     async def synchronize_generation(self, session_id: str, *, generation: int) -> int:
-        """Mirror an already-durable generation transition into this process.
-
-        This method never decides semantic reset. It invalidates queued local
-        work after SessionInputRuntimeState has become authoritative.
-        """
+        """Mirror an already-durable generation transition into this process."""
         session_id = self._session_id(session_id)
         if generation < 0:
             raise ValueError("generation must be non-negative")
