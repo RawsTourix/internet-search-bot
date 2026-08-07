@@ -4,7 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any
 
-from ..core.models import AgentResult, AgentStatus
+from ..core.models import AgentResult, AgentStatus, ClientType
 from ..input_runtime import CheckpointAction, CheckpointName, CycleStatus, get_input_runtime_binding
 from .input_runtime_checkpoints import _checkpoint_active_cycle
 
@@ -49,13 +49,7 @@ class InputRuntimeControlMixin:
         return super()._raise_if_interrupted(outcome)
 
     async def _call_main_llm_with_context_recovery(self, **kwargs: Any):
-        """Add the post-LLM/pre-tool control boundary.
-
-        A stop accepted while the bounded LLM request is in flight cannot cancel
-        that request.  Once it returns, controls are observed before its tool
-        calls can begin.  A multi-tool block is still completed by the existing
-        loop and is checked at CP-AFTER-TOOL-BLOCK before another LLM request.
-        """
+        """Observe controls after a bounded LLM response and before any tool."""
         response, messages = await super()._call_main_llm_with_context_recovery(
             **kwargs
         )
@@ -95,12 +89,8 @@ class InputRuntimeControlMixin:
             active_cycle.input_runtime_generation = snapshot.generation
             active_cycle.waiting_question = snapshot.waiting_question
             active_cycle.interruption_reason = snapshot.interruption_reason
-            active_cycle.input_runtime_safe_checkpoint = (
-                snapshot.safe_checkpoint.value
-            )
-            active_cycle.input_runtime_snapshot_revision = (
-                snapshot.snapshot_revision
-            )
+            active_cycle.input_runtime_safe_checkpoint = snapshot.safe_checkpoint.value
+            active_cycle.input_runtime_snapshot_revision = snapshot.snapshot_revision
             active_cycle.artifact_refs = list(snapshot.artifact_refs)
             active_cycle.read_artifact_refs = list(snapshot.read_artifact_refs)
             active_cycle.result_refs = list(snapshot.result_refs)
@@ -135,9 +125,8 @@ class InputRuntimeControlMixin:
             content = active_cycle.waiting_question or "input_runtime.control.waiting"
             can_resume = True
         elif unwind.action == CheckpointAction.PAUSE:
-            # AgentStatus predates IR-5 PAUSED. RUNNING is a compatibility shell;
-            # durable status remains paused_by_user and is protected from result
-            # mapping by InputAdmissionService.record_cycle_status().
+            # AgentStatus predates IR-5 PAUSED. RUNNING is only a compatibility
+            # shell; durable status remains paused_by_user.
             state.status = AgentStatus.RUNNING
             state.awaiting_user_input = False
             content = "input_runtime.control.paused"
@@ -154,10 +143,47 @@ class InputRuntimeControlMixin:
             cycle_id=active_cycle.cycle_id,
             iterations=state.iterations,
             tools_used=list(state.tools_used),
-            error=(unwind.reason_code if unwind.action == CheckpointAction.INTERRUPT else None),
-            error_kind=("runtime_control_fence" if unwind.action == CheckpointAction.INTERRUPT else None),
+            error=(
+                unwind.reason_code
+                if unwind.action == CheckpointAction.INTERRUPT
+                else None
+            ),
+            error_kind=(
+                "runtime_control_fence"
+                if unwind.action == CheckpointAction.INTERRUPT
+                else None
+            ),
             can_resume=can_resume,
             progress_events=list(state.progress_events),
+        )
+
+    def can_resume_controlled_cycle(self, *, session_id: str, cycle_id: str) -> bool:
+        session = self._get_or_create_session(session_id)
+        pending = session.pending_cycle
+        return pending is not None and str(pending.cycle_id) == cycle_id
+
+    async def resume_controlled_cycle(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+        client_type: ClientType | None = None,
+        progress_callback=None,
+        progress_locale: str = "ru",
+    ) -> AgentResult | None:
+        """Resume process-local state for the same durable cycle identity."""
+        if not self.can_resume_controlled_cycle(
+            session_id=session_id,
+            cycle_id=cycle_id,
+        ):
+            return None
+        return await self.process_query(
+            "",
+            session_id=session_id,
+            client_type=client_type,
+            progress_callback=progress_callback,
+            progress_locale=progress_locale,
+            cycle_id_override=cycle_id,
         )
 
     async def process_query(self, *args: Any, **kwargs: Any):
@@ -168,7 +194,7 @@ class InputRuntimeControlMixin:
             CycleStatus.INTERRUPTED.value,
         }:
             # A true control resume is a fresh CP-RESUME boundary for the same
-            # durable cycle even if this process saw the cycle before pausing.
+            # durable cycle even if this process saw it before pausing.
             self._input_runtime_seen_cycles.discard(str(pending.cycle_id))
         try:
             return await super().process_query(*args, **kwargs)
