@@ -22,17 +22,18 @@ last_reviewed: 2026-08-07
 
 Финальный подтверждённый IR-5 code/test boundary:
 
-- итоговый code/test HEAD:
-  `85c52d4b60a60786bdb10732eb0a52893a422eee`;
-- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
-  `0 failed`;
-- `Validate v0.4 file artifacts PR` #547 — success.
+- corrected code/test HEAD:
+  `0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`;
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
 
 IR-5 production boundary теперь гарантирует:
 
 ```text
 transport command
 → transport-neutral InputRuntimeControlService
+→ command-oriented SessionControlRepository acceptance
 → stable durable SessionControlCommand + monotonic sequence
 → pending_control_sequence
 → safe checkpoint control reducer
@@ -45,10 +46,18 @@ transport command
 следующий semantic block не начинается. `pause_requested`/`paused_by_user` input
 admitted как `QUEUE_PAUSED` без wake/auto-resume.
 
-`/continue` возобновляет тот же `cycle_id`; pre-continue paused additions
-фиксируются target watermark и drain-ятся bounded chunks через `CP-RESUME` до
-первого post-resume LLM. Continue без additions не создаёт fake input/revision;
-`WAITING_USER` без ответа возвращает `still_waiting_for_input`.
+`/continue` возобновляет тот же `cycle_id`. Repository primitive
+`accept_continue(...)` под одной короткой durable `root identity → session`
+coordination выполняет authoritative state read, exact-session control-frontier
+repair, freeze текущего `active_cycle_accepted_through_sequence`, unique control
+sequence allocation, command/index publication и pending watermark advance.
+Поэтому input, coordinated раньше continue, входит в resume target и drain-ится
+bounded chunks через `CP-RESUME` до первого post-resume LLM; input, coordinated
+после continue, не расширяет frozen target и остаётся следующему running
+checkpoint. Duplicate same-key continue сохраняет исходный ID/sequence/target,
+record-first publication crash сохраняет target и repair-ит missing pending
+watermark. Continue без additions не создаёт fake input/revision; `WAITING_USER`
+без ответа возвращает `still_waiting_for_input`.
 
 `/reset` использует durable `SessionInputRuntimeState.generation` как authority,
 повышает её ровно один раз на logical command, cancels/fences old-generation
@@ -265,6 +274,11 @@ async def begin(...)
 async def complete(...)
 async def mark_ambiguous(...)
 ```
+
+`SessionControlRepository` также предоставляет command-oriented
+`accept_continue(...)`: application передаёт source identity, а repository
+атомарно фиксирует authority-owned cycle/generation/resume target вместе с durable
+control publication. Concrete lock/layout в port не экспортируется.
 
 Generic `save(dict)`, filesystem paths, locks и serialization helpers в
 application-facing ports запрещены.
@@ -860,12 +874,12 @@ Cross-stage scenarios, которые accepted specification сохраняет,
 
 ## Статус
 
-Implemented and validated на code/test HEAD
-`85c52d4b60a60786bdb10732eb0a52893a422eee`:
+Implemented and validated на corrected code/test HEAD
+`0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`:
 
-- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
-  `0 failed`;
-- `Validate v0.4 file artifacts PR` #547 — success.
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
 
 ## Цель
 
@@ -877,6 +891,7 @@ generation/control contract без превращения in-process coordinator
 Основные production boundaries:
 
 ```text
+src/input_runtime/interfaces.py
 src/input_runtime/ir5_controls.py
 src/input_runtime/ir5_hardening.py
 src/input_runtime/ir5_checkpoints.py
@@ -887,20 +902,26 @@ src/mcp/input_runtime_controls.py
 src/api/input_runtime_controls.py
 src/api/session_reset.py
 src/core/message_processor.py
+src/servers/telegram/app.py
 src/servers/telegram/runtime_control_handlers.py
 ```
 
 Application-layer service не импортирует `Path`, filesystem layout,
 `SessionLockRegistry`, Telegram/aiogram/python-telegram-bot types. Filesystem
-coordination остаётся infrastructure adapter.
+coordination остаётся infrastructure adapter. Atomic continue acceptance выражена
+command-oriented repository port `accept_continue(...)`.
 
 ## Durable acceptance
 
 - one monotonic `sequence_number` allocated under short session coordination;
 - stable idempotency binds one source delivery to one logical command;
+- exact-session durable control frontier repair выполняется до любой новой
+  sequence allocation;
 - publication order record-first: command record → identity/index → session
   `pending_control_sequence`;
 - retry same key repairs missing pending watermark without new ID/sequence;
+- conflicting historical duplicate sequence возвращает managed consistency
+  conflict, а не silent selection;
 - rejected/cancelled/applied head records allow contiguous
   `applied_control_sequence` advancement;
 - no LLM/tool/network/Telegram await under repository coordination lock.
@@ -938,11 +959,25 @@ Input does not behave as `/continue`.
 - resumes the same durable `cycle_id` only;
 - true pause can reacquire defensive in-process execution lease for that same
   cycle after previous runner unwinds;
-- `CP-RESUME` drains every addition accepted before continue acceptance target in
-  bounded chunks, with no LLM between chunks;
-- input admitted after continue boundary remains future running checkpoint input;
+- application does not freeze target from a pre-lock state read;
+- under one shared `root identity → session` coordination boundary repository
+  loads authoritative session state, repairs control frontier, freezes current
+  `active_cycle_accepted_through_sequence`, allocates the next unique control
+  sequence, persists command/indexes and advances pending control watermark;
+- input coordinated before continue is included in frozen resume target;
+- input coordinated after continue is excluded and remains future running
+  checkpoint input;
+- no wall-clock/transport/task-creation order participates in the tie-break;
+- `CP-RESUME` drains every addition through frozen continue target in bounded
+  chunks, with no LLM between chunks;
+- duplicate same-key delivery returns the same control ID/sequence/frozen target
+  even if later input has advanced session accepted watermark;
+- continue record-first crash preserves frozen target; retry repairs missing
+  pending watermark and a later independent control receives the next sequence;
 - no-addition continue preserves original batch/context revision;
 - `WAITING_USER` without answer returns `still_waiting_for_input`;
+- `WAITING_USER` with real input coordinated before continue drains that input,
+  clears active wait after target drain and resumes RUNNING;
 - rapid `pause → continue` before pause application can reduce to running without
   phantom paused state or second runner.
 
@@ -975,38 +1010,52 @@ Effective priority:
 reset > pause > continue > ordinary input
 ```
 
-Audit order/records remain durable.
+Audit order/records remain durable. Durable `pause N → continue N+1` can
+neutralize a not-yet-applied pause even if session status projection lagged when
+continue request started.
 
 ## Deterministic tests
 
-IR-5 suites:
+IR-5 suites include:
 
 ```text
 tests/test_input_runtime_ir5_controls.py
+tests/test_input_runtime_ir5_corrective.py
+tests/test_input_runtime_ir5_continue_target.py
 tests/test_input_runtime_ir5_races.py
-tests/test_input_runtime_ir5_telegram.py
 tests/test_input_runtime_ir5_state_matrix.py
+tests/test_input_runtime_ir5_telegram.py
+tests/test_input_runtime_ir5_tool_executor.py
 ```
 
 Covered barriers/contracts:
 
 - concurrent control allocation and duplicate delivery;
 - command persisted / pending watermark write fault and retry repair;
+- competing command after record-first crash receives unique next sequence;
+- continue request held before durable `accept_continue` while input fully admits:
+  input is included in frozen target and drained before resumed LLM;
+- reverse barrier holds input before durable admission while continue fully
+  persists: target excludes late input and it stays queued to next checkpoint;
+- duplicate continue after late input preserves original ID/sequence/target;
+- continue record-first publication crash preserves target across repository
+  recreation and pending watermark repair;
 - session/snapshot control effect persisted / acknowledgement or apply marking
   fault and retry;
 - blocked fake LLM stop;
-- barrier inside complete multi-tool assistant block;
-- rapid stop/continue while LLM blocked;
+- production MCPClient multi-tool block barrier preserving all matching tool
+  results before `CP-AFTER-TOOL-BLOCK` pause;
+- rapid stop/continue while LLM blocked and pause-allocation/continue race;
 - paused input/no wake/FIFO;
 - continue same cycle with no additions and several bounded additions;
-- late post-continue input remains queued;
+- WAITING paused real-input drain, no-input WAIT and late-input boundary;
 - waiting/interrupted state matrix;
 - reset running/paused/waiting/interrupted;
 - generation exactly once and partial cleanup repair;
 - stale writer/wake fencing;
 - pause/reset vs terminal checkpoint;
 - compatibility result mapping;
-- Telegram high-priority routing and stable source identity.
+- Telegram production composition, high-priority routing and stable source identity.
 
 ## Done
 
@@ -1015,7 +1064,9 @@ Covered barriers/contracts:
 - cooperative safe-checkpoint stop with complete tool protocol;
 - durable `paused_by_user` snapshot;
 - paused FIFO input without auto-resume;
-- same-cycle continue and pre-continue drain target;
+- same-cycle continue with atomically frozen durable coordination target;
+- input-before-continue included, input-after-continue excluded;
+- duplicate/crash retry preserves original continue target;
 - durable reset generation authority and old-generation fencing;
 - legacy reset observable memory/draft behavior preserved;
 - Telegram `/stop`/`/continue` use common service; `/cancel` remains ingress-only;
@@ -1029,6 +1080,7 @@ Covered barriers/contracts:
 - не implement IR-6 durable emission lifecycle;
 - не close IR-7 late terminal window;
 - не implement IR-8 startup reconstruction/reconciliation;
+- не expand current exact-session repair into full IR-8/IR-10 corruption matrix;
 - не claim IR-9/IR-10 completion.
 
 ---
@@ -1306,6 +1358,7 @@ fix(input-runtime): close IR-3 capacity and runner handoff gaps
 fix(input-runtime): make IR-3 handoff cancellation-safe and portable
 feat(input-runtime): apply additions at safe checkpoints
 feat(input-runtime): implement IR-5 durable controls
+fix(input-runtime): linearize continue input target
 feat(input-runtime): add intermediate agent emissions
 feat(input-runtime): guard waiting and finalization races
 feat(input-runtime): recover durable active runtime state
