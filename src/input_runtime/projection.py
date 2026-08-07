@@ -3,9 +3,13 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any, Iterable
 
 from ..agent.protocol import dumps_json
+
+
+_EMISSION_ID_RE = re.compile(r"emit_[0-9a-f]{32}\Z")
 
 
 def _text_part_projection(part: Any) -> dict[str, Any]:
@@ -45,9 +49,20 @@ def _artifact_projection(batch: Any) -> list[dict[str, Any]]:
     return result
 
 
+def _reply_projection(batch: Any) -> dict[str, str] | None:
+    relation = getattr(batch, "reply_to_emission", None)
+    if not isinstance(relation, dict):
+        return None
+    emission_id = str(relation.get("emission_id") or "").strip()
+    kind = str(relation.get("kind") or "").strip()
+    if _EMISSION_ID_RE.fullmatch(emission_id) is None or kind != "intermediate":
+        return None
+    return {"emission_id": emission_id, "kind": kind}
+
+
 def project_committed_batch(batch: Any, *, cycle_sequence: int) -> dict[str, Any]:
     """Return one safe batch member while preserving canonical boundaries."""
-    return {
+    payload: dict[str, Any] = {
         "input_batch_id": str(batch.input_batch_id),
         "cycle_sequence": int(cycle_sequence),
         "text_parts": [
@@ -62,6 +77,10 @@ def project_committed_batch(batch: Any, *, cycle_sequence: int) -> dict[str, Any
             batch, "correction_of_batch_id", None
         ),
     }
+    reply_to = _reply_projection(batch)
+    if reply_to is not None:
+        payload["reply_to"] = reply_to
+    return payload
 
 
 def build_input_batch_update(
