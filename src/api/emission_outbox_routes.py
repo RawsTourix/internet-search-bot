@@ -30,6 +30,8 @@ class EmissionTransportClaimRequest(EmissionTransportAuthorityRequest):
 
 
 class EmissionTransportReceiptRequest(EmissionTransportAuthorityRequest):
+    cycle_id: str
+    generation: int
     claim_token: str
     outcome: str
     attempt_number: int
@@ -169,12 +171,8 @@ def add_emission_outbox_routes(
                 receipt = AgentEmissionDeliveryReceipt(
                     emission_id=emission_id,
                     session_id=body.session_id,
-                    cycle_id=(
-                        # The repository verifies this against immutable authority.
-                        # Worker repeats the exact cycle from the claimed record.
-                        str(getattr(body, "cycle_id", "") or "")
-                    ),
-                    generation=int(getattr(body, "generation", -1)),
+                    cycle_id=body.cycle_id,
+                    generation=body.generation,
                     claim_token=body.claim_token,
                     attempt_number=body.attempt_number,
                     client_type=normalized_client,
