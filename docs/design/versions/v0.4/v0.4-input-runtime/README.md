@@ -11,9 +11,57 @@ last_reviewed: 2026-08-07
 
 ## Статус реализации
 
-`IR-1`, `IR-2`, `IR-3` и `IR-4` реализованы и подтверждены CI. Этапы
-`IR-5`—`IR-10` остаются planned, поэтому общий update сохраняет статус
+`IR-1`, `IR-2`, `IR-3`, `IR-4` и `IR-5` реализованы и подтверждены CI. Этапы
+`IR-6`—`IR-10` остаются planned, поэтому общий update сохраняет статус
 `partial`.
+
+Финальный IR-5 code/test evidence:
+
+- итоговый code/test HEAD:
+  `85c52d4b60a60786bdb10732eb0a52893a422eee`;
+- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #547 — success.
+
+IR-5 добавил transport-neutral durable control service и сделал
+`SessionInputRuntimeState + SessionControlCommand + ActiveCycleSnapshot`
+semantic authority для `/stop`, `/continue` и `/reset`. Control sequence
+выделяется под короткой session coordination boundary, stable idempotency не
+создаёт второй logical command, а `pending_control_sequence` и
+`applied_control_sequence` работают как monotonic contiguous watermarks.
+
+Checkpoint reducer фиксирует pending-control watermark на входе и применяет
+controls до ordinary input. Cooperative `/stop` не force-cancel LLM/tool await:
+текущий bounded LLM attempt или полный assistant multi-tool block завершается
+protocol-valid, после чего snapshot фиксируется как `paused_by_user` без потери
+messages, context lineage, plan/artifact/result refs. Input во время
+`pause_requested/paused_by_user` получает `QUEUE_PAUSED`, durable FIFO admission
+и не будит runner.
+
+`/continue` возобновляет **тот же** cycle. Continue boundary сохраняет accepted
+input target; все paused additions, accepted до этой boundary, drain-ятся bounded
+chunks через `CP-RESUME` до первого meaningful post-resume LLM. Более поздний
+input остаётся следующему running checkpoint. Continue без additions не создаёт
+фиктивный input update или лишнюю context revision. `WAITING_USER` без нового
+ответа возвращает `still_waiting_for_input`.
+
+`/reset` повышает durable session generation ровно один раз на logical reset,
+fences old-generation writer/wake, отменяет старые queued admissions/inbox/
+pending controls/snapshot/finalization/emission records и очищает mutable session
+memory только после safe in-process execution lease boundary. Coordinator лишь
+синхронизируется с уже durable generation и не является authority.
+
+Telegram `/stop` и `/continue` — отдельные high-priority runtime handlers. Они
+используют тот же conversation/thread resolution, stable source command identity
+и общий Gateway/application service; `/cancel` остаётся ingress collection
+command.
+
+IR-5 намеренно закрывает только checkpoint-level control suppression. Если
+pause/reset уже виден `CP-BEFORE-TERMINAL-COMMIT`, stale candidate подавляется.
+Late race `последний checkpoint/recheck → новый control/input → terminal commit`
+остаётся IR-7 и требует durable `CycleFinalizationRecord` barrier. Startup-wide
+reconstruction/reconciliation остаётся IR-8. Полная corruption/recovery matrix
+вокруг `recover_cycle_authority()` остаётся IR-8/IR-10.
 
 Финальный IR-4 code/test evidence:
 
@@ -108,21 +156,13 @@ IR-4 добавил active-context ownership поверх этой admission bou
   checkpoint-level: accepted-at-entry mismatch заставляет применить input и
   продолжить cycle вместо публикации устаревшего candidate.
 
-Граница IR-4 намеренно не расширяется до следующих stages. Late input в окне
-после checkpoint-level final recheck и перед durable terminal commit остаётся
-race IR-7 и требует durable finalization barrier. Ambiguous handoff/startup
-reconciliation остаётся IR-8. Полная corruption/recovery matrix вокруг
-`recover_cycle_authority()` остаётся IR-8/IR-10 и не считается закрытой IR-4.
-
 Явно **не реализованы** на текущем baseline:
 
-- IR-5 durable controls;
-- `/stop`;
-- `/continue`;
-- redesign `/reset` на общий durable generation/control contract;
-- IR-6 durable `AgentEmission`;
-- IR-7 durable finalization barrier;
-- IR-8 startup recovery/reconciliation;
+- IR-6 durable `AgentEmission` и delivery lifecycle;
+- IR-7 durable finalization barrier и полный terminal phase machine;
+- IR-8 startup recovery/reconciliation и process-restart cycle reconstruction;
+- IR-9 complete diagnostics/client projection completion;
+- IR-10 full randomized/restart/synthetic/live acceptance;
 - scheduler и parallel branches/fork-join semantics;
 - Telegram history rewind по edited message.
 
@@ -176,28 +216,31 @@ workflow revisions и scheduler поверх той же admission boundary.
 
 ## Текущий baseline
 
-В ветке `feature` уже существуют важные переходные foundations:
+В рабочей ветке уже существуют важные foundations и IR-1—IR-5 implementation:
 
 - immutable `CommittedInputBatch` и durable ingress;
-- `SessionExecutionCoordinator` с in-process FIFO lane, run lease и generation;
+- `SessionExecutionCoordinator` с defensive in-process run lease/wake/generation
+  cache, но без durable semantic authority;
 - один active cycle на session на уровне текущего API orchestration;
 - durable admission/FIFO `CycleInbox` для additions активного cycle;
 - initial `R1`, linear context revisions, durable active-cycle snapshot и applied
   input watermarks;
 - protocol-safe checkpoints и common FIFO apply для running/WAITING additions;
-- `ProgressEvent`, durable `OutputBatch`, client capabilities и delivery receipts;
-- существующий compatibility `/reset`, который инвалидирует queued work и ждёт
-  runtime boundary перед очисткой памяти.
+- durable `SessionControlCommand`, control watermarks и generation fencing;
+- cooperative pause/resume/reset через общий application control service;
+- paused additions без auto-resume и same-cycle continue;
+- Telegram `/stop`/`/continue` через transport-neutral Gateway boundary;
+- `ProgressEvent`, durable `OutputBatch`, client capabilities и delivery receipts.
 
 Эти foundations всё ещё не являются полным input runtime:
 
-- `SessionExecutionCoordinator` остаётся in-process lease/wakeup layer, а durable
-  input authority принадлежит admission/inbox/snapshot repositories;
-- durable control plane для pause/resume/reset ещё не реализован;
-- intermediate agent message пока не является отдельной durable interaction;
-- checkpoint-level stale candidate suppression ещё не является durable
-  finalization barrier;
-- startup recovery ambiguous handoff/claim authority ещё не реализован.
+- durable intermediate agent message пока не является отдельной completed
+  interaction lifecycle (IR-6);
+- checkpoint-level stale candidate/control suppression ещё не является durable
+  finalization barrier (IR-7);
+- startup recovery ambiguous handoff/claim/control authority ещё не реализован
+  (IR-8);
+- full diagnostics/randomized/restart/live acceptance остаются IR-9/IR-10.
 
 Обновление должно мигрировать существующее поведение постепенно, без большого
 rewrite `src/mcp/mcp_client.py`. Полная декомпозиция ownership выполняется в
@@ -245,6 +288,9 @@ Interaction / Delivery
 
 Она не удерживается во время LLM request, tool call, compaction, чтения больших
 payloads или client delivery.
+
+IR-5 реализует control acceptance/reset generation transition под этой короткой
+boundary. LLM/tool/Telegram delivery и ожидание atomic block выполняются вне неё.
 
 ## Основные инварианты
 
@@ -305,6 +351,9 @@ payloads или client delivery.
 - startup recovery и diagnostics;
 - unit, race, randomized, restart, synthetic и live acceptance.
 
+IR-1—IR-5 уже покрывают первые control/input runtime slices этого scope;
+оставшиеся пункты реализуются IR-6—IR-10.
+
 ## Non-goals
 
 В update не входят:
@@ -342,6 +391,8 @@ FinalizationRepository
 Filesystem implementations принадлежат `v0.4`. PostgreSQL implementations
 `v0.5` сохраняют те же IDs, transitions, idempotency keys и ownership relations,
 но заменяют короткую filesystem coordination boundary транзакцией/row locking.
+IR-5 application control/checkpoint layers не зависят от `Path`, filesystem
+layout, Telegram types или concrete lock registry.
 
 ## Подготовка v0.6
 
@@ -380,3 +431,6 @@ Update считается завершённым только после:
 - live проверки Telegram `/stop`, `/continue`, addenda и intermediate emissions;
 - подтверждения отсутствия regression в batch/artifact/output flows;
 - актуализации v0.4/current/roadmap documentation.
+
+IR-5 implementation не меняет эту release boundary: общий update остаётся
+`partial` до IR-6—IR-10.
