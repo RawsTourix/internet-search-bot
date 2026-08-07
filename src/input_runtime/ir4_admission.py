@@ -1,10 +1,15 @@
-"""IR-4/IR-5 admission facade and runtime compatibility boundary."""
+"""IR-4/IR-6 admission facade and runtime compatibility boundary."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
 from .composition import register_input_runtime_binding
+from .emissions import (
+    AgentEmissionOutboxService,
+    AgentEmissionService,
+    ReplyAwareCommittedBatchReader,
+)
 from .errors import InputRuntimeConflictError
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
 from .handoff import RuntimeHandoffState
@@ -26,14 +31,29 @@ class DeferredWaitingApply:
 
 
 class InputAdmissionService(_IR3InputAdmissionService):
-    """Expose the IR-4 FIFO and IR-5 durable control services as one boundary."""
+    """Expose FIFO, controls and durable semantic emissions as one boundary."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
+        self.emission_service = AgentEmissionService(
+            config=self.config,
+            repository=self.repositories.emissions,
+            committed_batches=self.committed_batches,
+            clock=self.clock,
+        )
+        self.emission_outbox_service = AgentEmissionOutboxService(
+            self.repositories.emissions,
+            clock=self.clock,
+            claim_lease_seconds=self.config.claim_lease_seconds,
+        )
+        self.reply_aware_committed_batches = ReplyAwareCommittedBatchReader(
+            self.committed_batches,
+            self.repositories.emissions,
+        )
         self.cycle_input_applier = DurableClaimCycleInputApplier(
             config=self.config,
             repositories=self.repositories,
-            committed_batches=self.committed_batches,
+            committed_batches=self.reply_aware_committed_batches,
             clock=self.clock,
         )
         self.control_service = HardenedInputRuntimeControlService(
@@ -50,6 +70,8 @@ class InputAdmissionService(_IR3InputAdmissionService):
             repositories=self.repositories,
             committed_batches=self.committed_batches,
             checkpoint_service=self.checkpoint_service,
+            emission_service=self.emission_service,
+            emission_outbox_service=self.emission_outbox_service,
         )
 
     async def mark_initial_batch_applied(self, admission):
@@ -81,8 +103,8 @@ class InputAdmissionService(_IR3InputAdmissionService):
         """Compatibility result mapping may not overwrite IR-5 authority.
 
         A paused cycle deliberately unwinds through an AgentResult shape which
-        predates a PAUSED status.  Reset can also leave an old runner returning
-        after the durable generation has advanced.  In both cases durable input
+        predates a PAUSED status. Reset can also leave an old runner returning
+        after the durable generation has advanced. In both cases durable input
         runtime state wins over the compatibility result.
         """
         state = await self.repositories.sessions.get(session_id)
