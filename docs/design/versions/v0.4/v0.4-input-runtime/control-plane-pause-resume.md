@@ -11,17 +11,18 @@ last_reviewed: 2026-08-07
 
 ## Implementation evidence
 
-IR-5 control-plane slice реализован и подтверждён на code/test HEAD
-`85c52d4b60a60786bdb10732eb0a52893a422eee`:
+IR-5 control-plane slice реализован и подтверждён на corrected code/test HEAD
+`0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`:
 
-- `Validate Input Runtime` #173 — success, compile success, `278 passed`,
-  `0 failed`;
-- `Validate v0.4 file artifacts PR` #547 — success;
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success;
 - deterministic tests покрывают concurrent sequence allocation, duplicate
   deliveries, record-first publication repair, pause/continue marker crash
-  windows, blocked LLM, complete multi-tool block, rapid stop/continue, paused
-  FIFO additions, same-cycle resume, reset generation/cleanup fencing,
-  reset/pause vs `CP-BEFORE-TERMINAL-COMMIT` и Telegram source identity.
+  windows, blocked LLM, production multi-tool block, rapid stop/continue, paused
+  FIFO additions, atomic continue-target ordering в обе стороны, duplicate frozen
+  target, continue publication crash, same-cycle resume, reset generation/cleanup
+  fencing, reset/pause vs `CP-BEFORE-TERMINAL-COMMIT` и Telegram source identity.
 
 `SessionInputRuntimeState + SessionControlCommand + ActiveCycleSnapshot` являются
 durable semantic authority. `SessionExecutionCoordinator` остаётся defensive
@@ -144,9 +145,9 @@ record pause
 
 Почему завершается весь block: сохранение OpenAI-compatible sequence и отсутствие
 частично исполненного assistant message важнее минимальной latency остановки.
-Deterministic barrier test удерживает выполнение внутри multi-tool block,
-принимает pause, затем проверяет полный `assistant → tool → tool` history и
-отсутствие следующего LLM.
+Deterministic production-loop barrier test удерживает выполнение внутри второго
+tool call, принимает pause, затем проверяет полный `assistant → tool → tool`
+history и отсутствие следующего LLM.
 
 ### Во время compaction/final processing
 
@@ -167,6 +168,47 @@ paused_by_user
 
 Все additions, отправленные во время паузы, сохраняются, но сами не запускают
 runner.
+
+### Atomic continue acceptance target
+
+Resume target замораживается **атомарно внутри durable session coordination**,
+которая уже упорядочивает input admissions и control allocation:
+
+```text
+acquire root identity → session coordination
+→ load authoritative SessionInputRuntimeState
+→ repair exact-session control frontier
+→ observe active cycle / generation / accepted input watermark
+→ freeze accepted_input_through_sequence in SessionControlCommand
+→ allocate next unique control sequence
+→ persist command + indexes
+→ advance pending_control_sequence
+→ release coordination
+```
+
+Эта boundary не содержит LLM/MCP/network/Telegram await.
+
+Tie-break определяется только фактическим durable coordination order:
+
+```text
+input coordinated before continue
+→ input included in continue resume target
+
+continue coordinated before input
+→ input excluded from that target
+→ input remains for next ordinary running checkpoint
+```
+
+Transport arrival time, Telegram update order, wall clock, порядок создания
+`asyncio` tasks, state read до lock и повторный state read после durable continue
+не являются authority этой границы.
+
+Duplicate той же continue delivery возвращает тот же durable control ID,
+sequence и уже frozen input target: поздний input не расширяет старую resume
+boundary задним числом. Если continue record уже durable, а запись
+`pending_control_sequence` упала, retry восстанавливает watermark и сохраняет
+тот же frozen target; следующая independent command получает следующую unique
+control sequence.
 
 ### Continue without additions
 
@@ -202,13 +244,14 @@ CommittedInputBatch
 ```
 
 Несколько batches сохраняют FIFO order. Continue command durable metadata
-фиксирует accepted input target на coordination boundary. `CP-RESUME` применяет
-все additions до этого target в bounded chunks по существующим
+фиксирует accepted input target внутри той же coordination boundary, которая
+определяет порядок относительно admission. `CP-RESUME` применяет все additions до
+этого target в bounded chunks по существующим
 `max_batches_per_checkpoint`/`max_batch_bytes_per_checkpoint`; между chunks нет
 LLM request.
 
-Additions, admitted после `/continue` boundary, не затягиваются в initial resume
-drain и обрабатываются обычным running checkpoint.
+Additions, coordinated после durable `/continue` boundary, не затягиваются в
+initial resume drain и обрабатываются обычным running checkpoint.
 
 ## `/reset` semantics
 
@@ -255,7 +298,8 @@ client_type
 ```
 
 Повторная доставка одной команды возвращает прежний durable command/outcome.
-Один key не может молча изменить command/source relation.
+Один key не может молча изменить command/source relation. Для `/continue`
+repository-owned frozen target не пересчитывается при duplicate delivery.
 
 Для Web/first-party API рекомендуется explicit `Idempotency-Key`.
 
@@ -267,7 +311,8 @@ unsafe `read max → await → max+1`.
 Filesystem IR-5 publication:
 
 ```text
-allocate monotonic sequence
+repair exact-session durable frontier
+→ allocate monotonic sequence
 → persist SessionControlCommand
 → persist/index identity
 → advance SessionInputRuntimeState.pending_control_sequence
@@ -275,9 +320,11 @@ allocate monotonic sequence
 ```
 
 Если record уже durable, а pending-watermark write упал, retry того же key
-находит тот же record/sequence и repair-ит missing watermark. Control application
-сначала сохраняет state/snapshot effect, затем marking; retry не дублирует
-pause/resume/reset effect.
+находит тот же record/sequence и repair-ит missing watermark. Для continue такой
+retry также сохраняет уже durable frozen input target. Competing новая command
+сначала восстанавливает authoritative frontier, поэтому sequence уже
+опубликованного record не переиспользуется. Control application сначала сохраняет
+state/snapshot effect, затем marking; retry не дублирует pause/resume/reset effect.
 
 `applied_control_sequence <= pending_control_sequence`. Applied watermark
 продвигается только через contiguous terminal control records (`applied`,
@@ -332,8 +379,14 @@ Audit sequence не теряется. Rapid `pause → continue` может да
 
 ### Continue vs new input
 
-Input admitted до coordination snapshot `/continue` применяется в initial resume
-drain. Поздний input остаётся running checkpoint.
+Определяющим является не transport arrival, а shared durable coordination:
+
+- input получает coordination раньше continue — его accepted watermark входит в
+  frozen continue target и он применяется в initial `CP-RESUME` drain;
+- continue получает coordination раньше input — target замораживается без этого
+  input, а поздний admission остаётся queued до следующего running checkpoint.
+
+После persistence target не расширяется reread-ом более нового session state.
 
 ### Stop vs finalization
 
@@ -352,8 +405,9 @@ IR-7.
 ### Stop and continue arrive rapidly
 
 Records сохраняются по sequence. Effective reducer учитывает generation и current
-state. Если `continue` следует за ещё не применённым `pause`, итогом может быть
-`running` без observable paused state, но обе команды остаются в audit.
+state. Если durable `continue` следует за ещё не применённым durable `pause`,
+итогом может быть `running` без observable paused state, но обе команды остаются
+в audit. Atomic continue target не меняет эту rapid-control semantics.
 
 ## API contract
 
@@ -368,6 +422,11 @@ request_reset(...)
 Каждая команда принимает `session_id`, stable `idempotency_key`,
 `source_client_type`, safe `source_message_ref` и optional reason metadata и
 возвращает structured `ControlOutcome` с durable `SessionControlCommand`.
+
+Application layer не импортирует filesystem details. Command-oriented
+`SessionControlRepository.accept_continue(...)` владеет атомарным freeze target
+и publication protocol; конкретный filesystem lock/layout остаётся adapter
+implementation detail.
 
 Adapters не читают `MCPClient.session_states` напрямую для принятия semantic
 решения.
@@ -405,6 +464,13 @@ IR-5 deterministic acceptance подтверждает:
 - после applied pause не начинается новый LLM/tool block;
 - additions during pause admitted FIFO without auto-resume/wake;
 - `/continue` resumes same cycle and applies pre-continue queued additions;
+- continue target атомарно фиксируется shared durable coordination order;
+- input-before-continue включается в resume target, input-after-continue остаётся
+  следующему ordinary running checkpoint;
+- duplicate continue сохраняет исходный control ID/sequence/frozen target даже
+  после late input;
+- record-first continue crash сохраняет frozen target и repair-ит pending control
+  watermark без duplicate sequence;
 - continue without additions не создаёт fake semantic revision;
 - duplicate `/stop`/`/continue`/`/reset` сохраняют logical identity;
 - `/continue` не заменяет missing answer в `waiting_user`;
@@ -420,5 +486,5 @@ Deferred acceptance:
 - IR-7 final atomic accepted/control-vs-terminal persistence barrier;
 - IR-8 startup reconstruction/reconciliation;
 - IR-9 complete diagnostics/client projections;
-- IR-10 randomized/restart/synthetic/live roast;
+- IR-10 randomized/restart/synthetic/live roast и full corruption matrix;
 - Telegram history rewind.
