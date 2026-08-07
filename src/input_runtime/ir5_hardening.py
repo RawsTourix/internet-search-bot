@@ -95,34 +95,26 @@ class HardenedInputRuntimeControlService(InputRuntimeControlService):
                 effective_cycle_status=state.cycle_status,
             )
 
-        state = await self._state(session_id)
-        inactive = state.cycle_status in _TERMINAL_OR_IDLE or state.active_cycle_id is None
-        target = state.active_cycle_id or self._inactive_target(session_id)
+        # The target cycle, generation and resume input watermark below are
+        # placeholders only. accept_continue() replaces all authority-owned
+        # fields while holding the same durable session coordination boundary
+        # used by input admission. This prevents a pre-lock state read from
+        # defining which input belongs to the resume boundary.
         command = SessionControlCommand(
             control_id=self.control_id_factory(),
             session_id=session_id,
-            target_cycle_id=target,
-            generation=state.generation,
+            target_cycle_id=self._inactive_target(session_id),
+            generation=0,
             sequence_number=1,
             command=ControlCommandType.CONTINUE,
-            # Active-cycle classification happens only after allocation, when
-            # durable sequence order is fixed. Inactive sessions are stable no-op.
-            state=ControlState.REJECTED if inactive else ControlState.QUEUED,
+            state=ControlState.QUEUED,
             idempotency_key=idempotency_key,
             source_client_type=source_client_type,
-            source_message_ref=self._source_ref(
-                source_message_ref,
-                accepted_input_through_sequence=(
-                    state.active_cycle_accepted_through_sequence
-                    if not inactive
-                    else None
-                ),
-            ),
+            source_message_ref=self._source_ref(source_message_ref),
             reason=reason,
             created_at=self._now(),
-            rejection_code="nothing_to_continue" if inactive else None,
         )
-        allocated = await self.repositories.controls.allocate(command)  # type: ignore[attr-defined]
+        allocated = await self.repositories.controls.accept_continue(command)  # type: ignore[attr-defined]
         if allocated.state == ControlState.REJECTED:
             await self._advance_applied_watermark(session_id)
             latest = await self._state(session_id)
