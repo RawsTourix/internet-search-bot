@@ -29,6 +29,11 @@ file-artifacts-advanced и batch-workflows. `v0.4-input-runtime` остаётс�
   terminal collection snapshot;
 - durable `CommittedInputBatch` admission, one active cycle, FIFO `CycleInbox`,
   initial `R1`, active snapshot и protocol-safe input checkpoints;
+- admission-vs-terminal linearization на durable repository coordination:
+  admission allocation, выигравший первым, продвигает accepted watermark и
+  abort-ит stale finalization; terminal authority, выигравшая первой, заставляет
+  discard stale optimistic active-cycle classification и reclassify тот же
+  committed batch как `START_CYCLE` без transport retry;
 - durable pause/continue/reset controls с monotonic watermarks, cooperative
   `/stop`, same-cycle `/continue`, atomic frozen resume target и generation fence;
 - explicit durable semantic intermediate `AgentEmission` через manager tool
@@ -294,6 +299,18 @@ abort оставляет `RuntimeHandoff=HANDED_OFF`, stale output закрыт,
 может продолжить LLM/tool работу. После durable `RuntimeHandoff=COMPLETED` никакой
 новый LLM/tool side effect этого invocation не запускается.
 
+Admission и terminal commit также упорядочены той же durable `root identity →
+session` coordination boundary. Application state read остаётся optimistic и не
+является tie-break. Если admission allocation к cycle A получает durable boundary
+первым, accepted watermark продвигается и second terminal recheck abort-ит stale
+finalization как `ABORTED_NEW_INPUT`. Если terminal authority получает boundary
+первой, stale non-start candidate отвергается **до** admission/index/inbox/state
+write специальным managed stale-decision conflict; тот же in-process admission
+call один раз перечитывает authoritative state, заново вычисляет kind/action/
+capacity/target и создаёт ровно один `START_CYCLE` admission для нового cycle B.
+Transport retry и IR-8 committed-but-unadmitted recovery для этой normal live race
+не требуются. Arbitrary corruption/consistency conflicts этим retry не маскируются.
+
 `RESULT_PERSISTED` и `OUTPUT_READY` не являются delivery authority. Final
 `OutputBatch` скрыт из ready outbox и отвергается claim service до durable
 `TERMINAL_COMMITTED`. Для normal admitted-run path delivery gate дополнительно
@@ -328,15 +345,16 @@ commit linearized первым, новый old-cycle READY claim не старт
 
 Corrected IR-7 code/test boundary:
 
-- `eb93918b33ce7503d0e2d5d032b7e600f51e5661`;
-- `Validate Input Runtime` #387 — success, production compile success,
-  `384 passed`, `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #654 — success;
+- `6bd0dce0018b20520ed28236211fccdf0a8075fb`;
+- `Validate Input Runtime` #417 — success, production compile success,
+  `387 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #669 — success;
 - workflow сохраняет `permissions: contents: read`;
-- corrective tests детерминированно покрывают handoff completion fault, exact
-  handoff→snapshot→session→terminal-marker ordering, output worker до completion,
-  completed-handoff/incomplete-terminal direct retry, late input/control abort до
-  completion и cancellation по обе стороны durable handoff completion.
+- previous eight handoff-ordering tests остаются green;
+- три новые deterministic admission/terminal tests покрывают terminal-first
+  transparent `START_CYCLE` reclassification, admission-first
+  `ABORTED_NEW_INPUT` и pre-write managed stale-decision/no-raw-ValidationError
+  contract.
 
 IR-7 не добавляет startup scanner/reconstruction coordinator. Startup recovery,
 paused/interrupted/waiting runner reconstruction и global UNKNOWN/handoff
@@ -391,12 +409,16 @@ IR-10.
     successful admitted-run terminalization сначала durable завершает matching
     RuntimeHandoff, затем пишет terminal snapshot/session и только потом
     `CycleFinalizationRecord=TERMINAL_COMMITTED`.
-11. До terminal/waiting commit любой durable accepted input/control имеет право
+11. Durable admission allocation и terminal commit linearized одним session
+    ordering point: admission-first подавляет stale terminal candidate;
+    terminal-first reclassifies тот же committed batch в новый cycle без ошибки и
+    без transport retry.
+12. До terminal/waiting commit любой durable accepted input/control имеет право
     подавить stale candidate; после terminal commit новый ordinary input создаёт
     новую cycle-level работу.
-12. Filesystem adapters скрыты за command-oriented ports; application services не
+13. Filesystem adapters скрыты за command-oriented ports; application services не
     импортируют Path/layout/locks и сохраняют PostgreSQL v0.5 portability.
-13. Scheduler/branches не реализуются до отдельной orchestration layer.
+14. Scheduler/branches не реализуются до отдельной orchestration layer.
 
 ## Next implementation stage
 
