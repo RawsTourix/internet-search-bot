@@ -17,9 +17,66 @@ last_reviewed: 2026-08-08
 - `IR-4 — Active snapshot, checkpoints и CycleInputApplier`: implemented;
 - `IR-5 — Durable control plane /stop, /continue, /reset`: implemented and validated;
 - `IR-6 — AgentEmission и intermediate messages`: implemented and validated;
-- `IR-7`—`IR-10`: planned.
+- `IR-7 — Finalization barrier`: implemented and validated;
+- `IR-8`—`IR-10`: planned.
 
 Общий `v0.4-input-runtime` остаётся `partial`.
+
+Финальный подтверждённый IR-7 code/test boundary:
+
+- code/test HEAD:
+  `c58ab05c8354d7e76d4176e39ebf481edc4c613b`;
+- `Validate Input Runtime` #355 — success, production compile success,
+  `376 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #638 — success.
+
+IR-7 production boundary гарантирует:
+
+```text
+DONE candidate
+→ CP-BEFORE-FINAL-PROCESSING
+→ exact candidate authority
+→ final processing without terminal reservation
+→ PREPARED + short authoritative recheck
+→ FINALIZING
+→ RESULT_PERSISTED
+→ normal final OutputBatch persisted / OUTPUT_READY
+→ second authoritative recheck
+→ TERMINAL_COMMITTED
+→ output claim/delivery becomes eligible
+```
+
+Terminal eligibility использует authoritative accepted/applied input watermarks,
+pending/applied control watermarks, generation, active-cycle ownership и exact
+finalization identity. Любой late durable input/control до terminal commit
+abort-ит stale finalization; duplicate delivery без watermark transition не даёт
+phantom abort.
+
+Persisted result и `OutputBatch READY` сами не являются terminal authority.
+Ready outbox и direct claim закрыты до `TERMINAL_COMMITTED`; stale/aborted output
+не становится deliverable и освобождает unclaimed cycle-final identity для
+следующего корректного same-cycle final result.
+
+Filesystem commit использует короткий exact-session lock и пишет finalization
+terminal marker последним. Repository recreation/direct retry сходится к одной
+logical finalization/result/output/terminal authority. Partial terminal
+snapshot/session window не открывает delivery преждевременно; late input/control
+может выиграть до marker и repair-ить stale snapshot при controlled abort.
+
+WAITING candidate получает отдельный barrier
+`CP-BEFORE-WAITING → exact input/control recheck → one durable question authority
+→ WAITING_USER`. Input/control до waiting commit suppresses stale question; input
+после commit идёт существующим same-cycle `RESUME_WAITING` path.
+
+IR-6 emission READY claim и IR-7 terminal commit linearizable через один
+exact-session coordination ordering: claim-first attempt legitimately остаётся
+DELIVERING, terminal-first запрещает новый old-cycle claim. Network/LLM/tool await
+под этим lock не выполняется.
+
+Deterministic IR-7 tests покрывают finalization phases, waiting/control/reset,
+output gate, claim-vs-terminal ordering и direct crash/replay через explicit
+events/fault injection/repository recreation. Real LLM/MCP/Telegram/Web/internet
+calls не используются.
 
 Финальный подтверждённый IR-6 code/test boundary:
 
@@ -68,7 +125,7 @@ Reset fences old generation как `READY → CANCELLED` и
 `DELIVERING → UNKNOWN`; stale claim writer не может завершить reset record.
 Sequential terminal fencing отвергает новый emission после terminal state и не
 начинает READY delivery после уже-visible terminal. Atomic concurrent
-`claim ↔ terminal/finalization commit` остаётся IR-7.
+`claim ↔ terminal/finalization commit` закрыт IR-7 общей exact-session authority.
 
 Deterministic IR-6 tests покрывают duplicate/concurrent manager calls, fake-clock
 policy, record/index crash recovery, cancellation после READY, lost claim/receipt
@@ -121,7 +178,7 @@ records и синхронизирует defensive in-process coordinator тол�
 transition. Mutable session memory очищается после safe execution lease boundary.
 
 Checkpoint-level pause/reset suppression перед terminal transition реализовано,
-но late terminal race после последнего checkpoint recheck остаётся IR-7.
+а IR-7 добавляет repeated authoritative recheck и закрывает late terminal race.
 Startup-wide runner reconstruction/reconciliation остаётся IR-8. Полная corruption
 matrix `recover_cycle_authority()` остаётся IR-8/IR-10.
 
@@ -200,10 +257,8 @@ Cancellation contract IR-3:
 - cleanup запускается отдельной task, ожидается через `asyncio.shield`, завершается
   даже при повторной cancellation, затем исходный `CancelledError` re-raise-ится.
 
-После IR-6 следующие mandatory contracts остаются:
+После IR-7 следующие mandatory contracts остаются:
 
-- IR-7: durable finalization barrier, закрывающий late terminal и
-  concurrent claim/finalization race;
 - IR-8: ambiguous/startup recovery policy без blind replay;
 - IR-9: complete client projections/diagnostics/config examples;
 - IR-10: full race/restart/synthetic/live acceptance, включая corruption matrix.
@@ -803,7 +858,7 @@ Accepted IR-4 protocol сохраняется:
   linear context revision;
 - несколько contiguous batches внутри range сохраняют batch boundaries и ordered
   `cycle_sequence`;
-- IR-6 теперь отдельно реализует durable `AgentEmission`; emission persistence не
+- IR-6 отдельно реализует durable `AgentEmission`; emission persistence не
   участвует в input revision/watermark protocol;
 - checkpoint outcomes/runtime traces не подменяют IR-6 semantic emissions.
 
@@ -872,8 +927,9 @@ IR-4 не ослабляет handoff authority ради terminal persistence.
 опережает applied context, stale candidate подавляется, input применяется и cycle
 продолжается.
 
-Это **не** durable IR-7 finalization barrier. Late input после последнего
-checkpoint observation и до terminal commit остаётся IR-7 race.
+IR-7 дополняет, а не заменяет эту первую линию защиты: late durable input/control
+после checkpoint observation и до terminal/waiting commit теперь проверяется
+repeated authoritative barrier.
 
 ## Tests
 
@@ -897,11 +953,10 @@ checkpoint observation и до terminal commit остаётся IR-7 race.
 - protocol-valid tool sequence;
 - handoff completion before terminal snapshot sync.
 
-Cross-stage scenarios, которые accepted specification сохраняет, но IR-4 не
-объявляет закрытыми:
+Cross-stage scenarios:
 
 - ambiguous IR-3 handoff/startup claim reconciliation — IR-8;
-- late terminal race/durable output barrier — IR-7;
+- late terminal race/durable output barrier — реализован IR-7;
 - `recover_cycle_authority()` corruption/restart matrix — IR-8/IR-10.
 
 ## Done
@@ -922,7 +977,7 @@ Cross-stage scenarios, которые accepted specification сохраняет,
 - не create parallel task/branch;
 - не reset plan automatically;
 - не реализовывать IR-5 controls в IR-4;
-- не считать checkpoint suppression IR-7 finalization barrier;
+- не смешивать checkpoint suppression и durable finalization ownership;
 - не притягивать IR-8 startup/ambiguous recovery в IR-4.
 
 ---
@@ -1046,9 +1101,10 @@ Process-restart runner reconstruction остаётся IR-8.
 - durable generation is authority and advances exactly once per logical reset;
 - same-key duplicate does not advance generation twice;
 - partial old-generation cleanup failure is retried against same reset record;
-- old admissions/inbox/pending controls/snapshot/dormant finalization/emission
+- old admissions/inbox/pending controls/snapshot/finalization/emission
   records are cancelled/fenced;
-- stale old-generation checkpoint writer cannot regain current session authority;
+- stale old-generation checkpoint/finalization writer cannot regain current
+  session authority;
 - stale generation/cycle wake cannot wake new work;
 - coordinator synchronizes to already-durable generation;
 - open ingress drafts/collections are cancelled;
@@ -1135,7 +1191,7 @@ Covered barriers/contracts:
 - не reinterpret `/cancel` as runtime stop;
 - не promise force cancellation confirmed external side effects;
 - IR-6 durable emissions реализованы отдельным stage и не принадлежат IR-5;
-- не close IR-7 late terminal window;
+- IR-7 finalization barrier реализован отдельно и не принадлежит IR-5;
 - не implement IR-8 startup reconstruction/reconciliation;
 - не expand current exact-session repair into full IR-8/IR-10 corruption matrix;
 - не claim IR-9/IR-10 completion.
@@ -1250,9 +1306,9 @@ blind-retry-ится.
 - reset: old READY → CANCELLED; old DELIVERING → UNKNOWN;
 - stale old-generation claim writer fenced;
 - already terminal cycle rejects new emission;
-- READY emission не начинает новую delivery после already-visible terminal state.
-
-Atomic concurrent claim-vs-terminal closure остаётся IR-7.
+- READY emission не начинает новую delivery после already-visible terminal state;
+- concurrent READY claim vs terminal commit теперь упорядочен IR-7 общей
+  exact-session authority, без network await под lock.
 
 ## Telegram и reply binding
 
@@ -1315,7 +1371,7 @@ Covered critical windows:
 
 - не convert all progress to emissions;
 - не migrate question finalization;
-- не implement IR-7 finalization barrier;
+- IR-7 finalization barrier реализован отдельным stage и не принадлежит IR-6;
 - не implement IR-8 startup reconstruction/reconciliation;
 - не build IR-9 full timeline/status/Web UX;
 - не run IR-10 full randomized/live roast;
@@ -1328,51 +1384,177 @@ Covered critical windows:
 
 ## Статус
 
-Planned. IR-4/IR-5 реализуют checkpoint-level stale input/control candidate
-suppression, а IR-6 — sequential terminal emission fence. Durable finalization
-barrier и concurrent terminal race closure отсутствуют.
+Implemented and validated на code/test HEAD
+`c58ab05c8354d7e76d4176e39ebf481edc4c613b`:
+
+- `Validate Input Runtime` #355 — success, production compile success,
+  `376 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #638 — success.
 
 ## Цель
 
-Не допустить stale final/waiting response, игнорирующий accepted input/control,
-и атомарно закрыть terminal/finalization visibility races.
+Не допустить stale final/waiting response, игнорирующий durable accepted
+input/control, и линейно упорядочить terminal visibility, final output delivery и
+IR-6 semantic emission claim.
 
-## Mandatory contract
+## Реализованный ownership
 
-Pending accepted input/control подавляет stale `DONE`, question и output до
-terminal commit, даже если inbox/application ещё не завершились.
+```text
+src/input_runtime/finalization.py
+src/input_runtime/ir7_filesystem.py
+src/input_runtime/ir7_crash_hardening.py
+src/input_runtime/interfaces.py
+src/input_runtime/filesystem.py
+src/input_runtime/composition.py
+src/mcp/input_runtime_checkpoints.py
+src/interaction/output_claim.py
+src/interaction/output_outbox.py
+src/interaction/output_service.py
+src/interaction/ir7_output_barrier.py
+src/runtime/finalization_bridge.py
+```
 
-## Protocol
+Application finalization service остаётся storage/transport-neutral; exact
+filesystem coordination реализуется adapter commands. Telegram/FastAPI/Path не
+проникают в application finalization logic.
+
+## Mandatory authority
+
+Terminal eligibility:
+
+```text
+accepted_through_cycle_sequence == applied_through_cycle_sequence
+pending_control_sequence == applied_control_sequence
+session generation == cycle generation
+active cycle == finalizing cycle
+exact context/finalization identity unchanged
+```
+
+Duplicate transport request без authoritative watermark transition не abort-ит
+finalization.
+
+## Implemented protocol
 
 ```text
 candidate remains non-terminal
-→ pre-final checkpoint
-→ prepare finalization
-→ short watermark recheck
-→ persist result/output
-→ second terminal recheck
-→ terminal commit enables delivery
+→ CP-BEFORE-FINAL-PROCESSING
+→ capture exact candidate authority
+→ final audit/grounding outside lock
+→ durable PREPARED
+→ short exact-session recheck
+→ FINALIZING
+→ persist deterministic final result evidence / RESULT_PERSISTED
+→ assemble/persist normal final OutputBatch / OUTPUT_READY
+→ second exact-session recheck
+→ terminal snapshot/session convergence
+→ finalization TERMINAL_COMMITTED written last
+→ final OutputBatch claim becomes eligible
 ```
 
-IR-6 не заменяет этот barrier: race `AgentEmission claim begins ↔ terminal commit`
-закрывается здесь, если требует shared finalization authority.
+Late durable input/control на любом pre-terminal point приводит к controlled
+`ABORTED_NEW_INPUT`/`ABORTED_CONTROL`. Final processing не резервирует terminal
+right.
 
-## Tests
+## Output fence
 
-Inject input/control:
+`RESULT_PERSISTED` и `OUTPUT_READY` не дают delivery authority.
 
-- before/during final processing;
-- after result persistence;
-- after output ready;
-- immediately before terminal commit;
-- against emission claim start where shared terminal authority is required.
+- ready outbox не показывает final batch до terminal marker;
+- direct `IdempotentOutputClaimService` отвергает new READY claim;
+- stale/aborted output никогда не становится claimable;
+- unclaimed stale aggregate освобождает cycle-final commit-once binding для
+  следующего same-cycle final result;
+- normal delivery lifecycle после commit не меняется.
+
+## AgentEmission ordering
+
+IR-6 `READY → DELIVERING` claim и IR-7 terminal commit используют один
+exact-session coordination lock.
+
+Claim-first:
+
+```text
+READY → DELIVERING
+→ release lock
+→ transport attempt may continue
+→ terminal commit
+```
+
+Terminal-first:
+
+```text
+TERMINAL_COMMITTED
+→ old-cycle READY claim rejected/cancelled
+```
+
+Network send происходит после claim и вне lock; wall clock/task scheduling не
+являются authority. Existing `DELIVERING + reset/ambiguity → UNKNOWN` preserved.
+
+## WAITING barrier
+
+```text
+candidate question
+→ CP-BEFORE-WAITING
+→ short input/control recheck
+→ persist one waiting snapshot/question authority
+→ WAITING_USER
+```
+
+Input/control before waiting commit suppress stale question. Input after commit
+использует existing `RESUME_WAITING` same-cycle flow. `send_user_message` не
+перепрофилирован в question lifecycle.
+
+## Crash/retry
+
+Focused IR-7 direct retry/repository recreation covers:
+
+- PREPARED recreation with stable finalization ID;
+- result evidence persisted / state write failed;
+- RESULT_PERSISTED replay;
+- output persisted / OUTPUT_READY state write failed;
+- OUTPUT_READY recreation;
+- partial terminal snapshot/session/finalization marker;
+- terminal commit response lost;
+- abort after result/output persistence;
+- duplicate logical retry without second result/output/terminal authority.
+
+`TERMINAL_COMMITTED` marker is written last and gates output delivery. Partial
+terminal snapshot can be repaired to RUNNING when no terminal marker exists and a
+newer durable input/control wins before retry.
+
+These are direct finalization-protocol replay tests, not startup reconstruction.
+
+## Deterministic tests
+
+```text
+tests/test_input_runtime_ir7_finalization.py
+tests/test_input_runtime_ir7_production.py
+```
+
+They use fake clock, explicit `asyncio.Event`, injected persistence faults,
+repository recreation, real output claim/outbox paths and production MCP MRO
+characterization. No probabilistic sleeps and no real LLM/MCP/Telegram/Web calls.
 
 ## Done
 
-- all pre-terminal events abort stale finalization;
-- post-terminal input creates new cycle;
-- output not claimable before terminal commit;
-- restart does not duplicate cycle/output.
+- all durable pre-terminal input/control suppress stale finalization;
+- stale question suppressed before WAITING commit;
+- post-terminal input creates a new cycle;
+- final output not claimable before terminal commit;
+- stale/aborted output never deliverable;
+- finalization/result/output retry idempotent;
+- emission claim-vs-terminal ordering deterministic;
+- no network/LLM/tool await under finalization/session coordination;
+- IR-1—IR-6 regressions and production compile green.
+
+## Не делать
+
+- не implement startup scanner/reconstruction coordinator;
+- не reconstruct paused/interrupted/waiting runners on process start;
+- не reconcile all UNKNOWN emissions at startup;
+- не build startup readiness gate/shutdown recovery;
+- не expand to IR-9 full projections or IR-10 roast;
+- не add scheduler/branches/distributed runtime.
 
 ---
 
@@ -1380,7 +1562,8 @@ Inject input/control:
 
 ## Статус
 
-Planned. Snapshot/control/emission retry repair не является startup recovery.
+Planned. IR-7 direct finalization retry/repository recreation не является startup
+recovery.
 
 ## Цель
 
@@ -1394,12 +1577,13 @@ claims/runners.
 - inspect runtime handoff markers;
 - keep ambiguous external operation non-replayable;
 - reconcile post-handoff/UNKNOWN emission evidence by explicit policy;
+- discover/reconcile incomplete finalization records;
 - reconstruct resumable/paused/waiting runner only when safe;
 - enable new admission after mandatory recovery.
 
-IR-3 marker, IR-4 snapshot-first marking repair, IR-5 same-delivery control repair
-и IR-6 repository recreation/UNKNOWN preservation не являются готовой startup
-recovery implementation.
+IR-3 marker, IR-4 snapshot-first marking repair, IR-5 same-delivery control repair,
+IR-6 repository recreation/UNKNOWN preservation и IR-7 direct finalization replay
+не являются готовой startup recovery implementation.
 
 `recover_cycle_authority()` corruption matrix также не считается закрытой:
 её authoritative corruption/restart policy и negative cases относятся к IR-8, а
@@ -1410,7 +1594,7 @@ recovery implementation.
 - stop new runner starts;
 - persist resumable/interrupted state where possible;
 - cancel in-process wakeups;
-- retain durable admissions/inbox/claims/controls/emissions;
+- retain durable admissions/inbox/claims/controls/emissions/finalizations;
 - leave ambiguous external operations unknown;
 - close runtime after agent/tool lifecycle.
 
@@ -1423,6 +1607,7 @@ Two service instances over same temporary root:
 - ambiguous marker does not rerun runtime;
 - post-handoff claim evidence preserved/reconciled;
 - UNKNOWN emission is not blindly re-sent;
+- incomplete finalization discovered/reconciled by startup coordinator;
 - `recover_cycle_authority()` corrupted/missing/divergent authority cases;
 - no new work before recovery ready;
 - shutdown deterministic.
@@ -1433,8 +1618,9 @@ Two service instances over same temporary root:
 
 ## Статус
 
-Planned. IR-6 добавил минимальную transport-neutral emission/reply projection
-foundation, но не объявляет полный IR-9 completed.
+Planned. IR-6 добавил минимальную transport-neutral emission/reply projection, а
+IR-7 — transport-neutral final-output eligibility fence, но полный IR-9 не
+реализован.
 
 ## Цель
 
@@ -1462,7 +1648,7 @@ last error code
 - applied addition completion;
 - stop/continue outcome;
 - interrupted/ambiguous recovery notice;
-- complete emission timelines/status counts and Web/CLI UX.
+- complete emission/finalization timelines/status counts and Web/CLI UX.
 
 ## Done
 
@@ -1477,7 +1663,7 @@ last error code
 
 ## Статус
 
-Planned. IR-6 deterministic focused CI не заменяет full IR-10 acceptance.
+Planned. IR-7 deterministic focused CI не заменяет full IR-10 acceptance.
 
 ## Цель
 
@@ -1551,8 +1737,8 @@ localization и synthetic harness могли разрабатываться па
 Admission, checkpoint integration, controls и finalization выполняются
 последовательно, поскольку разделяют session state/watermarks.
 
-IR-6 интегрирован после stable cycle/context/control identity и до завершения
-finalization barrier. Следующий stage — только IR-7.
+IR-7 завершён после stable cycle/context/control/emission identity. Следующий
+stage — только IR-8 startup recovery/reconstruction.
 
 Scheduler/parallel branches не реализуются этим update stage sequence; future
 scheduler остаётся отдельной orchestration layer.
@@ -1571,14 +1757,17 @@ feat(input-runtime): apply additions at safe checkpoints
 feat(input-runtime): implement IR-5 durable controls
 fix(input-runtime): linearize continue input target
 feat(input-runtime): implement IR-6 agent emissions
-feat(input-runtime): guard waiting and finalization races
+feat(input-runtime): implement durable finalization barrier
+fix(input-runtime): close finalization race/crash gaps
+test(input-runtime): cover IR-7 finalization races
 feat(input-runtime): recover durable active runtime state
-test(input-runtime): add race restart and transport coverage
+test(input-runtime): add full race restart and transport coverage
 docs(input-runtime): finalize acceptance and current baseline
 ```
 
-IR-6 documentation evidence фиксируется отдельным documentation-only gate после
-зелёных code gates; этот commit не начинает IR-7.
+IR-7 documentation evidence фиксируется только после green code/test gate
+`c58ab05c8354d7e76d4176e39ebf481edc4c613b`; documentation commits не начинают
+IR-8.
 
 Один commit не должен одновременно вводить новый state contract, переписывать
 agent loop и менять transport presentation без characterization tests.
