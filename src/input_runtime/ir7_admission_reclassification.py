@@ -156,3 +156,43 @@ class InputAdmissionService(_IR7InputAdmissionService):
                     user_projection_key=projection_key,
                     reason_code="admitted",
                 )
+
+    async def recover_snapshot_session_authority(
+        self,
+        *,
+        state,
+        context_revision_id: str,
+        applied_through: int,
+        recovered_at,
+    ):
+        """Finish IR-4 marker publication from already-durable snapshot truth."""
+        return await self.cycle_input_applier._advance_session_authority(
+            state=state,
+            context_revision_id=context_revision_id,
+            applied_through=applied_through,
+            now=recovered_at,
+        )
+
+    async def recover_reset_command(self, command):
+        """Finish one already-durable IR-5 reset without allocating a new command."""
+        return await self.control_service._reconcile_reset(command)
+
+    async def recover_control_applied_watermark(self, session_id: str):
+        """Advance the IR-5 applied frontier from existing durable commands."""
+        return await self.control_service._advance_applied_watermark(session_id)
+
+    async def recover_cycle_status(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+        generation: int,
+        status,
+    ):
+        """Project a recovery disposition through the existing IR-5 status command."""
+        return await self.control_service._set_cycle_status(
+            session_id=session_id,
+            cycle_id=cycle_id,
+            generation=generation,
+            status=status,
+        )
