@@ -13,6 +13,7 @@ from ..artifacts.delivery import ArtifactDeliveryRecord, FileSystemArtifactDeliv
 from ..artifacts.models import ArtifactDeliveryState
 from ..core.models import AgentResult
 from ..ingress.models import CommittedInputBatch
+from ..runtime.finalization_bridge import bind_final_output_assembler
 from .capabilities import ClientCapabilitySnapshot
 from .config import OutputRuntimeConfig
 from .errors import InteractionValidationError
@@ -63,6 +64,7 @@ class OutputBatchAssembler:
         )
         if bind_claim_validator is not None:
             bind_claim_validator(self.renderer.plan)
+        bind_final_output_assembler(self)
 
     async def assemble_final(
         self,
