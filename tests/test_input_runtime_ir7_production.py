@@ -21,6 +21,7 @@ from src.input_runtime.finalization import FinalizationBarrierService
 from src.mcp.artifact_delivery_runtime import FinalizingArtifactDeliveryPlanningMCPClient
 from src.mcp.input_runtime_checkpoint_hardening import InputRuntimeCheckpointHardeningMixin
 from src.mcp.input_runtime_checkpoints import InputRuntimeCheckpointMixin
+from src.mcp.input_runtime_controls import InputRuntimeControlMixin
 from src.runtime import ActiveAgentCycle
 from src.storage import StorageConfigType
 
@@ -80,8 +81,9 @@ def test_production_api_uses_ir7_checkpoint_mro():
     production = FinalizingArtifactDeliveryPlanningMCPClient
     assert api_module.FinalizingArtifactDeliveryPlanningMCPClient is production
     mro = production.mro()
+    assert mro.index(InputRuntimeControlMixin) < mro.index(InputRuntimeCheckpointHardeningMixin)
     assert mro.index(InputRuntimeCheckpointHardeningMixin) < mro.index(InputRuntimeCheckpointMixin)
-    assert production.process_query is InputRuntimeCheckpointMixin.process_query
+    assert production.process_query is InputRuntimeControlMixin.process_query
     assert production._complete_finalization is InputRuntimeCheckpointMixin._complete_finalization
     assert production._run_input_checkpoint is InputRuntimeCheckpointHardeningMixin._run_input_checkpoint
 
