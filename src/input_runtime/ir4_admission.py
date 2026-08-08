@@ -1,12 +1,15 @@
-"""IR-4/IR-6 admission facade and runtime compatibility boundary."""
+"""IR-4/IR-7 admission facade and runtime compatibility boundary."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.runtime.finalization_bridge import bind_output_eligibility
+
 from .composition import register_input_runtime_binding
 from .emissions import AgentEmissionService, ReplyAwareCommittedBatchReader
 from .errors import InputRuntimeConflictError
+from .finalization import FinalizationBarrierService
 from .hardened_service import InputAdmissionService as _IR3InputAdmissionService
 from .handoff import RuntimeHandoffState
 from .ir4_persistence_windows import DurableClaimCycleInputApplier
@@ -28,7 +31,7 @@ class DeferredWaitingApply:
 
 
 class InputAdmissionService(_IR3InputAdmissionService):
-    """Expose FIFO, controls and durable semantic emissions as one boundary."""
+    """Expose FIFO, controls, emissions and finalization as one boundary."""
 
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
@@ -62,6 +65,11 @@ class InputAdmissionService(_IR3InputAdmissionService):
             applier=self.cycle_input_applier,
             control_service=self.control_service,
         )
+        self.finalization_service = FinalizationBarrierService(
+            repositories=self.repositories,
+            clock=self.clock,
+        )
+        bind_output_eligibility(self.finalization_service.output_delivery_allowed)
         self.application_binding = register_input_runtime_binding(
             config=self.config,
             repositories=self.repositories,
@@ -69,6 +77,7 @@ class InputAdmissionService(_IR3InputAdmissionService):
             checkpoint_service=self.checkpoint_service,
             emission_service=self.emission_service,
             emission_outbox_service=self.emission_outbox_service,
+            finalization_service=self.finalization_service,
         )
 
     async def mark_initial_batch_applied(self, admission):
@@ -97,13 +106,7 @@ class InputAdmissionService(_IR3InputAdmissionService):
         cycle_id: str,
         status: CycleStatus,
     ):
-        """Compatibility result mapping may not overwrite IR-5 authority.
-
-        A paused cycle deliberately unwinds through an AgentResult shape which
-        predates a PAUSED status. Reset can also leave an old runner returning
-        after the durable generation has advanced. In both cases durable input
-        runtime state wins over the compatibility result.
-        """
+        """Compatibility results may not overwrite control/finalization authority."""
         state = await self.repositories.sessions.get(session_id)
         if state is None:
             raise InputRuntimeConflictError("session state disappeared")
@@ -112,7 +115,13 @@ class InputAdmissionService(_IR3InputAdmissionService):
         if state.cycle_status in {
             CycleStatus.PAUSE_REQUESTED,
             CycleStatus.PAUSED_BY_USER,
+            CycleStatus.FINALIZING,
         }:
+            return state
+        if (
+            state.cycle_status in {CycleStatus.DONE, CycleStatus.ERROR, CycleStatus.CANCELLED}
+            and state.finalization_id is not None
+        ):
             return state
         return await super().record_cycle_status(
             session_id=session_id,
