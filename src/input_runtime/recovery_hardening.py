@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+from collections import defaultdict
+from dataclasses import dataclass
+
 from .handoff import RuntimeHandoffState
 from .models import (
     AdmissionState,
+    CheckpointName,
     ControlCommandType,
     ControlState,
     CycleStatus,
     FinalizationState,
+    InboxState,
 )
 from .recovery import (
     InputRuntimeRecoveryCoordinator as _BaseRecoveryCoordinator,
@@ -19,8 +24,21 @@ from .recovery import (
 )
 
 
+@dataclass(slots=True)
+class _RecoveryControlCycle:
+    session_id: str
+    cycle_id: str
+    input_runtime_generation: int
+
+
 class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
-    """Preserve unknown side effects and terminal delivery fences on restart."""
+    """Preserve unknown side effects and terminal delivery fences on restart.
+
+    The production coordinator intentionally re-exposes the two base recovery
+    steps that previously reached into IR-4/IR-5 private helpers.  Startup now
+    crosses only repository ports and explicit public recovery commands on the
+    application service, keeping the orchestration storage/transport neutral.
+    """
 
     async def _validate_output_ready_evidence(self, record) -> None:
         validator = getattr(self.final_output_recovery, "validate_output_ready", None)
@@ -35,6 +53,111 @@ class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
             if marker is not None and marker.state == RuntimeHandoffState.COMPLETED:
                 await self._validate_output_ready_evidence(record)
         await super()._preconverge_completed_terminal(finalizations, now, report)
+
+    async def _reconcile_snapshot_first_apply(self, snapshots, now, report) -> None:
+        for snapshot in snapshots:
+            await self._validate_snapshot(snapshot, allow_session_lag=True)
+            items = await self.repositories.inbox.list_for_cycle(snapshot.cycle_id)
+            groups = defaultdict(list)
+            for item in items:
+                if (
+                    item.state in {InboxState.CLAIMED, InboxState.APPLYING}
+                    and item.claim_token
+                    and item.claim_expires_at is not None
+                    and item.claim_expires_at <= now
+                ):
+                    groups[item.claim_token].append(item)
+
+            for group in groups.values():
+                states = {item.state for item in group}
+                claim = self._claim_from_group(group)
+                if states == {InboxState.CLAIMED}:
+                    await self.repositories.inbox.requeue_claim(
+                        claim,
+                        error_code="startup_claim_expired",
+                    )
+                    report.inbox_claims_reconciled += 1
+                    continue
+                if states != {InboxState.APPLYING}:
+                    raise self._fatal("mixed_claim_apply_state")
+
+                first = claim.first_cycle_sequence
+                last = claim.last_cycle_sequence
+                applied = snapshot.applied_through_cycle_sequence
+                if first <= applied < last:
+                    raise self._fatal("partial_claim_snapshot_authority")
+                if last <= applied:
+                    applied_ids = set(snapshot.applied_input_batch_ids)
+                    if any(
+                        item.input_batch_id not in applied_ids
+                        for item in claim.items
+                    ):
+                        raise self._fatal("snapshot_applied_batch_identity_gap")
+                    await self.repositories.inbox.mark_applied(
+                        claim,
+                        applied_at=now,
+                    )
+                    for item in claim.items:
+                        admission = (
+                            await self.repositories.admissions.get_by_input_batch_id(
+                                item.input_batch_id
+                            )
+                        )
+                        if admission is None:
+                            raise self._fatal("inbox_admission_missing")
+                        if admission.state == AdmissionState.ADMITTED:
+                            await self.repositories.admissions.mark_applied(
+                                admission.admission_id,
+                                applied_at=now,
+                            )
+                    report.inbox_claims_reconciled += 1
+                else:
+                    await self.repositories.inbox.requeue_claim(
+                        claim,
+                        error_code="startup_apply_not_committed",
+                    )
+                    report.inbox_claims_reconciled += 1
+
+            admissions = await self.repositories.admissions.list_for_session(
+                snapshot.session_id
+            )
+            cycle_rows = sorted(
+                (
+                    item
+                    for item in admissions
+                    if item.target_cycle_id == snapshot.cycle_id
+                    and item.admitted_generation == snapshot.generation
+                ),
+                key=lambda item: item.cycle_sequence,
+            )
+            by_sequence = {item.cycle_sequence: item for item in cycle_rows}
+            expected = list(
+                range(0, snapshot.applied_through_cycle_sequence + 1)
+            )
+            if any(sequence not in by_sequence for sequence in expected):
+                raise self._fatal("snapshot_applied_sequence_gap")
+            expected_ids = [
+                by_sequence[sequence].input_batch_id for sequence in expected
+            ]
+            if snapshot.applied_input_batch_ids != expected_ids:
+                raise self._fatal("snapshot_applied_batch_identity_mismatch")
+            for sequence in expected:
+                admission = by_sequence[sequence]
+                if admission.state == AdmissionState.ADMITTED:
+                    await self.repositories.admissions.mark_applied(
+                        admission.admission_id,
+                        applied_at=now,
+                    )
+
+            state = await self.repositories.sessions.get(snapshot.session_id)
+            if state is None:
+                raise self._fatal("snapshot_session_missing")
+            await self.admission_service.recover_snapshot_session_authority(
+                state=state,
+                context_revision_id=snapshot.active_context_revision_id,
+                applied_through=snapshot.applied_through_cycle_sequence,
+                recovered_at=now,
+            )
 
     async def _recover_controls(self, now, report) -> None:
         # A pause may have been durably accepted before the first safe snapshot
@@ -93,7 +216,53 @@ class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
             )
             report.controls_reconciled += 1
 
-        await super()._recover_controls(now, report)
+        # Reuse the existing IR-5 reset/reducer semantics through explicit
+        # public recovery commands; do not create a second control state machine.
+        states = await self.repositories.sessions.list_states()
+        for initial in states:
+            rows = await self.repositories.controls.list_for_session(  # type: ignore[attr-defined]
+                initial.session_id
+            )
+            for row in rows:
+                if (
+                    row.command == ControlCommandType.RESET
+                    and row.state not in {
+                        ControlState.APPLIED,
+                        ControlState.REJECTED,
+                        ControlState.CANCELLED,
+                    }
+                ):
+                    await self.admission_service.recover_reset_command(row)
+                    report.controls_reconciled += 1
+
+            state = await self.repositories.sessions.get(initial.session_id)
+            if (
+                state is None
+                or state.pending_control_sequence
+                <= state.applied_control_sequence
+            ):
+                continue
+            if state.active_cycle_id is None:
+                raise self._fatal("pending_control_without_active_cycle")
+            snapshot = await self.repositories.snapshots.get(state.active_cycle_id)
+            if snapshot is None:
+                raise self._fatal("pending_control_snapshot_missing")
+            view = _RecoveryControlCycle(
+                session_id=state.session_id,
+                cycle_id=state.active_cycle_id,
+                input_runtime_generation=state.generation,
+            )
+            outcome = await self.admission_service.control_service.reduce_at_checkpoint(
+                checkpoint=CheckpointName.RESUME,
+                active_cycle=view,
+                through_control_sequence=state.pending_control_sequence,
+            )
+            if (
+                outcome is not None
+                and outcome.reason_code == "reset_generation_transition_pending"
+            ):
+                raise self._fatal("reset_generation_recovery_incomplete")
+            report.controls_reconciled += 1
 
     async def _recover_finalizations(self, now, report) -> None:
         records = await self._finalizations_for_recovery()
@@ -204,12 +373,17 @@ class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
                         generation=state.generation,
                         disposition=RecoveryDisposition.AMBIGUOUS,
                         snapshot=snapshot,
-                        reason_code=marker.error_code or "ambiguous_runtime_handoff",
+                        reason_code=(
+                            marker.error_code or "ambiguous_runtime_handoff"
+                        ),
                     )
                 )
                 continue
             if state.cycle_status == CycleStatus.WAITING_USER:
-                if snapshot.status != CycleStatus.WAITING_USER or not snapshot.waiting_question:
+                if (
+                    snapshot.status != CycleStatus.WAITING_USER
+                    or not snapshot.waiting_question
+                ):
                     raise self._fatal("waiting_snapshot_authority_mismatch")
                 plans.append(
                     RecoverySessionPlan(
