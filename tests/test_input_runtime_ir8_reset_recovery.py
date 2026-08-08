@@ -8,7 +8,6 @@ from types import SimpleNamespace
 import pytest
 
 from src.input_runtime import (
-    ActiveAgentCycle,
     CheckpointName,
     CycleInputApplier,
     CycleStatus,
@@ -18,7 +17,7 @@ from src.input_runtime import (
 )
 from src.input_runtime.recovery import InputRuntimeReadinessGate
 from src.input_runtime.recovery_hardening import InputRuntimeRecoveryCoordinator
-from src.runtime import SessionExecutionCoordinator
+from src.runtime import ActiveAgentCycle, SessionExecutionCoordinator
 from src.storage import StorageConfigType
 
 NOW = datetime(2026, 8, 8, 20, 30, tzinfo=timezone.utc)
