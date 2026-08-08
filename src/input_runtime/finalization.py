@@ -14,6 +14,8 @@ from typing import Any, Callable
 
 from .errors import InputRuntimeConflictError
 from .factory import InputRuntimeRepositories
+from .handoff import RuntimeHandoffState
+from .handoff_context import get_runtime_handoff_context
 from .models import (
     CycleFinalizationRecord,
     CycleStatus,
@@ -35,6 +37,8 @@ class FinalizationCandidate:
     expected_accepted_sequence: int
     expected_applied_sequence: int
     expected_control_sequence: int
+    runtime_handoff_admission_id: str | None = None
+    runtime_handoff_token: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,6 +121,41 @@ class FinalizationBarrierService:
             raise InputRuntimeConflictError("finalization blocked by unapplied input")
         if state.pending_control_sequence != state.applied_control_sequence:
             raise InputRuntimeConflictError("finalization blocked by pending control")
+
+        handoff_admission_id: str | None = None
+        handoff_token: str | None = None
+        handoff_context = get_runtime_handoff_context()
+        if handoff_context is not None:
+            if (
+                handoff_context.session_id != session_id
+                or handoff_context.cycle_id != cycle_id
+                or handoff_context.generation != state.generation
+            ):
+                raise InputRuntimeConflictError(
+                    "finalization runtime handoff execution context changed"
+                )
+            marker = await self.repositories.handoffs.get(
+                handoff_context.admission_id
+            )
+            if marker is None:
+                raise InputRuntimeConflictError(
+                    "finalization runtime handoff marker is missing"
+                )
+            if (
+                marker.session_id != session_id
+                or marker.cycle_id != cycle_id
+                or marker.handoff_token != handoff_context.handoff_token
+            ):
+                raise InputRuntimeConflictError(
+                    "finalization runtime handoff authority changed"
+                )
+            if marker.state != RuntimeHandoffState.HANDED_OFF:
+                raise InputRuntimeConflictError(
+                    "finalization requires an active runtime handoff"
+                )
+            handoff_admission_id = marker.admission_id
+            handoff_token = marker.handoff_token
+
         return FinalizationCandidate(
             finalization_id=self._stable_id(
                 session_id=session_id,
@@ -138,6 +177,8 @@ class FinalizationBarrierService:
                 state.active_cycle_applied_through_sequence
             ),
             expected_control_sequence=state.pending_control_sequence,
+            runtime_handoff_admission_id=handoff_admission_id,
+            runtime_handoff_token=handoff_token,
         )
 
     async def prepare(
@@ -158,6 +199,28 @@ class FinalizationBarrierService:
             created_at=now,
             updated_at=now,
         )
+        if candidate.runtime_handoff_admission_id is not None:
+            if candidate.runtime_handoff_token is None:
+                raise InputRuntimeConflictError(
+                    "finalization runtime handoff token is missing"
+                )
+            binder = getattr(
+                self.repository,
+                "bind_runtime_handoff_authority",
+                None,
+            )
+            if not callable(binder):
+                raise InputRuntimeConflictError(
+                    "finalization repository cannot bind runtime handoff authority"
+                )
+            await binder(
+                finalization_id=record.finalization_id,
+                session_id=record.session_id,
+                cycle_id=record.cycle_id,
+                admission_id=candidate.runtime_handoff_admission_id,
+                handoff_token=candidate.runtime_handoff_token,
+                bound_at=now,
+            )
         current = await self.repository.prepare_authority(record)
         if current.state in {
             FinalizationState.ABORTED_NEW_INPUT,
