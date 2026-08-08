@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: implemented
-last_reviewed: 2026-08-06
+last_reviewed: 2026-08-08
 ---
 
 # Admission и CycleInbox
@@ -28,21 +28,21 @@ IR-3 реализован поверх IR-1/IR-2 и после contract hardenin
   inbox publication;
 - durable runtime handoff marker запрещает blind replay после неоднозначного
   `process_query()` или последующего persistence failure;
-- `WAITING_USER` временно использует compatibility adapter того же cycle, но
-  неоднозначный post-handoff failure не requeue-ится автоматически;
 - late wake несовпадающего cycle не изменяет wake event нового cycle.
 
-IR-3 заканчивается на admission/queue и runner-handoff boundary. Queued additions
-ещё не применяются к LLM context: checkpoints, общий `CycleInputApplier` и context
-revisions относятся к IR-4. `/stop`, `/continue`, emissions и finalization
-barrier также ещё не реализованы.
+IR-4 позже перевёл queued additions и `WAITING_USER` reply на общий
+`CycleInputApplier`; IR-5 добавил durable controls; IR-6 — semantic emissions;
+IR-7 — durable finalization barrier. Corrective IR-7 дополнительно linearizes
+**admission decision ↔ terminal commit** на durable repository coordination и
+подтверждён на code boundary
+`6bd0dce0018b20520ed28236211fccdf0a8075fb`:
 
-Для следующих этапов зафиксированы два обязательных контракта:
+- `Validate Input Runtime` #417 — success, compile success,
+  `387 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #669 — success;
+- workflow permission остаётся `contents: read`.
 
-- IR-4: `WAITING_USER` reply при наличии более ранних queued additions должен
-  применяться через общий FIFO `CycleInputApplier` вместе с ними;
-- IR-7: pending accepted input должен подавлять stale `DONE`, question и output
-  до terminal commit.
+Нормальная live race не зависит от IR-8 committed-but-unadmitted startup repair.
 
 ## Назначение
 
@@ -70,18 +70,41 @@ request/source metadata
 current SessionInputRuntimeState
 ```
 
-Под короткой session coordination boundary он:
+Application read и первичная classification являются optimistic. Настоящий
+linearization point для relation с terminal commit — короткая durable repository
+`root identity → session` coordination boundary.
 
-1. повторно читает authoritative committed batch;
-2. проверяет ownership `batch.session_id == session_id`;
-3. выполняет idempotency lookup по `input_batch_id`;
-4. читает active runtime state/generation;
-5. выбирает admission kind;
-6. назначает monotonic session/cycle sequence;
-7. сохраняет admission record;
-8. при addition создаёт `CycleInboxItem`;
-9. обновляет accepted watermark;
-10. возвращает typed outcome для caller/UI.
+Обычный flow:
+
+1. повторно читается authoritative committed batch;
+2. проверяется ownership `batch.session_id == session_id`;
+3. выполняется idempotency lookup по `input_batch_id`;
+4. читается current runtime state/generation;
+5. оптимистично выбираются admission kind/action/projection/target;
+6. capacity проверяется для non-start candidate;
+7. repository получает durable coordination и повторно читает latest state;
+8. назначает monotonic session/cycle sequence и сохраняет ровно один admission;
+9. при addition создаётся `CycleInboxItem`;
+10. accepted watermark становится durable;
+11. caller получает typed outcome.
+
+Если между steps 5 и 7 terminal authority выиграла ordering, stale non-start
+classification **не** разрешается только по совпадающему old `active_cycle_id`.
+Repository до admission/index/inbox/session-watermark write возвращает dedicated
+managed stale-decision conflict. Application только для этого exact conflict один
+раз перечитывает authoritative state и заново вычисляет:
+
+```text
+AdmissionKind
+InputAdmissionAction
+projection key
+target cycle
+capacity decision
+should_start_runner
+should_wake_runner
+```
+
+Arbitrary consistency/corruption conflict не retry-ится и не маскируется.
 
 Typed outcome:
 
@@ -121,12 +144,50 @@ class InputAdmissionOutcome(BaseModel):
 | `paused_by_user` | `queued_paused` | сохранить, не возобновлять |
 | `waiting_user` | `resume_waiting` | wake/resume тот же cycle |
 | `interrupted`, resumable | `resume_interrupted` | wake/resume тот же cycle |
-| `finalizing` | `queued_running` | accepted watermark aborts stale finalization |
+| `finalizing` | `queued_running` | если admission linearizes first, accepted watermark aborts stale finalization |
 | terminal/no resumable cycle | `start_cycle` | новый cycle после terminal boundary |
 
-Если state содержит terminal cycle, но terminal commit ещё не reconciled,
-admission не угадывает. Он ждёт/повторяет coordination operation после
-finalization reconciliation.
+### Admission ↔ terminal commit tie-break — implemented IR-7
+
+Порядок определяется durable coordination, а не временем application read,
+создания tasks, wall clock или transport arrival.
+
+**Admission wins first:**
+
+```text
+optimistic FINALIZING → CONTINUE_RUNNING for cycle A
+→ durable admission allocation for cycle A
+→ accepted watermark advances
+→ terminal second recheck observes accepted > applied
+→ ABORTED_NEW_INPUT
+→ RuntimeHandoff remains HANDED_OFF
+→ cycle A returns/remains RUNNING and later applies input
+```
+
+**Terminal wins first:**
+
+```text
+optimistic FINALIZING → CONTINUE_RUNNING for cycle A
+→ terminal second recheck clean
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session
+→ TERMINAL_COMMITTED
+→ stale non-start candidate reaches repository coordination
+→ dedicated stale-decision conflict before admission writes
+→ same in-process call re-reads terminal state
+→ START_CYCLE for new cycle B, cycle_sequence=0
+```
+
+No transport retry требуется. Старый final output остаётся валидным и deliverable;
+late committed batch получает ровно один admission нового cycle.
+
+`IDLE` имеет важную IR-2 nuance: raw IDLE может быть state, отставшим после
+record-first START admission crash. Поэтому repository сначала разрешает
+existing authoritative admission repair/corruption validation. Только если после
+этого state действительно остаётся IDLE, stale non-start classification может
+быть reclassified. `DONE/ERROR/CANCELLED` normal terminal authority fenced до
+нового admission write. Это сохраняет IR-2 crash repair и не превращает
+corruption (`gap`, duplicate sequence и т.п.) в retryable stale decision.
 
 ## Commit-to-admission protocol на filesystem
 
@@ -146,20 +207,17 @@ D. UI acknowledgement allowed
 
 Batch committed, но admission отсутствует.
 
-Recovery:
-
-```text
-scan committed batches eligible for runtime
-→ lookup admission by input_batch_id
-→ admit_if_absent()
-```
+Startup discovery/repair такого состояния относится к IR-8. Однако normal
+in-process admission-vs-terminal race IR-7 разрешает сразу внутри исходного
+admission call и не оставляет batch unadmitted только потому, что optimistic
+classification устарела.
 
 #### После B, до C
 
 Admission существует, но session watermark отстаёт.
 
 Recovery вычисляет expected watermark из ordered admission records и выполняет
-compare-and-swap repair.
+compare-and-swap repair. Existing IR-2 record-first repair сохраняется.
 
 #### После durable admission, до inbox publication
 
@@ -181,11 +239,29 @@ find existing admission
 Повтор transport request/idempotency key возвращает существующий admission
 outcome. Новый AgentCycle не создаётся.
 
+### Stale decision before B
+
+Dedicated terminal-race stale decision обнаруживается **до** B:
+
+```text
+no InputAdmissionRecord
+no admission indexes
+no CycleInboxItem
+no accepted watermark mutation
+```
+
+После reclassification тот же `input_batch_id` получает ровно один durable
+admission. Нельзя создать одновременно old-cycle `CONTINUE_RUNNING` и new-cycle
+`START_CYCLE` records.
+
 ### Acknowledgement rule
 
 Фраза «дополнение принято в текущую задачу» разрешена только после durable
 admission. До этого transport может показывать только ingress status вида
 «сообщение принято/пакет собирается».
+
+Если terminal-first reclassification создала новый cycle, typed outcome обязан
+сообщать `START_CYCLE`, а не stale `QUEUED_RUNNING` projection.
 
 ## Session sequence и cycle sequence
 
@@ -217,7 +293,9 @@ Source timestamps и transport order сохраняются как metadata/evid
 - item с generation, отличной от active session generation, не применяется;
 - item не содержит raw payload; только refs/identity;
 - batch content читается из committed batch store при apply;
-- unread content не попадает в compaction summary.
+- unread content не попадает в compaction summary;
+- terminal-first stale candidate не создаёт old-cycle inbox item перед
+  reclassification.
 
 ## Claim и bounded drain
 
@@ -283,6 +361,10 @@ Initial admission с `cycle_sequence == 0` не является addition и cap
 занимает. Applied/cancelled/failed-terminal records очередь не занимают.
 Отсутствующий после crash inbox не освобождает reservation до reconciliation.
 
+При stale-decision reclassification capacity пересчитывается заново относительно
+latest state. Terminal-first path становится `START_CYCLE`, поэтому stale
+old-cycle capacity decision не переносится в новый cycle.
+
 ### Running/paused cycle
 
 Если limit исчерпан:
@@ -293,17 +375,17 @@ Initial admission с `cycle_sequence == 0` не является addition и cap
 - caller получает явный retryable response;
 - runtime не создаёт второй cycle как обход лимита.
 
-Для первой реализации предпочтителен conservative protocol:
+Для первой реализации conservative protocol остаётся:
 
 ```text
 committed batch persisted
 → admission capacity unavailable
 → return retryable accepted-but-not-admitted status
-→ recovery/admission retry
+→ explicit admission retry/recovery according to policy
 ```
 
-Пользовательский текст не должен утверждать, что дополнение уже будет учтено в
-текущем cycle, пока admission не завершён.
+Это отдельный backpressure contract и не относится к normal terminal race, где
+transparent reclassification должна завершиться в том же call.
 
 ### Почему нельзя rejected-and-forgotten
 
@@ -351,9 +433,13 @@ admission queued
 только если `cycle_id` совпадает с exact reserved/active cycle. Несовпадающий
 late wake возвращает `False` и не изменяет event нового cycle.
 
+Terminal-first reclassification возвращает `should_start_runner=true` для new
+cycle B и `should_wake_runner=false`; stale cycle A не получает wake и второй
+old-cycle runner не появляется.
+
 Потерянный signal безопасен: runner всё равно проверяет inbox перед следующим
 LLM request, `WAITING_USER` и finalization. После restart recovery создаёт новый
-runner/resume command по policy.
+runner/resume command по policy IR-8.
 
 `SessionExecutionCoordinator` остаётся execution lease/wakeup foundation, но не
 source of truth очереди.
@@ -376,39 +462,53 @@ resolve authoritative batch/capabilities
 cycle в ambiguous/interrupted contract без automatic replay внешних действий.
 Этот marker не заменяет IR-4 active snapshot и не реализует IR-8 startup recovery.
 
-## WAITING_USER migration
-
-Текущий специальный `WaitingUserBatchContinuationMixin` временно сохраняется как
-compatibility adapter.
-
-Migration:
+Corrected IR-7 сохраняет отдельный terminal invariant:
 
 ```text
-committed reply
-→ InputAdmissionService(resume_waiting)
-→ durable inbox item
-→ resume same cycle
-→ common CycleInputApplier
+second terminal recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session
+→ TERMINAL_COMMITTED
 ```
 
-После durable runtime handoff compatibility path не requeue-ит claim при
-неоднозначной ошибке: такой requeue был бы blind replay потенциально выполненных
-LLM/tool side effects.
+Admission-first accepted watermark выигрывает **до** этого completion и оставляет
+handoff `HANDED_OFF`. Terminal-first полностью завершает old handoff, после чего
+late batch начинает independent new cycle B.
+
+## WAITING_USER migration
+
+`WAITING_USER` reply теперь admitted в тот же cycle и проходит common FIFO
+`CP-RESUME`; legacy compatibility details остаются только историческим IR-3
+контекстом.
 
 Обязательный контракт IR-4: если перед `WAITING_USER` reply уже существуют более
 ранние queued additions, reply не может обходить их. Общий `CycleInputApplier`
-должен применить contiguous FIFO range в порядке cycle sequence.
+применяет contiguous FIFO range в порядке cycle sequence.
 
-После parity tests mixin удаляется. Artifact refs прежнего и нового batch
-сохраняются через общий context/application path, а не через временную замену
-`original_input_batch_id`.
+Artifact refs прежнего и нового batch сохраняются через общий context/application
+path, а не через временную замену `original_input_batch_id`.
 
-## Finalization follow-up
+## Finalization integration
 
-Обязательный контракт IR-7: наличие pending accepted input должно подавлять stale
-`DONE`, question и output до terminal commit. Durable admission watermark является
-основанием abort/recheck finalization, даже если inbox/application ещё не успели
-завершиться.
+IR-7 требует, чтобы pending accepted input подавлял stale `DONE`, question и
+output до terminal commit. Durable admission watermark является основанием
+abort/recheck finalization, даже если inbox/application ещё не успели завершиться.
+
+Admission-vs-terminal race имеет один durable tie-break:
+
+```text
+admission allocation first
+→ same-cycle accepted watermark
+→ finalization ABORTED_NEW_INPUT
+
+terminal authority first
+→ old cycle TERMINAL_COMMITTED
+→ stale optimistic admission discarded before writes
+→ same committed batch START_CYCLE in new cycle
+```
+
+Нормальный live race не должен оставлять committed-but-unadmitted input для
+будущего IR-8 scanner.
 
 ## Diagnostics
 
@@ -440,4 +540,17 @@ Raw user text, file payload и secrets в diagnostics не выводятся.
 - runtime handoff ambiguity не приводит к automatic replay;
 - late wake старого cycle не будит новый cycle;
 - capacity limit не теряет committed input;
-- lost wakeup не блокирует последующее checkpoint применение.
+- lost wakeup не блокирует последующее checkpoint применение;
+- terminal-first после stale optimistic `CONTINUE_RUNNING` transparently возвращает
+  `START_CYCLE` нового cycle без raw Pydantic `ValidationError` и без transport
+  retry;
+- admission-first durable allocation к finalizing cycle продвигает accepted
+  watermark и заставляет terminal barrier вернуть `ABORTED_NEW_INPUT`, сохраняя
+  handoff `HANDED_OFF`;
+- stale-decision detection происходит до admission/index/inbox/watermark write;
+- один committed batch получает ровно один admission; terminal-first path не
+  оставляет old-cycle inbox relation;
+- IR-2 record-first state repair и corruption conflicts не маскируются новым
+  stale-decision retry.
+
+Startup committed-but-unadmitted discovery/reconciliation остаётся IR-8.
