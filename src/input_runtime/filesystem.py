@@ -17,7 +17,7 @@ from ._filesystem_session import FileSystemSessionInputRuntimeRepository
 from .coordination import GLOBAL_SESSION_LOCKS, SessionLockRegistry
 from .ir5_filesystem_controls import FileSystemSessionControlRepository
 from .ir6_delivery_authority import FileSystemAgentEmissionRepository
-from .ir7_filesystem import FileSystemFinalizationRepository
+from .ir7_crash_hardening import FileSystemFinalizationRepository
 
 
 class FileSystemInputRuntimeRepositories:
