@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from src.runtime.finalization_bridge import clear_finalization_bridge_for_tests
+
 from .admission import CommittedInputBatchReader
 from .checkpoints import InputRuntimeCheckpointService
 from .config import InputRuntimeConfigType
@@ -58,3 +60,4 @@ def get_input_runtime_binding() -> InputRuntimeApplicationBinding | None:
 def clear_input_runtime_binding_for_tests() -> None:
     global _binding
     _binding = None
+    clear_finalization_bridge_for_tests()
