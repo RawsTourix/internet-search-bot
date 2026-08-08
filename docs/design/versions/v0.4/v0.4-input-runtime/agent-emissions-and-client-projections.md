@@ -22,6 +22,16 @@ IR-6 реализован на code/test boundary
   Telegram/http transport;
 - real LLM, MCP, Telegram, Web и internet calls для этих tests не выполняются.
 
+IR-7 не меняет semantic `AgentEmission` lifecycle, но закрывает его shared
+terminal ordering на code/test boundary
+`c58ab05c8354d7e76d4176e39ebf481edc4c613b`:
+
+- `Validate Input Runtime` #355 — success, production compile success,
+  `376 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #638 — success;
+- `READY claim ↔ terminal commit` теперь linearizable через общую exact-session
+  coordination authority; network send остаётся вне lock.
+
 ## Назначение
 
 IR-6 вводит устойчивое промежуточное общение агента с пользователем, не смешивая
@@ -75,13 +85,19 @@ path и не создаёт `AgentEmission` из обычного progress ав�
 
 Question остаётся отдельным waiting transition. IR-6 не превращает
 `send_user_message` в `ask_user` и не мигрирует existing waiting lifecycle.
-Canonical ordering `candidate → CP-BEFORE-WAITING → recheck → waiting commit`
-остаётся связан с future IR-7 finalization/waiting barrier.
+IR-7 реализует ordering
+`candidate → CP-BEFORE-WAITING → exact input/control recheck → one durable waiting
+question authority → WAITING_USER`. Late durable input/control до waiting commit
+подавляет stale question; input после successful commit использует existing
+same-cycle `RESUME_WAITING` path.
 
 ### Final response
 
 Final response остаётся `OutputBatch` и finalization pipeline. Intermediate
 `AgentEmission` не создаёт fake final `OutputBatch` и не является mini-final.
+IR-7 дополнительно разделяет final `OutputBatch READY` и delivery authority:
+final batch становится claimable только после durable
+`CycleFinalizationRecord=TERMINAL_COMMITTED`.
 
 ## Manager tool `send_user_message`
 
@@ -246,6 +262,11 @@ manager-tool durable contract; agent loop не ждёт network receipt.
   и client instance;
 - route-filtered READY listing bounded.
 
+IR-7 terminal authority входит в тот же exact-session claim ordering. Если
+terminal commit linearized раньше, новый old-cycle READY claim не стартует. Если
+claim linearized раньше, уже durable `DELIVERING` attempt остаётся legitimate и
+может завершить этот IR-6 lifecycle после release lock.
+
 ### Durable receipt
 
 Generic receipt сохраняет:
@@ -299,25 +320,34 @@ DELIVERING нельзя безопасно объявить CANCELLED, пото�
 message. Claim token очищается/fenced; stale old-generation writer не может
 позднее записать DELIVERED/FAILED поверх authoritative reset state.
 
-## Sequential terminal fencing и IR-7 boundary
+## Terminal fencing и IR-7 shared ordering
 
-IR-6 реализует sequential cases:
+IR-6 сохраняет sequential semantics:
 
 - cycle уже terminal → новый `send_user_message` rejected, READY record не
   создаётся;
 - emission READY, затем cycle уже стал terminal до claim → worker не начинает
   новый client send; record становится controlled CANCELLED/superseded.
 
-IR-6 **не объявляет** закрытым concurrent race:
+IR-7 закрывает concurrent race:
 
 ```text
-emission claim begins
+emission READY claim
 ↔ terminal/finalization commit
 ```
 
-Если его полная атомарность требует shared finalization record/barrier, это
-IR-7. IR-6 sequential terminal fencing != IR-7 atomic terminal/finalization race
-closure.
+Оба command path используют одну short exact-session coordination authority.
+Допустимы только два deterministic order:
+
+```text
+claim first: READY → DELIVERING → release lock → terminal commit
+terminal first: TERMINAL_COMMITTED → old-cycle READY claim rejected/cancelled
+```
+
+Network send, receipt persistence и иные external awaits не выполняются под
+shared session/finalization lock. Wall clock и task scheduling не являются
+authority. IR-6 conservative ambiguity не ослаблена: already-started DELIVERING
+при reset/ambiguous side effect остаётся UNKNOWN по existing lifecycle.
 
 ## Telegram delivery
 
@@ -333,7 +363,9 @@ separate durable semantic lifecycle.
 - `message_id` successful send сохраняется в durable generic receipt.
 
 Final `OutputBatch` worker остаётся отдельным lifecycle и не переиспользует
-`AgentEmission` как final output.
+`AgentEmission` как final output. IR-7 final-output claim gate является
+transport-neutral server-owned finalization authority, а не Telegram-specific
+решением.
 
 ## Safe reply binding
 
@@ -394,15 +426,26 @@ input_addendum_cancelled
 input_addendum_failed
 ```
 
-и полный Telegram/Web/CLI UX **не реализуются IR-6**. Это IR-9. IR-6 добавляет
-только минимальную transport-neutral emission outbox/reply projection foundation,
-не расширяя `/status` и не создавая новый WebSocket/event-stream framework.
+и полный Telegram/Web/CLI UX **не реализуются IR-6/IR-7**. Это IR-9. IR-6
+добавляет только минимальную transport-neutral emission outbox/reply projection
+foundation, а IR-7 — только shared terminal/output eligibility boundaries. Они не
+расширяют `/status` и не создают новый WebSocket/event-stream framework.
 
 ## Questions
 
-IR-6 не меняет existing `WAITING_USER` ownership. Полный question ordering и late
-waiting/finalization barrier остаются IR-7. Нельзя создавать второй durable
-question поверх legacy path или считать intermediate emission вопросом.
+IR-6 не меняет existing `WAITING_USER` ownership. IR-7 реализует late
+waiting barrier без второго question lifecycle:
+
+```text
+candidate question
+→ CP-BEFORE-WAITING
+→ exact input/control recheck
+→ one durable waiting question authority
+→ WAITING_USER
+```
+
+Нельзя считать intermediate emission вопросом. Input после committed
+`WAITING_USER` продолжает existing same-cycle `RESUME_WAITING` semantics.
 
 ## Localization и rendering
 
@@ -432,8 +475,10 @@ safe presentation; Telegram IR-6 использует plain text.
 - authenticated internal emission READY/claim/receipt API;
 - Telegram emission outbox worker beside final OutputBatch worker;
 - server-resolved optional reply binding в input projection;
-- reset/terminal sequential fencing;
-- compile coverage production IR-6 paths в read-only workflow.
+- reset/terminal fencing;
+- IR-7 shared exact-session READY-claim/terminal ordering;
+- IR-7 transport-neutral final `OutputBatch` terminal-commit claim gate;
+- compile coverage production IR-6/IR-7 paths в read-only workflow.
 
 Полное выделение `RuntimeEventSink`/notification service остаётся будущей
 modularization/v0.6 задачей.
@@ -452,10 +497,20 @@ IR-6 acceptance подтверждает:
 - delivery failure не уничтожает AgentCycle и не блокирует final answer;
 - reset безопасно fences old READY/DELIVERING;
 - already-terminal cycle не принимает новую semantic emission;
-- READY emission не начинает новую delivery после уже-visible terminal state;
+- READY emission не начинает новую delivery после already-visible terminal state;
 - Telegram semantic message — отдельный new message;
 - optional reply binding scoped и cross-session-safe;
 - ordinary progress/`agent_request` не становится durable dialog message;
-- final `OutputBatch` остаётся отдельной authority;
-- IR-7 concurrent finalization barrier, IR-8 startup reconstruction, IR-9 complete
-  projections и IR-10 full roast остаются deferred.
+- final `OutputBatch` остаётся отдельной authority.
+
+IR-7 acceptance дополнительно подтверждает:
+
+- claim-first READY emission получает один legitimate DELIVERING attempt;
+- terminal-first не позволяет начать новый old-cycle READY claim;
+- network await не удерживает shared finalization/session coordination;
+- final `OutputBatch READY` не становится claimable до
+  `TERMINAL_COMMITTED`;
+- WAITING barrier не создаёт duplicate question presentation.
+
+IR-8 startup reconstruction, IR-9 complete projections и IR-10 full roast
+остаются deferred.
