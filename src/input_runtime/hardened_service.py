@@ -7,6 +7,10 @@ from datetime import datetime
 from .admission import InputAdmissionAction, InputAdmissionOutcome
 from .errors import InputRuntimeConflictError
 from .handoff import RuntimeHandoffRecord, RuntimeHandoffState
+from .handoff_context import (
+    activate_runtime_handoff_context,
+    clear_runtime_handoff_context_if_matches,
+)
 from .models import (
     AdmissionKind,
     AdmissionState,
@@ -132,10 +136,19 @@ class InputAdmissionService(_BaseInputAdmissionService):
             handed_off_at=self._now(),
         )
         current = await self.runtime_handoffs.begin(marker)
-        return (
+        owns_handoff = (
             current.handoff_token == handoff_token
             and current.state == RuntimeHandoffState.HANDED_OFF
         )
+        if owns_handoff:
+            activate_runtime_handoff_context(
+                admission_id=admission.admission_id,
+                session_id=admission.session_id,
+                cycle_id=admission.target_cycle_id,
+                generation=admission.admitted_generation,
+                handoff_token=handoff_token,
+            )
+        return owns_handoff
 
     async def complete_runtime_handoff(
         self,
@@ -143,11 +156,16 @@ class InputAdmissionService(_BaseInputAdmissionService):
         *,
         handoff_token: str,
     ) -> RuntimeHandoffRecord:
-        return await self.runtime_handoffs.complete(
+        marker = await self.runtime_handoffs.complete(
             admission.admission_id,
             handoff_token=handoff_token,
             completed_at=self._now(),
         )
+        clear_runtime_handoff_context_if_matches(
+            admission_id=admission.admission_id,
+            handoff_token=handoff_token,
+        )
+        return marker
 
     async def mark_runtime_handoff_ambiguous(
         self,
@@ -158,13 +176,23 @@ class InputAdmissionService(_BaseInputAdmissionService):
     ) -> RuntimeHandoffRecord | None:
         marker = await self.runtime_handoffs.get(admission.admission_id)
         if marker is None or marker.handoff_token != handoff_token:
+            clear_runtime_handoff_context_if_matches(
+                admission_id=admission.admission_id,
+                handoff_token=handoff_token,
+            )
             return None
-        return await self.runtime_handoffs.mark_ambiguous(
-            admission.admission_id,
-            handoff_token=handoff_token,
-            ambiguous_at=self._now(),
-            error_code=error_code,
-        )
+        try:
+            return await self.runtime_handoffs.mark_ambiguous(
+                admission.admission_id,
+                handoff_token=handoff_token,
+                ambiguous_at=self._now(),
+                error_code=error_code,
+            )
+        finally:
+            clear_runtime_handoff_context_if_matches(
+                admission_id=admission.admission_id,
+                handoff_token=handoff_token,
+            )
 
     async def get_runtime_handoff(
         self,
