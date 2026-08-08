@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from types import MethodType
 from typing import Any
 from uuid import uuid4
 
@@ -227,13 +228,8 @@ async def _install_recovered_runtime(
         if session_plan.should_rehydrate:
             cycle = rehydrate_active_agent_cycle(session_plan.snapshot)
             cycle.active_plan_state = recovered_plans.get(session_plan.cycle_id)
-            if (
-                cycle.active_plan_id is not None
-                and cycle.active_plan_state is None
-            ):
-                raise InputRuntimeRecoveryError(
-                    "recovered_active_plan_state_missing"
-                )
+            if cycle.active_plan_id is not None and cycle.active_plan_state is None:
+                raise InputRuntimeRecoveryError("recovered_active_plan_state_missing")
             installer(cycle)
         if not session_plan.should_auto_schedule:
             continue
@@ -265,7 +261,7 @@ async def _cancel_recovered_tasks(api: Any) -> None:
 
 
 def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
-    """Install IR-8 on the production Api class exactly once."""
+    """Install IR-8 on production Api instances without mutating test shells."""
 
     Api = api_module.Api
     if getattr(Api, "_ir8_lifecycle_installed", False):
@@ -273,6 +269,7 @@ def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
 
     logger = api_module.logger
     APIError = api_module.APIError
+    original_init = Api.__init__
     original_start_admitted_cycle = Api.start_admitted_cycle
     original_submit_input = Api.submit_input
     original_admit = Api.admit_committed_batch
@@ -394,9 +391,7 @@ def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
                 try:
                     await self.mcp_client.cleanup()
                 except Exception:
-                    logger.exception(
-                        "MCP cleanup failed after startup recovery error"
-                    )
+                    logger.exception("MCP cleanup failed after startup recovery error")
             raise APIError(f"Ошибка запуска API runtime: {error!r}") from error
 
     async def stop(self):
@@ -438,12 +433,23 @@ def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
         _require_ready(self)
         return await original_call_agent(self, *args, **kwargs)
 
-    Api.start = start
-    Api.stop = stop
-    Api.submit_input = guarded_submit
-    Api.admit_committed_batch = guarded_admit
-    Api.start_admitted_cycle = guarded_start_cycle
-    Api.resume_admitted_cycle = guarded_resume_cycle
-    Api.call_agent_batch = guarded_call_batch
-    Api.call_agent = guarded_call_agent
+    def install_instance(instance: Any) -> None:
+        if getattr(instance, "_ir8_lifecycle_instance_installed", False):
+            return
+        instance.start = MethodType(start, instance)
+        instance.stop = MethodType(stop, instance)
+        instance.submit_input = MethodType(guarded_submit, instance)
+        instance.admit_committed_batch = MethodType(guarded_admit, instance)
+        instance.start_admitted_cycle = MethodType(guarded_start_cycle, instance)
+        instance.resume_admitted_cycle = MethodType(guarded_resume_cycle, instance)
+        instance.call_agent_batch = MethodType(guarded_call_batch, instance)
+        instance.call_agent = MethodType(guarded_call_agent, instance)
+        instance._ir8_lifecycle_instance_installed = True
+
+    def init_with_ir8(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        install_instance(self)
+
+    Api.__init__ = init_with_ir8
+    install_instance(api_module.API)
     Api._ir8_lifecycle_installed = True
