@@ -176,6 +176,15 @@ IR-7 закрывает durable pre-terminal races, которые IR-6 intentio
 - late durable input/control до terminal marker даёт `ABORTED_NEW_INPUT` или
   `ABORTED_CONTROL`; stale persisted output не доставляется и его unclaimed
   cycle-final identity освобождается для следующего same-cycle финала;
+- durable admission allocation и terminal commit используют общий session
+  ordering: admission-first продвигает accepted watermark и abort-ит stale
+  finalization; terminal-first заставляет discard stale optimistic non-start
+  classification до writes и transparently reclassify тот же committed batch в
+  new-cycle `START_CYCLE` без transport retry;
+- terminal-first stale candidate не создаёт old-cycle admission/index/inbox/
+  watermark mutation; one input_batch_id получает ровно один admission;
+- only dedicated stale-decision conflict разрешает bounded reclassification;
+  IR-2 record-first repair/corruption conflicts не маскируются;
 - waiting question получает одну durable authority только после
   `CP-BEFORE-WAITING` и exact input/control recheck;
 - `AgentEmission READY claim ↔ terminal commit` linearizable через общий
@@ -188,19 +197,19 @@ IR-7 закрывает durable pre-terminal races, которые IR-6 intentio
 
 Corrected IR-7 final code evidence:
 
-- code/test boundary `eb93918b33ce7503d0e2d5d032b7e600f51e5661`;
-- `Validate Input Runtime` #387 — success, production compile success,
-  `384 passed`, `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #654 — success;
+- code/test boundary `6bd0dce0018b20520ed28236211fccdf0a8075fb`;
+- `Validate Input Runtime` #417 — success, production compile success,
+  `387 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #669 — success;
 - workflow permission остаётся `contents: read`;
-- focused tests используют deterministic events/faults/repository recreation и
-  production-like admission/handoff/output claim paths; real LLM/MCP/Telegram/
-  Web/internet calls не требуются.
+- focused tests сохраняют предыдущие handoff/order/crash contracts и добавляют
+  deterministic terminal-first/admission-first admission races без real
+  LLM/MCP/Telegram/Web/internet calls.
 
 Startup-wide reconstruction/reconcile `READY/UNKNOWN`, paused/interrupted/waiting
-runtime и incomplete finalization scan остаются IR-8. Полный client timeline,
-`/status`, Web/CLI projections и addendum UX остаются IR-9;
-randomized/full-system/live roast — IR-10.
+runtime, committed-but-unadmitted discovery и incomplete finalization scan
+остаются IR-8. Полный client timeline, `/status`, Web/CLI projections и addendum
+UX остаются IR-9; randomized/full-system/live roast — IR-10.
 
 IR-1—IR-6 implementation evidence и исторические boundary подробно сохранены в
 [`v0.4-input-runtime/README.md`](v0.4-input-runtime/README.md) и
@@ -265,6 +274,10 @@ v0.4-storage-foundation
   corrected IR-7 order сначала завершает matching RuntimeHandoff, затем terminal
   snapshot/session и только потом `TERMINAL_COMMITTED`, после которого разрешён
   claim.
+- Admission-vs-terminal ordering также durable: admission-first aborts stale
+  terminal candidate; terminal-first reclassifies stale optimistic continuation
+  в new-cycle `START_CYCLE` within the same call. IR-8 startup repair для normal
+  live race не требуется.
 - Ambiguous/startup reconstruction/reconciliation остаётся IR-8; полная
   `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
 - Scheduler/parallel branches и Telegram history rewind не реализованы текущим
