@@ -22,9 +22,7 @@ from src.input_runtime import (
     create_filesystem_input_runtime_repositories,
 )
 from src.input_runtime.finalization import FinalizationBarrierService
-from src.input_runtime.handoff_context import (
-    clear_runtime_handoff_context_for_tests,
-)
+from src.input_runtime.handoff_context import clear_runtime_handoff_context_for_tests
 from src.interaction.capabilities import ClientCapabilitySnapshot
 from src.interaction.errors import OutputBatchConflictError
 from src.interaction.ids import (
@@ -46,9 +44,8 @@ from src.runtime import ActiveAgentCycle
 from src.runtime.finalization_bridge import bind_final_output_assembler
 from src.storage import StorageConfigType
 
-
 NOW = datetime(2026, 8, 8, 13, 0, tzinfo=timezone.utc)
-INPUT_BATCH_ID = "initial"
+INPUT_BATCH_ID = "ibat_" + "1" * 32
 
 
 @pytest.fixture(autouse=True)
@@ -72,9 +69,7 @@ class Batch:
     committed_at: datetime = NOW
     continuation_of_batch_id: str | None = None
     correction_of_batch_id: str | None = None
-    artifact_manifest: object = field(
-        default_factory=lambda: type("Manifest", (), {"items": ()})()
-    )
+    artifact_manifest: object = field(default_factory=lambda: type("Manifest", (), {"items": ()})())
 
     def model_dump_json(self) -> str:
         return "x" * self.payload_size
@@ -117,19 +112,10 @@ def output_batch(output_batch_id: str) -> OutputBatch:
         cycle_id="cycle",
         sequence_number=1,
         kind=OutputBatchKind.FINAL,
-        response_route=ClientResponseRoute(
-            route_type="telegram",
-            conversation_id="100",
-        ),
+        response_route=ClientResponseRoute(route_type="telegram", conversation_id="100"),
         locale="en",
         capability_snapshot=snapshot,
-        parts=(
-            TextOutputPart(
-                part_id=new_output_part_id(),
-                index=0,
-                text="final",
-            ),
-        ),
+        parts=(TextOutputPart(part_id=new_output_part_id(), index=0, text="final"),),
         state=OutputBatchState.READY,
         created_at=NOW,
         ready_at=NOW,
@@ -147,10 +133,7 @@ async def output_ready_runtime(tmp_path):
         clock=lambda: NOW,
         payload_size_resolver=lambda batch: batch.payload_size,
     )
-    outcome = await runtime.admit_committed_batch(
-        INPUT_BATCH_ID,
-        session_id="session",
-    )
+    outcome = await runtime.admit_committed_batch(INPUT_BATCH_ID, session_id="session")
     admission = outcome.admission
     assert admission is not None
     assert outcome.target_cycle_id == "cycle"
@@ -175,10 +158,7 @@ async def output_ready_runtime(tmp_path):
     )
 
     handoff_token = "handoff-token"
-    assert await runtime.begin_runtime_handoff(
-        admission,
-        handoff_token=handoff_token,
-    )
+    assert await runtime.begin_runtime_handoff(admission, handoff_token=handoff_token)
     candidate = await runtime.finalization_service.capture_candidate(
         session_id="session",
         cycle_id="cycle",
@@ -219,18 +199,13 @@ async def mutate_state(repos, **updates):
 
 @pytest.mark.asyncio
 async def test_handoff_completion_fault_blocks_every_terminal_authority(tmp_path, monkeypatch):
-    runtime, repos, admission, token, record, store, batch = (
-        await output_ready_runtime(tmp_path)
-    )
+    runtime, repos, admission, _, record, store, batch = await output_ready_runtime(tmp_path)
     import src.input_runtime.ir7_handoff_ordering as ordering
 
     original = ordering.atomic_write_model
 
     def injected(path, model):
-        if (
-            isinstance(model, RuntimeHandoffRecord)
-            and model.state == RuntimeHandoffState.COMPLETED
-        ):
+        if isinstance(model, RuntimeHandoffRecord) and model.state == RuntimeHandoffState.COMPLETED:
             raise RuntimeError("handoff completion write failed")
         return original(path, model)
 
@@ -272,10 +247,7 @@ async def test_terminal_writes_persist_handoff_before_snapshot_session_and_marke
     original_final_write = finalization_writes.atomic_write_model
 
     def handoff_write(path, model):
-        if (
-            isinstance(model, RuntimeHandoffRecord)
-            and model.state == RuntimeHandoffState.COMPLETED
-        ):
+        if isinstance(model, RuntimeHandoffRecord) and model.state == RuntimeHandoffState.COMPLETED:
             events.append("handoff_completed")
         return original_handoff_write(path, model)
 
@@ -284,18 +256,13 @@ async def test_terminal_writes_persist_handoff_before_snapshot_session_and_marke
             events.append("terminal_snapshot")
         elif isinstance(model, SessionInputRuntimeState) and model.cycle_status == CycleStatus.DONE:
             events.append("terminal_session")
-        elif (
-            isinstance(model, CycleFinalizationRecord)
-            and model.state == FinalizationState.TERMINAL_COMMITTED
-        ):
+        elif isinstance(model, CycleFinalizationRecord) and model.state == FinalizationState.TERMINAL_COMMITTED:
             events.append("terminal_committed")
         return original_final_write(path, model)
 
     monkeypatch.setattr(ordering, "atomic_write_model", handoff_write)
     monkeypatch.setattr(finalization_writes, "atomic_write_model", final_write)
-    committed = await runtime.finalization_service.terminal_commit(
-        record.finalization_id
-    )
+    committed = await runtime.finalization_service.terminal_commit(record.finalization_id)
     assert committed.state == FinalizationState.TERMINAL_COMMITTED
     assert events == [
         "handoff_completed",
@@ -307,10 +274,7 @@ async def test_terminal_writes_persist_handoff_before_snapshot_session_and_marke
     assert marker is not None and marker.state == RuntimeHandoffState.COMPLETED
     completed_at = marker.completed_at
 
-    replay = await runtime.complete_runtime_handoff(
-        admission,
-        handoff_token=token,
-    )
+    replay = await runtime.complete_runtime_handoff(admission, handoff_token=token)
     assert replay.state == RuntimeHandoffState.COMPLETED
     assert replay.completed_at == completed_at
     marker_after = await repos.handoffs.get(admission.admission_id)
@@ -330,9 +294,7 @@ async def test_output_worker_cannot_claim_before_handoff_and_terminal_marker(tmp
         return await original(*args, **kwargs)
 
     runtime.finalization_service.repository.commit_terminal_authority = blocked
-    task = asyncio.create_task(
-        runtime.finalization_service.terminal_commit(record.finalization_id)
-    )
+    task = asyncio.create_task(runtime.finalization_service.terminal_commit(record.finalization_id))
     await entered.wait()
 
     marker = await repos.handoffs.get(admission.admission_id)
@@ -380,11 +342,7 @@ async def test_completed_handoff_incomplete_terminal_direct_retry_reuses_all_ids
 
     def injected(path, model):
         nonlocal failed
-        if (
-            not failed
-            and isinstance(model, ActiveCycleSnapshot)
-            and model.status == CycleStatus.DONE
-        ):
+        if not failed and isinstance(model, ActiveCycleSnapshot) and model.status == CycleStatus.DONE:
             failed = True
             raise RuntimeError("terminal snapshot write failed")
         return original(path, model)
@@ -427,21 +385,11 @@ async def test_completed_handoff_incomplete_terminal_direct_retry_reuses_all_ids
 @pytest.mark.parametrize(
     ("updates", "expected_state"),
     [
-        (
-            {"active_cycle_accepted_through_sequence": 1},
-            FinalizationState.ABORTED_NEW_INPUT,
-        ),
-        (
-            {"pending_control_sequence": 1},
-            FinalizationState.ABORTED_CONTROL,
-        ),
+        ({"active_cycle_accepted_through_sequence": 1}, FinalizationState.ABORTED_NEW_INPUT),
+        ({"pending_control_sequence": 1}, FinalizationState.ABORTED_CONTROL),
     ],
 )
-async def test_late_authority_aborts_before_handoff_completion(
-    tmp_path,
-    updates,
-    expected_state,
-):
+async def test_late_authority_aborts_before_handoff_completion(tmp_path, updates, expected_state):
     runtime, repos, admission, _, record, _, batch = await output_ready_runtime(tmp_path)
     await mutate_state(repos, **updates)
     aborted = await runtime.finalization_service.terminal_commit(record.finalization_id)
@@ -462,10 +410,7 @@ async def test_cancellation_before_handoff_completion_keeps_no_terminal_authorit
     original = ordering.atomic_write_model
 
     def injected(path, model):
-        if (
-            isinstance(model, RuntimeHandoffRecord)
-            and model.state == RuntimeHandoffState.COMPLETED
-        ):
+        if isinstance(model, RuntimeHandoffRecord) and model.state == RuntimeHandoffState.COMPLETED:
             raise asyncio.CancelledError()
         return original(path, model)
 
