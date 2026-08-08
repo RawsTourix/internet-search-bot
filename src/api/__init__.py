@@ -30,12 +30,14 @@ if not getattr(_output_routes, "_ir6_emission_routes_installed", False):
     _output_routes._ir6_emission_routes_installed = True
 
 
-# Api.start()/stop() remain the public lifecycle surface.  IR-8 is installed at
+# Api.start()/stop() remain the public lifecycle surface. IR-8 is installed at
 # class level after the submodule creates the existing singleton so fresh Api
 # instances and the production singleton share the same recovery boundary.
 from . import api as _api_module  # noqa: E402
-from .input_runtime_recovery import (  # noqa: E402
-    install_input_runtime_recovery_lifecycle,
+from . import input_runtime_recovery as _ir8_lifecycle  # noqa: E402
+from ..input_runtime.recovery_hardening import (  # noqa: E402
+    InputRuntimeRecoveryCoordinator as _ConservativeRecoveryCoordinator,
 )
 
-install_input_runtime_recovery_lifecycle(_api_module)
+_ir8_lifecycle.InputRuntimeRecoveryCoordinator = _ConservativeRecoveryCoordinator
+_ir8_lifecycle.install_input_runtime_recovery_lifecycle(_api_module)
