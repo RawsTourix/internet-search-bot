@@ -14,15 +14,12 @@ class FileSystemInputAdmissionRepository(_IR8AdmissionRepository):
     """Repair derived cycle pointers only after all durable sources agree."""
 
     async def recover_session_authority(self, session_id: str):
-        state = await super().recover_session_authority(session_id)
-        if state is None:
-            return None
         rows = await self.list_for_session(session_id)
+
+        # Validate immutable ownership before any derived/session repair.  A
+        # contradictory history must fail startup without first mutating a
+        # watermark or rebuilding an index from only one side of the conflict.
         for row in rows:
-            # Startup is allowed one whole-repository consistency pass. Unlike
-            # the normal hot-path helper, IR-8 must compare cycle-local records
-            # with admissions/controls from every session before rebuilding a
-            # derived pointer. Contradictory immutable history is fatal.
             durable_sessions = _all_cycle_sessions(self, row.target_cycle_id)
             if len(durable_sessions) > 1:
                 raise InputRuntimeConflictError(
@@ -33,6 +30,11 @@ class FileSystemInputAdmissionRepository(_IR8AdmissionRepository):
                     "cycle authority points to multiple sessions"
                 )
 
+        state = await super().recover_session_authority(session_id)
+        if state is None:
+            return None
+
+        for row in rows:
             recover_cycle_authority(
                 self,
                 row.target_cycle_id,
