@@ -230,7 +230,7 @@ async def test_waiting_user_survives_fresh_restart_with_question_and_context(tmp
         update={
             "status": CycleStatus.WAITING_USER,
             "waiting_question": "Which option?",
-            "safe_checkpoint": CheckpointName.WAITING_USER,
+            "safe_checkpoint": CheckpointName.BEFORE_WAITING,
             "snapshot_revision": snapshot.snapshot_revision + 1,
             "updated_at": NOW,
         }
