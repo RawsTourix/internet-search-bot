@@ -34,18 +34,18 @@ if not getattr(_output_routes, "_ir6_emission_routes_installed", False):
 
 
 # Keep importing `src.api.config`, artifact routes, etc. side-effect free when
-# no agent composition is configured.  Production uses the same .env loading as
+# no agent composition is configured. Production uses the same .env loading as
 # api.config; with a real AGENT_CONFIG_PATH the direct `src.api.api` import is
-# intercepted here and the class-level IR-8 lifecycle is installed before the
-# package import returns.  Validation suites without agent config therefore do
-# not instantiate the production singleton merely by importing an API helper.
+# intercepted here and IR-8 is installed before the package import returns.
 load_dotenv()
 if (os.getenv("AGENT_CONFIG_PATH") or "").strip():
     from . import api as _api_module  # noqa: E402
     from . import input_runtime_recovery as _ir8_lifecycle  # noqa: E402
+    from .ir8_final_output_recovery import FinalOutputRecovery  # noqa: E402
     from ..input_runtime.recovery_hardening import (  # noqa: E402
         InputRuntimeRecoveryCoordinator as _ConservativeRecoveryCoordinator,
     )
 
     _ir8_lifecycle.InputRuntimeRecoveryCoordinator = _ConservativeRecoveryCoordinator
+    _ir8_lifecycle._FinalOutputRecovery = FinalOutputRecovery
     _ir8_lifecycle.install_input_runtime_recovery_lifecycle(_api_module)
