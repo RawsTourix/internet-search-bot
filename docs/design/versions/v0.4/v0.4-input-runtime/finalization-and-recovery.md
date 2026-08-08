@@ -9,20 +9,23 @@ last_reviewed: 2026-08-08
 
 # Finalization и recovery
 
-## Current boundary after IR-7
+## Current boundary after corrected IR-7
 
-Этот документ теперь `partial`: durable finalization barrier реализован IR-7,
+Этот документ остаётся `partial`: durable finalization barrier реализован IR-7,
 а startup recovery/reconstruction остаётся IR-8 planned.
 
-IR-7 production path активирует existing `CycleFinalizationRecord` и закрывает:
+Corrected IR-7 production path активирует existing `CycleFinalizationRecord` и
+закрывает:
 
 - late durable input/control vs stale DONE;
 - late durable input/control vs stale WAITING question;
 - `PREPARED → RESULT_PERSISTED → OUTPUT_READY → TERMINAL_COMMITTED`;
+- exact admitted `RuntimeHandoff` completion между final recheck и terminal
+  snapshot/session authority;
 - final `OutputBatch` persistence отдельно от claim/delivery authority;
 - exact-session `AgentEmission READY claim ↔ terminal commit` ordering;
 - repository recreation/direct retry собственного finalization protocol;
-- partial terminal snapshot/session convergence без premature final delivery.
+- completed-handoff/incomplete-terminal direct convergence без LLM/tool replay.
 
 IR-8 по-прежнему отвечает за startup-wide reconstruction/reconciliation retained
 `READY/UNKNOWN`, interrupted/paused/waiting runners, ambiguous handoffs,
@@ -37,7 +40,7 @@ IR-6 conservative emission semantics сохранены:
   `DELIVERING → UNKNOWN`, потому что transport side effect мог произойти;
 - expired/ambiguous emission delivery сохраняется `UNKNOWN` и не blind-retry-ится.
 
-IR-7 добавляет общий exact-session ordering для атомарного race:
+IR-7 использует общий exact-session ordering для атомарного race:
 
 ```text
 AgentEmission READY claim
@@ -71,7 +74,7 @@ agent сформировал DONE
 IR-7 не использует empty-inbox как terminal authority. Он повторно читает durable
 session input/control watermarks непосредственно под coordination boundary.
 
-## Watermarks
+## Watermarks и exact invocation authority
 
 Для active cycle runtime хранит:
 
@@ -82,7 +85,7 @@ pending_control_sequence
 applied_control_sequence
 ```
 
-Terminal commit разрешён только когда:
+Terminal eligibility разрешена только когда:
 
 ```text
 accepted_through_cycle_sequence == applied_through_cycle_sequence
@@ -93,10 +96,12 @@ cycle status == finalizing
 ```
 
 Exact finalization candidate additionally сохраняет `context_revision_id` и
-expected accepted/applied/control sequence. Persisted result evidence связано с
-тем же stable finalization ID.
+expected accepted/applied/control sequence. Exact admitted invocation передаёт
+runtime-owned `admission_id + handoff_token`, которые проверяются против durable
+`RuntimeHandoff`. Эти values не задаются LLM/client и не выводятся из mutable
+global state. Persisted result evidence связано с тем же stable finalization ID.
 
-## Finalization protocol — implemented in IR-7
+## Finalization protocol — implemented in corrected IR-7
 
 ### Phase 1: candidate
 
@@ -118,6 +123,8 @@ watermarks. Начатый final-processing LLM call не резервирует
 
 Durable stable `CycleFinalizationRecord(state=PREPARED)` создаётся идемпотентно.
 Logical retry той же exact candidate authority получает тот же finalization ID.
+Для normal admitted-run path finalization durable связывается с exact current
+`RuntimeHandoff` relation (`admission_id + handoff_token`).
 
 ### Phase 5: short coordination recheck
 
@@ -157,29 +164,61 @@ Ready outbox скрывает такой final batch, а direct claim отвер
 не доставляется и освобождает cycle-final commit-once binding, чтобы следующий
 корректный same-cycle final result не конфликтовал с superseded batch.
 
-### Phase 7: second recheck и terminal commit
+### Phase 7: second recheck → RuntimeHandoff completion → terminal commit
 
-Непосредственно перед terminal marker под той же exact-session coordination
-повторно проверяются generation, active cycle, context/finalization identity и
-input/control watermarks. Late durable input/control до этого ordering point
-выигрывает и abort-ит stale finalization.
+Непосредственно перед любым successful terminal authority под одной короткой
+exact-session coordination повторно проверяются generation, active cycle,
+context/finalization identity и input/control watermarks.
 
-Filesystem не имеет multi-file SQL transaction, поэтому terminal convergence
-использует последовательные durable writes. Finalization
-`TERMINAL_COMMITTED` записывается последним и является server-owned delivery
-fence. До этого marker final output остаётся неclaimable.
+Corrected successful order:
 
-Repository recreation/direct retry поддерживает partial windows. Lost terminal
-commit response не создаёт второй result/output/terminal commit. Если crash успел
-оставить terminal snapshot, но terminal authority не завершилась и затем late
-input/control стал durable, abort repair-ит stale terminal snapshot обратно к
-RUNNING authority.
+```text
+OUTPUT_READY
+→ acquire exact-session finalization coordination
+→ second authoritative terminal recheck
+→ matching RuntimeHandoff HANDED_OFF → COMPLETED
+→ terminal ActiveCycleSnapshot
+→ terminal SessionInputRuntimeState
+→ CycleFinalizationRecord TERMINAL_COMMITTED
+→ release coordination
+→ final OutputBatch claim eligibility
+```
+
+Late durable input/control до second recheck выигрывает и abort-ит stale
+finalization **до** RuntimeHandoff completion. Поэтому handoff остаётся
+`HANDED_OFF`, same cycle может продолжить LLM/tool работу и отсутствует ложное
+утверждение, что side-effecting invocation завершена.
+
+`RuntimeHandoffRepository.complete()` обычно сам берёт session lock, поэтому
+corrected filesystem adapter использует command-oriented lock-aware internal
+completion primitive внутри уже удерживаемой finalization coordination. Application
+layer не знает filesystem layout/lock implementation; future PostgreSQL adapter
+может выразить тот же command одной transaction/row-lock boundary.
+
+Если durable transition `HANDED_OFF → COMPLETED` падает или cancellation
+происходит до его persistence:
+
+```text
+NO terminal snapshot
+NO terminal session DONE
+NO TERMINAL_COMMITTED
+NO final-output delivery eligibility
+```
+
+Existing handoff ambiguity/cancellation policy остаётся authoritative.
+
+Filesystem не имеет multi-file SQL transaction, поэтому после successful handoff
+completion terminal convergence использует последовательные durable writes.
+Finalization `TERMINAL_COMMITTED` записывается последним и является server-owned
+delivery fence. До этого marker final output остаётся неclaimable.
 
 ### Phase 8: delivery
 
 Final `OutputBatch` становится claimable через normal delivery path только после
-`TERMINAL_COMMITTED`. Delivery выполняется вне session lock. Execution success и
-delivery success остаются разными lifecycle states.
+`TERMINAL_COMMITTED`. Для normal admitted-run path delivery gate дополнительно
+проверяет, что matching exact `RuntimeHandoff` уже `COMPLETED`. Delivery выполняется
+вне session lock. Execution success и delivery success остаются разными lifecycle
+states.
 
 ## Why repeated recheck
 
@@ -190,13 +229,12 @@ Input/control может стать durable:
 - после PREPARED;
 - после result persistence;
 - после OutputBatch persistence/OUTPUT_READY;
-- непосредственно перед terminal commit.
+- непосредственно перед terminal coordination.
 
 Поэтому одного раннего inbox/context check недостаточно.
 
 После terminal commit новый ordinary input начинает новый cycle. До terminal
 commit durable accepted input/control обязан suppress stale finalization.
-
 Duplicate transport delivery, не изменившая authoritative accepted/pending
 watermark, сама по себе finalization не abort-ит.
 
@@ -204,9 +242,9 @@ watermark, сама по себе finalization не abort-ит.
 
 | New event | До PREPARED | После PREPARED, до result | После result/output, до terminal | После terminal |
 |---|---|---|---|---|
-| user input | apply/continue | abort | abort; retained evidence not deliverable | new cycle |
-| `/stop` | pause | abort/pause | abort/pause; output fenced | post-terminal control semantics |
-| `/reset` | reset | invalidate generation | invalidate; output fenced | new-generation post-terminal reset semantics |
+| user input | apply/continue | abort | abort before handoff completion; retained evidence not deliverable | new cycle |
+| `/stop` | pause | abort/pause | abort before handoff completion; output fenced | post-terminal control semantics |
+| `/reset` | reset | invalidate generation | invalidate before handoff completion; output fenced | new-generation post-terminal reset semantics |
 | duplicate input/control | no watermark change | no phantom abort | no phantom abort | idempotent/new decision |
 | final output delivery retry | n/a | forbidden | forbidden | delivery subsystem |
 | intermediate emission create | allowed while running | finalization policy | cannot bypass terminal authority | rejected/new-cycle decision |
@@ -225,16 +263,19 @@ Persisted stale result/output после abort не считается final ans
 READY → DELIVERING
 → release lock
 → network send may start/continue
-→ terminal commit
+→ later terminal coordination
 ```
 
 Attempt легитимно начался до terminal authority и завершает IR-6 lifecycle.
 Terminal commit не превращает уже claimed attempt обратно в READY/CANCELLED.
 
-### Terminal commit linearized first
+### Terminal coordination linearized first
 
 ```text
-TERMINAL_COMMITTED
+second final recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session
+→ TERMINAL_COMMITTED
 → old-cycle READY claim request
 → claim rejected/cancelled before transport attempt
 ```
@@ -255,12 +296,12 @@ candidate question
 ```
 
 Если input/control durable accepted до waiting commit, stale question suppressed.
-
 Если input приходит после waiting commit, existing admission `RESUME_WAITING`
 продолжает тот же cycle.
 
 `send_user_message(kind=intermediate)` не используется как ask-user и второй
-параллельный durable question lifecycle не создаётся.
+параллельный durable question lifecycle не создаётся. Corrective handoff ordering
+не меняет WAITING semantics.
 
 ## Pause commit
 
@@ -292,12 +333,33 @@ recreation, без startup scanner:
 | result evidence persisted, state write lost | same payload hash/ref reused; state converges to `RESULT_PERSISTED` |
 | `RESULT_PERSISTED` | same logical result reused; no second main AgentCycle |
 | OutputBatch persisted, `OUTPUT_READY` state write lost | same output identity is rebound/reused by retry path |
-| `OUTPUT_READY` | delivery remains forbidden until terminal marker |
-| partial terminal snapshot/session | finalization marker still gates delivery; retry converges or aborts on newer durable authority |
+| `OUTPUT_READY`, handoff still `HANDED_OFF` | delivery remains forbidden; second recheck must still run before completion |
+| handoff `COMPLETED`, terminal snapshot/session/marker incomplete | direct known-ID retry keeps same handoff token/completed_at, finalization ID, result_ref and OutputBatch ID; no LLM/tool replay |
+| partial terminal snapshot/session | finalization marker still gates delivery; retry converges without second handoff completion |
 | `TERMINAL_COMMITTED` response lost | repeat returns same terminal authority; no duplicate final output |
 | abort after result/output persistence | retained evidence never becomes claimable/deliverable |
 
-Эта таблица не является startup reconstruction coordinator.
+Durable `COMPLETED` handoff не переводится обратно в `HANDED_OFF`/`AMBIGUOUS`.
+Поздний API compatibility call `complete_runtime_handoff()` идемпотентен и
+возвращает тот же COMPLETED marker без нового token или `completed_at`.
+
+Эта таблица не является startup reconstruction coordinator. IR-8 должен только
+обнаруживать/reconcile такие records на startup; IR-7 direct retry уже умеет
+сойтись, когда известны exact IDs.
+
+## Cancellation windows — corrected IR-7
+
+### До handoff completion
+
+Cancellation/failure не создаёт terminal delivery authority. Existing API cleanup
+может сохранить `AMBIGUOUS` согласно IR-3 policy. Исходный `CancelledError`
+сохраняется существующим cancellation contract.
+
+### После durable COMPLETED, до TERMINAL_COMMITTED
+
+Handoff остаётся `COMPLETED` и не может быть понижен до `AMBIGUOUS`. Output всё
+ещё fenced, потому что terminal marker отсутствует. Direct finalization retry
+заканчивает terminal convergence без side-effect replay.
 
 ## Restart classification — planned IR-8
 
@@ -332,7 +394,7 @@ Recommended order:
 5. reconcile control commands/generation
 6. reconcile active-cycle snapshots
 7. reconcile emission claims/UNKNOWN receipts without blind resend
-8. reconcile incomplete finalization records/results/outputs
+8. discover/reconcile incomplete finalization and handoff records
 9. list resumable cycles and pending deliveries
 10. connect MCP/tool runtime
 11. allow new admission/runners
@@ -406,7 +468,8 @@ record is terminal consistency defect.
 ## Finalization startup recovery — planned IR-8
 
 IR-7 уже делает direct retry/repository recreation идемпотентным. IR-8 должен
-добавить обнаружение и orchestration incomplete records на process startup.
+добавить обнаружение и orchestration incomplete records на process startup,
+включая valid `RuntimeHandoff=COMPLETED` + incomplete terminal convergence.
 
 ### `PREPARED`
 
@@ -420,15 +483,17 @@ output/terminal convergence без rerun whole AgentCycle.
 
 ### `OUTPUT_READY`
 
-Startup coordinator должен проверить terminal authority:
+Startup coordinator должен проверить terminal/handoff authority:
 
 - terminal committed — enable/reconcile delivery;
-- not terminal and watermarks unchanged — complete terminal commit;
-- new input/control exists — preserve abort/superseded evidence and resume cycle.
+- handoff completed + terminal incomplete — invoke safe direct terminal convergence;
+- handoff still active + watermarks unchanged — run final recheck, then complete handoff and terminal commit;
+- new input/control exists before handoff completion — preserve abort/superseded evidence and resume cycle.
 
 ### `TERMINAL_COMMITTED`
 
-Cycle never reruns. Output delivery/retrieval handled independently.
+Cycle never reruns. Matching admitted-run RuntimeHandoff уже обязан быть
+`COMPLETED`. Output delivery/retrieval handled independently.
 
 ## Retention
 
@@ -440,13 +505,13 @@ Committed user inputs and artifacts are not treated as temporary queue files.
 
 ## PostgreSQL migration
 
-In `v0.5` admission, watermarks, finalization and output intent can be committed in
-one or several explicit SQL transactions with row locks. Recovery semantics and
-states remain the same; filesystem repair paths become migration/import tools.
+In `v0.5` admission, watermarks, handoff completion, finalization and output intent
+can be committed in explicit SQL transactions with row locks. Recovery semantics
+and states remain the same; filesystem repair paths become migration/import tools.
 
-IR-6 command-oriented emission acceptance/claim/receipt и IR-7 command-oriented
-finalization operations естественно маппятся на SQL transactions/row locks без
-application dependency on filesystem layout.
+IR-6 command-oriented emission acceptance/claim/receipt и corrected IR-7
+command-oriented terminal operation естественно маппятся на SQL transaction/row
+locks без application dependency on filesystem layout.
 
 ## Distributed preparation
 
@@ -465,15 +530,23 @@ revision и не зависит от Telegram external message ID.
 
 ## Acceptance
 
-### IR-7 — implemented and validated
+### IR-7 — implemented and validated after corrective pass
 
 - input accepted at every finalization phase aborts stale result until terminal
   commit;
 - `/stop`/`/reset` before terminal commit suppress stale final output;
 - duplicate input/control without watermark change does not phantom-abort;
 - `WAITING_USER` question is suppressed by precommit input/control;
-- output is never claimable before terminal commit;
+- late final recheck occurs before RuntimeHandoff completion;
+- abort never completes handoff prematurely;
+- successful terminal path persists matching RuntimeHandoff COMPLETED before
+  terminal snapshot/session and TERMINAL_COMMITTED;
+- handoff completion persistence failure produces no terminal authority;
+- output is never claimable before terminal commit and normal admitted-run
+  delivery gate requires matching completed handoff;
 - stale/aborted output never becomes deliverable;
+- completed-handoff/incomplete-terminal direct retry preserves exact IDs and does
+  not replay LLM/tool work;
 - concurrent AgentEmission claim-vs-terminal commit has deterministic shared
   exact-session ordering;
 - network await does not occur under session/finalization coordination;
@@ -481,12 +554,13 @@ revision и не зависит от Telegram external message ID.
   authority;
 - post-terminal ordinary input is admitted as new cycle-level work.
 
-Code/test evidence:
+Corrected code/test evidence:
 
-- `c58ab05c8354d7e76d4176e39ebf481edc4c613b`;
-- `Validate Input Runtime` #355 — success, compile success, `376 passed`,
+- `eb93918b33ce7503d0e2d5d032b7e600f51e5661`;
+- `Validate Input Runtime` #387 — success, compile success, `384 passed`,
   `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #638 — success.
+- `Validate v0.4 file artifacts PR` #654 — success;
+- workflow permission remains `contents: read`.
 
 ### IR-8 — still planned
 
@@ -497,5 +571,5 @@ Code/test evidence:
 - corruption matrix and startup readiness gate;
 - shutdown/startup lifecycle recovery ordering.
 
-Focused IR-7 repository recreation tests не переводят эти IR-8 contracts в
-implemented.
+Focused IR-7 repository recreation/direct retry tests не переводят эти IR-8
+contracts в implemented.
