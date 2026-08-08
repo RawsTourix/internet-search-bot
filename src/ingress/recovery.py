@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 from .models import CommittedInputBatch
 from .store import FileSystemInputBatchStore
 
@@ -23,11 +25,10 @@ class FileSystemCommittedInputBatchRecoveryReader:
     async def list_committed_for_recovery(self) -> tuple[CommittedInputBatch, ...]:
         def scan() -> tuple[CommittedInputBatch, ...]:
             rows: list[CommittedInputBatch] = []
-            batches_root = self.store.root / "input-batches"
-            if not batches_root.exists():
+            if not self.store.root.exists():
                 return ()
-            for path in sorted(batches_root.glob("ibat_*/committed.json")):
-                rows.append(self.store._read_committed(path))
+            for path in sorted(self.store.root.glob("ibat_*/committed.json")):
+                rows.append(self.store._load_committed_sync(path.parent.name))
             rows.sort(
                 key=lambda item: (
                     item.session_id,
@@ -37,7 +38,5 @@ class FileSystemCommittedInputBatchRecoveryReader:
                 )
             )
             return tuple(rows)
-
-        import asyncio
 
         return await asyncio.to_thread(scan)
