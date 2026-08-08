@@ -295,7 +295,7 @@ def test_recovery_tool_protocol_rejects_incomplete_assistant_block():
 
 
 @pytest.mark.asyncio
-async def test_recovered_reservation_prevents_second_runner_and_shutdown_cancels(tmp_path):
+async def test_recovered_reservation_prevents_second_runner_and_shutdown_cancels():
     coordinator = SessionExecutionCoordinator()
     await coordinator.install_recovered_reservation(
         session_id="session",
@@ -303,22 +303,17 @@ async def test_recovered_reservation_prevents_second_runner_and_shutdown_cancels
         generation=4,
     )
     entered = asyncio.Event()
-    cancelled = asyncio.Event()
 
     async def owner():
-        try:
-            async with coordinator.admitted_run_lease(
-                session_id="session",
-                input_batch_id="initial",
-                cycle_id="cycle",
-                expected_generation=4,
-            ) as acquired:
-                assert acquired is True
-                entered.set()
-                await asyncio.Event().wait()
-        except asyncio.CancelledError:
-            cancelled.set()
-            raise
+        async with coordinator.admitted_run_lease(
+            session_id="session",
+            input_batch_id="initial",
+            cycle_id="cycle",
+            expected_generation=4,
+        ) as acquired:
+            assert acquired is True
+            entered.set()
+            await asyncio.Event().wait()
 
     task = asyncio.create_task(owner())
     await entered.wait()
@@ -330,6 +325,6 @@ async def test_recovered_reservation_prevents_second_runner_and_shutdown_cancels
     ) as acquired:
         assert acquired is False
     await coordinator.shutdown()
-    await cancelled.wait()
+    assert task.done()
     result = await asyncio.gather(task, return_exceptions=True)
     assert isinstance(result[0], asyncio.CancelledError)
