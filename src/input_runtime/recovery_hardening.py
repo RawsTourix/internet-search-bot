@@ -1,8 +1,8 @@
-"""IR-8 conservative classification for legacy control-resume invocations."""
+"""IR-8 conservative recovery hardening over earlier runtime stages."""
 
 from __future__ import annotations
 
-from .models import ControlCommandType, ControlState
+from .models import ControlCommandType, ControlState, FinalizationState
 from .recovery import (
     InputRuntimeRecoveryCoordinator as _BaseRecoveryCoordinator,
     InputRuntimeRecoveryPlan,
@@ -12,14 +12,7 @@ from .recovery import (
 
 
 class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
-    """Do not infer pre-handoff safety for a dead `/continue` invocation.
-
-    IR-5 predates per-control RuntimeHandoff records.  An applied/acknowledged
-    CONTINUE followed by a durable RUNNING snapshot proves that continuation was
-    authorized, but cannot prove whether its fresh process invocation crossed an
-    external side-effect boundary.  Until stronger durable evidence exists, IR-8
-    preserves that uncertainty and requires reset rather than blind replay.
-    """
+    """Preserve unknown side effects and terminal delivery fences on restart."""
 
     async def recover(self) -> InputRuntimeRecoveryPlan:
         plan = await super().recover()
@@ -62,6 +55,31 @@ class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
                 plan.report.resumable_cycles - changed,
             )
             plan.report.handoffs_ambiguous += changed
+
+        cancelled = 0
+        finalizations = await self.repositories.finalizations.list_for_recovery()  # type: ignore[attr-defined]
+        reconcile = getattr(
+            self.repositories.emissions,
+            "reconcile_terminal_ready_for_recovery",
+            None,
+        )
+        if callable(reconcile):
+            for record in finalizations:
+                if record.state != FinalizationState.TERMINAL_COMMITTED:
+                    continue
+                rows = await reconcile(
+                    session_id=record.session_id,
+                    cycle_id=record.cycle_id,
+                    generation=record.generation,
+                )
+                cancelled += len(rows)
+        if cancelled:
+            plan.report.emissions_cancelled += cancelled
+            plan.report.emissions_retained = max(
+                0,
+                plan.report.emissions_retained - cancelled,
+            )
+
         return InputRuntimeRecoveryPlan(
             sessions=tuple(hardened),
             report=plan.report,
