@@ -9,6 +9,7 @@ from .checkpoints import InputRuntimeCheckpointService
 from .config import InputRuntimeConfigType
 from .emissions import AgentEmissionService
 from .factory import InputRuntimeRepositories
+from .finalization import FinalizationBarrierService
 from .ir6_outbox import AgentEmissionOutboxService
 
 
@@ -20,6 +21,7 @@ class InputRuntimeApplicationBinding:
     checkpoint_service: InputRuntimeCheckpointService
     emission_service: AgentEmissionService
     emission_outbox_service: AgentEmissionOutboxService
+    finalization_service: FinalizationBarrierService
 
 
 _binding: InputRuntimeApplicationBinding | None = None
@@ -33,6 +35,7 @@ def register_input_runtime_binding(
     checkpoint_service: InputRuntimeCheckpointService,
     emission_service: AgentEmissionService,
     emission_outbox_service: AgentEmissionOutboxService,
+    finalization_service: FinalizationBarrierService,
 ) -> InputRuntimeApplicationBinding:
     global _binding
     candidate = InputRuntimeApplicationBinding(
@@ -42,6 +45,7 @@ def register_input_runtime_binding(
         checkpoint_service=checkpoint_service,
         emission_service=emission_service,
         emission_outbox_service=emission_outbox_service,
+        finalization_service=finalization_service,
     )
     _binding = candidate
     return candidate
