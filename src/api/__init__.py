@@ -5,6 +5,8 @@ from __future__ import annotations
 import inspect
 import os
 
+from dotenv import load_dotenv
+
 from . import output_outbox_routes as _output_routes
 from .emission_outbox_routes import add_emission_outbox_routes
 
@@ -31,11 +33,13 @@ if not getattr(_output_routes, "_ir6_emission_routes_installed", False):
     _output_routes._ir6_emission_routes_installed = True
 
 
-# Keep importing `src.api.config`, artifact routes, etc. side-effect free.  The
-# historical API singleton requires AGENT_CONFIG_PATH, so only a configured
-# direct `src.api.api` composition may be installed eagerly here.  Gateway also
-# installs IR-8 explicitly after importing the production API module, which is
-# the authoritative process startup path.
+# Keep importing `src.api.config`, artifact routes, etc. side-effect free when
+# no agent composition is configured.  Production uses the same .env loading as
+# api.config; with a real AGENT_CONFIG_PATH the direct `src.api.api` import is
+# intercepted here and the class-level IR-8 lifecycle is installed before the
+# package import returns.  Validation suites without agent config therefore do
+# not instantiate the production singleton merely by importing an API helper.
+load_dotenv()
 if (os.getenv("AGENT_CONFIG_PATH") or "").strip():
     from . import api as _api_module  # noqa: E402
     from . import input_runtime_recovery as _ir8_lifecycle  # noqa: E402
