@@ -12,6 +12,13 @@ on:
       - "src/api/api.py"
       - "src/api/__init__.py"
       - "src/api/emission_outbox_routes.py"
+      - "src/api/output_outbox_routes.py"
+      - "src/interaction/output_claim.py"
+      - "src/interaction/output_outbox.py"
+      - "src/interaction/output_service.py"
+      - "src/interaction/ir7_output_barrier.py"
+      - "src/runtime/finalization_bridge.py"
+      - "src/mcp/input_runtime_checkpoints.py"
       - "src/mcp/input_runtime_emissions.py"
       - "src/mcp/artifact_delivery_runtime.py"
       - "src/servers/telegram/emission_outbox.py"
@@ -39,13 +46,20 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest pytest-asyncio
-      - name: Compile input runtime and production IR-6 callers
+      - name: Compile input runtime and production IR-7 callers
         run: >-
           python -m compileall -q
           src/input_runtime
           src/api/api.py
           src/api/__init__.py
           src/api/emission_outbox_routes.py
+          src/api/output_outbox_routes.py
+          src/interaction/output_claim.py
+          src/interaction/output_outbox.py
+          src/interaction/output_service.py
+          src/interaction/ir7_output_barrier.py
+          src/runtime/finalization_bridge.py
+          src/mcp/input_runtime_checkpoints.py
           src/mcp/input_runtime_emissions.py
           src/mcp/artifact_delivery_runtime.py
           src/servers/telegram/emission_outbox.py
