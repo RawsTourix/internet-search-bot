@@ -11,13 +11,23 @@ from .errors import (
     InputRuntimeConflictError,
     InputRuntimeNotFoundError,
 )
-from .models import AdmissionKind, InputAdmissionRecord, SessionInputRuntimeState
+from .models import (
+    AdmissionKind,
+    CycleStatus,
+    InputAdmissionRecord,
+    SessionInputRuntimeState,
+)
 from .serialization import read_model
 
 
 STALE_TERMINAL_ADMISSION_REASON = (
     "terminal_state_after_optimistic_admission_decision"
 )
+_PRE_REPAIR_TERMINAL = {
+    CycleStatus.DONE,
+    CycleStatus.ERROR,
+    CycleStatus.CANCELLED,
+}
 
 
 class FileSystemInputAdmissionRepository(
@@ -30,16 +40,27 @@ class FileSystemInputAdmissionRepository(
     point against terminal commit. If terminal authority won first, a non-start
     candidate is rejected as a dedicated, retryable classification condition
     before record/index/inbox/session-watermark mutation for this batch.
+
+    A raw IDLE state is special: IR-2 record-first crash recovery may still have
+    an authoritative START_CYCLE admission that must repair the state to RUNNING.
+    Therefore DONE/ERROR/CANCELLED are fenced immediately, while IDLE is judged
+    only after authoritative-admission repair. Corruption conflicts from that
+    repair remain authoritative and are never reclassified/retried as this race.
     """
 
     @staticmethod
     def _reject_stale_terminal_decision(
         record: InputAdmissionRecord,
         state: SessionInputRuntimeState,
+        *,
+        include_idle: bool,
     ) -> None:
+        terminal_states = (
+            TERMINAL_OR_IDLE if include_idle else _PRE_REPAIR_TERMINAL
+        )
         if (
             record.admission_kind != AdmissionKind.START_CYCLE
-            and state.cycle_status in TERMINAL_OR_IDLE
+            and state.cycle_status in terminal_states
         ):
             raise InputAdmissionDecisionStaleError(
                 STALE_TERMINAL_ADMISSION_REASON
@@ -60,15 +81,24 @@ class FileSystemInputAdmissionRepository(
                 )
             state = read_model(state_path, SessionInputRuntimeState)
 
-            # The exact terminal-vs-admission race must be detected before the
-            # allocation path performs any repair or durable write for this batch.
-            self._reject_stale_terminal_decision(record, state)
+            # A real terminal commit must fence the stale candidate before any
+            # repair/write for this batch. IDLE is deferred because record-first
+            # admission recovery may legitimately reconstruct an active cycle.
+            self._reject_stale_terminal_decision(
+                record,
+                state,
+                include_idle=False,
+            )
 
             state = await self._repair_from_authoritative_admissions(
                 state_path,
                 state,
             )
-            self._reject_stale_terminal_decision(record, state)
+            self._reject_stale_terminal_decision(
+                record,
+                state,
+                include_idle=True,
+            )
 
             cached_rows: tuple[InputAdmissionRecord, ...] | None = None
 
