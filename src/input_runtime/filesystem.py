@@ -12,12 +12,12 @@ from ._filesystem_identity_recovery_cycle import (
     FileSystemContextRevisionRepository,
     FileSystemCycleInboxRepository,
 )
-from ._filesystem_identity_recovery_delivery import FileSystemFinalizationRepository
 from ._filesystem_identity_recovery_session import FileSystemInputAdmissionRepository
 from ._filesystem_session import FileSystemSessionInputRuntimeRepository
 from .coordination import GLOBAL_SESSION_LOCKS, SessionLockRegistry
 from .ir5_filesystem_controls import FileSystemSessionControlRepository
 from .ir6_delivery_authority import FileSystemAgentEmissionRepository
+from .ir7_filesystem import FileSystemFinalizationRepository
 
 
 class FileSystemInputRuntimeRepositories:
