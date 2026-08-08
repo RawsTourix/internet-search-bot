@@ -7,6 +7,8 @@ import logging
 from dataclasses import dataclass
 from uuid import uuid4
 
+from ..input_runtime.recovery import InputRuntimeRecoveryError
+
 
 logger = logging.getLogger("API.SessionReset")
 
@@ -39,6 +41,13 @@ def _completed_reset_controls(api) -> set[str]:
     return completed
 
 
+def _require_runtime_ready(api) -> None:
+    gate = getattr(api, "input_runtime_readiness_gate", None)
+    if gate is None:
+        raise InputRuntimeRecoveryError("input_runtime_not_ready", fatal=False)
+    gate.require_ready()
+
+
 async def reset_runtime_session(
     api,
     session_id: str,
@@ -49,11 +58,12 @@ async def reset_runtime_session(
 ) -> SessionResetResult:
     """Advance durable generation, then clear mutable memory at a safe lease.
 
-    The coordinator only mirrors the already-durable generation.  Open ingress
-    drafts and shared MCP/session memory are cleared after the old runner leaves
-    its current atomic block and releases the in-process execution lease.
+    `/reset` is also the safe escape from an IR-8 ambiguous/non-resumable cycle:
+    it never replays that invocation and only clears the block after the durable
+    generation transition has converged.
     """
 
+    _require_runtime_ready(api)
     execution_coordinator = getattr(api, "execution_coordinator", None)
     control_service = getattr(
         getattr(api, "input_admission_service", None),
@@ -62,6 +72,8 @@ async def reset_runtime_session(
     )
     control_id: str | None = None
     durable_generation: int | None = None
+    old_state = await api.input_runtime_repositories.sessions.get(session_id)
+    old_cycle_id = old_state.active_cycle_id if old_state is not None else None
 
     if control_service is not None:
         outcome = await control_service.request_reset(
@@ -83,12 +95,13 @@ async def reset_runtime_session(
                 generation=durable_generation,
             )
     elif execution_coordinator is not None:
-        # Compatibility only for a composition without the IR-5 service.
         durable_generation = await execution_coordinator.reset_session(session_id)
 
     async with _reset_application_lock(api, session_id):
         completed = _completed_reset_controls(api)
         if control_id is not None and control_id in completed:
+            if old_cycle_id is not None:
+                getattr(api, "_ir8_blocked_cycles", {}).pop(old_cycle_id, None)
             return SessionResetResult(
                 session_id=session_id,
                 cancelled_input_batch_ids=(),
@@ -132,13 +145,13 @@ async def reset_runtime_session(
             api.mcp_client.clear_session(session_id)
         else:
             # Never mutate shared memory underneath an old-generation runner.
-            # Durable generation fencing makes its next safe checkpoint unwind;
-            # this lease only waits for that bounded cooperative boundary.
             async with execution_coordinator.run_lease(session_id=session_id):
                 api.mcp_client.clear_session(session_id)
 
         if control_id is not None:
             completed.add(control_id)
+        if old_cycle_id is not None:
+            getattr(api, "_ir8_blocked_cycles", {}).pop(old_cycle_id, None)
 
     result = SessionResetResult(
         session_id=session_id,
