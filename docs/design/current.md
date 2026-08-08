@@ -39,6 +39,9 @@ file-artifacts-advanced и batch-workflows. `v0.4-input-runtime` остаётс�
 - durable `CycleFinalizationRecord` barrier с stable logical identity,
   `PREPARED → RESULT_PERSISTED → OUTPUT_READY → TERMINAL_COMMITTED`, двумя
   authoritative watermark/control rechecks и crash-safe replay;
+- exact admitted invocation `RuntimeHandoff` binding: successful terminal path
+  durable фиксирует `RuntimeHandoff=COMPLETED` после final recheck, но до terminal
+  snapshot/session convergence и до `TERMINAL_COMMITTED`;
 - final `OutputBatch` delivery gate: persistence/READY не даёт claim authority до
   `TERMINAL_COMMITTED`, а stale/aborted output освобождает cycle-final identity;
 - shared exact-session ordering `AgentEmission READY claim ↔ terminal commit`,
@@ -264,11 +267,13 @@ session.active_cycle_id == finalizing cycle
 
 DONE candidate сначала проходит `CP-BEFORE-FINAL-PROCESSING`. После clean
 checkpoint runtime фиксирует exact candidate authority: session/cycle/generation,
-context revision и expected input/control watermarks. Final audit/grounding не
-резервирует terminal authority. После final processing durable stable
-`finalization_id` переводится в `PREPARED`, а короткий exact-session recheck либо
-закрепляет `FINALIZING`, либо даёт controlled `ABORTED_NEW_INPUT` /
-`ABORTED_CONTROL`.
+context revision и expected input/control watermarks. Exact admitted invocation
+также передаёт runtime-owned `admission_id + handoff_token`; эти values не
+приходят от LLM/client и durable связывают finalization с текущим
+`RuntimeHandoff`. Final audit/grounding не резервирует terminal authority. После
+final processing durable stable `finalization_id` переводится в `PREPARED`, а
+короткий exact-session recheck либо закрепляет `FINALIZING`, либо даёт controlled
+`ABORTED_NEW_INPUT` / `ABORTED_CONTROL`.
 
 После успешного prepare выполняются:
 
@@ -277,26 +282,36 @@ persist final AgentResult evidence
 → RESULT_PERSISTED
 → assemble/persist normal final OutputBatch
 → OUTPUT_READY
-→ second authoritative recheck
-→ terminal session/snapshot convergence
+→ second authoritative terminal recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session convergence
 → TERMINAL_COMMITTED
+→ final OutputBatch claim eligibility
 ```
+
+Late input/control mismatch обрабатывается **до** handoff completion. Поэтому
+abort оставляет `RuntimeHandoff=HANDED_OFF`, stale output закрыт, а тот же cycle
+может продолжить LLM/tool работу. После durable `RuntimeHandoff=COMPLETED` никакой
+новый LLM/tool side effect этого invocation не запускается.
 
 `RESULT_PERSISTED` и `OUTPUT_READY` не являются delivery authority. Final
 `OutputBatch` скрыт из ready outbox и отвергается claim service до durable
-`TERMINAL_COMMITTED`. Если late durable input/control выигрывает до terminal
-marker, stale finalization abort-ится; persisted stale output не доставляется и
-его unclaimed cycle-final binding освобождается для следующего корректного
-same-cycle final result.
+`TERMINAL_COMMITTED`. Для normal admitted-run path delivery gate дополнительно
+требует matching `RuntimeHandoff=COMPLETED`. Если handoff completion write падает,
+не появляется ни новый terminal snapshot, ни session DONE, ни
+`TERMINAL_COMMITTED`, ни delivery eligibility.
 
 Filesystem terminal commit использует последовательные durable writes под одной
-короткой exact-session coordination boundary. Finalization
-`TERMINAL_COMMITTED` marker записывается последним и является server-owned
-output-delivery fence. Repository recreation повторяет ту же logical finalization
-без второго result/output/terminal commit. Partial terminal snapshot/session
-windows сходятся безопасно; если terminal authority не была завершена и late
-input/control успел стать durable, stale terminal snapshot repair-ится обратно к
-RUNNING authority при abort.
+короткой exact-session coordination boundary. Lock-aware infrastructure primitive
+завершает exact RuntimeHandoff без повторного захвата non-reentrant session lock.
+Finalization `TERMINAL_COMMITTED` marker записывается последним и является
+server-owned output-delivery fence.
+
+Crash после durable `RuntimeHandoff=COMPLETED`, но до terminal snapshot/session/
+marker, допускает только direct IR-7 retry известного `finalization_id`: повтор
+сохраняет тот же handoff token/completed_at, finalization ID, result_ref и
+OutputBatch ID и завершает terminal convergence без LLM/tool replay. Startup-wide
+discovery/reconstruction такого состояния остаётся IR-8.
 
 WAITING candidate проходит `CP-BEFORE-WAITING`, затем отдельный короткий exact
 input/control recheck и одну durable waiting-question authority. Input/control,
@@ -311,15 +326,17 @@ coordination ordering. Если READY→DELIVERING claim linearized первым
 commit linearized первым, новый old-cycle READY claim не стартует. Network send
 остаётся за пределами lock; ambiguous `DELIVERING` semantics IR-6 не ослаблены.
 
-IR-7 code/test boundary:
+Corrected IR-7 code/test boundary:
 
-- `c58ab05c8354d7e76d4176e39ebf481edc4c613b`;
-- `Validate Input Runtime` #355 — success, production compile success,
-  `376 passed`, `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #638 — success;
-- focused tests используют explicit `asyncio.Event`, fake clock, injected
-  persistence faults, repository recreation и real production MRO/output-claim
-  composition без real LLM/MCP/Telegram/Web/internet calls.
+- `eb93918b33ce7503d0e2d5d032b7e600f51e5661`;
+- `Validate Input Runtime` #387 — success, production compile success,
+  `384 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #654 — success;
+- workflow сохраняет `permissions: contents: read`;
+- corrective tests детерминированно покрывают handoff completion fault, exact
+  handoff→snapshot→session→terminal-marker ordering, output worker до completion,
+  completed-handoff/incomplete-terminal direct retry, late input/control abort до
+  completion и cancellation по обе стороны durable handoff completion.
 
 IR-7 не добавляет startup scanner/reconstruction coordinator. Startup recovery,
 paused/interrupted/waiting runner reconstruction и global UNKNOWN/handoff
@@ -371,7 +388,8 @@ IR-10.
 8. Runtime-owned route/provenance/idempotency не принимаются от LLM/client.
 9. Ambiguous external side effect не replay-ится blindly.
 10. Persisted final result/`OutputBatch READY` не являются terminal authority;
-    final output получает delivery authority только после
+    successful admitted-run terminalization сначала durable завершает matching
+    RuntimeHandoff, затем пишет terminal snapshot/session и только потом
     `CycleFinalizationRecord=TERMINAL_COMMITTED`.
 11. До terminal/waiting commit любой durable accepted input/control имеет право
     подавить stale candidate; после terminal commit новый ordinary input создаёт
