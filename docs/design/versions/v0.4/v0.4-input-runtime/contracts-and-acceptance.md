@@ -16,24 +16,26 @@ Observable contracts IR-1—IR-7 реализованы. IR-8—IR-10 остаю
 
 Финальный corrected IR-7 code/test boundary:
 
-- code/test HEAD: `eb93918b33ce7503d0e2d5d032b7e600f51e5661`;
-- `Validate Input Runtime` #387 — success, production compile success,
-  `384 passed`, `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #654 — success;
+- code/test HEAD: `6bd0dce0018b20520ed28236211fccdf0a8075fb`;
+- `Validate Input Runtime` #417 — success, production compile success,
+  `387 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #669 — success;
 - workflow сохраняет `permissions: contents: read`;
-- focused tests используют fake clock, explicit `asyncio.Event`, injected
-  persistence faults, repository recreation и production-like
-  admission/handoff/output-claim paths;
+- focused tests используют explicit `asyncio.Event`, injected persistence faults,
+  repository recreation и production-like admission/handoff/output-claim paths;
+- previous eight handoff-ordering tests остаются green;
+- три новых deterministic tests закрывают terminal-first reclassification,
+  admission-first terminal abort и pre-write stale-decision/no-raw-ValidationError;
 - real Agent/LLM/MCP/Telegram/Web/internet calls для IR-7 tests не выполняются.
 
 Corrected IR-7 активирует existing
-`CycleFinalizationRecord`/`FinalizationRepository`, добавляет stable logical
+`CycleFinalizationRecord`/`FinalizationRepository`, сохраняет stable logical
 finalization identity, exact admitted `RuntimeHandoff` relation,
 `PREPARED → RESULT_PERSISTED → OUTPUT_READY → TERMINAL_COMMITTED`, repeated
 authoritative input/control rechecks, WAITING commit barrier и transport-neutral
 final `OutputBatch` claim fence.
 
-Successful terminal ordering теперь фактически соответствует IR-3/IR-4 invariant:
+Successful terminal ordering соответствует IR-3/IR-4 invariant:
 
 ```text
 second terminal recheck
@@ -48,8 +50,14 @@ result/`OutputBatch READY` не являются terminal authority. Concurrent
 `AgentEmission READY claim ↔ terminal commit` linearizable через общую
 exact-session coordination; network send остаётся вне lock. Direct
 repository-recreation retry собственного finalization protocol идемпотентен,
-включая completed-handoff/incomplete-terminal window, но startup-wide recovery
-остаётся IR-8.
+включая completed-handoff/incomplete-terminal window.
+
+Corrected IR-7 также linearizes `admission durable allocation ↔ terminal commit`:
+optimistic application state read не является tie-break. Admission-first
+продвигает same-cycle accepted watermark и заставляет stale finalization abort;
+terminal-first invalidates stale non-start classification до admission writes и
+тот же call reclassifies committed batch как новый `START_CYCLE`. Это normal
+in-process contract, не IR-8 startup recovery.
 
 Финальный IR-6 code/test boundary:
 
@@ -129,6 +137,51 @@ ibat_2, ibat_3, ibat_4 admitted
 → exact order and boundaries retained
 ```
 
+### Admission vs terminal commit
+
+Authoritative tie-break — durable repository coordination, не optimistic state
+read и не task creation/wall clock.
+
+Admission-first:
+
+```text
+optimistic FINALIZING → CONTINUE_RUNNING(A)
+→ durable admission allocation to A
+→ accepted watermark advances
+→ terminal second recheck sees accepted > applied
+→ ABORTED_NEW_INPUT
+→ RuntimeHandoff remains HANDED_OFF
+→ cycle A RUNNING/continues
+```
+
+Terminal-first:
+
+```text
+optimistic FINALIZING → CONTINUE_RUNNING(A)
+→ terminal second recheck clean
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session
+→ TERMINAL_COMMITTED
+→ stale candidate reaches repository
+→ managed stale-decision conflict before writes
+→ same admission call re-reads latest state
+→ START_CYCLE(B), cycle_sequence=0
+→ should_start_runner=true, should_wake_runner=false
+```
+
+Before reclassification there must be no late-batch admission record/index,
+old-cycle inbox item or accepted-watermark mutation. Same `input_batch_id` ends
+with exactly one durable admission; duplicate replay returns it.
+
+Retry/reclassification is bounded and only recognizes the dedicated stale-decision
+conflict. Raw Pydantic `ValidationError` must not leak from this race and
+arbitrary corruption/consistency conflict must not be silently retried.
+
+Raw `IDLE` is first reconciled against IR-2 authoritative admission records, so
+record-first START crash repair and gap/duplicate corruption remain visible.
+Normal `DONE/ERROR/CANCELLED` terminal authority fences stale non-start admission
+before writes.
+
 ### WAITING_USER
 
 ```text
@@ -156,7 +209,7 @@ candidate question
 Input/control, durable accepted до waiting commit, suppress stale question. Input
 после successful waiting commit использует existing same-cycle
 `RESUME_WAITING` semantics; второй durable question lifecycle не создаётся.
-Corrective RuntimeHandoff terminal ordering WAITING path не перерабатывает.
+Admission-vs-terminal correction WAITING path не перерабатывает.
 
 ### Pause/resume
 
@@ -312,6 +365,11 @@ runtime blocks и second terminal recheck.
 ## Persistence contract
 
 - committed input is never deleted because admission temporarily failed;
+- normal live admission-vs-terminal race resolves within the same admission call,
+  not by leaving the batch committed-but-unadmitted for IR-8;
+- stale optimistic admission classification is rejected before admission/index/
+  inbox/session-watermark mutation;
+- one committed `input_batch_id` ends with exactly one durable admission relation;
 - every applied batch has admission and context revision evidence;
 - session/cycle watermarks are monotonic within generation;
 - reset advances generation and fences old work;
@@ -405,6 +463,10 @@ finalization. Повтор той же logical finalization возвращает
 identity/state/result/output; repeated handoff completion возвращает тот же
 COMPLETED marker без нового token или `completed_at`.
 
+Stale admission reclassification сохраняет `input_batch_id` idempotency: old-cycle
+candidate до write не становится admission; new-cycle START relation создаётся
+один раз, а последующий duplicate возвращает existing admission.
+
 ## Ordering contract
 
 Authoritative order within session/cycle is durable coordination/sequence, not
@@ -416,7 +478,9 @@ client message timestamp or arrival completion.
 - controls have explicit priority but preserve audit sequence;
 - intermediate policy uses exact cycle/generation durable creation ordering;
 - terminalization observes all accepted sequences up to current watermark;
-- successful terminal authority cannot precede exact RuntimeHandoff completion.
+- successful terminal authority cannot precede exact RuntimeHandoff completion;
+- admission-vs-terminal tie-break is durable repository coordination, not
+  optimistic application state read.
 
 IR-5 control sequence выделяется под короткой session coordination boundary.
 `pending_control_sequence` продвигается durable acceptance, а
@@ -431,9 +495,9 @@ continue target. State, прочитанный вне этой boundary, не о
 IR-6 max-count/min-interval acceptance и persistence используют короткую exact
 session coordination, но Telegram/Web network await под ней не выполняется.
 
-Corrected IR-7 terminal command и IR-6 READY emission claim используют
-совместимую exact-session coordination authority. Terminal-success order внутри
-boundary:
+Corrected IR-7 terminal command, durable admission allocation и IR-6 READY
+emission claim используют compatible exact-session coordination authority.
+Terminal-success order внутри boundary:
 
 ```text
 second recheck
@@ -443,10 +507,16 @@ second recheck
 → TERMINAL_COMMITTED
 ```
 
-Claim-first legitimate attempt становится `DELIVERING` до terminal authority;
-terminal-first запрещает новый old-cycle READY claim. Ни final processing, ни
-client/network delivery под этим lock не выполняются. Handoff completion
-выполняется lock-aware infrastructure command без re-enter того же session lock.
+If admission allocation to the finalizing cycle linearizes first, accepted
+watermark changes before this recheck and terminal aborts. If terminal command
+linearizes first, a pre-formed stale non-start admission candidate cannot mutate
+terminal state and must be reclassified.
+
+Claim-first legitimate emission attempt становится `DELIVERING` до terminal
+authority; terminal-first запрещает новый old-cycle READY claim. Ни final
+processing, ни client/network delivery под этим lock не выполняются. Handoff
+completion выполняется lock-aware infrastructure command без re-enter того же
+session lock.
 
 ## Backpressure contract
 
@@ -471,6 +541,10 @@ Behavior:
 - no unbounded in-memory buffering;
 - diagnostics expose counts/age, not raw content;
 - emission READY outbox listing is bounded and route-filtered.
+
+Stale terminal-race reclassification recomputes capacity decision together with
+kind/action/target. Terminal-first `START_CYCLE` outcome must not retain stale
+old-cycle capacity/projection state.
 
 ## Control contract
 
@@ -589,8 +663,9 @@ unknown emission delivery → retain unknown; no blind resend
 Этот startup-wide contract остаётся IR-8. IR-6 гарантирует durable
 repository recreation semantics, expiry→UNKNOWN и no blind READY requeue; IR-7
 гарантирует direct retry/repository recreation собственного finalization protocol,
-включая known completed-handoff/incomplete-terminal state, но ни один из них не
-является startup reconstruction coordinator.
+known completed-handoff/incomplete-terminal convergence и live admission-vs-
+terminal reclassification. Ни один из этих IR-7 contracts не является startup
+reconstruction coordinator.
 
 ## Compatibility contract
 
@@ -666,8 +741,9 @@ Metrics/diagnostics distinguish:
 
 IR-5 добавил control watermarks/generation в current runtime status projection.
 IR-6 добавил transport-neutral emission lifecycle/query foundation. IR-7 добавил
-durable finalization/result/output eligibility state и exact handoff relation, но
-полный IR-9 diagnostics/client projection completion остаётся planned.
+durable finalization/result/output eligibility state, exact handoff relation и
+admission-terminal live ordering; полный IR-9 diagnostics/client projection
+completion остаётся planned.
 
 ## Unit test matrix
 
@@ -693,7 +769,12 @@ durable finalization/result/output eligibility state и exact handoff relation, 
 - concurrent commits;
 - duplicate batch;
 - capacity;
-- session/generation mismatch.
+- session/generation mismatch;
+- stale non-start candidate after terminal authority rejected pre-write;
+- terminal-first same call reclassifies to new `START_CYCLE`;
+- admission-first accepted watermark aborts stale finalization;
+- no raw Pydantic `ValidationError` in normal terminal race;
+- IR-2 IDLE repair/corruption not masked by stale-decision retry.
 
 ### Checkpoints
 
@@ -778,10 +859,15 @@ Corrected IR-7 deterministic tests cover:
 - late input/control at OUTPUT_READY aborts before handoff completion;
 - cancellation before completion keeps no terminal authority;
 - cancellation after COMPLETED preserves completed handoff and allows direct retry;
-- API compatibility completion after terminal commit is idempotent.
+- API compatibility completion after terminal commit is idempotent;
+- terminal-first stale admission returns valid new-cycle START_CYCLE from the same
+  API admission call;
+- admission-first durable late input yields ABORTED_NEW_INPUT with handoff still
+  HANDED_OFF and stale output fenced.
 
-IR-8 startup order/readiness, global ambiguous side-effect reconciliation and
-startup reconstruction remain planned.
+IR-8 startup order/readiness, global ambiguous side-effect reconciliation,
+committed-but-unadmitted startup discovery and startup reconstruction remain
+planned.
 
 ## Race test matrix
 
@@ -790,6 +876,7 @@ Deterministic barriers covered through corrected IR-7:
 ```text
 commit vs admission
 admission vs initial cycle creation
+admission optimistic classification vs terminal commit
 input vs before-LLM checkpoint
 input vs tool-block completion
 input vs waiting commit
@@ -816,9 +903,9 @@ absence of exception.
 
 IR-6 closes duplicate/policy/claim/receipt/expiry/reset/sequential-terminal
 windows. Corrected IR-7 closes atomic concurrent emission claim-vs-terminal,
-late input/control-vs-terminal/waiting commit и handoff-before-terminal durable
-ordering. Shutdown/startup-wide recovery races remain IR-8;
-randomized/full-system repetition remains IR-10.
+late input/control-vs-terminal/waiting commit, handoff-before-terminal durable
+ordering и stale admission-decision-vs-terminal race. Shutdown/startup-wide
+recovery races remain IR-8; randomized/full-system repetition remains IR-10.
 
 ## Randomized tests
 
@@ -841,6 +928,8 @@ Each seed must verify global invariants:
 - no terminal with pending accepted/control;
 - no final OutputBatch delivery before terminal commit;
 - terminal admitted-run output never exists with matching handoff non-COMPLETED;
+- no committed batch gets both old-cycle continuation and new-cycle START
+  admission from one terminal race;
 - no blind retry of UNKNOWN semantic emission;
 - no protocol-invalid history;
 - reset generation fences old work.
@@ -895,7 +984,7 @@ Live checks verify user-visible messages and backend IDs/statuses. Private conte
 is not committed to reports.
 
 IR-6 содержит deterministic fake Telegram delivery tests, IR-7 — transport-neutral
-final-output/emission/handoff ordering tests, но maintainer live Telegram
+final-output/emission/handoff/admission ordering tests, но maintainer live Telegram
 acceptance остаётся IR-10.
 
 ## Performance/safety gates
@@ -914,8 +1003,11 @@ acceptance остаётся IR-10.
 Corrected IR-7 terminal recheck использует exact session/cycle/generation/
 finalization/handoff authority. Lock-aware handoff completion выполняет только
 short durable transition внутри уже удерживаемой session coordination и не
-re-enter-ит lock. Final output eligibility lookup ограничен exact cycle
-finalization records и не делает repository-wide scan на каждом checkpoint.
+re-enter-ит lock. Admission repository также выполняет только short pre-write
+latest-state/recovery validation under the same durable ordering; application
+reclassification остаётся storage-neutral и bounded. Final output eligibility
+lookup ограничен exact cycle finalization records и не делает repository-wide
+scan на каждом checkpoint.
 
 ## Documentation gate
 
