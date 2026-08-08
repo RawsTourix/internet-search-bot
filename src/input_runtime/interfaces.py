@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 from .handoff import RuntimeHandoffRecord
 from .models import (
@@ -13,6 +13,7 @@ from .models import (
     CycleContextRevision,
     CycleFinalizationRecord,
     CycleInboxItem,
+    CycleStatus,
     InputAdmissionRecord,
     SessionControlCommand,
     SessionInputRuntimeState,
@@ -384,3 +385,56 @@ class FinalizationRepository(Protocol):
         generation: int,
         reason_code: str,
     ) -> tuple[CycleFinalizationRecord, ...]: ...
+
+    # IR-7 command-oriented exact-session boundary. A future SQL adapter maps
+    # these commands to one row/transaction authority without exposing storage
+    # layout to the application service.
+    async def prepare_authority(
+        self,
+        record: CycleFinalizationRecord,
+    ) -> CycleFinalizationRecord: ...
+
+    async def persist_result_payload(
+        self,
+        finalization_id: str,
+        *,
+        result_payload: dict[str, Any],
+        persisted_at: datetime,
+    ) -> CycleFinalizationRecord: ...
+
+    async def mark_output_ready(
+        self,
+        finalization_id: str,
+        *,
+        output_batch_id: str,
+        persisted_at: datetime,
+    ) -> CycleFinalizationRecord: ...
+
+    async def commit_terminal_authority(
+        self,
+        finalization_id: str,
+        *,
+        terminal_status: CycleStatus,
+        committed_at: datetime,
+    ) -> CycleFinalizationRecord: ...
+
+    async def commit_waiting_authority(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+        generation: int,
+        context_revision_id: str,
+        expected_input_sequence: int,
+        expected_control_sequence: int,
+        waiting_question: str,
+        committed_at: datetime,
+    ) -> SessionInputRuntimeState: ...
+
+    async def output_delivery_allowed(
+        self,
+        *,
+        session_id: str,
+        cycle_id: str,
+        output_batch_id: str,
+    ) -> bool: ...
