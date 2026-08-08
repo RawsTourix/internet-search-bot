@@ -29,16 +29,21 @@ def get_final_output_assembler() -> Any | None:
 
 
 def bind_output_eligibility(checker: OutputEligibility) -> None:
-    global _output_eligibility
+    global _final_output_assembler, _output_eligibility
+    # InputAdmissionService is composed before OutputBatchAssembler. Clearing
+    # the prior assembler here makes the later assembler bind the activation
+    # edge for this exact composition root instead of inheriting stale process
+    # state from an earlier Api/test runtime.
+    _final_output_assembler = None
     _output_eligibility = checker
 
 
 async def output_delivery_allowed(batch: Any) -> bool:
     checker = _output_eligibility
-    if checker is None:
-        # Compatibility mode outside the input runtime keeps the pre-IR-7
-        # delivery contract. Production input-runtime composition binds the
-        # durable finalization checker during startup.
+    if checker is None or _final_output_assembler is None:
+        # Compatibility mode outside a complete IR-7 composition keeps the
+        # pre-IR-7 delivery contract. Production Api composition always binds
+        # admission/finalization authority first and the final assembler next.
         return True
     return bool(await checker(batch))
 
