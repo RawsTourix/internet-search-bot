@@ -1,0 +1,2011 @@
+---
+id: design.v0.4.input-runtime.sequence
+version: v0.4
+update: v0.4-input-runtime
+spec_status: accepted
+implementation_status: partial
+last_reviewed: 2026-08-08
+---
+
+# Последовательность реализации v0.4-input-runtime
+
+## Статус реализации
+
+- `IR-1 — Domain models, config и repository ports`: implemented;
+- `IR-2 — Filesystem repositories и coordination service`: implemented;
+- `IR-3 — Admission service и initial-cycle integration`: implemented and hardened;
+- `IR-4 — Active snapshot, checkpoints и CycleInputApplier`: implemented;
+- `IR-5 — Durable control plane /stop, /continue, /reset`: implemented and validated;
+- `IR-6 — AgentEmission и intermediate messages`: implemented and validated;
+- `IR-7 — Finalization barrier`: implemented and validated after corrective passes;
+- `IR-8`—`IR-10`: planned.
+
+Общий `v0.4-input-runtime` остаётся `partial`.
+
+Финальный corrected IR-7 code/test boundary:
+
+- code/test HEAD:
+  `6bd0dce0018b20520ed28236211fccdf0a8075fb`;
+- `Validate Input Runtime` #417 — success, production compile success,
+  `387 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #669 — success;
+- workflow permission remains `contents: read`.
+
+Corrected IR-7 production boundary гарантирует два связанных durable ordering
+contracts.
+
+Terminal success:
+
+```text
+DONE candidate
+→ CP-BEFORE-FINAL-PROCESSING
+→ exact candidate authority + exact admitted RuntimeHandoff relation
+→ final processing without terminal reservation
+→ PREPARED + short authoritative recheck
+→ FINALIZING
+→ RESULT_PERSISTED
+→ normal final OutputBatch persisted / OUTPUT_READY
+→ second authoritative terminal recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session convergence
+→ TERMINAL_COMMITTED
+→ output claim/delivery becomes eligible
+```
+
+Admission-vs-terminal tie-break:
+
+```text
+admission allocation first
+→ same-cycle accepted watermark advances
+→ second terminal recheck sees accepted > applied
+→ ABORTED_NEW_INPUT
+→ RuntimeHandoff remains HANDED_OFF
+→ same cycle continues
+
+terminal command first
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session
+→ TERMINAL_COMMITTED
+→ stale optimistic non-start admission rejected before writes
+→ same admission call re-reads latest state
+→ START_CYCLE for a new cycle, cycle_sequence=0
+```
+
+Terminal eligibility использует authoritative accepted/applied input watermarks,
+pending/applied control watermarks, generation, active-cycle ownership, exact
+finalization identity и exact runtime-owned `admission_id + handoff_token`.
+Любой late durable input/control на second terminal recheck abort-ит stale
+finalization **до** handoff completion; duplicate delivery без watermark
+transition не даёт phantom abort.
+
+Application admission state read остаётся optimistic и не является durable
+linearization point. Filesystem admission allocation и terminal command используют
+shared `root identity → session` ordering. Если terminal authority выиграла
+первой, dedicated managed stale-decision conflict возникает до admission record,
+index, inbox item или accepted-watermark mutation; только этот exact conflict
+может вызвать один bounded full reclassification. Arbitrary consistency/corruption
+conflicts не retry-ятся. Raw `IDLE` сначала проходит existing IR-2 authoritative
+admission repair, поэтому record-first START crash recovery и corruption checks не
+маскируются.
+
+Persisted result и `OutputBatch READY` сами не являются terminal authority.
+Ready outbox и direct claim закрыты до `TERMINAL_COMMITTED`; normal admitted-run
+output gate дополнительно требует matching `RuntimeHandoff=COMPLETED`.
+Stale/aborted output не становится deliverable и освобождает unclaimed
+cycle-final identity для следующего корректного same-cycle final result.
+
+Filesystem terminal command использует короткий exact-session lock. После second
+recheck lock-aware infrastructure primitive durable завершает exact
+RuntimeHandoff без повторного захвата того же non-reentrant lock. Только после
+этого записываются terminal snapshot/session, а finalization terminal marker —
+последним. Failure/cancellation до durable handoff completion не создаёт terminal
+snapshot/session/marker или output delivery authority.
+
+Crash после durable handoff COMPLETED, но до terminal writes, direct-retry-ится по
+известному finalization ID: same handoff token/completed_at, finalization ID,
+result_ref и OutputBatch ID сохраняются, LLM/tool work не replay-ится. Startup
+обнаружение/reconstruction такого состояния остаётся IR-8.
+
+WAITING candidate получает отдельный barrier
+`CP-BEFORE-WAITING → exact input/control recheck → one durable question authority
+→ WAITING_USER`. Input/control до waiting commit suppresses stale question; input
+после commit идёт существующим same-cycle `RESUME_WAITING` path. Corrective
+terminal/admission ordering WAITING path не меняет.
+
+IR-6 emission READY claim и IR-7 terminal command linearizable через один
+exact-session coordination ordering: claim-first attempt legitimately остаётся
+DELIVERING, terminal-first запрещает новый old-cycle claim. Network/LLM/tool await
+под этим lock не выполняется.
+
+Deterministic corrected IR-7 tests покрывают finalization phases,
+waiting/control/reset, output gate, claim-vs-terminal ordering, handoff completion
+fault, exact durable write order, output worker в pre-handoff terminal window,
+completed-handoff/incomplete-terminal direct retry, late input/control before
+completion, cancellation вокруг completion, terminal-first admission
+reclassification, admission-first terminal abort и pre-write stale-decision
+contract без raw Pydantic `ValidationError`. Real LLM/MCP/Telegram/Web/internet
+calls не используются.
+
+Финальный подтверждённый IR-6 code/test boundary:
+
+- code/test HEAD:
+  `4447d1bfe487bfd764829e701f274655aa8c3c50`;
+- `Validate Input Runtime` #297 — success, compile success, `350 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #609 — success.
+
+IR-6 production boundary гарантирует:
+
+```text
+assistant native tool_call(send_user_message)
+→ runtime-owned ManagerToolExecutionContext
+→ trusted route + stable tool-call idempotency
+→ linearizable policy acceptance
+→ durable AgentEmission READY before tool success
+→ independent route-scoped outbox claim
+→ durable client receipt/outcome
+→ DELIVERED | FAILED | UNKNOWN
+```
+
+Manager schema содержит только `message`, `kind=intermediate`, `importance`.
+Runtime injects exact session/cycle/generation/context revision/native tool-call
+identity и original input batch. Same logical replay возвращает тот же emission;
+changed semantic arguments под той же identity дают managed conflict. Policy
+count/interval/persistence выполняются command-oriented repository primitive под
+короткой exact-session coordination и не удерживают lock во время network await.
+
+Trusted response route выводится из original authoritative committed input,
+response anchor и capability snapshot, sanitizes transport metadata/secrets и не
+может быть переопределён LLM. Delivery wake после READY best-effort; agent loop
+не ждёт client receipt, emission не создаёт context revision и не меняет WAITING
+или input/control watermarks.
+
+Claim/receipt lifecycle hardened для production windows: same-token claim retry
+идемпотентен, competing token rejected, durable generic receipt precedes
+`DELIVERED`, duplicate receipt идемпотентен, expired/ambiguous attempt становится
+`UNKNOWN`, а UNKNOWN не requeue-ится blind. Telegram worker sends new plain-text
+semantic message, не progress edit, и durable сохраняет external message ID.
+Server-owned external reply ref сопоставляется с delivered emission только по
+exact session/client instance/conversation/thread scope и может добавить optional
+`reply_to` marker без branch/FIFO semantics.
+
+Reset fences old generation как `READY → CANCELLED` и
+`DELIVERING → UNKNOWN`; stale claim writer не может завершить reset record.
+Sequential terminal fencing отвергает новый emission после terminal state и не
+начинает READY delivery после already-visible terminal. Atomic concurrent
+`claim ↔ terminal/finalization commit` закрыт IR-7 общей exact-session authority.
+
+Deterministic IR-6 tests покрывают duplicate/concurrent manager calls, fake-clock
+policy, record/index crash recovery, cancellation после READY, lost claim/receipt
+HTTP response, expiry, reset during delivery, terminal-before-claim, exact worker
+route authority, fake Telegram failure/ambiguity и cross-session reply fencing.
+Real LLM/MCP/Telegram/Web/internet calls не используются.
+
+Финальный подтверждённый IR-5 code/test boundary:
+
+- corrected code/test HEAD:
+  `0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`;
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
+
+IR-5 production boundary теперь гарантирует:
+
+```text
+transport command
+→ transport-neutral InputRuntimeControlService
+→ command-oriented SessionControlRepository acceptance
+→ stable durable SessionControlCommand + monotonic sequence
+→ pending_control_sequence
+→ safe checkpoint control reducer
+→ pause/continue/reset semantic effect
+→ contiguous applied_control_sequence
+```
+
+`/stop` cooperative: bounded LLM attempt/complete assistant tool block
+завершается protocol-valid, затем snapshot фиксируется `paused_by_user` и
+следующий semantic block не начинается. `pause_requested`/`paused_by_user` input
+admitted как `QUEUE_PAUSED` без wake/auto-resume.
+
+`/continue` возобновляет тот же `cycle_id`. Repository primitive
+`accept_continue(...)` под одной короткой durable `root identity → session`
+coordination выполняет authoritative state read, exact-session control-frontier
+repair, freeze текущего `active_cycle_accepted_through_sequence`, unique control
+sequence allocation, command/index publication и pending watermark advance.
+Поэтому input, coordinated раньше continue, входит в resume target и drain-ится
+bounded chunks через `CP-RESUME` до первого post-resume LLM; input, coordinated
+после continue, не расширяет frozen target и остаётся следующему running
+checkpoint. Duplicate same-key continue сохраняет исходный ID/sequence/target,
+record-first publication crash сохраняет target и repair-ит missing pending
+watermark. Continue без additions не создаёт fake input/revision; `WAITING_USER`
+без ответа возвращает `still_waiting_for_input`.
+
+`/reset` использует durable `SessionInputRuntimeState.generation` как authority,
+повышает её ровно один раз на logical command, cancels/fences old-generation
+records и синхронизирует defensive in-process coordinator только после durable
+transition. Mutable session memory очищается после safe execution lease boundary.
+
+Checkpoint-level pause/reset suppression перед terminal transition реализовано,
+а IR-7 добавляет repeated authoritative recheck и закрывает late terminal race.
+Startup-wide runner reconstruction/reconciliation остаётся IR-8. Полная corruption
+matrix `recover_cycle_authority()` остаётся IR-8/IR-10.
+
+Финальный подтверждённый IR-4 code/test boundary:
+
+- итоговый code/test HEAD:
+  `1d31b6fbd1d5e88966d3964dc35cf4680f32f522`;
+- `Validate Input Runtime` #115 — success, compile success, `241 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #518 — success, validation suites и status
+  enforcement success;
+- regression-fix проход после `224911a…` затронул только tests; production code
+  не менялся.
+
+IR-4 production boundary гарантирует:
+
+```text
+admitted active cycle
+→ CP-RESUME
+→ initial R1 + durable ActiveCycleSnapshot
+→ protocol-safe checkpoint entry watermark
+→ bounded contiguous FIFO apply
+→ one input_batch_update per applied range
+→ next linear CycleContextRevision
+→ snapshot-first applied watermark
+→ inbox/admission marking reconciliation
+```
+
+WAITING reply проходит тот же common FIFO `CP-RESUME`, не обходит более ранние
+queued additions и не владеет legacy semantic continuation path. Claim acquisition
+и apply cancellation-safe. Runtime handoff completion предшествует terminal
+snapshot synchronization; corrected IR-7 теперь фактически сохраняет этот
+IR-3/IR-4 invariant на terminal path.
+
+Финальный подтверждённый IR-3 code boundary сохраняется как предыдущий stage
+evidence:
+
+- основной admission implementation:
+  `4929b703d7f6e200392661b2b66205b8fa4ca034`;
+- crash-safe capacity и runner handoff hardening:
+  `d11db7f2a2f8caae900f3bc94ed91de020059231`;
+- cancellation-safe/storage-neutral handoff implementation:
+  `e8192380cc3104668ea9b0f3f017d3c962fd65e4`;
+- итоговый IR-3 code HEAD после узкого test-fixture fix:
+  `c36e4cc38095e15f54f63ae81c29b4829defec1f`;
+- `Validate Input Runtime` #84 — success, `198 passed`;
+- `Validate v0.4 file artifacts PR` #503 — success.
+
+IR-3 production boundary гарантирует:
+
+```text
+CommittedInputBatch
+→ authoritative InputAdmission
+→ один exact active cycle либо FIFO CycleInbox
+→ pre-run setup
+→ durable RuntimeHandoffRecord
+→ process_query invocation
+```
+
+Running additions durable сохраняются в том же cycle без второго
+`process_query()`. Count/byte capacity определяется authoritative admissions, а
+не только наличием inbox file. Exact-cycle wake не позволяет позднему signal
+старого cycle будить новый.
+
+Runtime handoff storage-neutral: application service зависит от
+`RuntimeHandoffRepository`, а concrete filesystem adapter создаётся только
+`create_filesystem_input_runtime_repositories(...)`.
+
+Cancellation contract IR-3:
+
+- initial cancellation до marker оставляет admission retryable;
+- initial cancellation после marker переводит marker в `AMBIGUOUS`, cycle — в
+  `interrupted`, duplicate не запускает runtime повторно;
+- WAITING cancellation после claim, но до marker, requeue-ит claim;
+- WAITING cancellation после marker не requeue-ит claim, оставляет его evidence,
+  переводит marker в `AMBIGUOUS`, cycle — в `interrupted`;
+- cleanup запускается отдельной task, ожидается через `asyncio.shield`, завершается
+  даже при повторной cancellation, затем исходный `CancelledError` re-raise-ится.
+
+Corrected IR-7 уточняет два уже принятых IR-3 contracts:
+
+- final terminal recheck выполняется раньше handoff completion; если recheck clean,
+  exact handoff durable становится COMPLETED внутри terminal coordination, после
+  чего snapshot/session/marker могут сходиться;
+- stale optimistic active-cycle admission decision не может мутировать уже
+  terminal session: terminal-first relation reclassifies тот же committed batch в
+  new-cycle START admission, не оставляя old-cycle admission/inbox evidence.
+
+Поздний API compatibility `complete_runtime_handoff()` идемпотентен и не меняет
+`completed_at`.
+
+После IR-7 следующие mandatory contracts остаются:
+
+- IR-8: ambiguous/startup recovery policy без blind replay;
+- IR-9: complete client projections/diagnostics/config examples;
+- IR-10: full race/restart/synthetic/live acceptance, включая corruption matrix.
+
+Scheduler/parallel branches и Telegram history rewind в текущий implemented
+baseline не входят.
+
+## Назначение документа
+
+Документ является канонической последовательностью implementation patches. Каждый
+этап фиксирует:
+
+- цель и ownership boundary;
+- изменяемые components;
+- обязательные invariants и transitions;
+- deterministic tests и acceptance;
+- условие завершения;
+- запрещённое расширение scope.
+
+Реализация выполняется небольшими fast-forward patches. Большой rewrite
+`src/mcp/mcp_client.py`, преждевременная modularization, PostgreSQL, Redis и
+scheduler в этот update не входят.
+
+## Предварительная инвентаризация
+
+Перед каждым следующим этапом implementation agent повторно проверяет branch,
+HEAD, status и diff относительно target branch, затем читает current owners:
+
+```text
+src/core/message_processor.py
+src/api/api.py
+src/api/session_reset.py
+src/runtime/cycle.py
+src/runtime/session_execution.py
+src/mcp/mcp_client.py
+src/mcp/waiting_user_batch_continuation.py
+src/agent/protocol.py
+src/interaction/*
+src/servers/telegram/*
+src/ingress/*
+src/input_runtime/*
+```
+
+Обязательно определить:
+
+- где committed batch проходит admission;
+- где создаётся/resumes active cycle;
+- точный LLM/tool loop и terminal return paths;
+- где фиксируются `WAITING_USER`, `DONE`, interrupted/error;
+- где выполняются final audit и output assembly;
+- где хранятся memory/pending cycle;
+- как `/reset` и shutdown взаимодействуют с execution lease;
+- какие tests фиксируют FIFO, continuation, progress и delivery.
+
+Результат инвентаризации — code comments/tests или PR evidence, а не новый
+competing canonical design document.
+
+---
+
+# IR-1 — Domain models, config и repository ports
+
+## Статус
+
+Implemented и подтверждён CI. Production runtime integration не входит в IR-1.
+
+## Цель
+
+Создать независимый package `src/input_runtime/` с pure models, errors, config и
+command-oriented repository Protocols.
+
+## Основные файлы
+
+```text
+src/input_runtime/__init__.py
+src/input_runtime/models.py
+src/input_runtime/handoff.py
+src/input_runtime/errors.py
+src/input_runtime/config.py
+src/input_runtime/interfaces.py
+src/input_runtime/factory.py
+```
+
+## Models
+
+Минимальный набор:
+
+```text
+SessionInputRuntimeState
+InputAdmissionRecord
+InputAdmissionOutcome
+CycleInboxItem
+ClaimedInboxRange
+RuntimeHandoffRecord
+SessionControlCommand
+ControlOutcome
+CycleContextRevision
+AgentEmission
+CycleFinalizationRecord
+CheckpointOutcome
+```
+
+Stable ID factories и enums определяются один раз. Timestamp fields timezone-aware;
+terminal runtime handoff timestamp не может предшествовать `handed_off_at`.
+
+## Ports
+
+```python
+class SessionInputRuntimeRepository(Protocol): ...
+class InputAdmissionRepository(Protocol): ...
+class CycleInboxRepository(Protocol): ...
+class RuntimeHandoffRepository(Protocol): ...
+class SessionControlRepository(Protocol): ...
+class ActiveCycleSnapshotRepository(Protocol): ...
+class ContextRevisionRepository(Protocol): ...
+class AgentEmissionRepository(Protocol): ...
+class FinalizationRepository(Protocol): ...
+```
+
+`RuntimeHandoffRepository` имеет только command-oriented surface:
+
+```python
+async def get(...)
+async def begin(...)
+async def complete(...)
+async def mark_ambiguous(...)
+```
+
+`SessionControlRepository` также предоставляет command-oriented
+`accept_continue(...)`: application передаёт source identity, а repository
+атомарно фиксирует authority-owned cycle/generation/resume target вместе с durable
+control publication. Concrete lock/layout в port не экспортируется.
+
+Generic `save(dict)`, filesystem paths, locks и serialization helpers в
+application-facing ports запрещены.
+
+## Config
+
+```yaml
+input_runtime:
+  enabled: true
+  max_queued_batches_per_session: ...
+  max_queued_bytes_per_session: ...
+  max_batches_per_checkpoint: ...
+  max_batch_bytes_per_checkpoint: ...
+  claim_lease_seconds: ...
+  max_intermediate_messages_per_cycle: ...
+  min_intermediate_message_interval_seconds: ...
+  max_intermediate_message_chars: ...
+```
+
+Defaults conservative и valid для current single-process mode.
+
+## Tests
+
+- model/state/ID validation;
+- invalid sequence/watermark rejected;
+- config examples cover all settings;
+- serialization round-trip;
+- Protocols command-oriented;
+- no Telegram/FastAPI/MCP concrete imports in domain/interfaces.
+
+## Done
+
+- package импортируется без side effects;
+- ports пригодны для filesystem и PostgreSQL adapters;
+- current production behavior не изменён;
+- full existing suite green.
+
+## Не делать
+
+- не подключать stores к API;
+- не добавлять checkpoints;
+- не менять transport command handlers;
+- не переносить agent loop.
+
+---
+
+# IR-2 — Filesystem repositories и coordination service
+
+## Статус
+
+Implemented и подтверждён CI. Реализованы durable filesystem adapters,
+atomic-write/restart contracts, sequence repair, bounded coordination, global
+identity fencing и crash-recoverable indexes.
+
+## Цель
+
+Реализовать local durable backend, atomic replacement, per-session short
+coordination и startup-readable indexes поверх `StorageConfigType.root_dir`.
+
+## Infrastructure files
+
+```text
+src/input_runtime/filesystem.py
+src/input_runtime/_filesystem_*.py
+src/input_runtime/coordination.py
+src/input_runtime/serialization.py
+src/input_runtime/factory.py
+```
+
+Filesystem implementation `RuntimeHandoffRepository` также принадлежит
+infrastructure-модулю и подключается только composition factory.
+
+## Storage/coordination invariants
+
+- user-controlled IDs не используются raw path segments;
+- one short in-process lock per normalized session;
+- bounded/ref-counted lock registry cancellation-safe;
+- fixed lock order `root identity → session`;
+- no long LLM/tool/delivery await под coordination lock;
+- deterministic session/cycle sequence allocation;
+- compare-and-swap revisions;
+- durable record write предшествует indexes;
+- missing/dangling index запускает exact-identity recovery до competing create;
+- один authoritative record rebuilds relations;
+- отсутствие durable record очищает dangling reservation;
+- ambiguous durable identity возвращает managed consistency error.
+
+## Claim leases
+
+```text
+claim contiguous head range
+validate generation/token
+mark applying
+mark applied
+requeue retryable/expired claim
+cancel generation
+reconcile by authoritative watermark in later stages
+```
+
+IR-4 реализовал snapshot-watermark reconciliation для applied active-cycle
+ranges. Startup-wide ambiguous/corruption reconciliation остаётся IR-8/IR-10.
+
+## Tests
+
+- concurrent sequence allocation;
+- duplicate admission creation;
+- claim conflict/expiry;
+- stale CAS revision;
+- partial atomic-write/index failures;
+- dangling pointer без durable record;
+- lost identity/cycle-authority indexes;
+- ambiguous duplicate records;
+- path traversal rejection;
+- recreation two repository bundles over same root;
+- filesystem handoff marker survives recreation;
+- stale handoff token cannot complete another attempt.
+
+## Done
+
+- repositories survive process recreation;
+- ordered list operations deterministic;
+- no duplicate identities/sequences under race;
+- partial metadata writes recover safely;
+- application service does not import filesystem adapter details.
+
+## Не делать
+
+- не emulate distributed transaction длинным global lock;
+- не добавлять Redis/PostgreSQL;
+- не выполнять whole-repository scan на каждом hot path.
+
+---
+
+# IR-3 — Admission service и initial-cycle integration
+
+## Статус
+
+Implemented, hardened и подтверждён CI на итоговом IR-3 code HEAD
+`c36e4cc38095e15f54f63ae81c29b4829defec1f`:
+
+- `Validate Input Runtime` #84 — success, `198 passed`;
+- `Validate v0.4 file artifacts PR` #503 — success;
+- production composition создаёт filesystem repository bundle и injects готовый
+  `RuntimeHandoffRepository` в `InputAdmissionService`;
+- каждый `CommittedInputBatch` проходит `admit → start/resume/acknowledge`;
+- second batch during running получает durable admission/FIFO inbox того же cycle
+  без второго `process_query()`;
+- duplicate, count/byte capacity, crash windows, runner handoff, cancellation и
+  exact-cycle wake покрыты deterministic tests;
+- IR-3 сохранял временный same-cycle WAITING compatibility adapter до IR-4;
+- `interrupted` и `AMBIGUOUS` не запускают automatic replay.
+
+## Цель
+
+Every committed batch проходит transport-neutral `InputAdmissionService`. New
+input во время active cycle не создаёт second run operation.
+
+## Основные файлы
+
+```text
+src/input_runtime/admission.py
+src/input_runtime/service.py
+src/input_runtime/hardened_service.py
+src/input_runtime/handoff.py
+src/input_runtime/interfaces.py
+src/input_runtime/factory.py
+src/input_runtime/_filesystem_handoff.py
+src/api/api.py
+src/core/message_processor.py
+src/runtime/session_execution.py
+```
+
+## Composition boundary
+
+`Api.__init__` создаёт filesystem adapters через factory и injects:
+
+- committed batch reader;
+- `InputRuntimeRepositories`, включая `handoffs` port;
+- execution coordinator/wakeup port;
+- config и deterministic identity/time policies.
+
+`InputAdmissionService` не импортирует `Path`, `SessionLockRegistry`, concrete
+filesystem handoff store или serialization helpers.
+
+Corrected IR-7 later adds a storage-neutral stale-decision reclassification layer:
+application keeps its short admission serialization boundary, while filesystem
+repository coordination remains the durable tie-break against terminal commit.
+
+## Admission API
+
+```python
+async def admit_committed_batch(
+    input_batch_id: str,
+    *,
+    session_id: str,
+) -> InputAdmissionOutcome
+```
+
+Call flow IR-3:
+
+```text
+submit/commit
+→ admit
+→ start_cycle: reserve exact runner
+→ queued_running: durable enqueue + wake intent
+→ resume_waiting: compatibility claim + same-cycle runner
+→ duplicate: return existing relation
+→ capacity_blocked: retryable response, committed input retained
+```
+
+На IR-4 WAITING semantic continuation переведён на common FIFO checkpoint path;
+историческое `resume_waiting` описание выше фиксирует именно IR-3 boundary.
+
+## Initial cycle
+
+1. allocate service-owned cycle ID and sequence `0`;
+2. persist admission/session state;
+3. acquire exact admitted execution lease;
+4. resolve authoritative batch and capabilities;
+5. persist runtime handoff marker;
+6. invoke current agent runtime with exact batch/cycle identity;
+7. persist applied/status/output compatibility steps;
+8. complete handoff marker.
+
+Initial context revision и active snapshot ownership были intentionally deferred
+из IR-3 в IR-4; теперь IR-4 реализует initial `R1` + durable snapshot до first main
+LLM/result.
+
+## Running addition и capacity authority
+
+- addition получает `cycle_sequence > 0`;
+- persist admission, accepted watermark и inbox relation;
+- signal exact active runner;
+- return acknowledgement without awaiting final result.
+
+Capacity reservation определяется authoritative admissions текущего generation и
+cycle, для которых:
+
+```text
+cycle_sequence > 0
+cycle_sequence > active_cycle_applied_through_sequence
+state == admitted/pending
+payload_size_bytes contributes to byte limit
+```
+
+Initial sequence `0` и terminal applied/cancelled/failed records capacity не
+занимают. Missing inbox после crash не освобождает reservation. Retry exact batch
+восстанавливает ровно один inbox relation с исходной sequence.
+
+Corrected IR-7 reclassification recomputes capacity together with kind/action/
+target after a recognized terminal race; stale old-cycle capacity result does not
+leak into the new-cycle START outcome.
+
+## Runtime handoff contract
+
+```text
+pre-run resolution
+→ RuntimeHandoffRepository.begin(HANDED_OFF)
+→ process_query()
+→ complete(COMPLETED) or mark_ambiguous(AMBIGUOUS)
+```
+
+- failure до marker retryable;
+- после marker duplicate не вызывает runtime повторно;
+- exception/crash/cancellation после marker становится ambiguous/interrupted;
+- successful runtime result + subsequent persistence failure также не rerun-ится;
+- stale token не завершает marker другой attempt.
+
+IR-4 сохраняет этот ownership: successful handoff completion выполняется раньше
+terminal snapshot synchronization. Corrected IR-7 переносит exact successful
+completion внутрь final terminal coordination, но только после second terminal
+recheck; поздний API completion остаётся idempotent compatibility call.
+
+## Cancellation contract
+
+Оба IR-3 paths имеют отдельный:
+
+```python
+except asyncio.CancelledError:
+    ...
+    raise
+```
+
+Durable cleanup:
+
+```text
+create cleanup task
+→ await through asyncio.shield
+→ if repeated cancellation: continue waiting cleanup task
+→ inspect cleanup result/log failure
+→ re-raise original CancelledError
+```
+
+Initial:
+
+- cancellation до marker: marker отсутствует, admission retryable;
+- cancellation после marker, включая окно до фактического invocation: marker
+  `AMBIGUOUS`, cycle `interrupted`, duplicate no-rerun.
+
+Corrected terminal nuance: cancellation/failure после durable handoff COMPLETED
+не переводит marker обратно в AMBIGUOUS. Если terminal marker ещё не записан,
+direct known-ID IR-7 retry завершает convergence без side-effect replay.
+
+WAITING compatibility на IR-3:
+
+- cancellation после claim, до marker: requeue claim;
+- cancellation после marker: не requeue claim, сохранить claim evidence,
+  `AMBIGUOUS` + `interrupted`, duplicate no-rerun.
+
+IR-4 дополнительно делает cancellation-safe common claim acquisition/apply на
+checkpoint path.
+
+## SessionExecutionCoordinator
+
+Coordinator остаётся in-process execution lease/wakeup foundation, но не durable
+queue. `wake(session_id, cycle_id=...)` выставляет event только при exact match
+reserved/active cycle; mismatch возвращает `False` и event не меняет.
+
+## Tests
+
+```text
+tests/test_input_runtime_admission.py
+tests/test_input_runtime_api_admission.py
+tests/test_input_runtime_no_parallel_cycle.py
+tests/test_input_runtime_ir3_contract_gaps.py
+tests/test_input_runtime_ir3_cancellation_and_portability.py
+```
+
+Mandatory scenarios IR-3:
+
+- idle batch starts one cycle;
+- running additions never create parallel runner;
+- missing inbox admission reserves count and byte capacity;
+- retry missing inbox creates exactly one relation;
+- pre-handoff resolution failure/cancellation retryable;
+- cancellation during `process_query()` ambiguous/interrupted;
+- cancellation after marker before invocation ambiguous/interrupted;
+- repeated cancellation cannot interrupt durable cleanup;
+- WAITING pre-marker cancellation requeues claim;
+- WAITING post-marker cancellation preserves applying claim evidence;
+- every post-handoff duplicate no-rerun;
+- durable session status after post-handoff cancellation is interrupted;
+- in-memory fake handoff port works without root/locks;
+- filesystem bundle provides `handoffs` and reads marker after recreation;
+- stale token rejected;
+- terminal timestamp ordering validated;
+- late wake old cycle does not wake new cycle.
+
+Corrected IR-7 additionally characterizes the live stale-decision race without
+changing historical IR-3 stage completion: terminal-first reclassification must
+create exactly one new-cycle admission and admission-first must advance the old
+cycle watermark before terminal recheck.
+
+## Done
+
+- every production committed batch проходит admission;
+- ordinary initial request remains compatible;
+- one active cycle enforced durably and in-process;
+- additions no longer wait as separate conflicting cycles;
+- handoff cancellation-safe and storage-neutral;
+- no blind replay after ambiguous runtime boundary.
+
+## Не делать на этапе IR-3
+
+- не применять additions к LLM context;
+- не добавлять safe checkpoints/snapshots;
+- не реализовывать startup recovery policy;
+- не удалять WAITING compatibility before common applier;
+- не начинать IR-4 внутри IR-3 patch.
+
+Эти пункты фиксируют историческую stage boundary; IR-4 теперь реализован отдельно.
+
+---
+
+# IR-4 — Active snapshot, checkpoints и CycleInputApplier
+
+## Статус
+
+Implemented и закрыт по code gate на
+`1d31b6fbd1d5e88966d3964dc35cf4680f32f522`:
+
+- `Validate Input Runtime` #115 — success, compile success, `241 passed`,
+  `0 failed`;
+- `Validate v0.4 file artifacts PR` #518 — success;
+- regression fixes после `224911a…` — test-only, production code unchanged.
+
+## Цель
+
+Apply admitted additions к тому же active cycle только в protocol-safe
+checkpoints.
+
+## Основные файлы
+
+```text
+src/input_runtime/checkpoints.py
+src/input_runtime/applier.py
+src/input_runtime/context_revisions.py
+src/runtime/cycle.py
+src/mcp/mcp_client.py
+src/mcp/waiting_user_batch_continuation.py
+```
+
+Фактическая implementation может быть разделена дополнительными IR-4 modules,
+но ownership остаётся `src/input_runtime` + thin agent-loop hooks; filesystem logic
+в `mcp_client.py` не переносится.
+
+## Active snapshot
+
+```text
+generation
+applied_input_batch_ids
+applied_through_cycle_sequence
+active_context_revision_id
+safe_checkpoint
+pause/interruption metadata
+```
+
+Initial `CP-RESUME` создаёт `R1` и durable `ActiveCycleSnapshot` до первого main
+LLM/result. Snapshot сохраняет semantic context authority, applied IDs/watermark,
+runtime refs и safe checkpoint.
+
+## Hooks
+
+```text
+after create/resume
+before main LLM request
+after complete tool block
+before WAITING_USER
+before final processing
+before terminal return
+after controlled interruption
+```
+
+No filesystem logic inside `mcp_client.py`.
+
+## Protocol-safe checkpoint matrix
+
+IR-4 использует общую checkpoint service boundary:
+
+```text
+CP-RESUME
+CP-BEFORE-LLM
+CP-AFTER-TOOL-BLOCK
+CP-BEFORE-WAITING
+CP-BEFORE-FINAL-PROCESSING
+CP-BEFORE-TERMINAL-COMMIT
+CP-AFTER-INTERRUPTION
+```
+
+Checkpoint не вставляет user update между `assistant.tool_calls` и matching
+`role=tool` results и не меняет context revision уже начатого atomic block.
+
+## Accepted-at-entry watermark
+
+На входе checkpoint фиксируется `active_cycle_accepted_through_sequence`.
+Checkpoint может выполнить несколько bounded contiguous apply ranges, чтобы
+догнать именно этот target, но input, admitted позже, не расширяет текущий drain.
+
+```text
+entry accepted = N
+apply from current watermark through N
+late admission N+1
+→ N+1 waits for next safe checkpoint
+```
+
+Это делает next LLM/tool block привязанным к deterministic context revision.
+
+## Apply protocol
+
+Accepted IR-4 protocol сохраняется:
+
+- claim contiguous FIFO range;
+- load exact committed batches;
+- validate generation/order;
+- build one `input_batch_update`;
+- activate artifact refs;
+- append protocol-valid user message;
+- persist context revision + active snapshot + watermark;
+- mark inbox/admissions applied;
+- emit lifecycle/projection events.
+
+Реализованная semantic ownership уточняет:
+
+- каждый bounded applied range создаёт один `input_batch_update` и одну следующую
+  linear context revision;
+- несколько contiguous batches внутри range сохраняют batch boundaries и ordered
+  `cycle_sequence`;
+- IR-6 отдельно реализует durable `AgentEmission`; emission persistence не
+  участвует в input revision/watermark protocol;
+- checkpoint outcomes/runtime traces не подменяют IR-6 semantic emissions.
+
+## Linear context revisions
+
+```text
+initial batch → R1
+range A → R2(parent=R1)
+range B → R3(parent=R2)
+```
+
+No-op checkpoint не создаёт новую revision. Multiple-parent identity остаётся
+future-compatible, но scheduler/parallel branches/merge semantics не реализованы.
+
+## Snapshot-first crash reconciliation
+
+Порядок authority:
+
+```text
+append next context revision
+→ persist ActiveCycleSnapshot with new watermark
+→ mark inbox/admission applied
+```
+
+Если crash/failure происходит после snapshot persistence и до marking, snapshot
+watermark является authority. Следующий checkpoint/reconciliation домаркировывает
+inbox/admission без duplicate `input_batch_update`, без второй revision и без
+повторного semantic apply. Retry после repair — no-op для уже applied range.
+
+## Cancellation-safe claim/apply
+
+Claim acquisition и apply обрабатывают cancellation так, чтобы durable state
+оставался recoverable:
+
+- до persisted snapshot claim может быть безопасно requeued/reconciled;
+- после persisted snapshot watermark marking завершается из snapshot authority;
+- cancellation не создаёт duplicate update/revision;
+- repeated cleanup/cancellation не ослабляет existing IR-3 no-blind-replay
+  contract.
+
+## Mandatory WAITING contract
+
+Если перед `WAITING_USER` reply существуют более ранние queued additions, reply
+не может обойти их через compatibility path. Общий `CycleInputApplier` применяет
+contiguous range строго в cycle-sequence order.
+
+На реализованном IR-4 WAITING reply проходит common FIFO `CP-RESUME`. Legacy
+adapter больше не владеет semantic continuation и не подменяет
+`original_input_batch_id`; initial batch identity сохраняется.
+
+## Terminal snapshot ordering
+
+Successful runtime handoff завершается до terminal snapshot synchronization:
+
+```text
+RuntimeHandoffRecord.complete
+→ terminal ActiveCycleSnapshot sync
+```
+
+IR-4 не ослабляет handoff authority ради terminal persistence. Corrected IR-7
+сохраняет этот invariant, выполняя completion после second terminal recheck и до
+terminal snapshot/session/finalization marker.
+
+## Checkpoint-level stale candidate suppression
+
+`CP-BEFORE-WAITING`, `CP-BEFORE-FINAL-PROCESSING` и
+`CP-BEFORE-TERMINAL-COMMIT` видят accepted-at-entry watermark. Если accepted input
+опережает applied context, stale candidate подавляется, input применяется и cycle
+продолжается.
+
+IR-7 дополняет, а не заменяет эту первую линию защиты: late durable input/control
+после checkpoint observation и до terminal/waiting commit проверяется repeated
+authoritative barrier. Second terminal recheck должен завершиться до handoff
+completion.
+
+## Tests
+
+Реализованный IR-4 deterministic coverage включает:
+
+- addition during LLM;
+- addition during tool block;
+- addition immediately before WAITING_USER;
+- two/multiple additions between checkpoints;
+- initial `R1` + durable snapshot lifecycle;
+- accepted-at-entry watermark;
+- bounded contiguous FIFO application;
+- exactly one update/revision per applied range;
+- snapshot persisted / mark applied fails;
+- snapshot watermark marking repair + retry no-op;
+- expired/aborted claim handling на безопасной IR-4 boundary;
+- cancellation during claim acquisition/apply;
+- WAITING reply common FIFO `CP-RESUME`;
+- compaction before/after update;
+- plan/artifact refs preserved;
+- protocol-valid tool sequence;
+- handoff completion before terminal snapshot sync.
+
+Cross-stage scenarios:
+
+- ambiguous IR-3 handoff/startup claim reconciliation — IR-8;
+- late terminal race/durable output barrier — реализован corrected IR-7;
+- `recover_cycle_authority()` corruption/restart matrix — IR-8/IR-10.
+
+## Done
+
+- same active cycle consumes new input;
+- protocol sequence valid;
+- initial `R1` и durable active snapshot authoritative;
+- stale WAITING/final candidate suppressed на checkpoint-level;
+- additions exactly-once/FIFO в пределах snapshot-first apply contract;
+- accepted-at-entry watermark deterministic;
+- compatibility adapter loses semantic ownership;
+- handoff completion precedes terminal snapshot;
+- cancellation-safe claim/apply подтверждён tests.
+
+## Не делать
+
+- не classify additions semantically;
+- не create parallel task/branch;
+- не reset plan automatically;
+- не реализовывать IR-5 controls в IR-4;
+- не смешивать checkpoint suppression и durable finalization ownership;
+- не притягивать IR-8 startup/ambiguous recovery в IR-4.
+
+---
+
+# IR-5 — Durable control plane `/stop`, `/continue`, `/reset`
+
+## Статус
+
+Implemented and validated на corrected code/test HEAD
+`0fabe15c6730a4e8db6be8b54ecec2c13ea773c7`:
+
+- `Validate Input Runtime` #219 — success, compile success, `291 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #570 — success.
+
+## Цель
+
+Добавить pause/resume без state loss и перевести reset на общий durable
+generation/control contract без превращения in-process coordinator в authority.
+
+## Реализованный ownership
+
+Основные production boundaries:
+
+```text
+src/input_runtime/interfaces.py
+src/input_runtime/ir5_controls.py
+src/input_runtime/ir5_hardening.py
+src/input_runtime/ir5_checkpoints.py
+src/input_runtime/ir5_filesystem_controls.py
+src/input_runtime/_filesystem_identity_recovery_session.py
+src/runtime/session_execution.py
+src/mcp/input_runtime_controls.py
+src/api/input_runtime_controls.py
+src/api/session_reset.py
+src/core/message_processor.py
+src/servers/telegram/app.py
+src/servers/telegram/runtime_control_handlers.py
+```
+
+Application-layer service не импортирует `Path`, filesystem layout,
+`SessionLockRegistry`, Telegram/aiogram/python-telegram-bot types. Filesystem
+coordination остаётся infrastructure adapter. Atomic continue acceptance выражена
+command-oriented repository port `accept_continue(...)`.
+
+## Durable acceptance
+
+- one monotonic `sequence_number` allocated under short session coordination;
+- stable idempotency binds one source delivery to one logical command;
+- exact-session durable control frontier repair выполняется до любой новой
+  sequence allocation;
+- publication order record-first: command record → identity/index → session
+  `pending_control_sequence`;
+- retry same key repairs missing pending watermark without new ID/sequence;
+- conflicting historical duplicate sequence возвращает managed consistency
+  conflict, а не silent selection;
+- rejected/cancelled/applied head records allow contiguous
+  `applied_control_sequence` advancement;
+- no LLM/tool/network/Telegram await under repository coordination lock.
+
+## `/stop`
+
+```text
+running
+→ durable pause accepted
+→ pause_requested
+→ current bounded atomic block completes
+→ protocol-safe control checkpoint
+→ paused_by_user snapshot
+```
+
+- no history/plan/artifact/result/context reset;
+- stop during blocked LLM waits that bounded attempt then prevents next semantic
+  tool/LLM block;
+- stop inside assistant multi-tool block waits all matching `role=tool` results
+  and pauses at `CP-AFTER-TOOL-BLOCK`;
+- waiting/interrupted resumable snapshot can be paused without losing question or
+  interruption metadata;
+- terminal/idle returns `no_active_cycle`;
+- compatibility AgentResult mapping cannot overwrite durable pause.
+
+## Paused admission
+
+`pause_requested` and `paused_by_user` ordinary committed batches use existing
+IR-3 admission/FIFO stores and return `QUEUE_PAUSED`. Accepted watermark advances,
+items remain FIFO queued, `should_start_runner=false`, `should_wake_runner=false`.
+Input does not behave as `/continue`.
+
+## `/continue`
+
+- resumes the same durable `cycle_id` only;
+- true pause can reacquire defensive in-process execution lease for that same
+  cycle after previous runner unwinds;
+- application does not freeze target from a pre-lock state read;
+- under one shared `root identity → session` coordination boundary repository
+  loads authoritative session state, repairs control frontier, freezes current
+  `active_cycle_accepted_through_sequence`, allocates the next unique control
+  sequence, persists command/indexes and advances pending control watermark;
+- input coordinated before continue is included in frozen resume target;
+- input coordinated after continue is excluded and remains future running
+  checkpoint input;
+- no wall-clock/transport/task-creation order participates in the tie-break;
+- `CP-RESUME` drains every addition through frozen continue target in bounded
+  chunks, with no LLM between chunks;
+- duplicate same-key delivery returns the same control ID/sequence/frozen target
+  even if later input has advanced session accepted watermark;
+- continue record-first crash preserves frozen target; retry repairs missing
+  pending watermark and a later independent control receives the next sequence;
+- no-addition continue preserves original batch/context revision;
+- `WAITING_USER` without answer returns `still_waiting_for_input`;
+- `WAITING_USER` with real input coordinated before continue drains that input,
+  clears active wait after target drain and resumes RUNNING;
+- rapid `pause → continue` before pause application can reduce to running without
+  phantom paused state or second runner.
+
+Process-restart runner reconstruction остаётся IR-8.
+
+## `/reset`
+
+- reset has highest effective priority;
+- durable generation is authority and advances exactly once per logical reset;
+- same-key duplicate does not advance generation twice;
+- partial old-generation cleanup failure is retried against same reset record;
+- old admissions/inbox/pending controls/snapshot/finalization/emission
+  records are cancelled/fenced;
+- stale old-generation checkpoint/finalization writer cannot regain current
+  session authority;
+- stale generation/cycle wake cannot wake new work;
+- coordinator synchronizes to already-durable generation;
+- open ingress drafts/collections are cancelled;
+- mutable MCP/session memory clears only after old execution lease boundary.
+
+## Checkpoint reducer
+
+Checkpoint entry captures both accepted-input and pending-control watermarks.
+Completed atomic block context is persisted first, controls are reduced through
+captured control target, and only then ordinary input may apply. Control arriving
+after entry cannot mutate an already-started atomic block.
+
+Effective priority:
+
+```text
+reset > pause > continue > ordinary input
+```
+
+Audit order/records remain durable. Durable `pause N → continue N+1` can
+neutralize a not-yet-applied pause even if session status projection lagged when
+continue request started.
+
+## Deterministic tests
+
+IR-5 suites include:
+
+```text
+tests/test_input_runtime_ir5_controls.py
+tests/test_input_runtime_ir5_corrective.py
+tests/test_input_runtime_ir5_continue_target.py
+tests/test_input_runtime_ir5_races.py
+tests/test_input_runtime_ir5_state_matrix.py
+tests/test_input_runtime_ir5_telegram.py
+tests/test_input_runtime_ir5_tool_executor.py
+```
+
+Covered barriers/contracts:
+
+- concurrent control allocation and duplicate delivery;
+- command persisted / pending watermark write fault and retry repair;
+- competing command after record-first crash receives unique next sequence;
+- continue request held before durable `accept_continue` while input fully admits:
+  input is included in frozen target and drained before resumed LLM;
+- reverse barrier holds input before durable admission while continue fully
+  persists: target excludes late input and it stays queued to next checkpoint;
+- duplicate continue after late input preserves original ID/sequence/target;
+- continue record-first publication crash preserves target across repository
+  recreation and pending watermark repair;
+- session/snapshot control effect persisted / acknowledgement or apply marking
+  fault and retry;
+- blocked fake LLM stop;
+- production MCPClient multi-tool block barrier preserving all matching tool
+  results before `CP-AFTER-TOOL-BLOCK` pause;
+- rapid stop/continue while LLM blocked and pause-allocation/continue race;
+- paused input/no wake/FIFO;
+- continue same cycle with no additions and several bounded additions;
+- WAITING paused real-input drain, no-input WAIT and late-input boundary;
+- waiting/interrupted state matrix;
+- reset running/paused/waiting/interrupted;
+- generation exactly once and partial cleanup repair;
+- stale writer/wake fencing;
+- pause/reset vs terminal checkpoint;
+- compatibility result mapping;
+- Telegram production composition, high-priority routing and stable source identity.
+
+## Done
+
+- durable transport-neutral control service;
+- race-safe sequence/idempotency and real control watermarks;
+- cooperative safe-checkpoint stop with complete tool protocol;
+- durable `paused_by_user` snapshot;
+- paused FIFO input without auto-resume;
+- same-cycle continue with atomically frozen durable coordination target;
+- input-before-continue included, input-after-continue excluded;
+- duplicate/crash retry preserves original continue target;
+- durable reset generation authority and old-generation fencing;
+- legacy reset observable memory/draft behavior preserved;
+- Telegram `/stop`/`/continue` use common service; `/cancel` remains ingress-only;
+- focused full input-runtime regression and compile gate green.
+
+## Не делать
+
+- не implement conversation rewind;
+- не reinterpret `/cancel` as runtime stop;
+- не promise force cancellation confirmed external side effects;
+- IR-6 durable emissions реализованы отдельным stage и не принадлежат IR-5;
+- IR-7 finalization barrier реализован отдельно и не принадлежит IR-5;
+- не implement IR-8 startup reconstruction/reconciliation;
+- не expand current exact-session repair into full IR-8/IR-10 corruption matrix;
+- не claim IR-9/IR-10 completion.
+
+---
+
+# IR-6 — AgentEmission и intermediate messages
+
+## Статус
+
+Implemented and validated на code/test HEAD
+`4447d1bfe487bfd764829e701f274655aa8c3c50`:
+
+- `Validate Input Runtime` #297 — success, compile success, `350 passed`,
+  `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #609 — success.
+
+## Цель
+
+Durable semantic intermediate messages independent from transient progress,
+question/WAITING and terminal `OutputBatch`.
+
+## Реализованный ownership
+
+```text
+src/input_runtime/emissions.py
+src/input_runtime/ir6_filesystem.py
+src/input_runtime/ir6_delivery_authority.py
+src/input_runtime/ir6_outbox.py
+src/input_runtime/composition.py
+src/input_runtime/projection.py
+src/mcp/input_runtime_emissions.py
+src/api/emission_outbox_routes.py
+src/servers/telegram/emission_outbox.py
+```
+
+Application service не импортирует filesystem/Telegram/FastAPI. Concrete
+filesystem adapter реализует command-oriented policy/claim/receipt transitions;
+transport worker работает через authenticated outbox API.
+
+## Manager tool и exact context
+
+`send_user_message` schema:
+
+```text
+message
+kind = intermediate
+importance = normal | high
+```
+
+Runtime-owned context:
+
+```text
+session_id
+cycle_id
+generation
+context_revision_id
+tool_call_id
+original_input_batch_id
+```
+
+Exact context revision соответствует LLM request, на котором native tool call был
+создан. Scoped active-cycle ContextVar token/reset-ится вокруг exact execution;
+concurrent sessions deterministic test не показывает context bleed.
+
+## Idempotency и policy
+
+Stable key = manager tool namespace + cycle + generation + assistant tool-call ID.
+
+- same replay → same emission;
+- changed semantics → controlled conflict;
+- concurrent same key → one record;
+- record-first/index-publication crash → same durable record after recreation;
+- READY persisted / manager task cancelled → replay returns same emission;
+- max chars/count/min interval реально enforced;
+- count/interval acceptance linearizable under short exact-session coordination;
+- delivery outcome не освобождает semantic spam budget.
+
+## Trusted route
+
+Route берётся только из original authoritative committed batch, response anchor и
+capability snapshot. LLM не задаёт chat/conversation/thread, client instance,
+reply target или capability. Transport metadata/secrets не сохраняются. Missing
+route → `route_unavailable`, без arbitrary fallback.
+
+## Persistence/delivery
+
+```text
+validate
+→ atomic accept + READY persistence
+→ best-effort wake
+→ compact role=tool result
+→ AgentCycle continues
+
+READY
+→ exact worker claim / DELIVERING
+→ client send
+→ durable receipt/outcome
+→ DELIVERED | FAILED | UNKNOWN
+```
+
+Same-token claim retry идемпотентен, different token conflicts. Successful durable
+receipt содержит attempt/client/conversation/thread/external message ref и
+повторяется идемпотентно. Deterministic rejection → FAILED; ambiguous timeout/
+connection/claim expiry → UNKNOWN. Expiry не requeue-ит READY. UNKNOWN не
+blind-retry-ится.
+
+## Reset/pause/terminal
+
+- pause не отменяет already READY semantic intent;
+- continue same cycle сохраняет history/idempotency;
+- reset: old READY → CANCELLED; old DELIVERING → UNKNOWN;
+- stale old-generation claim writer fenced;
+- already terminal cycle rejects new emission;
+- READY emission не начинает новую delivery после already-visible terminal state;
+- concurrent READY claim vs terminal commit упорядочен IR-7 общей exact-session
+  authority, без network await под lock.
+
+## Telegram и reply binding
+
+Telegram semantic message — separate `send_message`, `parse_mode=None`, не
+progress edit. Successful external `message_id` сохраняется receipt-ом.
+Server-owned Telegram `reply_to_message.message_id` связывается с emission только
+по exact session/client type/instance/conversation/thread/external ID. Projection
+добавляет optional `reply_to.emission_id` без branch/FIFO changes. Cross-session
+numeric ID spoof не bind-ится.
+
+## Progress/history/final independence
+
+Existing `AgentAction.agent_request` остаётся transient progress
+`agent_message`; automatic migration отсутствует. LLM history содержит native
+assistant tool-call + matching role=tool result, без duplicate assistant message.
+Delivery failure не меняет AgentCycle/WAITING/context revision и не мешает later
+final `OutputBatch`.
+
+## Tests
+
+```text
+tests/test_input_runtime_ir6_emissions.py
+tests/test_input_runtime_ir6_delivery.py
+tests/test_input_runtime_ir6_manager_tool.py
+tests/test_input_runtime_ir6_telegram_delivery.py
+tests/test_input_runtime_ir6_reply_binding.py
+tests/test_input_runtime_ir6_races.py
+```
+
+Covered critical windows:
+
+- duplicate/concurrent logical manager calls;
+- fake-clock max-count/rate acceptance;
+- record durable/index publication failure;
+- cancellation after READY persistence;
+- lost claim HTTP response;
+- lost receipt HTTP response;
+- competing claim token;
+- claim expiry → UNKNOWN;
+- reset during DELIVERING;
+- terminal before READY claim;
+- exact failure receipt route fencing;
+- fake Telegram FAILED/UNKNOWN outcomes;
+- external reply cross-session/conversation/thread fencing.
+
+## Done
+
+- durable READY before tool success;
+- runtime-owned provenance/route/idempotency;
+- linearizable policy;
+- independent claim/receipt lifecycle;
+- conservative FAILED/UNKNOWN;
+- no blind external replay;
+- reset/sequential terminal fences;
+- transport-neutral outbox and Telegram consumer;
+- optional safe reply relation;
+- full input-runtime regression green.
+
+## Не делать
+
+- не convert all progress to emissions;
+- не migrate question finalization;
+- IR-7 finalization barrier реализован отдельным stage и не принадлежит IR-6;
+- не implement IR-8 startup reconstruction/reconciliation;
+- не build IR-9 full timeline/status/Web UX;
+- не run IR-10 full randomized/live roast;
+- не build distributed event bus;
+- не expose arbitrary route to LLM.
+
+---
+
+# IR-7 — Finalization barrier
+
+## Статус
+
+Implemented and validated after corrective passes на code/test HEAD
+`6bd0dce0018b20520ed28236211fccdf0a8075fb`:
+
+- `Validate Input Runtime` #417 — success, production compile success,
+  `387 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #669 — success;
+- workflow permission remains `contents: read`.
+
+## Цель
+
+Не допустить stale final/waiting response, игнорирующий durable accepted
+input/control, сохранить IR-3/IR-4 `RuntimeHandoff completion → terminal snapshot`
+ordering, linearize optimistic admission decision against terminal commit и
+упорядочить terminal visibility, final output delivery и IR-6 semantic emission
+claim.
+
+## Реализованный ownership
+
+```text
+src/input_runtime/finalization.py
+src/input_runtime/ir7_filesystem.py
+src/input_runtime/ir7_crash_hardening.py
+src/input_runtime/ir7_handoff_ordering.py
+src/input_runtime/ir7_admission_ordering.py
+src/input_runtime/ir7_admission_reclassification.py
+src/input_runtime/handoff_context.py
+src/input_runtime/hardened_service.py
+src/input_runtime/interfaces.py
+src/input_runtime/filesystem.py
+src/input_runtime/composition.py
+src/mcp/input_runtime_checkpoints.py
+src/interaction/output_claim.py
+src/interaction/output_outbox.py
+src/interaction/output_service.py
+src/interaction/ir7_output_barrier.py
+src/runtime/finalization_bridge.py
+```
+
+Application finalization/admission services остаются storage/transport-neutral;
+exact filesystem coordination реализуется adapter commands. Telegram/FastAPI/Path
+не проникают в application finalization logic. Task-local RuntimeHandoff context
+несёт exact runtime-owned `admission_id + handoff_token` от уже durable API handoff
+к candidate/finalization boundary без transport/LLM ownership.
+
+## Mandatory terminal authority
+
+Terminal eligibility:
+
+```text
+accepted_through_cycle_sequence == applied_through_cycle_sequence
+pending_control_sequence == applied_control_sequence
+session generation == cycle generation
+active cycle == finalizing cycle
+exact context/finalization identity unchanged
+exact RuntimeHandoff relation unchanged
+```
+
+Duplicate transport request без authoritative watermark transition не abort-ит
+finalization.
+
+## Implemented terminal protocol
+
+```text
+candidate remains non-terminal
+→ CP-BEFORE-FINAL-PROCESSING
+→ capture exact candidate + handoff authority
+→ final audit/grounding outside lock
+→ durable PREPARED
+→ short exact-session recheck
+→ FINALIZING
+→ persist deterministic final result evidence / RESULT_PERSISTED
+→ assemble/persist normal final OutputBatch / OUTPUT_READY
+→ second exact-session terminal recheck
+IF mismatch:
+    ABORTED_NEW_INPUT | ABORTED_CONTROL
+    handoff remains HANDED_OFF
+    same cycle may continue
+ELSE:
+    exact RuntimeHandoff COMPLETED
+    → terminal snapshot
+    → terminal session state
+    → finalization TERMINAL_COMMITTED written last
+    → final OutputBatch claim becomes eligible
+```
+
+Final processing не резервирует terminal right. Никакой LLM/tool work не
+выполняется после durable handoff completion на successful terminal path.
+
+## RuntimeHandoff ordering
+
+Corrected IR-7 восстанавливает IR-3/IR-4 invariant:
+
+```text
+all side-effecting runtime work complete
+→ final terminal recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session convergence
+→ TERMINAL_COMMITTED
+```
+
+Handoff нельзя complete до final recheck, иначе late input/control мог бы
+потребовать продолжить уже объявленный completed invocation. Handoff completion
+нельзя откладывать после terminal marker, иначе final output мог бы стать
+claimable при `HANDED_OFF/AMBIGUOUS`.
+
+Filesystem finalization command уже держит exact-session lock, поэтому corrected
+adapter использует lock-aware internal handoff completion primitive и не re-enter-ит
+тот же non-reentrant lock. Application layer не знает filesystem layout/lock;
+будущий PostgreSQL adapter может выразить весь successful command одной
+transaction/row lock.
+
+Если durable handoff completion падает:
+
+- finalization остаётся pre-terminal;
+- новый terminal snapshot не authoritative;
+- session не становится DONE;
+- `TERMINAL_COMMITTED` отсутствует;
+- final OutputBatch остаётся fenced.
+
+Поздний API `complete_runtime_handoff(...)` после successful terminal path
+идемпотентен: тот же token/state/completed_at, без second completion.
+
+## Admission decision ↔ terminal commit
+
+Application может прочитать `FINALIZING` и сформировать
+`CONTINUE_RUNNING(cycle A)` до repository coordination. Этот optimistic read не
+является authority.
+
+Repository admission allocation и final terminal command используют совместимый
+`root identity → session` ordering.
+
+### Admission linearized first
+
+```text
+CONTINUE_RUNNING(A) reaches durable allocation
+→ one admission to cycle A persists
+→ accepted watermark advances
+→ terminal second recheck sees accepted > applied
+→ ABORTED_NEW_INPUT
+→ RuntimeHandoff stays HANDED_OFF
+→ session/cycle A RUNNING and can apply input
+```
+
+### Terminal linearized first
+
+```text
+CONTINUE_RUNNING(A) already formed optimistically
+→ final terminal command completes old cycle A
+→ stale candidate reaches repository allocation
+→ dedicated InputAdmissionDecisionStaleError before writes
+→ same application admission call re-reads latest state
+→ recomputes kind/action/projection/capacity/target/start/wake
+→ START_CYCLE(B), cycle_sequence=0
+```
+
+Before stale reclassification there is no late-batch admission record/index,
+old-cycle inbox item or session watermark mutation. The same committed batch ends
+with exactly one durable admission; duplicate replay returns that existing
+relation. `Api.admit_committed_batch()` therefore does not leak raw Pydantic
+`ValidationError` or require transport retry for the normal terminal-wins race.
+
+Retry is intentionally narrow and bounded to one recognized stale-decision
+condition. Arbitrary consistency/corruption conflicts remain authoritative and are
+not silently retried. Raw `IDLE` is judged after existing IR-2 authoritative
+admission repair so record-first START crash recovery and gap/duplicate corruption
+semantics remain intact; normal `DONE/ERROR/CANCELLED` terminal states fence a
+stale non-start candidate before admission writes.
+
+This is IR-7 live ordering, not IR-8 startup committed-but-unadmitted repair.
+
+## Output fence
+
+`RESULT_PERSISTED` и `OUTPUT_READY` не дают delivery authority.
+
+- ready outbox не показывает final batch до terminal marker;
+- direct `IdempotentOutputClaimService` отвергает new READY claim;
+- normal admitted-run delivery gate при `TERMINAL_COMMITTED` также проверяет
+  matching `RuntimeHandoff=COMPLETED`;
+- stale/aborted output никогда не становится claimable;
+- unclaimed stale aggregate освобождает cycle-final commit-once binding для
+  следующего same-cycle final result;
+- normal delivery lifecycle после commit не меняется.
+
+## AgentEmission ordering
+
+IR-6 `READY → DELIVERING` claim и IR-7 terminal command используют один
+exact-session coordination lock.
+
+Claim-first:
+
+```text
+READY → DELIVERING
+→ release lock
+→ transport attempt may continue
+→ later terminal command
+```
+
+Terminal-first:
+
+```text
+second final recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session
+→ TERMINAL_COMMITTED
+→ old-cycle READY claim rejected/cancelled
+```
+
+Network send происходит после claim и вне lock; wall clock/task scheduling не
+являются authority. Existing `DELIVERING + reset/ambiguity → UNKNOWN` preserved.
+
+## WAITING barrier
+
+```text
+candidate question
+→ CP-BEFORE-WAITING
+→ short input/control recheck
+→ persist one waiting snapshot/question authority
+→ WAITING_USER
+```
+
+Input/control before waiting commit suppress stale question. Input after commit
+использует existing `RESUME_WAITING` same-cycle flow. `send_user_message` не
+перепрофилирован в question lifecycle. Corrective terminal/admission ordering
+этот path не перерабатывает.
+
+## Crash/retry
+
+Focused IR-7 direct retry/repository recreation covers:
+
+- PREPARED recreation with stable finalization ID;
+- result evidence persisted / state write failed;
+- RESULT_PERSISTED replay;
+- output persisted / OUTPUT_READY state write failed;
+- OUTPUT_READY recreation;
+- handoff completion durable write failure before any terminal authority;
+- durable handoff COMPLETED / terminal snapshot write failed;
+- completed handoff + incomplete terminal direct recreation/retry;
+- partial terminal snapshot/session/finalization marker;
+- terminal commit response lost;
+- abort after result/output persistence;
+- duplicate logical retry without second result/output/terminal authority.
+
+Crash после handoff COMPLETED не reopens handoff и не replay-ит LLM/MCP/tool.
+Direct retry сохраняет exact handoff token/completed_at, finalization ID,
+result_ref и OutputBatch ID и продолжает только terminal convergence.
+
+These are direct finalization-protocol replay tests, not startup discovery or
+reconstruction.
+
+## Deterministic tests
+
+```text
+tests/test_input_runtime_ir7_finalization.py
+tests/test_input_runtime_ir7_production.py
+tests/test_input_runtime_ir7_handoff_ordering.py
+tests/test_input_runtime_ir7_admission_terminal_race.py
+```
+
+They use fake clock, explicit `asyncio.Event`, injected persistence faults,
+repository recreation, real output claim/outbox paths and production-like
+admission/handoff composition. No probabilistic sleeps and no real
+LLM/MCP/Telegram/Web calls.
+
+Corrective mandatory coverage asserts exact durable states/IDs/watermarks for:
+
+- handoff completion fault;
+- write order `COMPLETED → snapshot → session → TERMINAL_COMMITTED`;
+- concurrent output outbox/direct claim before handoff completion;
+- completed-handoff/incomplete-terminal recreation/direct retry;
+- late input/control abort before handoff completion;
+- cancellation before and after durable completion;
+- idempotent late API completion preserving original `completed_at`;
+- terminal wins after optimistic `CONTINUE_RUNNING(A)` candidate: same original
+  API admission call returns `START_CYCLE(B)`, seq0, start=true/wake=false;
+- old finalization/output remain valid in terminal-first case while late batch has
+  exactly one new-cycle admission and no old-cycle inbox relation;
+- admission wins before terminal second recheck: durable seq1/accepted watermark,
+  then `ABORTED_NEW_INPUT`, handoff HANDED_OFF and stale output fenced;
+- dedicated repository stale-decision conflict occurs before writes and no raw
+  Pydantic `ValidationError` leaks;
+- existing IR-2 IDLE repair/corruption tests remain green.
+
+## Done
+
+- all durable pre-terminal input/control suppress stale finalization;
+- stale question suppressed before WAITING commit;
+- post-terminal input creates a new cycle;
+- final terminal recheck precedes handoff completion;
+- abort never completes handoff prematurely;
+- successful handoff completion precedes terminal snapshot/session/marker;
+- completion failure cannot expose terminal/output authority;
+- no LLM/tool side effect occurs after durable handoff completion;
+- final output not claimable before terminal commit;
+- normal terminal output implies matching handoff COMPLETED;
+- stale/aborted output never deliverable;
+- completed-handoff/incomplete-terminal direct retry is idempotent;
+- finalization/result/output retry idempotent;
+- admission-first durable late input aborts stale finalization;
+- terminal-first stale admission transparently reclassifies to new-cycle START;
+- stale candidate performs no pre-reclassification admission/index/inbox/watermark
+  write and one input batch gets exactly one admission;
+- normal terminal race exposes no raw ValidationError and needs no transport retry;
+- arbitrary IR-2 consistency/corruption conflicts are not swallowed by retry;
+- emission claim-vs-terminal ordering deterministic;
+- no network/LLM/tool await under finalization/session coordination;
+- IR-1—IR-6 regressions and production compile green.
+
+## Не делать
+
+- не implement startup scanner/reconstruction coordinator;
+- не reconstruct paused/interrupted/waiting runners on process start;
+- не implement committed-but-unadmitted startup discovery/repair as part of this
+  live race fix;
+- не reconcile all UNKNOWN emissions at startup;
+- не automatically discover incomplete finalization/handoff state on startup;
+- не build startup readiness gate/shutdown recovery;
+- не expand to IR-9 full projections or IR-10 roast;
+- не add scheduler/branches/distributed runtime.
+
+---
+
+# IR-8 — Startup recovery и lifecycle
+
+## Статус
+
+Planned. IR-7 direct finalization retry/repository recreation, exact
+`RuntimeHandoff=COMPLETED + incomplete terminal` retry и live
+admission-vs-terminal reclassification не являются startup recovery.
+
+## Цель
+
+Recover durable runtime before accepting new work and shutdown without orphan
+claims/runners.
+
+## Startup
+
+- reconcile sessions/admissions/inbox/controls/emissions;
+- repair committed-but-unadmitted inputs discovered after restart;
+- inspect runtime handoff markers;
+- keep ambiguous external operation non-replayable;
+- reconcile post-handoff/UNKNOWN emission evidence by explicit policy;
+- discover/reconcile incomplete finalization/handoff records;
+- reconstruct resumable/paused/waiting runner only when safe;
+- enable new admission after mandatory recovery.
+
+Normal in-process terminal-wins admission race is not an IR-8 case: corrected
+IR-7 resolves it inside the original admission call by bounded stale-decision
+reclassification.
+
+IR-3 marker, IR-4 snapshot-first marking repair, IR-5 same-delivery control repair,
+IR-6 repository recreation/UNKNOWN preservation и IR-7 direct finalization/live
+race protocols не являются готовой startup recovery implementation.
+
+`recover_cycle_authority()` corruption matrix также не считается закрытой:
+её authoritative corruption/restart policy и negative cases относятся к IR-8, а
+полная randomized/restart acceptance — к IR-10.
+
+## Shutdown
+
+- stop new runner starts;
+- persist resumable/interrupted state where possible;
+- cancel in-process wakeups;
+- retain durable admissions/inbox/claims/controls/emissions/finalizations;
+- leave ambiguous external operations unknown;
+- close runtime after agent/tool lifecycle.
+
+## Tests
+
+Two service instances over same temporary root:
+
+- pause/wait/inbox/emission survive recreation;
+- committed unadmitted repaired on startup;
+- ambiguous marker does not rerun runtime;
+- post-handoff claim evidence preserved/reconciled;
+- UNKNOWN emission is not blindly re-sent;
+- incomplete finalization/handoff discovered/reconciled by startup coordinator;
+- `recover_cycle_authority()` corrupted/missing/divergent authority cases;
+- no new work before recovery ready;
+- shutdown deterministic.
+
+---
+
+# IR-9 — Client projections, diagnostics и configuration examples
+
+## Статус
+
+Planned. IR-6 добавил минимальную transport-neutral emission/reply projection, а
+IR-7 — transport-neutral final-output eligibility fence, но полный IR-9 не
+реализован.
+
+## Цель
+
+Expose coherent safe status without raw-content leakage and preserve client
+independence.
+
+## Diagnostics
+
+```text
+runtime status/generation
+active cycle
+accepted/applied sequences
+queued/claimed/applying additions
+runtime handoff state
+oldest queued age
+pending/applied controls
+emission/finalization states
+last error code
+```
+
+## Projections
+
+- initial request status;
+- running/paused addition acknowledgement;
+- applied addition completion;
+- stop/continue outcome;
+- interrupted/ambiguous recovery notice;
+- complete emission/finalization timelines/status counts and Web/CLI UX.
+
+## Done
+
+- RU/EN keys complete;
+- Telegram editing fallback safe;
+- Web/CLI consume structured outcomes;
+- config examples/documentation synchronized.
+
+---
+
+# IR-10 — Full acceptance, roast и live validation
+
+## Статус
+
+Planned. IR-7 deterministic focused CI не заменяет full IR-10 acceptance.
+
+## Цель
+
+Prove contracts под unit, race, restart, synthetic и real transport behavior.
+
+## Automated suites
+
+```text
+input-runtime focused suite
+artifact/storage/plans/planning/API regressions
+Telegram transport/audit suite
+full repository baseline
+compile/config example audit
+```
+
+## Race/randomized matrix
+
+- concurrent commit/admission;
+- optimistic admission classification vs terminal commit;
+- addition at every checkpoint/finalization boundary;
+- stop/continue/reset ordering;
+- claim expiry/restart;
+- lost wakeup;
+- output ready vs new input;
+- duplicate requests;
+- additions with files;
+- shutdown while queued/claimed/applying;
+- cancellation before/after handoff and during cleanup;
+- `recover_cycle_authority()` corruption/restart matrix;
+- broader randomized emission delivery/finalization interactions.
+
+Every randomized run records seed and selector.
+
+## Synthetic no-network roast
+
+Must not call real LLM/MCP/network/Telegram. Use deterministic fake runtime and
+transport sinks.
+
+## Maintainer live Telegram acceptance
+
+1. long run + text addition;
+2. several additions/files during tools;
+3. `/stop` during visible work;
+4. additions while paused;
+5. `/continue` and same-cycle apply;
+6. intermediate message while work continues;
+7. addition immediately before final;
+8. `/reset` while active;
+9. restart while paused/waiting/queued;
+10. regression collection/artifact delivery commands.
+
+Telegram history rewind по edited message остаётся deferred client-specific
+follow-up и не входит в этот release gate.
+
+## Completion gate
+
+- zero deterministic failures;
+- no unexplained flaky race;
+- full baseline green;
+- no production bypass of admission;
+- no canonical documentation conflicts;
+- current/roadmap/PR evidence synchronized;
+- PR remains draft until all IR-1—IR-10 and live acceptance complete.
+
+---
+
+# Допустимая параллельность patches
+
+После IR-1 независимые filesystem adapters, emission policy drafts,
+localization и synthetic harness могли разрабатываться параллельно.
+
+Admission, checkpoint integration, controls и finalization выполняются
+последовательно, поскольку разделяют session state/watermarks.
+
+IR-7 завершён после stable cycle/context/control/emission/handoff/admission
+identity. Следующий stage — только IR-8 startup recovery/reconstruction.
+
+Scheduler/parallel branches не реализуются этим update stage sequence; future
+scheduler остаётся отдельной orchestration layer.
+
+---
+
+# Рекомендуемые commit boundaries
+
+```text
+feat(input-runtime): add domain contracts and config
+feat(input-runtime): add filesystem repositories and claims
+feat(input-runtime): route committed batches through admission
+fix(input-runtime): close IR-3 capacity and runner handoff gaps
+fix(input-runtime): make IR-3 handoff cancellation-safe and portable
+feat(input-runtime): apply additions at safe checkpoints
+feat(input-runtime): implement IR-5 durable controls
+fix(input-runtime): linearize continue input target
+feat(input-runtime): implement IR-6 agent emissions
+feat(input-runtime): implement durable finalization barrier
+fix(input-runtime): close finalization race/crash gaps
+fix(input-runtime): complete handoff before terminal authority
+fix(input-runtime): reclassify admission after terminal race
+test(input-runtime): cover IR-7 finalization races
+feat(input-runtime): recover durable active runtime state
+test(input-runtime): add full race restart and transport coverage
+docs(input-runtime): finalize acceptance and current baseline
+```
+
+Corrected IR-7 documentation evidence фиксируется только после green code/test
+gate `6bd0dce0018b20520ed28236211fccdf0a8075fb`; documentation commits не
+начинают IR-8.
+
+Один commit не должен одновременно вводить новый state contract, переписывать
+agent loop и менять transport presentation без characterization tests.

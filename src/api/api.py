@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import os
 from collections.abc import AsyncIterator, Mapping
@@ -31,6 +32,18 @@ from ..ingress import (
     create_ingress_services,
     load_ingress_config,
     resolve_input_grouping,
+)
+from ..input_runtime import (
+    AdmissionKind,
+    CycleStatus,
+    InputAdmissionAction,
+    InputAdmissionOutcome,
+    InputAdmissionService,
+    InputRuntimeConfigType,
+    RuntimeHandoffState,
+    create_filesystem_input_runtime_repositories,
+    load_input_runtime_config,
+    safe_input_runtime_config_summary,
 )
 from ..mcp.artifact_delivery_runtime import (
     FinalizingArtifactDeliveryPlanningMCPClient,
@@ -86,7 +99,7 @@ class Api:
             self.execution_coordinator = SessionExecutionCoordinator()
             logger.info(
                 "Загрузка конфигурации MCP, LLM, storage, memory, runtime, "
-                "planning, artifacts и ingress"
+                "planning, artifacts, ingress и input-runtime"
             )
             (
                 self.server_configs,
@@ -99,6 +112,11 @@ class Api:
             self.artifact_config = load_artifact_config(config_path)
             self.ingress_config = load_ingress_config(config_path)
             self.interaction_config = load_interaction_config(config_path)
+            self.input_runtime_config = (
+                load_input_runtime_config(config_path)
+                if config_path
+                else InputRuntimeConfigType()
+            )
             apply_local_workspace_server_policy(
                 self.server_configs,
                 self.artifact_config,
@@ -158,6 +176,10 @@ class Api:
                 "Interaction: %s",
                 safe_interaction_config_summary(self.interaction_config),
             )
+            logger.info(
+                "Input runtime: %s",
+                safe_input_runtime_config_summary(self.input_runtime_config),
+            )
 
             base_storage = create_storage_services(self.storage_config)
             self.storage_services = StorageServices(
@@ -179,6 +201,18 @@ class Api:
                 artifact_services=self.artifact_services,
                 interaction_config=self.interaction_config,
             )
+            self.input_runtime_repositories = (
+                create_filesystem_input_runtime_repositories(
+                    storage_config=self.storage_config,
+                )
+            )
+            self.input_admission_service = InputAdmissionService(
+                config=self.input_runtime_config,
+                repositories=self.input_runtime_repositories,
+                committed_batches=self.ingress_services.batch_store,
+                wake_coordinator=self.execution_coordinator,
+            )
+
             output_root = Path(self.storage_config.root_dir).expanduser()
             if not output_root.is_absolute():
                 output_root = Path.cwd() / output_root
@@ -378,6 +412,487 @@ class Api:
             logger.error("Ошибка durable ingress: %r", error)
             raise APIError(f"Ошибка приёма входного batch: {error}") from error
 
+    async def admit_committed_batch(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+    ) -> InputAdmissionOutcome:
+        """Route one authoritative committed batch through the IR-3 boundary."""
+        if not self.input_runtime_config.enabled:
+            raise APIError(
+                "input_runtime is disabled; use explicit compatibility path"
+            )
+        try:
+            return await self.input_admission_service.admit_committed_batch(
+                input_batch_id,
+                session_id=session_id,
+            )
+        except Exception as error:
+            logger.error("Input admission failed: %r", error)
+            raise APIError(f"Ошибка admission committed batch: {error}") from error
+
+    async def _resolve_batch_and_capability(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+    ):
+        batch = await self.ingress_services.batch_store.get_committed(
+            input_batch_id
+        )
+        if batch.session_id != session_id:
+            raise APIError("Input batch belongs to another session")
+        capability_snapshot = batch.capability_snapshot
+        if capability_snapshot is None:
+            if batch.client_type == ClientType.TELEGRAM:
+                declaration = build_telegram_capability_declaration(
+                    document_grouping=(
+                        self.interaction_config.telegram_output
+                        .prefer_document_groups
+                    ),
+                    message_editing=(
+                        self.interaction_config.telegram_output
+                        .status_message_editing
+                    ),
+                )
+            elif batch.client_type == ClientType.WEB:
+                declaration = build_web_capability_declaration()
+            else:
+                declaration = build_cli_capability_declaration()
+            capability_snapshot, _ = (
+                await self.ingress_services.capability_store.resolve(
+                    declaration,
+                    client_type=batch.client_type.value,
+                    client_instance_id=(
+                        f"legacy-committed-batch:{batch.client_type.value}"
+                    ),
+                )
+            )
+        return batch, capability_snapshot
+
+    async def _assemble_final_if_needed(
+        self,
+        *,
+        result: AgentResult,
+        batch,
+        capability_snapshot,
+        progress_locale: str,
+    ) -> None:
+        if (
+            result.status == AgentStatus.DONE
+            and self.interaction_config.output_runtime.enabled
+        ):
+            await self.output_assembler.assemble_final(
+                result=result,
+                input_batch=batch,
+                capability_snapshot=capability_snapshot,
+                locale=batch.locale or progress_locale,
+            )
+
+    @staticmethod
+    def _cycle_status_from_result(result: AgentResult) -> CycleStatus:
+        if result.status == AgentStatus.WAITING_USER:
+            return CycleStatus.WAITING_USER
+        if result.status == AgentStatus.DONE:
+            return CycleStatus.DONE
+        if result.status == AgentStatus.ERROR:
+            return (
+                CycleStatus.INTERRUPTED
+                if result.can_resume
+                else CycleStatus.ERROR
+            )
+        return CycleStatus.RUNNING
+
+    async def _validate_admitted_runner_authority(
+        self,
+        outcome: InputAdmissionOutcome,
+    ) -> None:
+        admission = outcome.admission
+        if admission is None or outcome.target_cycle_id is None:
+            raise APIError("Admission outcome has no runner authority")
+        current = await self.input_runtime_repositories.admissions.get_by_input_batch_id(
+            outcome.input_batch_id
+        )
+        state = await self.input_runtime_repositories.sessions.get(
+            outcome.session_id
+        )
+        if current is None or current.admission_id != admission.admission_id:
+            raise APIError("Admission identity changed before runner start")
+        if state is None:
+            raise APIError("Session runtime state is missing")
+        if (
+            state.generation != admission.admitted_generation
+            or state.active_cycle_id != admission.target_cycle_id
+        ):
+            raise APIError("Admitted cycle authority is stale")
+
+    @staticmethod
+    async def _await_cancellation_cleanup(cleanup) -> None:
+        """Finish durable cleanup even if cancellation is requested again."""
+        cleanup_task = asyncio.create_task(cleanup)
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                continue
+        try:
+            cleanup_task.result()
+        except Exception:
+            logger.exception("Runtime cancellation cleanup failed")
+
+    async def _runtime_handoff_marker(
+        self,
+        admission,
+        *,
+        handoff_token: str | None,
+    ):
+        marker = await self.input_admission_service.get_runtime_handoff(
+            admission
+        )
+        if marker is None:
+            return None
+        if (
+            handoff_token is not None
+            and marker.handoff_token != handoff_token
+        ):
+            return None
+        return marker
+
+    async def _record_runtime_handoff_ambiguity(
+        self,
+        admission,
+        *,
+        handoff_token: str | None,
+        error_code: str,
+    ) -> bool:
+        marker = await self._runtime_handoff_marker(
+            admission,
+            handoff_token=handoff_token,
+        )
+        if marker is None or marker.state == RuntimeHandoffState.COMPLETED:
+            return False
+        if marker.state == RuntimeHandoffState.AMBIGUOUS:
+            return True
+        marker = await (
+            self.input_admission_service.mark_runtime_handoff_ambiguous(
+                admission,
+                handoff_token=marker.handoff_token,
+                error_code=error_code,
+            )
+        )
+        return marker is not None and marker.state == RuntimeHandoffState.AMBIGUOUS
+
+    async def _cleanup_initial_runtime_failure(
+        self,
+        admission,
+        *,
+        handoff_token: str | None,
+        error_code: str,
+    ) -> None:
+        ambiguous = False
+        try:
+            ambiguous = await self._record_runtime_handoff_ambiguity(
+                admission,
+                handoff_token=handoff_token,
+                error_code=error_code,
+            )
+        except Exception:
+            logger.exception("Failed to persist admitted runner ambiguity")
+        if ambiguous:
+            try:
+                await self.input_admission_service.record_cycle_status(
+                    session_id=admission.session_id,
+                    cycle_id=admission.target_cycle_id,
+                    status=CycleStatus.INTERRUPTED,
+                )
+            except Exception:
+                logger.exception("Failed to record admitted runner interruption")
+
+    async def _cleanup_waiting_runtime_failure(
+        self,
+        admission,
+        *,
+        claim,
+        handoff_token: str | None,
+        error_code: str,
+        pre_handoff_error_code: str,
+    ) -> None:
+        ambiguous = False
+        try:
+            ambiguous = await self._record_runtime_handoff_ambiguity(
+                admission,
+                handoff_token=handoff_token,
+                error_code=error_code,
+            )
+        except Exception:
+            logger.exception("Failed to persist compatibility ambiguity")
+        if claim is not None and not ambiguous:
+            try:
+                await (
+                    self.input_admission_service
+                    .requeue_waiting_compatibility_apply(
+                        claim,
+                        error_code=pre_handoff_error_code,
+                    )
+                )
+            except Exception:
+                logger.exception("Failed to requeue compatibility claim")
+        if ambiguous:
+            try:
+                await self.input_admission_service.record_cycle_status(
+                    session_id=admission.session_id,
+                    cycle_id=admission.target_cycle_id,
+                    status=CycleStatus.INTERRUPTED,
+                )
+            except Exception:
+                logger.exception("Failed to record compatibility interruption")
+
+    async def start_admitted_cycle(
+        self,
+        outcome: InputAdmissionOutcome,
+        *,
+        progress_callback=None,
+        progress_locale: str = "ru",
+    ) -> AgentResult | None:
+        """Start exactly one cycle after a durable runtime handoff marker."""
+        admission = outcome.admission
+        if (
+            admission is None
+            or admission.admission_kind != AdmissionKind.START_CYCLE
+            or not outcome.should_start_runner
+        ):
+            return None
+        cycle_id = admission.target_cycle_id
+        handoff_token: str | None = None
+        try:
+            async with self.execution_coordinator.admitted_run_lease(
+                session_id=admission.session_id,
+                input_batch_id=admission.input_batch_id,
+                cycle_id=cycle_id,
+            ) as acquired:
+                if not acquired:
+                    return None
+                await self._validate_admitted_runner_authority(outcome)
+                batch, capability_snapshot = (
+                    await self._resolve_batch_and_capability(
+                        admission.input_batch_id,
+                        session_id=admission.session_id,
+                    )
+                )
+                handoff_token = uuid4().hex
+                owns_handoff = (
+                    await self.input_admission_service.begin_runtime_handoff(
+                        admission,
+                        handoff_token=handoff_token,
+                    )
+                )
+                if not owns_handoff:
+                    return None
+                result = await self.mcp_client.process_query(
+                    "",
+                    session_id=admission.session_id,
+                    client_type=batch.client_type,
+                    progress_callback=progress_callback,
+                    progress_locale=progress_locale,
+                    input_batch=batch,
+                    cycle_id_override=cycle_id,
+                )
+                await self.input_admission_service.mark_initial_batch_applied(
+                    admission
+                )
+                await self.input_admission_service.record_cycle_status(
+                    session_id=admission.session_id,
+                    cycle_id=cycle_id,
+                    status=self._cycle_status_from_result(result),
+                )
+                await self._assemble_final_if_needed(
+                    result=result,
+                    batch=batch,
+                    capability_snapshot=capability_snapshot,
+                    progress_locale=progress_locale,
+                )
+                await self.input_admission_service.complete_runtime_handoff(
+                    admission,
+                    handoff_token=handoff_token,
+                )
+                return result
+        except asyncio.CancelledError:
+            await self._await_cancellation_cleanup(
+                self._cleanup_initial_runtime_failure(
+                    admission,
+                    handoff_token=handoff_token,
+                    error_code="initial_runtime_cancelled",
+                )
+            )
+            raise
+        except APIError:
+            await self._cleanup_initial_runtime_failure(
+                admission,
+                handoff_token=handoff_token,
+                error_code="initial_runtime_handoff_ambiguous",
+            )
+            raise
+        except Exception as error:
+            logger.error("Ошибка запуска admitted cycle: %r", error)
+            await self._cleanup_initial_runtime_failure(
+                admission,
+                handoff_token=handoff_token,
+                error_code="initial_runtime_handoff_ambiguous",
+            )
+            raise APIError(f"Ошибка запуска admitted cycle: {error}") from error
+
+    async def resume_admitted_cycle(
+        self,
+        outcome: InputAdmissionOutcome,
+        *,
+        progress_callback=None,
+        progress_locale: str = "ru",
+    ) -> AgentResult | None:
+        """Compatibility adapter for WAITING_USER until IR-4."""
+        admission = outcome.admission
+        if (
+            admission is None
+            or admission.admission_kind != AdmissionKind.RESUME_WAITING
+            or not outcome.should_wake_runner
+        ):
+            return None
+        cycle_id = admission.target_cycle_id
+        claim = None
+        handoff_token: str | None = None
+        try:
+            async with self.execution_coordinator.admitted_run_lease(
+                session_id=admission.session_id,
+                input_batch_id=admission.input_batch_id,
+                cycle_id=cycle_id,
+            ) as acquired:
+                if not acquired:
+                    return None
+                await self._validate_admitted_runner_authority(outcome)
+                claim = (
+                    await self.input_admission_service
+                    .begin_waiting_compatibility_apply(admission)
+                )
+                if claim is None:
+                    return None
+                batch, capability_snapshot = (
+                    await self._resolve_batch_and_capability(
+                        admission.input_batch_id,
+                        session_id=admission.session_id,
+                    )
+                )
+                handoff_token = uuid4().hex
+                owns_handoff = (
+                    await self.input_admission_service.begin_runtime_handoff(
+                        admission,
+                        handoff_token=handoff_token,
+                    )
+                )
+                if not owns_handoff:
+                    return None
+                # TODO(IR-4): WAITING_USER reply must join every earlier queued
+                # addition through the common FIFO CycleInputApplier.
+                result = await self.mcp_client.process_query(
+                    "",
+                    session_id=admission.session_id,
+                    client_type=batch.client_type,
+                    progress_callback=progress_callback,
+                    progress_locale=progress_locale,
+                    input_batch=batch,
+                    cycle_id_override=cycle_id,
+                )
+                await (
+                    self.input_admission_service
+                    .complete_waiting_compatibility_apply(claim)
+                )
+                claim = None
+                await self.input_admission_service.record_cycle_status(
+                    session_id=admission.session_id,
+                    cycle_id=cycle_id,
+                    status=self._cycle_status_from_result(result),
+                )
+                await self._assemble_final_if_needed(
+                    result=result,
+                    batch=batch,
+                    capability_snapshot=capability_snapshot,
+                    progress_locale=progress_locale,
+                )
+                await self.input_admission_service.complete_runtime_handoff(
+                    admission,
+                    handoff_token=handoff_token,
+                )
+                return result
+        except asyncio.CancelledError:
+            await self._await_cancellation_cleanup(
+                self._cleanup_waiting_runtime_failure(
+                    admission,
+                    claim=claim,
+                    handoff_token=handoff_token,
+                    error_code="waiting_runtime_cancelled",
+                    pre_handoff_error_code=(
+                        "waiting_compatibility_pre_handoff_cancelled"
+                    ),
+                )
+            )
+            raise
+        except APIError:
+            await self._cleanup_waiting_runtime_failure(
+                admission,
+                claim=claim,
+                handoff_token=handoff_token,
+                error_code="waiting_runtime_handoff_ambiguous",
+                pre_handoff_error_code=(
+                    "waiting_compatibility_pre_handoff_failed"
+                ),
+            )
+            raise
+        except Exception as error:
+            await self._cleanup_waiting_runtime_failure(
+                admission,
+                claim=claim,
+                handoff_token=handoff_token,
+                error_code="waiting_runtime_handoff_ambiguous",
+                pre_handoff_error_code=(
+                    "waiting_compatibility_pre_handoff_failed"
+                ),
+            )
+            raise APIError(f"Ошибка resume admitted cycle: {error}") from error
+
+    async def _call_agent_batch_compatibility(
+        self,
+        input_batch_id: str,
+        *,
+        session_id: str,
+        progress_callback=None,
+        progress_locale: str = "ru",
+    ) -> AgentResult:
+        """Pre-IR-3 behavior used only when input_runtime.enabled is false."""
+        batch, capability_snapshot = await self._resolve_batch_and_capability(
+            input_batch_id,
+            session_id=session_id,
+        )
+        async with self.execution_coordinator.run_lease(
+            session_id=session_id,
+            input_batch_id=input_batch_id,
+            cycle_id=(cycle_id := uuid4().hex),
+        ):
+            result = await self.mcp_client.process_query(
+                "",
+                session_id=session_id,
+                client_type=batch.client_type,
+                progress_callback=progress_callback,
+                progress_locale=progress_locale,
+                input_batch=batch,
+                cycle_id_override=cycle_id,
+            )
+            await self._assemble_final_if_needed(
+                result=result,
+                batch=batch,
+                capability_snapshot=capability_snapshot,
+                progress_locale=progress_locale,
+            )
+        return result
+
     async def call_agent_batch(
         self,
         input_batch_id: str,
@@ -386,64 +901,43 @@ class Api:
         progress_callback=None,
         progress_locale: str = "ru",
     ) -> AgentResult:
-        """Run the agent only from an authoritative committed input batch."""
+        """Compatibility facade; enabled runtime always admits before execution."""
         try:
-            batch = await self.ingress_services.batch_store.get_committed(
-                input_batch_id
-            )
-            if batch.session_id != session_id:
-                raise APIError("Input batch belongs to another session")
-            capability_snapshot = batch.capability_snapshot
-            if capability_snapshot is None:
-                if batch.client_type == ClientType.TELEGRAM:
-                    declaration = build_telegram_capability_declaration(
-                        document_grouping=(
-                            self.interaction_config.telegram_output
-                            .prefer_document_groups
-                        ),
-                        message_editing=(
-                            self.interaction_config.telegram_output
-                            .status_message_editing
-                        ),
-                    )
-                elif batch.client_type == ClientType.WEB:
-                    declaration = build_web_capability_declaration()
-                else:
-                    declaration = build_cli_capability_declaration()
-                capability_snapshot, _ = (
-                    await self.ingress_services.capability_store.resolve(
-                        declaration,
-                        client_type=batch.client_type.value,
-                        client_instance_id=(
-                            f"legacy-committed-batch:{batch.client_type.value}"
-                        ),
-                    )
-                )
-            async with self.execution_coordinator.run_lease(
-                session_id=session_id,
-                input_batch_id=input_batch_id,
-                cycle_id=(cycle_id := uuid4().hex),
-            ):
-                result = await self.mcp_client.process_query(
-                    "",
+            if not self.input_runtime_config.enabled:
+                return await self._call_agent_batch_compatibility(
+                    input_batch_id,
                     session_id=session_id,
-                    client_type=batch.client_type,
                     progress_callback=progress_callback,
                     progress_locale=progress_locale,
-                    input_batch=batch,
-                    cycle_id_override=cycle_id,
                 )
-                if (
-                    result.status == AgentStatus.DONE
-                    and self.interaction_config.output_runtime.enabled
-                ):
-                    await self.output_assembler.assemble_final(
-                        result=result,
-                        input_batch=batch,
-                        capability_snapshot=capability_snapshot,
-                        locale=batch.locale or progress_locale,
-                    )
-            return result
+            outcome = await self.admit_committed_batch(
+                input_batch_id,
+                session_id=session_id,
+            )
+            result = None
+            if outcome.should_start_runner:
+                result = await self.start_admitted_cycle(
+                    outcome,
+                    progress_callback=progress_callback,
+                    progress_locale=progress_locale,
+                )
+            elif outcome.action in {
+                InputAdmissionAction.RESUME_WAITING,
+                InputAdmissionAction.DUPLICATE,
+            } and outcome.should_wake_runner:
+                result = await self.resume_admitted_cycle(
+                    outcome,
+                    progress_callback=progress_callback,
+                    progress_locale=progress_locale,
+                )
+            if result is not None:
+                return result
+            return AgentResult(
+                content=outcome.user_projection_key,
+                status=AgentStatus.RUNNING,
+                session_id=session_id,
+                cycle_id=outcome.target_cycle_id,
+            )
         except APIError:
             raise
         except Exception as error:

@@ -1,9 +1,13 @@
-"""Session-level reset across memory and uncommitted filesystem ingress state."""
+"""Session reset coordinated by the IR-5 durable control plane."""
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
+from uuid import uuid4
+
+from ..input_runtime.recovery import InputRuntimeRecoveryError
 
 
 logger = logging.getLogger("API.SessionReset")
@@ -13,67 +17,156 @@ logger = logging.getLogger("API.SessionReset")
 class SessionResetResult:
     session_id: str
     cancelled_input_batch_ids: tuple[str, ...]
+    control_id: str | None = None
+    generation: int | None = None
 
     @property
     def cancelled_input_batch_count(self) -> int:
         return len(self.cancelled_input_batch_ids)
 
 
-async def reset_runtime_session(api, session_id: str) -> SessionResetResult:
-    """Cancel open logical inputs, close presentations and clear LLM memory."""
+def _reset_application_lock(api, session_id: str) -> asyncio.Lock:
+    locks = getattr(api, "_input_runtime_reset_application_locks", None)
+    if locks is None:
+        locks = {}
+        setattr(api, "_input_runtime_reset_application_locks", locks)
+    return locks.setdefault(session_id, asyncio.Lock())
 
-    cancelled = []
+
+def _completed_reset_controls(api) -> set[str]:
+    completed = getattr(api, "_input_runtime_completed_reset_controls", None)
+    if completed is None:
+        completed = set()
+        setattr(api, "_input_runtime_completed_reset_controls", completed)
+    return completed
+
+
+def _require_runtime_ready(api) -> None:
+    gate = getattr(api, "input_runtime_readiness_gate", None)
+    if gate is None:
+        raise InputRuntimeRecoveryError("input_runtime_not_ready", fatal=False)
+    gate.require_ready()
+
+
+async def reset_runtime_session(
+    api,
+    session_id: str,
+    *,
+    idempotency_key: str | None = None,
+    source_client_type: str = "application",
+    source_message_ref: dict | None = None,
+) -> SessionResetResult:
+    """Advance durable generation, then clear mutable memory at a safe lease.
+
+    `/reset` is also the safe escape from an IR-8 ambiguous/non-resumable cycle:
+    it never replays that invocation and only clears the block after the durable
+    generation transition has converged.
+    """
+
+    _require_runtime_ready(api)
     execution_coordinator = getattr(api, "execution_coordinator", None)
-    if execution_coordinator is not None:
-        await execution_coordinator.reset_session(session_id)
-    batch_store = getattr(api.ingress_services, "batch_store", None)
-    cancel_open = getattr(batch_store, "cancel_open_drafts", None)
-    if cancel_open is not None:
-        cancelled = await cancel_open(
-            session_id=session_id,
-            code="session_reset",
-        )
-
-    coordinator = getattr(
-        api.ingress_services.ingress_service,
-        "presentation_coordinator",
+    control_service = getattr(
+        getattr(api, "input_admission_service", None),
+        "control_service",
         None,
     )
-    if coordinator is not None:
-        for draft in cancelled:
-            try:
-                await coordinator.finalize_batch(
-                    input_batch_id=draft.input_batch_id,
-                    state="failed",
-                    file_count=len(draft.attachment_parts),
-                    text_part_count=len(draft.text_parts),
-                    response_anchor=draft.response_anchor,
-                )
-            except Exception:
-                logger.exception(
-                    "session_reset_presentation_finalize_failed "
-                    "session_id=%s input_batch_id=%s",
-                    session_id,
-                    draft.input_batch_id,
-                )
+    control_id: str | None = None
+    durable_generation: int | None = None
+    old_state = await api.input_runtime_repositories.sessions.get(session_id)
+    old_cycle_id = old_state.active_cycle_id if old_state is not None else None
 
-    if execution_coordinator is None:
-        api.mcp_client.clear_session(session_id)
-    else:
-        # Do not clear shared memory underneath an active AgentCycle. The
-        # generation already rejected queued work; this lease waits only for
-        # the current cycle's safe runtime boundary.
-        async with execution_coordinator.run_lease(session_id=session_id):
+    if control_service is not None:
+        outcome = await control_service.request_reset(
+            session_id=session_id,
+            idempotency_key=(
+                idempotency_key
+                or f"application-reset:{session_id}:{uuid4().hex}"
+            ),
+            source_client_type=source_client_type,
+            source_message_ref=source_message_ref,
+            reason="user_reset",
+        )
+        control_id = outcome.command.control_id
+        state = await api.input_runtime_repositories.sessions.get(session_id)
+        durable_generation = state.generation if state is not None else None
+        if execution_coordinator is not None and durable_generation is not None:
+            await execution_coordinator.synchronize_generation(
+                session_id,
+                generation=durable_generation,
+            )
+    elif execution_coordinator is not None:
+        durable_generation = await execution_coordinator.reset_session(session_id)
+
+    async with _reset_application_lock(api, session_id):
+        completed = _completed_reset_controls(api)
+        if control_id is not None and control_id in completed:
+            if old_cycle_id is not None:
+                getattr(api, "_ir8_blocked_cycles", {}).pop(old_cycle_id, None)
+            return SessionResetResult(
+                session_id=session_id,
+                cancelled_input_batch_ids=(),
+                control_id=control_id,
+                generation=durable_generation,
+            )
+
+        cancelled = []
+        batch_store = getattr(api.ingress_services, "batch_store", None)
+        cancel_open = getattr(batch_store, "cancel_open_drafts", None)
+        if cancel_open is not None:
+            cancelled = await cancel_open(
+                session_id=session_id,
+                code="session_reset",
+            )
+
+        coordinator = getattr(
+            api.ingress_services.ingress_service,
+            "presentation_coordinator",
+            None,
+        )
+        if coordinator is not None:
+            for draft in cancelled:
+                try:
+                    await coordinator.finalize_batch(
+                        input_batch_id=draft.input_batch_id,
+                        state="failed",
+                        file_count=len(draft.attachment_parts),
+                        text_part_count=len(draft.text_parts),
+                        response_anchor=draft.response_anchor,
+                    )
+                except Exception:
+                    logger.exception(
+                        "session_reset_presentation_finalize_failed "
+                        "session_id=%s input_batch_id=%s",
+                        session_id,
+                        draft.input_batch_id,
+                    )
+
+        if execution_coordinator is None:
             api.mcp_client.clear_session(session_id)
+        else:
+            # Never mutate shared memory underneath an old-generation runner.
+            async with execution_coordinator.run_lease(session_id=session_id):
+                api.mcp_client.clear_session(session_id)
+
+        if control_id is not None:
+            completed.add(control_id)
+        if old_cycle_id is not None:
+            getattr(api, "_ir8_blocked_cycles", {}).pop(old_cycle_id, None)
+
     result = SessionResetResult(
         session_id=session_id,
         cancelled_input_batch_ids=tuple(
             draft.input_batch_id for draft in cancelled
         ),
+        control_id=control_id,
+        generation=durable_generation,
     )
     logger.info(
-        "session_reset_completed session_id=%s cancelled_input_batches=%s",
+        "session_reset_completed session_id=%s generation=%s control_id=%s "
+        "cancelled_input_batches=%s",
         session_id,
+        durable_generation,
+        control_id,
         result.cancelled_input_batch_count,
     )
     return result

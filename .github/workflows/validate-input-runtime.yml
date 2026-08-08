@@ -1,0 +1,70 @@
+name: Validate Input Runtime
+
+on:
+  push:
+    branches:
+      - feat/v0.4-input-runtime
+  pull_request:
+    branches:
+      - feature
+    paths:
+      - "src/input_runtime/**"
+      - "src/api/api.py"
+      - "src/api/__init__.py"
+      - "src/api/emission_outbox_routes.py"
+      - "src/api/output_outbox_routes.py"
+      - "src/interaction/output_claim.py"
+      - "src/interaction/output_outbox.py"
+      - "src/interaction/output_service.py"
+      - "src/interaction/ir7_output_barrier.py"
+      - "src/runtime/finalization_bridge.py"
+      - "src/mcp/input_runtime_checkpoints.py"
+      - "src/mcp/input_runtime_emissions.py"
+      - "src/mcp/artifact_delivery_runtime.py"
+      - "src/servers/telegram/emission_outbox.py"
+      - "src/servers/telegram/__init__.py"
+      - "src/core/message_processor.py"
+      - "src/runtime/session_execution.py"
+      - "tests/test_input_runtime_*.py"
+      - "src/api/mcp.config.example"
+      - "scripts/audit_configuration_examples.py"
+      - ".github/workflows/validate-input-runtime.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  validate-input-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install dependencies
+        run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest pytest-asyncio
+      - name: Compile input runtime and production IR-7 callers
+        run: >-
+          python -m compileall -q
+          src/input_runtime
+          src/api/api.py
+          src/api/__init__.py
+          src/api/emission_outbox_routes.py
+          src/api/output_outbox_routes.py
+          src/interaction/output_claim.py
+          src/interaction/output_outbox.py
+          src/interaction/output_service.py
+          src/interaction/ir7_output_barrier.py
+          src/runtime/finalization_bridge.py
+          src/mcp/input_runtime_checkpoints.py
+          src/mcp/input_runtime_emissions.py
+          src/mcp/artifact_delivery_runtime.py
+          src/servers/telegram/emission_outbox.py
+          src/servers/telegram/__init__.py
+          src/core/message_processor.py
+          src/runtime/session_execution.py
+      - name: Run input-runtime contracts and common config audit
+        run: python -m pytest -q tests/test_input_runtime_*.py tests/test_artifact_configuration_examples.py

@@ -3,23 +3,26 @@
 The low-level webhook module remains import-compatible, but every Telegram
 control client uses exact instance-scoped claim/receipt routes, every
 ``TelegramOutputPlanExecutor`` uses immutable OutputBatch-scoped artifact byte
-access, and semantic-only Telegram events never enter attachment commit logic.
-The READY outbox worker itself is still owned only by
-``src.servers.telegram.app``.
+access, semantic-only Telegram events never enter attachment commit logic, and
+IR-6 durable AgentEmission records are delivered beside (not through) the final
+OutputBatch outbox.
 """
 
 from __future__ import annotations
 
 from dataclasses import replace
 
+from .emission_outbox import install_on_ready_worker
 from .input_handler_policy import install_attachment_handler_registration_policy
 from .output_batch_gateway import TelegramClaimedOutputGateway
 from .output_control_policy import install_output_control_policy
 from .output_plan_executor import TelegramOutputPlanExecutor
+from .ready_outbox import TelegramReadyOutboxWorker
 
 
 install_attachment_handler_registration_policy()
 install_output_control_policy()
+install_on_ready_worker(TelegramReadyOutboxWorker)
 _original_execute = TelegramOutputPlanExecutor.execute
 
 
