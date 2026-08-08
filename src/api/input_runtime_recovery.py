@@ -8,17 +8,18 @@ from uuid import uuid4
 
 from ..core.models import AgentResult
 from ..ingress.recovery import FileSystemCommittedInputBatchRecoveryReader
-from ..input_runtime.handoff import RuntimeHandoffState
 from ..input_runtime.recovery import (
     InputRuntimeReadinessGate,
     InputRuntimeRecoveryCoordinator,
     InputRuntimeRecoveryError,
     RecoveryDisposition,
 )
-from ..interaction.output_startup_recovery import (
-    reconcile_unclaimable_legacy_ready,
-)
+from ..interaction.output_startup_recovery import reconcile_unclaimable_legacy_ready
 from ..runtime.input_runtime_rehydration import rehydrate_active_agent_cycle
+from .input_runtime_recovery_dependencies import (
+    RecoveredRuntimeDependencies,
+    validate_recovered_runtime_dependencies,
+)
 
 
 class _FinalOutputRecovery:
@@ -27,7 +28,12 @@ class _FinalOutputRecovery:
     def __init__(self, api: Any) -> None:
         self.api = api
 
-    async def recover_final_output(self, *, record, result_payload: dict[str, Any]) -> str:
+    async def recover_final_output(
+        self,
+        *,
+        record,
+        result_payload: dict[str, Any],
+    ) -> str:
         snapshot = await self.api.input_runtime_repositories.snapshots.get(
             record.cycle_id
         )
@@ -50,7 +56,10 @@ class _FinalOutputRecovery:
             capability_snapshot=capability_snapshot,
             locale=batch.locale or "ru",
         )
-        if record.output_batch_id is not None and output.output_batch_id != record.output_batch_id:
+        if (
+            record.output_batch_id is not None
+            and output.output_batch_id != record.output_batch_id
+        ):
             raise InputRuntimeRecoveryError("finalization_output_identity_mismatch")
         return output.output_batch_id
 
@@ -73,6 +82,9 @@ def _ensure_components(api: Any) -> None:
     )
     api.input_runtime_recovery_plan = None
     api.input_runtime_recovery_report = None
+    api.input_runtime_recovery_dependencies = RecoveredRuntimeDependencies(
+        active_plan_states={}
+    )
     api._ir8_blocked_cycles: dict[str, str] = {}
     api._ir8_runner_tasks: set[asyncio.Task[Any]] = set()
 
@@ -210,9 +222,18 @@ async def _install_recovered_runtime(
     if not callable(installer):
         raise InputRuntimeRecoveryError("mcp_recovered_cycle_installer_missing")
 
+    recovered_plans = api.input_runtime_recovery_dependencies.active_plan_states
     for session_plan in plan.sessions:
         if session_plan.should_rehydrate:
             cycle = rehydrate_active_agent_cycle(session_plan.snapshot)
+            cycle.active_plan_state = recovered_plans.get(session_plan.cycle_id)
+            if (
+                cycle.active_plan_id is not None
+                and cycle.active_plan_state is None
+            ):
+                raise InputRuntimeRecoveryError(
+                    "recovered_active_plan_state_missing"
+                )
             installer(cycle)
         if not session_plan.should_auto_schedule:
             continue
@@ -227,7 +248,10 @@ async def _install_recovered_runtime(
                 session_plan,
                 original_start_admitted_cycle=original_start_admitted_cycle,
             ),
-            name=f"input-runtime-recovered:{session_plan.session_id}:{session_plan.cycle_id}",
+            name=(
+                "input-runtime-recovered:"
+                f"{session_plan.session_id}:{session_plan.cycle_id}"
+            ),
         )
         _track_runner(api, task, logger)
 
@@ -296,6 +320,9 @@ def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
             plan = await self.input_runtime_recovery.recover()
             self.input_runtime_recovery_plan = plan
             self.input_runtime_recovery_report = plan.report
+            self.input_runtime_recovery_dependencies = (
+                await validate_recovered_runtime_dependencies(self, plan)
+            )
 
             expired_presentations = await (
                 self.ingress_services.presentation_store.expire_stale_reservations(
@@ -334,9 +361,12 @@ def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
             )
             recoverable_outputs = await self.output_store.list_recoverable()
             if recoverable_outputs:
-                ready_outputs = sum(item.state.value == "ready" for item in recoverable_outputs)
+                ready_outputs = sum(
+                    item.state.value == "ready" for item in recoverable_outputs
+                )
                 delivering_outputs = sum(
-                    item.state.value == "delivering" for item in recoverable_outputs
+                    item.state.value == "delivering"
+                    for item in recoverable_outputs
                 )
                 logger.warning(
                     "Found %s recoverable output batches (ready=%s, delivering=%s); no automatic resend performed",
@@ -364,7 +394,9 @@ def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
                 try:
                     await self.mcp_client.cleanup()
                 except Exception:
-                    logger.exception("MCP cleanup failed after startup recovery error")
+                    logger.exception(
+                        "MCP cleanup failed after startup recovery error"
+                    )
             raise APIError(f"Ошибка запуска API runtime: {error!r}") from error
 
     async def stop(self):
@@ -415,7 +447,3 @@ def install_input_runtime_recovery_lifecycle(api_module: Any) -> None:
     Api.call_agent_batch = guarded_call_batch
     Api.call_agent = guarded_call_agent
     Api._ir8_lifecycle_installed = True
-
-    # The module-level singleton was constructed before this package hook runs;
-    # class method lookup is already patched, while process-local components are
-    # created lazily on first start/boundary use.
