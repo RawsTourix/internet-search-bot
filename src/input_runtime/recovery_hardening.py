@@ -14,6 +14,21 @@ from .recovery import (
 class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
     """Preserve unknown side effects and terminal delivery fences on restart."""
 
+    async def _recover_finalizations(self, now, report) -> None:
+        records = await self._finalizations_for_recovery()
+        for record in records:
+            if record.state != FinalizationState.FAILED_RECOVERABLE:
+                continue
+            await self._interrupt_if_current(
+                record,
+                reason_code=(
+                    record.failure_code
+                    or "startup_failed_finalization_requires_explicit_resume"
+                ),
+                now=now,
+            )
+        await super()._recover_finalizations(now, report)
+
     async def recover(self) -> InputRuntimeRecoveryPlan:
         plan = await super().recover()
         hardened: list[RecoverySessionPlan] = []
