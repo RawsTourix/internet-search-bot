@@ -22,6 +22,20 @@ from .recovery import (
 class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
     """Preserve unknown side effects and terminal delivery fences on restart."""
 
+    async def _validate_output_ready_evidence(self, record) -> None:
+        validator = getattr(self.final_output_recovery, "validate_output_ready", None)
+        if callable(validator):
+            await validator(record)
+
+    async def _preconverge_completed_terminal(self, finalizations, now, report) -> None:
+        for record in finalizations:
+            if record.state != FinalizationState.OUTPUT_READY:
+                continue
+            marker = await self._handoff_for_finalization(record)
+            if marker is not None and marker.state == RuntimeHandoffState.COMPLETED:
+                await self._validate_output_ready_evidence(record)
+        await super()._preconverge_completed_terminal(finalizations, now, report)
+
     async def _recover_controls(self, now, report) -> None:
         # A pause may have been durably accepted before the first safe snapshot
         # was ever persisted. Do not run a new semantic block merely to reach a
@@ -68,10 +82,10 @@ class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
                 )
                 if current.state != ControlState.APPLIED:
                     raise self._fatal("pause_recovery_marker_not_applied")
-            await self.admission_service.control_service._advance_applied_watermark(
+            await self.admission_service.recover_control_applied_watermark(
                 state.session_id
             )
-            await self.admission_service.control_service._set_cycle_status(
+            await self.admission_service.recover_cycle_status(
                 session_id=state.session_id,
                 cycle_id=state.active_cycle_id,
                 generation=state.generation,
@@ -84,16 +98,17 @@ class InputRuntimeRecoveryCoordinator(_BaseRecoveryCoordinator):
     async def _recover_finalizations(self, now, report) -> None:
         records = await self._finalizations_for_recovery()
         for record in records:
-            if record.state != FinalizationState.FAILED_RECOVERABLE:
-                continue
-            await self._interrupt_if_current(
-                record,
-                reason_code=(
-                    record.failure_code
-                    or "startup_failed_finalization_requires_explicit_resume"
-                ),
-                now=now,
-            )
+            if record.state == FinalizationState.FAILED_RECOVERABLE:
+                await self._interrupt_if_current(
+                    record,
+                    reason_code=(
+                        record.failure_code
+                        or "startup_failed_finalization_requires_explicit_resume"
+                    ),
+                    now=now,
+                )
+            elif record.state == FinalizationState.OUTPUT_READY:
+                await self._validate_output_ready_evidence(record)
         await super()._recover_finalizations(now, report)
 
     async def _build_session_plans(
