@@ -17,65 +17,79 @@ last_reviewed: 2026-08-08
 - `IR-4 — Active snapshot, checkpoints и CycleInputApplier`: implemented;
 - `IR-5 — Durable control plane /stop, /continue, /reset`: implemented and validated;
 - `IR-6 — AgentEmission и intermediate messages`: implemented and validated;
-- `IR-7 — Finalization barrier`: implemented and validated;
+- `IR-7 — Finalization barrier`: implemented and validated after corrective pass;
 - `IR-8`—`IR-10`: planned.
 
 Общий `v0.4-input-runtime` остаётся `partial`.
 
-Финальный подтверждённый IR-7 code/test boundary:
+Финальный corrected IR-7 code/test boundary:
 
 - code/test HEAD:
-  `c58ab05c8354d7e76d4176e39ebf481edc4c613b`;
-- `Validate Input Runtime` #355 — success, production compile success,
-  `376 passed`, `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #638 — success.
+  `eb93918b33ce7503d0e2d5d032b7e600f51e5661`;
+- `Validate Input Runtime` #387 — success, production compile success,
+  `384 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #654 — success;
+- workflow permission remains `contents: read`.
 
-IR-7 production boundary гарантирует:
+Corrected IR-7 production boundary гарантирует:
 
 ```text
 DONE candidate
 → CP-BEFORE-FINAL-PROCESSING
-→ exact candidate authority
+→ exact candidate authority + exact admitted RuntimeHandoff relation
 → final processing without terminal reservation
 → PREPARED + short authoritative recheck
 → FINALIZING
 → RESULT_PERSISTED
 → normal final OutputBatch persisted / OUTPUT_READY
-→ second authoritative recheck
+→ second authoritative terminal recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session convergence
 → TERMINAL_COMMITTED
 → output claim/delivery becomes eligible
 ```
 
 Terminal eligibility использует authoritative accepted/applied input watermarks,
-pending/applied control watermarks, generation, active-cycle ownership и exact
-finalization identity. Любой late durable input/control до terminal commit
-abort-ит stale finalization; duplicate delivery без watermark transition не даёт
-phantom abort.
+pending/applied control watermarks, generation, active-cycle ownership, exact
+finalization identity и exact runtime-owned `admission_id + handoff_token`.
+Любой late durable input/control на second terminal recheck abort-ит stale
+finalization **до** handoff completion; duplicate delivery без watermark
+transition не даёт phantom abort.
 
 Persisted result и `OutputBatch READY` сами не являются terminal authority.
-Ready outbox и direct claim закрыты до `TERMINAL_COMMITTED`; stale/aborted output
-не становится deliverable и освобождает unclaimed cycle-final identity для
-следующего корректного same-cycle final result.
+Ready outbox и direct claim закрыты до `TERMINAL_COMMITTED`; normal admitted-run
+output gate дополнительно требует matching `RuntimeHandoff=COMPLETED`.
+Stale/aborted output не становится deliverable и освобождает unclaimed
+cycle-final identity для следующего корректного same-cycle final result.
 
-Filesystem commit использует короткий exact-session lock и пишет finalization
-terminal marker последним. Repository recreation/direct retry сходится к одной
-logical finalization/result/output/terminal authority. Partial terminal
-snapshot/session window не открывает delivery преждевременно; late input/control
-может выиграть до marker и repair-ить stale snapshot при controlled abort.
+Filesystem terminal command использует короткий exact-session lock. После second
+recheck lock-aware infrastructure primitive durable завершает exact
+RuntimeHandoff без повторного захвата того же non-reentrant lock. Только после
+этого записываются terminal snapshot/session, а finalization terminal marker —
+последним. Failure/cancellation до durable handoff completion не создаёт terminal
+snapshot/session/marker или output delivery authority.
+
+Crash после durable handoff COMPLETED, но до terminal writes, direct-retry-ится по
+известному finalization ID: same handoff token/completed_at, finalization ID,
+result_ref и OutputBatch ID сохраняются, LLM/tool work не replay-ится. Startup
+обнаружение/reconstruction такого состояния остаётся IR-8.
 
 WAITING candidate получает отдельный barrier
 `CP-BEFORE-WAITING → exact input/control recheck → one durable question authority
 → WAITING_USER`. Input/control до waiting commit suppresses stale question; input
-после commit идёт существующим same-cycle `RESUME_WAITING` path.
+после commit идёт существующим same-cycle `RESUME_WAITING` path. Corrective
+handoff ordering WAITING path не меняет.
 
-IR-6 emission READY claim и IR-7 terminal commit linearizable через один
+IR-6 emission READY claim и IR-7 terminal command linearizable через один
 exact-session coordination ordering: claim-first attempt legitimately остаётся
 DELIVERING, terminal-first запрещает новый old-cycle claim. Network/LLM/tool await
 под этим lock не выполняется.
 
-Deterministic IR-7 tests покрывают finalization phases, waiting/control/reset,
-output gate, claim-vs-terminal ordering и direct crash/replay через explicit
-events/fault injection/repository recreation. Real LLM/MCP/Telegram/Web/internet
+Deterministic corrected IR-7 tests покрывают finalization phases,
+waiting/control/reset, output gate, claim-vs-terminal ordering, handoff completion
+fault, exact durable write order, output worker в pre-handoff terminal window,
+completed-handoff/incomplete-terminal direct retry, late input/control before
+completion и cancellation вокруг completion. Real LLM/MCP/Telegram/Web/internet
 calls не используются.
 
 Финальный подтверждённый IR-6 code/test boundary:
@@ -124,7 +138,7 @@ exact session/client instance/conversation/thread scope и может добав
 Reset fences old generation как `READY → CANCELLED` и
 `DELIVERING → UNKNOWN`; stale claim writer не может завершить reset record.
 Sequential terminal fencing отвергает новый emission после terminal state и не
-начинает READY delivery после уже-visible terminal. Atomic concurrent
+начинает READY delivery после already-visible terminal. Atomic concurrent
 `claim ↔ terminal/finalization commit` закрыт IR-7 общей exact-session authority.
 
 Deterministic IR-6 tests покрывают duplicate/concurrent manager calls, fake-clock
@@ -210,7 +224,8 @@ admitted active cycle
 WAITING reply проходит тот же common FIFO `CP-RESUME`, не обходит более ранние
 queued additions и не владеет legacy semantic continuation path. Claim acquisition
 и apply cancellation-safe. Runtime handoff completion предшествует terminal
-snapshot synchronization.
+snapshot synchronization; corrected IR-7 теперь фактически сохраняет этот
+IR-3/IR-4 invariant на terminal path.
 
 Финальный подтверждённый IR-3 code boundary сохраняется как предыдущий stage
 evidence:
@@ -256,6 +271,12 @@ Cancellation contract IR-3:
   переводит marker в `AMBIGUOUS`, cycle — в `interrupted`;
 - cleanup запускается отдельной task, ожидается через `asyncio.shield`, завершается
   даже при повторной cancellation, затем исходный `CancelledError` re-raise-ится.
+
+Corrected IR-7 terminal success является уточнением уже принятого IR-3 contract:
+final terminal recheck выполняется раньше completion; если recheck clean, exact
+handoff durable становится COMPLETED внутри той же coordination boundary, после
+чего terminal snapshot/session/marker могут сходиться. Поздний API compatibility
+`complete_runtime_handoff()` идемпотентен и не меняет `completed_at`.
 
 После IR-7 следующие mandatory contracts остаются:
 
@@ -651,7 +672,9 @@ pre-run resolution
 - stale token не завершает marker другой attempt.
 
 IR-4 сохраняет этот ownership: successful handoff completion выполняется раньше
-terminal snapshot synchronization.
+terminal snapshot synchronization. Corrected IR-7 переносит exact successful
+completion внутрь final terminal coordination, но только после second terminal
+recheck; поздний API completion остаётся idempotent compatibility call.
 
 ## Cancellation contract
 
@@ -678,6 +701,10 @@ Initial:
 - cancellation до marker: marker отсутствует, admission retryable;
 - cancellation после marker, включая окно до фактического invocation: marker
   `AMBIGUOUS`, cycle `interrupted`, duplicate no-rerun.
+
+Corrected terminal nuance: cancellation/failure после durable handoff COMPLETED
+не переводит marker обратно в AMBIGUOUS. Если terminal marker ещё не записан,
+direct known-ID IR-7 retry завершает convergence без side-effect replay.
 
 WAITING compatibility на IR-3:
 
@@ -918,7 +945,9 @@ RuntimeHandoffRecord.complete
 → terminal ActiveCycleSnapshot sync
 ```
 
-IR-4 не ослабляет handoff authority ради terminal persistence.
+IR-4 не ослабляет handoff authority ради terminal persistence. Corrected IR-7
+сохраняет этот invariant, выполняя completion после second terminal recheck и до
+terminal snapshot/session/finalization marker.
 
 ## Checkpoint-level stale candidate suppression
 
@@ -928,8 +957,9 @@ IR-4 не ослабляет handoff authority ради terminal persistence.
 продолжается.
 
 IR-7 дополняет, а не заменяет эту первую линию защиты: late durable input/control
-после checkpoint observation и до terminal/waiting commit теперь проверяется
-repeated authoritative barrier.
+после checkpoint observation и до terminal/waiting commit проверяется repeated
+authoritative barrier. Second terminal recheck должен завершиться до handoff
+completion.
 
 ## Tests
 
@@ -956,7 +986,7 @@ repeated authoritative barrier.
 Cross-stage scenarios:
 
 - ambiguous IR-3 handoff/startup claim reconciliation — IR-8;
-- late terminal race/durable output barrier — реализован IR-7;
+- late terminal race/durable output barrier — реализован corrected IR-7;
 - `recover_cycle_authority()` corruption/restart matrix — IR-8/IR-10.
 
 ## Done
@@ -1307,8 +1337,8 @@ blind-retry-ится.
 - stale old-generation claim writer fenced;
 - already terminal cycle rejects new emission;
 - READY emission не начинает новую delivery после already-visible terminal state;
-- concurrent READY claim vs terminal commit теперь упорядочен IR-7 общей
-  exact-session authority, без network await под lock.
+- concurrent READY claim vs terminal commit упорядочен IR-7 общей exact-session
+  authority, без network await под lock.
 
 ## Telegram и reply binding
 
@@ -1384,18 +1414,20 @@ Covered critical windows:
 
 ## Статус
 
-Implemented and validated на code/test HEAD
-`c58ab05c8354d7e76d4176e39ebf481edc4c613b`:
+Implemented and validated after corrective pass на code/test HEAD
+`eb93918b33ce7503d0e2d5d032b7e600f51e5661`:
 
-- `Validate Input Runtime` #355 — success, production compile success,
-  `376 passed`, `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #638 — success.
+- `Validate Input Runtime` #387 — success, production compile success,
+  `384 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #654 — success;
+- workflow permission remains `contents: read`.
 
 ## Цель
 
 Не допустить stale final/waiting response, игнорирующий durable accepted
-input/control, и линейно упорядочить terminal visibility, final output delivery и
-IR-6 semantic emission claim.
+input/control, сохранить IR-3/IR-4 `RuntimeHandoff completion → terminal snapshot`
+ordering и линейно упорядочить terminal visibility, final output delivery и IR-6
+semantic emission claim.
 
 ## Реализованный ownership
 
@@ -1403,6 +1435,9 @@ IR-6 semantic emission claim.
 src/input_runtime/finalization.py
 src/input_runtime/ir7_filesystem.py
 src/input_runtime/ir7_crash_hardening.py
+src/input_runtime/ir7_handoff_ordering.py
+src/input_runtime/handoff_context.py
+src/input_runtime/hardened_service.py
 src/input_runtime/interfaces.py
 src/input_runtime/filesystem.py
 src/input_runtime/composition.py
@@ -1416,7 +1451,9 @@ src/runtime/finalization_bridge.py
 
 Application finalization service остаётся storage/transport-neutral; exact
 filesystem coordination реализуется adapter commands. Telegram/FastAPI/Path не
-проникают в application finalization logic.
+проникают в application finalization logic. Task-local RuntimeHandoff context
+несёт exact runtime-owned `admission_id + handoff_token` от уже durable API handoff
+к candidate/finalization boundary без transport/LLM ownership.
 
 ## Mandatory authority
 
@@ -1428,6 +1465,7 @@ pending_control_sequence == applied_control_sequence
 session generation == cycle generation
 active cycle == finalizing cycle
 exact context/finalization identity unchanged
+exact RuntimeHandoff relation unchanged
 ```
 
 Duplicate transport request без authoritative watermark transition не abort-ит
@@ -1438,22 +1476,62 @@ finalization.
 ```text
 candidate remains non-terminal
 → CP-BEFORE-FINAL-PROCESSING
-→ capture exact candidate authority
+→ capture exact candidate + handoff authority
 → final audit/grounding outside lock
 → durable PREPARED
 → short exact-session recheck
 → FINALIZING
 → persist deterministic final result evidence / RESULT_PERSISTED
 → assemble/persist normal final OutputBatch / OUTPUT_READY
-→ second exact-session recheck
-→ terminal snapshot/session convergence
-→ finalization TERMINAL_COMMITTED written last
-→ final OutputBatch claim becomes eligible
+→ second exact-session terminal recheck
+IF mismatch:
+    ABORTED_NEW_INPUT | ABORTED_CONTROL
+    handoff remains HANDED_OFF
+    same cycle may continue
+ELSE:
+    exact RuntimeHandoff COMPLETED
+    → terminal snapshot
+    → terminal session state
+    → finalization TERMINAL_COMMITTED written last
+    → final OutputBatch claim becomes eligible
 ```
 
-Late durable input/control на любом pre-terminal point приводит к controlled
-`ABORTED_NEW_INPUT`/`ABORTED_CONTROL`. Final processing не резервирует terminal
-right.
+Final processing не резервирует terminal right. Никакой LLM/tool work не
+выполняется после durable handoff completion на successful terminal path.
+
+## RuntimeHandoff ordering
+
+Corrected IR-7 восстанавливает IR-3/IR-4 invariant:
+
+```text
+all side-effecting runtime work complete
+→ final terminal recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session convergence
+→ TERMINAL_COMMITTED
+```
+
+Handoff нельзя complete до final recheck, иначе late input/control мог бы
+потребовать продолжить уже объявленный completed invocation. Handoff completion
+нельзя откладывать после terminal marker, иначе final output мог бы стать
+claimable при `HANDED_OFF/AMBIGUOUS`.
+
+Filesystem finalization command уже держит exact-session lock, поэтому corrected
+adapter использует lock-aware internal handoff completion primitive и не re-enter-ит
+тот же non-reentrant lock. Application layer не знает filesystem layout/lock;
+будущий PostgreSQL adapter может выразить весь successful command одной
+transaction/row lock.
+
+Если durable handoff completion падает:
+
+- finalization остаётся pre-terminal;
+- новый terminal snapshot не authoritative;
+- session не становится DONE;
+- `TERMINAL_COMMITTED` отсутствует;
+- final OutputBatch остаётся fenced.
+
+Поздний API `complete_runtime_handoff(...)` после successful terminal path
+идемпотентен: тот же token/state/completed_at, без second completion.
 
 ## Output fence
 
@@ -1461,6 +1539,8 @@ right.
 
 - ready outbox не показывает final batch до terminal marker;
 - direct `IdempotentOutputClaimService` отвергает new READY claim;
+- normal admitted-run delivery gate при `TERMINAL_COMMITTED` также проверяет
+  matching `RuntimeHandoff=COMPLETED`;
 - stale/aborted output никогда не становится claimable;
 - unclaimed stale aggregate освобождает cycle-final commit-once binding для
   следующего same-cycle final result;
@@ -1468,7 +1548,7 @@ right.
 
 ## AgentEmission ordering
 
-IR-6 `READY → DELIVERING` claim и IR-7 terminal commit используют один
+IR-6 `READY → DELIVERING` claim и IR-7 terminal command используют один
 exact-session coordination lock.
 
 Claim-first:
@@ -1477,13 +1557,16 @@ Claim-first:
 READY → DELIVERING
 → release lock
 → transport attempt may continue
-→ terminal commit
+→ later terminal command
 ```
 
 Terminal-first:
 
 ```text
-TERMINAL_COMMITTED
+second final recheck
+→ RuntimeHandoff COMPLETED
+→ terminal snapshot/session
+→ TERMINAL_COMMITTED
 → old-cycle READY claim rejected/cancelled
 ```
 
@@ -1502,7 +1585,8 @@ candidate question
 
 Input/control before waiting commit suppress stale question. Input after commit
 использует existing `RESUME_WAITING` same-cycle flow. `send_user_message` не
-перепрофилирован в question lifecycle.
+перепрофилирован в question lifecycle. Corrective RuntimeHandoff terminal
+ordering этот path не перерабатывает.
 
 ## Crash/retry
 
@@ -1513,35 +1597,58 @@ Focused IR-7 direct retry/repository recreation covers:
 - RESULT_PERSISTED replay;
 - output persisted / OUTPUT_READY state write failed;
 - OUTPUT_READY recreation;
+- handoff completion durable write failure before any terminal authority;
+- durable handoff COMPLETED / terminal snapshot write failed;
+- completed handoff + incomplete terminal direct recreation/retry;
 - partial terminal snapshot/session/finalization marker;
 - terminal commit response lost;
 - abort after result/output persistence;
 - duplicate logical retry without second result/output/terminal authority.
 
-`TERMINAL_COMMITTED` marker is written last and gates output delivery. Partial
-terminal snapshot can be repaired to RUNNING when no terminal marker exists and a
-newer durable input/control wins before retry.
+Crash после handoff COMPLETED не reopens handoff и не replay-ит LLM/MCP/tool.
+Direct retry сохраняет exact handoff token/completed_at, finalization ID,
+result_ref и OutputBatch ID и продолжает только terminal convergence.
 
-These are direct finalization-protocol replay tests, not startup reconstruction.
+These are direct finalization-protocol replay tests, not startup discovery or
+reconstruction.
 
 ## Deterministic tests
 
 ```text
 tests/test_input_runtime_ir7_finalization.py
 tests/test_input_runtime_ir7_production.py
+tests/test_input_runtime_ir7_handoff_ordering.py
 ```
 
 They use fake clock, explicit `asyncio.Event`, injected persistence faults,
-repository recreation, real output claim/outbox paths and production MCP MRO
-characterization. No probabilistic sleeps and no real LLM/MCP/Telegram/Web calls.
+repository recreation, real output claim/outbox paths and production-like
+admission/handoff composition. No probabilistic sleeps and no real
+LLM/MCP/Telegram/Web calls.
+
+Corrective mandatory coverage asserts exact durable states/IDs/watermarks for:
+
+- handoff completion fault;
+- write order `COMPLETED → snapshot → session → TERMINAL_COMMITTED`;
+- concurrent output outbox/direct claim before handoff completion;
+- completed-handoff/incomplete-terminal recreation/direct retry;
+- late input/control abort before handoff completion;
+- cancellation before and after durable completion;
+- idempotent late API completion preserving original `completed_at`.
 
 ## Done
 
 - all durable pre-terminal input/control suppress stale finalization;
 - stale question suppressed before WAITING commit;
 - post-terminal input creates a new cycle;
+- final terminal recheck precedes handoff completion;
+- abort never completes handoff prematurely;
+- successful handoff completion precedes terminal snapshot/session/marker;
+- completion failure cannot expose terminal/output authority;
+- no LLM/tool side effect occurs after durable handoff completion;
 - final output not claimable before terminal commit;
+- normal terminal output implies matching handoff COMPLETED;
 - stale/aborted output never deliverable;
+- completed-handoff/incomplete-terminal direct retry is idempotent;
 - finalization/result/output retry idempotent;
 - emission claim-vs-terminal ordering deterministic;
 - no network/LLM/tool await under finalization/session coordination;
@@ -1552,6 +1659,7 @@ characterization. No probabilistic sleeps and no real LLM/MCP/Telegram/Web calls
 - не implement startup scanner/reconstruction coordinator;
 - не reconstruct paused/interrupted/waiting runners on process start;
 - не reconcile all UNKNOWN emissions at startup;
+- не automatically discover incomplete finalization/handoff state on startup;
 - не build startup readiness gate/shutdown recovery;
 - не expand to IR-9 full projections or IR-10 roast;
 - не add scheduler/branches/distributed runtime.
@@ -1562,7 +1670,8 @@ characterization. No probabilistic sleeps and no real LLM/MCP/Telegram/Web calls
 
 ## Статус
 
-Planned. IR-7 direct finalization retry/repository recreation не является startup
+Planned. IR-7 direct finalization retry/repository recreation, включая exact
+`RuntimeHandoff=COMPLETED + incomplete terminal` retry, не является startup
 recovery.
 
 ## Цель
@@ -1577,7 +1686,7 @@ claims/runners.
 - inspect runtime handoff markers;
 - keep ambiguous external operation non-replayable;
 - reconcile post-handoff/UNKNOWN emission evidence by explicit policy;
-- discover/reconcile incomplete finalization records;
+- discover/reconcile incomplete finalization/handoff records;
 - reconstruct resumable/paused/waiting runner only when safe;
 - enable new admission after mandatory recovery.
 
@@ -1607,7 +1716,7 @@ Two service instances over same temporary root:
 - ambiguous marker does not rerun runtime;
 - post-handoff claim evidence preserved/reconciled;
 - UNKNOWN emission is not blindly re-sent;
-- incomplete finalization discovered/reconciled by startup coordinator;
+- incomplete finalization/handoff discovered/reconciled by startup coordinator;
 - `recover_cycle_authority()` corrupted/missing/divergent authority cases;
 - no new work before recovery ready;
 - shutdown deterministic.
@@ -1737,8 +1846,8 @@ localization и synthetic harness могли разрабатываться па
 Admission, checkpoint integration, controls и finalization выполняются
 последовательно, поскольку разделяют session state/watermarks.
 
-IR-7 завершён после stable cycle/context/control/emission identity. Следующий
-stage — только IR-8 startup recovery/reconstruction.
+IR-7 завершён после stable cycle/context/control/emission/handoff identity.
+Следующий stage — только IR-8 startup recovery/reconstruction.
 
 Scheduler/parallel branches не реализуются этим update stage sequence; future
 scheduler остаётся отдельной orchestration layer.
@@ -1759,15 +1868,16 @@ fix(input-runtime): linearize continue input target
 feat(input-runtime): implement IR-6 agent emissions
 feat(input-runtime): implement durable finalization barrier
 fix(input-runtime): close finalization race/crash gaps
+fix(input-runtime): complete handoff before terminal authority
 test(input-runtime): cover IR-7 finalization races
 feat(input-runtime): recover durable active runtime state
 test(input-runtime): add full race restart and transport coverage
 docs(input-runtime): finalize acceptance and current baseline
 ```
 
-IR-7 documentation evidence фиксируется только после green code/test gate
-`c58ab05c8354d7e76d4176e39ebf481edc4c613b`; documentation commits не начинают
-IR-8.
+Corrected IR-7 documentation evidence фиксируется только после green code/test
+gate `eb93918b33ce7503d0e2d5d032b7e600f51e5661`; documentation commits не
+начинают IR-8.
 
 Один commit не должен одновременно вводить новый state contract, переписывать
 agent loop и менять transport presentation без characterization tests.
