@@ -39,6 +39,7 @@ from .factory import (
     create_input_runtime_contracts,
 )
 from .handoff import RuntimeHandoffRecord, RuntimeHandoffState
+from .handoff_context import clear_runtime_handoff_context_for_tests
 from .interfaces import RuntimeHandoffRepository
 from .models import (
     ActiveCycleSnapshot, AdmissionKind, AdmissionState, AgentEmission,
