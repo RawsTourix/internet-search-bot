@@ -12,11 +12,11 @@ from .coordination import GLOBAL_SESSION_LOCKS, SessionLockRegistry
 from .ir8_control_recovery import FileSystemSessionControlRepository
 from .ir8_emissions import FileSystemAgentEmissionRepository
 from .ir8_filesystem import (
-    FileSystemActiveCycleSnapshotRepository,
     FileSystemFinalizationRepository,
     FileSystemInputAdmissionRepository,
     FileSystemRuntimeHandoffRepository,
 )
+from .ir8_snapshot_recovery import FileSystemActiveCycleSnapshotRepository
 from ._filesystem_identity_recovery_cycle import FileSystemCycleInboxRepository
 
 
