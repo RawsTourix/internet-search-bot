@@ -155,14 +155,24 @@ IR-7 закрывает durable pre-terminal races, которые IR-6 intentio
   logical finalization identity;
 - DONE проходит `CP-BEFORE-FINAL-PROCESSING`, exact candidate authority и durable
   `PREPARED`; final processing сам по себе не резервирует terminal right;
+- exact admitted invocation добавляет runtime-owned `admission_id + handoff_token`
+  relation к finalization; LLM/client не могут задавать эту identity;
 - short prepare recheck и второй pre-terminal recheck используют authoritative
   generation, active-cycle ownership, accepted/applied input watermarks и
   pending/applied control watermarks;
 - final result durable сохраняется как `RESULT_PERSISTED`, normal final
   `OutputBatch` — как `OUTPUT_READY`, но оба состояния ещё не дают delivery
   authority;
+- corrected terminal order:
+  `OUTPUT_READY → second recheck → RuntimeHandoff COMPLETED → terminal snapshot/session → TERMINAL_COMMITTED`;
+- mismatch на second recheck abort-ит finalization **до** handoff completion, так
+  что same cycle может продолжить работу; completed handoff не появляется раньше
+  окончательной terminal eligibility;
 - final output становится visible/claimable только после
-  `CycleFinalizationRecord=TERMINAL_COMMITTED`;
+  `CycleFinalizationRecord=TERMINAL_COMMITTED`; normal admitted-run gate также
+  требует matching `RuntimeHandoff=COMPLETED`;
+- durable failure transition `HANDED_OFF → COMPLETED` не допускает terminal
+  snapshot/session/marker и оставляет output fenced;
 - late durable input/control до terminal marker даёт `ABORTED_NEW_INPUT` или
   `ABORTED_CONTROL`; stale persisted output не доставляется и его unclaimed
   cycle-final identity освобождается для следующего same-cycle финала;
@@ -171,20 +181,21 @@ IR-7 закрывает durable pre-terminal races, которые IR-6 intentio
 - `AgentEmission READY claim ↔ terminal commit` linearizable через общий
   exact-session coordination lock: claim-first attempt остаётся legitimate,
   terminal-first не позволяет начать новый old-cycle attempt;
-- filesystem partial terminal writes replay-ятся к одной logical finalization;
-  terminal marker записывается последним как output delivery fence, а stale
-  partial terminal snapshot repair-ится при abort;
+- crash после durable handoff COMPLETED, но до terminal marker, direct-retry-ится
+  по известному finalization ID с теми же handoff/finalization/result/output IDs и
+  без LLM/tool replay; startup discovery остаётся IR-8;
 - network/LLM/tool awaits не выполняются под finalization/session lock.
 
-IR-7 final code evidence:
+Corrected IR-7 final code evidence:
 
-- code/test boundary `c58ab05c8354d7e76d4176e39ebf481edc4c613b`;
-- `Validate Input Runtime` #355 — success, production compile success,
-  `376 passed`, `0 failed`, `0 skipped`;
-- `Validate v0.4 file artifacts PR` #638 — success;
+- code/test boundary `eb93918b33ce7503d0e2d5d032b7e600f51e5661`;
+- `Validate Input Runtime` #387 — success, production compile success,
+  `384 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #654 — success;
+- workflow permission остаётся `contents: read`;
 - focused tests используют deterministic events/faults/repository recreation и
-  production MRO/output claim paths; real LLM/MCP/Telegram/Web/internet calls не
-  требуются.
+  production-like admission/handoff/output claim paths; real LLM/MCP/Telegram/
+  Web/internet calls не требуются.
 
 Startup-wide reconstruction/reconcile `READY/UNKNOWN`, paused/interrupted/waiting
 runtime и incomplete finalization scan остаются IR-8. Полный client timeline,
@@ -251,7 +262,9 @@ v0.4-storage-foundation
   auto-resume runner, `/continue` возобновляет тот же cycle, а `/reset` использует
   durable generation как authority.
 - Persisted result и final `OutputBatch READY` не являются terminal authority;
-  claim разрешён только после IR-7 `TERMINAL_COMMITTED`.
+  corrected IR-7 order сначала завершает matching RuntimeHandoff, затем terminal
+  snapshot/session и только потом `TERMINAL_COMMITTED`, после которого разрешён
+  claim.
 - Ambiguous/startup reconstruction/reconciliation остаётся IR-8; полная
   `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
 - Scheduler/parallel branches и Telegram history rewind не реализованы текущим
