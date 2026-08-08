@@ -4,12 +4,12 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: implemented
-last_reviewed: 2026-08-07
+last_reviewed: 2026-08-08
 ---
 
 # Safe checkpoints и context revisions
 
-## Статус реализации IR-4
+## Статус реализации IR-4 и IR-7 integration
 
 IR-4 реализован на code/test HEAD
 `1d31b6fbd1d5e88966d3964dc35cf4680f32f522` и подтверждён:
@@ -44,8 +44,22 @@ Regression-fix проход после `224911a…` менял только test
 - stale WAITING/final candidates подавляются на checkpoint-level, когда accepted
   watermark уже опережает applied watermark.
 
-IR-4 не является durable finalization/recovery completion. Late terminal race
-между последним checkpoint-level recheck и durable terminal commit остаётся IR-7.
+IR-7 не меняет IR-4 safe-checkpoint semantics, а добавляет обязательную вторую
+линию защиты после них. На code/test boundary
+`c58ab05c8354d7e76d4176e39ebf481edc4c613b` подтверждены:
+
+- `CP-BEFORE-FINAL-PROCESSING` остаётся ранним stale-DONE suppression point;
+- clean DONE candidate фиксирует exact generation/context/input/control authority,
+  но final-processing LLM call не резервирует terminal right;
+- `PREPARED/FINALIZING` и второй pre-terminal recheck используют authoritative
+  accepted/applied input и pending/applied control watermarks;
+- `CP-BEFORE-WAITING` дополняется short exact input/control recheck перед одной
+  durable waiting-question authority;
+- late durable input/control между checkpoint observation и commit теперь
+  suppress stale final/question candidate;
+- `Validate Input Runtime` #355 — success, `376 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #638 — success.
+
 Ambiguous handoff/startup reconciliation остаётся IR-8. Полная corruption matrix
 `recover_cycle_authority()` остаётся IR-8/IR-10.
 
@@ -76,8 +90,8 @@ one final-processing LLM operation
 потребовала бы synthetic cancellation results и отдельной durable незавершённой
 tool-block state machine.
 
-`/stop` и durable control application из этого абзаца относятся к accepted IR-5
-contract и на IR-4 ещё не реализованы.
+`/stop` и durable control application реализованы IR-5 поверх этой checkpoint
+matrix и не меняют atomic-block contract IR-4.
 
 ## Обязательные checkpoints
 
@@ -95,9 +109,8 @@ validate generation/snapshot
 → continue
 ```
 
-На IR-4 реализованы generation/snapshot validation, initial context
-initialization и common FIFO input drain. `/continue` и effective durable controls
-остаются IR-5.
+IR-4 реализовал generation/snapshot validation, initial context initialization и
+common FIFO input drain. IR-5 добавил `/continue` и effective durable controls.
 
 ### `CP-BEFORE-LLM`
 
@@ -117,7 +130,7 @@ initialization и common FIFO input drain. `/continue` и effective durable cont
 
 После candidate `ask_user`, но до фиксации `waiting_user` и доставки вопроса.
 
-Если accepted input уже существует:
+Если accepted input уже существует на checkpoint:
 
 ```text
 suppress candidate question
@@ -125,13 +138,21 @@ suppress candidate question
 → continue cycle
 ```
 
-Это suppression реализовано на checkpoint-level. Durable delivery/finalization
-barrier для более поздних races не входит в IR-4.
+IR-4 реализует это checkpoint-level suppression. IR-7 дополняет его отдельным
+коротким exact-session recheck непосредственно перед durable waiting commit. Если
+input/control становится durable после checkpoint observation, но до waiting
+commit, stale question всё равно suppressed. После successful waiting commit
+late input использует existing `RESUME_WAITING` same-cycle semantics.
 
 ### `CP-BEFORE-FINAL-PROCESSING`
 
 Перед final audit/formatting/grounding. Позволяет не тратить дополнительный LLM
 вызов на уже устаревший draft.
+
+IR-7 после clean checkpoint фиксирует exact candidate authority
+`session/cycle/generation/context_revision/expected input+control watermarks`.
+Final processing выполняется вне coordination lock и не резервирует terminal
+authority: новый durable input/control всё ещё может отменить candidate позже.
 
 ### `CP-BEFORE-TERMINAL-COMMIT`
 
@@ -139,9 +160,14 @@ barrier для более поздних races не входит в IR-4.
 terminal commit выполняется под finalization protocol из
 `finalization-and-recovery.md`.
 
-IR-4 реализует checkpoint-level input recheck/suppression на этой boundary, но не
-IR-7 durable finalization barrier. Поэтому input, пришедший после последнего
-checkpoint recheck в late terminal window, остаётся явным IR-7 race.
+IR-4 checkpoint-level recheck остаётся первой линией suppression. IR-7 не считает
+его достаточным terminal barrier: после него existing finalization protocol делает
+`PREPARED` exact-session recheck, persist result/output, затем обязательный второй
+short authoritative recheck непосредственно перед `TERMINAL_COMMITTED`.
+
+Поэтому late input/control после checkpoint observation, после PREPARED, после
+result persistence или после `OUTPUT_READY` всё ещё может выиграть до terminal
+marker и перевести finalization в `ABORTED_NEW_INPUT`/`ABORTED_CONTROL`.
 
 ### `CP-AFTER-INTERRUPTION`
 
@@ -151,7 +177,7 @@ block уже закрыт.
 
 ## Checkpoint order
 
-Полный accepted pipeline для `v0.4-input-runtime` остаётся:
+Полный current pipeline для `v0.4-input-runtime`:
 
 ```text
 1. load SessionInputRuntimeState
@@ -173,9 +199,10 @@ block уже закрыт.
 IR-4 реализует input/context slice этого pipeline: cycle/generation authority,
 accepted-at-entry watermark, bounded contiguous claim/apply, committed-batch
 validation/projection, context revision, snapshot-first persistence,
-mark-applied reconciliation и typed checkpoint outcome. Steps 3—5 принадлежат
+mark-applied reconciliation и typed checkpoint outcome. Steps 3—5 реализованы
 IR-5 durable controls; durable `AgentEmission` в step 13 принадлежит IR-6;
-durable terminal/finalization ownership относится к IR-7.
+durable terminal/finalization ownership реализован IR-7 как отдельный protocol
+после соответствующих checkpoint hooks.
 
 ```python
 class CheckpointOutcome(BaseModel):
@@ -193,12 +220,10 @@ class CheckpointOutcome(BaseModel):
     applied_through_sequence: int
 ```
 
-Accepted outcome surface сохраняет будущие pause/reset decisions. Их наличие в
-specification не означает, что IR-5 controls уже реализованы.
-
 Checkpoint не вызывает client delivery синхронно внутри session coordination
-lock. Он только сохраняет canonical runtime state/outcome; durable emission intent
-будет принадлежать IR-6.
+lock. Он только сохраняет canonical runtime state/outcome. IR-6 durable emission
+и IR-7 result/output/finalization delivery gates также не выполняют network await
+под exact-session coordination.
 
 ## Accepted-at-entry watermark
 
@@ -217,6 +242,10 @@ current applied = 2
 Input с sequence `6`, admitted во время checkpoint, остаётся queued для следующего
 safe checkpoint. Это сохраняет deterministic relation между atomic runtime block и
 использованной context revision.
+
+Для finalization этот accepted-at-entry contract намеренно не является terminal
+authority: IR-7 rechecks latest durable session watermarks после final processing
+и непосредственно перед terminal marker.
 
 ## `input_batch_update` projection
 
@@ -273,10 +302,8 @@ revision как parent. Identity сохраняет возможность multi
 Если checkpoint не применил input и не выполнил semantic resume/recovery change,
 новая revision не создаётся.
 
-`/continue` без input может создать revision с reason `resumed`, если это нужно
-для audit. Эта accepted возможность относится к IR-5; durable `/continue` на IR-4
-ещё не реализован. Такая revision не добавляет LLM message автоматически;
-runtime notice может быть trace-only.
+IR-5 `/continue` без input не создаёт fake input message/revision. Resume audit
+остаётся отдельной control/snapshot authority.
 
 ## Physical prompt и semantic revision
 
@@ -303,6 +330,11 @@ applied_through_cycle_sequence
 Durable `ActiveCycleSnapshot` сохраняет ту же semantic authority вместе с
 messages/runtime refs, generation, applied batch IDs, safe checkpoint и snapshot
 revision.
+
+IR-7 finalization candidate сохраняет exact `active_context_revision_id`, но
+terminal eligibility определяется latest authoritative generation/cycle и
+accepted/applied input + pending/applied control watermarks. Новая context
+revision, возникшая из late input, инвалидирует stale exact candidate.
 
 ## Compaction integration
 
@@ -352,8 +384,8 @@ active_plan_id/revision/node
 input admission IDs
 ```
 
-Scheduler/workflow revision и parallel branches появятся отдельно; IR-4 их не
-реализует.
+Scheduler/workflow revision и parallel branches появятся отдельно; IR-4/IR-7 их
+не реализуют.
 
 ## Artifact integration
 
@@ -385,6 +417,10 @@ validate_openai_tool_sequence(messages_for_llm) == valid
 Если tool result persistence завершилась, но artifact projection ещё нет, это не
 safe checkpoint: сначала завершается весь tool handling contract.
 
+IR-7 WAITING/final suppression не создаёт synthetic unmatched tool result и не
+перепрофилирует `send_user_message` как question. Native OpenAI tool/message
+sequence остаётся той же IR-4/IR-6 authority.
+
 ## Input во время LLM request
 
 ```text
@@ -397,8 +433,7 @@ LLM request uses R2
 ```
 
 Уже выбранное действие не отменяется автоматически. Исключение — отдельная
-control command policy; `/stop` относится к IR-5 и также должен ждать конца
-atomic block.
+control command policy; IR-5 `/stop` также ждёт конца atomic block.
 
 ## Input перед final candidate
 
@@ -411,12 +446,22 @@ model returned DONE based on R4
 → continue
 ```
 
-Если input приходит после final processing, тот же checkpoint-level guard
-выполняется в `CP-BEFORE-TERMINAL-COMMIT`.
+Если checkpoint clean, IR-7 фиксирует exact final candidate authority. Возможный
+late input после final-processing start не вставляется внутрь этого immutable
+LLM block, но durable accepted watermark немедленно лишает старый candidate права
+на terminal commit:
 
-Это не заменяет IR-7 durable finalization barrier. Input, accepted после
-последнего checkpoint observation, но до durable terminal commit, должен быть
-закрыт отдельным IR-7 short recheck/commit protocol.
+```text
+final processing based on R4
+→ late input durable accepted
+→ PREPARED or second terminal recheck sees mismatch
+→ ABORTED_NEW_INPUT
+→ stale result/output not deliverable
+→ same cycle continues and later applies input
+```
+
+То же правило действует для durable pending control. Persisted result или
+`OutputBatch READY` не заменяют terminal authority.
 
 ## Error handling
 
@@ -449,25 +494,26 @@ watermark retry завершает marking из snapshot authority. Cancellation
 ### Progress/emission failure
 
 Не откатывает уже применённый input. Projection/delivery retry выполняется
-отдельно. Durable semantic `AgentEmission` относится к IR-6 и ещё не реализован.
+отдельно. Durable semantic `AgentEmission` реализован IR-6; IR-7 shared terminal
+ordering не превращает delivery failure в AgentCycle failure.
 
 ## Runtime handoff и terminal snapshot
 
 IR-3 `RuntimeHandoffRecord` остаётся authority side-effecting runtime invocation.
-На успешном path порядок IR-4:
+На successful runtime path handoff completion предшествует terminal/finalization
+snapshot convergence.
 
-```text
-runtime result
-→ complete RuntimeHandoffRecord
-→ synchronize terminal ActiveCycleSnapshot
-```
-
-Terminal snapshot synchronization не выполняется вместо handoff completion и не
-ослабляет post-handoff ambiguity contract.
+IR-7 terminal commit может последовательно записывать terminal snapshot, session
+state и finalization marker под одной exact-session coordination boundary.
+`TERMINAL_COMMITTED` marker записывается последним и является final-output
+delivery fence. Если crash оставил terminal snapshot без завершённой terminal
+authority и затем late input/control выиграл, direct finalization retry repair-ит
+stale snapshot обратно к RUNNING при controlled abort. Startup-wide discovery
+этого состояния остаётся IR-8.
 
 ## Current-code integration points
 
-До modularization hooks добавляются минимально:
+До modularization hooks добавлены минимально:
 
 ```text
 MCPClient.process_query
@@ -479,21 +525,28 @@ MCPClient.process_query
 → before terminal return
 ```
 
-Hooks делегируют `InputRuntimeCheckpointService`. Они не получают filesystem path
-и не реализуют store logic внутри `mcp_client.py`.
+Hooks делегируют `InputRuntimeCheckpointService`. IR-7 production MRO поверх тех
+же hooks делегирует durable candidate/finalization/waiting operations
+`FinalizationBarrierService`. Они не получают filesystem path и не реализуют
+store logic внутри `mcp_client.py`.
 
 `ActiveAgentCycle` получает только bounded runtime fields и service-facing
 identity. Concrete repositories создаются composition root `Api`.
 
-## Deferred после IR-4
+## Deferred после IR-7
 
-Пока не реализованы:
+Уже реализованы отдельными stages:
 
-- IR-5 controls, `/stop`, `/continue` и `/reset` redesign;
-- IR-6 durable emissions;
-- IR-7 durable finalization barrier и late terminal race closure;
+- IR-5 controls, `/stop`, `/continue`, durable-generation `/reset`;
+- IR-6 durable semantic emissions;
+- IR-7 durable finalization/waiting barrier и late terminal race closure.
+
+Остаются deferred:
+
 - IR-8 startup recovery, ambiguous handoff/startup reconciliation;
 - `recover_cycle_authority()` corruption matrix — IR-8/IR-10;
+- IR-9 complete client projections/diagnostics;
+- IR-10 randomized/restart/full-system/live acceptance;
 - scheduler/parallel context branches;
 - Telegram history rewind.
 
@@ -516,6 +569,17 @@ IR-4 подтверждает:
 - handoff completion предшествует terminal snapshot synchronization;
 - claim/apply cancellation не создаёт duplicate application.
 
-IR-4 acceptance **не** утверждает, что закрыт late terminal race, durable
-finalization, startup/ambiguous recovery или corruption recovery matrix; эти
-contracts остаются соответственно IR-7, IR-8 и IR-8/IR-10.
+IR-7 acceptance дополнительно подтверждает:
+
+- input/control durable accepted после checkpoint observation всё ещё suppresses
+  stale DONE/question до terminal/waiting commit;
+- final processing не резервирует terminal authority;
+- finalization exact context/watermarks rechecked на PREPARED и непосредственно
+  перед terminal marker;
+- result/output persistence не открывает final delivery;
+- stale output после late input/control не становится claimable;
+- waiting commit создаёт одну durable question authority;
+- no LLM/tool/network await выполняется под finalization/session coordination.
+
+Startup/ambiguous recovery и corruption recovery matrix остаются соответственно
+IR-8 и IR-8/IR-10.
