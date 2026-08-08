@@ -157,6 +157,33 @@ class InputRuntimeControlMixin:
             progress_events=list(state.progress_events),
         )
 
+    def install_recovered_cycle(self, active_cycle: Any) -> None:
+        """Install one validated durable cycle into fresh process memory.
+
+        This is process-local reconstruction only.  Durable ownership was already
+        validated by IR-8 and remains in input-runtime repositories.
+        """
+        session_id = str(active_cycle.session_id)
+        cycle_id = str(active_cycle.cycle_id)
+        if not session_id or not cycle_id:
+            raise ValueError("recovered cycle identity is required")
+        session = self._get_or_create_session(session_id)
+        pending = session.pending_cycle
+        if pending is not None and str(pending.cycle_id) != cycle_id:
+            raise RuntimeError("fresh MCP session already owns another cycle")
+        session.pending_cycle = active_cycle
+        state = self._get_or_create_state(session_id)
+        if str(active_cycle.status) == CycleStatus.WAITING_USER.value:
+            state.status = AgentStatus.WAITING_USER
+            state.awaiting_user_input = True
+        elif str(active_cycle.status) == CycleStatus.INTERRUPTED.value:
+            state.status = AgentStatus.ERROR
+            state.awaiting_user_input = False
+        else:
+            state.status = AgentStatus.RUNNING
+            state.awaiting_user_input = False
+        self._input_runtime_seen_cycles.discard(cycle_id)
+
     def can_resume_controlled_cycle(self, *, session_id: str, cycle_id: str) -> bool:
         session = self._get_or_create_session(session_id)
         pending = session.pending_cycle
