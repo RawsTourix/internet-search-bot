@@ -9,7 +9,7 @@ from src.storage import StorageConfigType
 from ._filesystem_identity_recovery_cycle import FileSystemContextRevisionRepository
 from ._filesystem_session import FileSystemSessionInputRuntimeRepository
 from .coordination import GLOBAL_SESSION_LOCKS, SessionLockRegistry
-from .ir6_delivery_authority import FileSystemAgentEmissionRepository
+from .ir8_emissions import FileSystemAgentEmissionRepository
 from .ir8_filesystem import (
     FileSystemActiveCycleSnapshotRepository,
     FileSystemFinalizationRepository,
