@@ -1,4 +1,4 @@
-"""API package composition hooks for internal transport routes."""
+"""API package composition hooks for internal transport routes and lifecycle."""
 
 from __future__ import annotations
 
@@ -28,3 +28,14 @@ if not getattr(_output_routes, "_ir6_emission_routes_installed", False):
         _create_output_and_emission_outbox_router
     )
     _output_routes._ir6_emission_routes_installed = True
+
+
+# Api.start()/stop() remain the public lifecycle surface.  IR-8 is installed at
+# class level after the submodule creates the existing singleton so fresh Api
+# instances and the production singleton share the same recovery boundary.
+from . import api as _api_module  # noqa: E402
+from .input_runtime_recovery import (  # noqa: E402
+    install_input_runtime_recovery_lifecycle,
+)
+
+install_input_runtime_recovery_lifecycle(_api_module)
