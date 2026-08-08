@@ -6,7 +6,6 @@ from pathlib import Path
 
 from src.storage import StorageConfigType
 
-from ._filesystem_handoff import FileSystemRuntimeHandoffRepository
 from ._filesystem_identity_recovery_cycle import (
     FileSystemActiveCycleSnapshotRepository,
     FileSystemContextRevisionRepository,
@@ -17,7 +16,10 @@ from ._filesystem_session import FileSystemSessionInputRuntimeRepository
 from .coordination import GLOBAL_SESSION_LOCKS, SessionLockRegistry
 from .ir5_filesystem_controls import FileSystemSessionControlRepository
 from .ir6_delivery_authority import FileSystemAgentEmissionRepository
-from .ir7_crash_hardening import FileSystemFinalizationRepository
+from .ir7_handoff_ordering import (
+    FileSystemFinalizationRepository,
+    FileSystemRuntimeHandoffRepository,
+)
 
 
 class FileSystemInputRuntimeRepositories:
@@ -62,4 +64,5 @@ class FileSystemInputRuntimeRepositories:
         self.finalizations = FileSystemFinalizationRepository(
             root=root,
             locks=locks,
+            handoffs=self.handoffs,
         )
