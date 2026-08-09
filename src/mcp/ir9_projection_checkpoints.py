@@ -28,6 +28,31 @@ _projection_progress_callback: ContextVar[Any | None] = ContextVar(
 )
 
 
+async def _applied_projection_sequence(
+    *,
+    active_cycle: Any,
+    input_batch_id: str,
+) -> int | None:
+    """Read one already-applied admission without extending checkpoint authority."""
+
+    binding = checkpoint_module.get_input_runtime_binding()
+    if binding is None:
+        return None
+    admission = await binding.repositories.admissions.get_by_input_batch_id(
+        input_batch_id
+    )
+    if admission is None:
+        return None
+    if (
+        admission.session_id != str(active_cycle.session_id)
+        or admission.target_cycle_id != str(active_cycle.cycle_id)
+        or admission.admitted_generation
+        != int(getattr(active_cycle, "input_runtime_generation", 0) or 0)
+    ):
+        return None
+    return int(admission.cycle_sequence)
+
+
 async def _emit_applied_projection(
     owner: Any,
     *,
@@ -48,10 +73,16 @@ async def _emit_applied_projection(
         return
 
     generation = int(getattr(active_cycle, "input_runtime_generation", 0) or 0)
-    sequences = tuple(int(value) for value in outcome.applied_cycle_sequences)
-    batch_ids = tuple(str(value) for value in outcome.applied_input_batch_ids)
-    for index, input_batch_id in enumerate(batch_ids):
-        cycle_sequence = sequences[index] if index < len(sequences) else 0
+    for input_batch_id_value in outcome.applied_input_batch_ids:
+        input_batch_id = str(input_batch_id_value)
+        cycle_sequence = await _applied_projection_sequence(
+            active_cycle=active_cycle,
+            input_batch_id=input_batch_id,
+        )
+        if cycle_sequence is None or cycle_sequence < 1:
+            # Initial START_CYCLE is not an addendum projection, and a missing
+            # admission relation is safer to suppress than to fabricate.
+            continue
         await emit(
             state=progress_state,
             session_id=str(active_cycle.session_id),
