@@ -74,7 +74,10 @@ def active_cycle(cycle_id: str) -> ActiveAgentCycle:
         original_user_request="initial",
         messages_for_llm=[
             {"role": "system", "content": "system"},
-            {"role": "user", "content": "initial"},
+            {
+                "role": "user",
+                "content": '{"type":"user_request","user_request":"initial"}',
+            },
         ],
         cycle_trace=[],
         original_user_message_index=1,
