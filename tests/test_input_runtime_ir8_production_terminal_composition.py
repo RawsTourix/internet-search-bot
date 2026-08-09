@@ -23,6 +23,7 @@ from src.input_runtime import (
     create_filesystem_input_runtime_repositories,
 )
 from src.input_runtime.handoff import RuntimeHandoffState
+from src.input_runtime.handoff_context import clear_runtime_handoff_context_for_tests
 from src.input_runtime.recovery import (
     InputRuntimeLifecycleState,
     InputRuntimeRecoveryError,
@@ -81,6 +82,7 @@ class Reader:
 class FakeMCP:
     def __init__(self) -> None:
         self.connect_calls = 0
+        self.llm_calls = 0
         self.tool_calls = 0
         self.delivery_calls = 0
 
@@ -89,6 +91,7 @@ class FakeMCP:
 
 
 async def _seed_active_runtime(tmp_path):
+    clear_runtime_handoff_context_for_tests()
     reader = Reader()
     repositories = create_filesystem_input_runtime_repositories(
         storage_config=StorageConfigType(root_dir=str(tmp_path))
@@ -141,14 +144,10 @@ async def _seed_active_runtime(tmp_path):
     return reader, repositories, service, admission
 
 
-async def _seed_terminal_runtime(tmp_path, *, bind_handoff: bool = True):
+async def _prepare_bound_output_ready(tmp_path):
     reader, repositories, service, admission = await _seed_active_runtime(tmp_path)
     token = "handoff-token"
-    if bind_handoff:
-        assert await service.begin_runtime_handoff(
-            admission,
-            handoff_token=token,
-        )
+    assert await service.begin_runtime_handoff(admission, handoff_token=token)
     candidate = await service.finalization_service.capture_candidate(
         session_id="session",
         cycle_id=admission.target_cycle_id,
@@ -163,14 +162,82 @@ async def _seed_terminal_runtime(tmp_path, *, bind_handoff: bool = True):
         record.finalization_id,
         output_batch_id=OUTPUT_ID,
     )
+    assert record.state == FinalizationState.OUTPUT_READY
+    return reader, repositories, service, admission, token, record
+
+
+async def _seed_terminal_runtime(tmp_path):
+    (
+        reader,
+        repositories,
+        service,
+        admission,
+        token,
+        record,
+    ) = await _prepare_bound_output_ready(tmp_path)
     record = await service.finalization_service.terminal_commit(record.finalization_id)
     assert record.state == FinalizationState.TERMINAL_COMMITTED
-    if bind_handoff:
-        marker = await repositories.handoffs.get(admission.admission_id)
-        assert marker is not None and marker.state == RuntimeHandoffState.COMPLETED
-        # Clear the process-local handoff ContextVar after the durable commit.
-        await service.complete_runtime_handoff(admission, handoff_token=token)
+    marker = await repositories.handoffs.get(admission.admission_id)
+    assert marker is not None and marker.state == RuntimeHandoffState.COMPLETED
+    # This is idempotent for durable COMPLETED and clears only process-local context.
+    await service.complete_runtime_handoff(admission, handoff_token=token)
     return reader, record
+
+
+async def _seed_terminal_marker_with_open_handoff(tmp_path):
+    (
+        reader,
+        repositories,
+        _,
+        admission,
+        _,
+        record,
+    ) = await _prepare_bound_output_ready(tmp_path)
+    marker = await repositories.handoffs.get(admission.admission_id)
+    assert marker is not None and marker.state == RuntimeHandoffState.HANDED_OFF
+
+    # Fault injection: expose a terminal marker/projection without using the
+    # coordinated IR-7 terminal command, so the bound handoff stays HANDED_OFF.
+    terminal = record.model_copy(
+        update={
+            "state": FinalizationState.TERMINAL_COMMITTED,
+            "updated_at": NOW,
+        }
+    )
+    terminal = await repositories.finalizations.advance(
+        record.finalization_id,
+        expected_state=FinalizationState.OUTPUT_READY.value,
+        next_record=terminal,
+    )
+    snapshot = await repositories.snapshots.get(admission.target_cycle_id)
+    assert snapshot is not None
+    await repositories.snapshots.compare_and_swap(
+        snapshot.snapshot_revision,
+        snapshot.model_copy(
+            update={
+                "status": CycleStatus.DONE,
+                "snapshot_revision": snapshot.snapshot_revision + 1,
+                "updated_at": NOW,
+            }
+        ),
+    )
+    state = await repositories.sessions.get("session")
+    assert state is not None
+    await repositories.sessions.compare_and_swap(
+        state.revision,
+        state.model_copy(
+            update={
+                "cycle_status": CycleStatus.DONE,
+                "finalization_id": terminal.finalization_id,
+                "revision": state.revision + 1,
+                "updated_at": NOW,
+            }
+        ),
+    )
+    clear_runtime_handoff_context_for_tests()
+    marker = await repositories.handoffs.get(admission.admission_id)
+    assert marker is not None and marker.state == RuntimeHandoffState.HANDED_OFF
+    return reader, terminal
 
 
 async def _seed_done_projection_without_marker(tmp_path):
@@ -309,11 +376,11 @@ async def test_production_composed_terminal_marker_missing_output_fails_before_m
 
 
 @pytest.mark.asyncio
-async def test_production_composed_terminal_without_completed_handoff_is_rejected(
+async def test_production_composed_terminal_with_open_handoff_is_rejected(
     tmp_path,
     monkeypatch,
 ):
-    reader, _ = await _seed_terminal_runtime(tmp_path, bind_handoff=False)
+    reader, _ = await _seed_terminal_marker_with_open_handoff(tmp_path)
     output_store = FileSystemOutputBatchStore(tmp_path)
     await output_store.commit(_matching_output())
     api = _compose_fresh_recovery(
@@ -346,6 +413,7 @@ async def test_production_composed_valid_terminal_restart_is_idempotent_and_loca
     assert api.input_runtime_readiness_gate.state == InputRuntimeLifecycleState.RECOVERING
     assert api.input_runtime_readiness_gate.is_ready is False
     assert api.mcp_client.connect_calls == 0
+    assert api.mcp_client.llm_calls == 0
     assert api.mcp_client.tool_calls == 0
     assert api.mcp_client.delivery_calls == 0
 
