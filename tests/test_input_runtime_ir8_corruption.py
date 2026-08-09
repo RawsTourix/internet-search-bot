@@ -232,12 +232,13 @@ async def test_duplicate_admission_session_sequence_is_rejected(tmp_path):
     reader = Reader(Batch("initial", 1), Batch("corrupt", 2))
     repositories, _, _ = await seed_running(tmp_path, reader)
     original = await repositories.admissions.get_by_input_batch_id("initial")
+    # Keep both records individually valid. The contradiction under test is the
+    # duplicate immutable session/cycle sequence, not malformed START_CYCLE data.
     corrupt = original.model_copy(
         update={
             "admission_id": new_admission_id(),
             "input_batch_id": "corrupt",
             "idempotency_key": "committed-input:corrupt",
-            "cycle_sequence": 1,
         }
     )
     atomic_write_model(
