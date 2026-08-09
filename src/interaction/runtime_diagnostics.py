@@ -6,6 +6,7 @@ from typing import Any
 
 from ..input_runtime.diagnostics import (
     RuntimeAddendumProjection,
+    RuntimeRecoveryNotice,
     RuntimeStatusSnapshot,
 )
 from ..localization.models import LocalizationMessage
@@ -22,10 +23,7 @@ def render_runtime_status_cli(snapshot: RuntimeStatusSnapshot) -> str:
 
     if snapshot.process_readiness != "ready":
         issue = snapshot.current_issue_code or "none"
-        return (
-            f"process_readiness={snapshot.process_readiness}\n"
-            f"issue={issue}"
-        )
+        return f"process_readiness={snapshot.process_readiness}\nissue={issue}"
     state = (
         snapshot.session_status.value
         if snapshot.session_status is not None
@@ -85,6 +83,31 @@ def _state_text(snapshot: RuntimeStatusSnapshot, service, locale: str) -> str:
     )
 
 
+def render_recovery_notice_telegram(
+    notice: RuntimeRecoveryNotice | None,
+    localization_service,
+    *,
+    locale: str,
+) -> str:
+    if notice is None:
+        return ""
+    key = {
+        "ambiguous": "input_runtime.recovery.ambiguous",
+        "interrupted": "input_runtime.recovery.interrupted",
+        "paused": "input_runtime.recovery.paused",
+        "waiting": "input_runtime.recovery.waiting",
+        "non_resumable": "input_runtime.recovery.fatal",
+    }.get(notice.disposition)
+    if key is None:
+        return ""
+    return _render(
+        localization_service,
+        key,
+        locale=locale,
+        reason=notice.reason_code or "none",
+    )
+
+
 def render_runtime_status_telegram(
     snapshot: RuntimeStatusSnapshot,
     localization_service,
@@ -134,12 +157,24 @@ def render_runtime_status_telegram(
             locale=locale,
         )
     else:
+        command = _render(
+            localization_service,
+            "input_runtime.status.control_command."
+            f"{snapshot.controls.effective_command.value}",
+            locale=locale,
+        )
+        control_state = _render(
+            localization_service,
+            "input_runtime.status.control_state."
+            f"{snapshot.controls.effective_state.value}",
+            locale=locale,
+        )
         control = _render(
             localization_service,
             "input_runtime.status.control",
             locale=locale,
-            command=snapshot.controls.effective_command.value,
-            state=snapshot.controls.effective_state.value,
+            command=command,
+            state=control_state,
         )
     emissions = _render(
         localization_service,
@@ -150,15 +185,19 @@ def render_runtime_status_telegram(
         unknown=snapshot.emissions.unknown,
         failed=snapshot.emissions.failed,
     )
-    finalization = (
-        snapshot.finalization_state.value
-        if snapshot.finalization_state is not None
-        else _render(
+    if snapshot.finalization_state is None:
+        finalization = _render(
             localization_service,
             "input_runtime.status.none",
             locale=locale,
         )
-    )
+    else:
+        finalization = _render(
+            localization_service,
+            "input_runtime.status.finalization."
+            f"{snapshot.finalization_state.value}",
+            locale=locale,
+        )
     issue = snapshot.current_issue_code or snapshot.last_runtime_issue_code
     issue_text = (
         issue
@@ -169,28 +208,40 @@ def render_runtime_status_telegram(
             locale=locale,
         )
     )
-    replay_note = ""
-    if not snapshot.automatic_replay_enabled:
-        replay_note = "\n" + _render(
-            localization_service,
-            "input_runtime.status.automatic_replay_disabled",
-            locale=locale,
-        )
-    return (
-        _render(
-            localization_service,
-            "input_runtime.status.compact",
-            locale=locale,
-            state=state,
-            additions=additions,
-            applied=applied,
-            control=control,
-            emissions=emissions,
-            finalization=finalization,
-            issue=issue_text,
-        )
-        + replay_note
+    notes: list[str] = []
+    recovery_note = render_recovery_notice_telegram(
+        snapshot.recovery_notice,
+        localization_service,
+        locale=locale,
     )
+    if recovery_note:
+        notes.append(recovery_note)
+    if not snapshot.automatic_replay_enabled and (
+        snapshot.recovery_notice is None
+        or snapshot.recovery_notice.disposition != "ambiguous"
+    ):
+        notes.append(
+            _render(
+                localization_service,
+                "input_runtime.status.automatic_replay_disabled",
+                locale=locale,
+            )
+        )
+    result = _render(
+        localization_service,
+        "input_runtime.status.compact",
+        locale=locale,
+        state=state,
+        additions=additions,
+        applied=applied,
+        control=control,
+        emissions=emissions,
+        finalization=finalization,
+        issue=issue_text,
+    )
+    if notes:
+        result += "\n" + "\n".join(notes)
+    return result
 
 
 def render_addendum_projection_telegram(
