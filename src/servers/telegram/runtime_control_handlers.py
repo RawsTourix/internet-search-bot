@@ -17,7 +17,10 @@ from telegram.ext import (
     ContextTypes,
 )
 
-from .runtime_projection_edits import install_runtime_projection_editing
+from .runtime_projection_edits import (
+    install_runtime_projection_editing,
+    install_runtime_projection_progress_middleware,
+)
 
 
 _RUNTIME_CONTROL_COMMANDS = ("stop", "continue")
@@ -31,11 +34,14 @@ def install_runtime_control_handlers(application: Any) -> None:
 
     # Never force-import the Telegram host here: IR-5 characterization and
     # composition seams intentionally install handlers without a real bot token.
-    # In production app.py has already imported telegram_server, so the IR-9
-    # presentation wrapper can be installed without changing host lifecycle.
+    # In production app.py has already imported telegram_server, so IR-9
+    # presentation wrappers can be installed without changing host lifecycle.
     server = sys.modules.get(f"{__package__}.telegram_server")
     if server is not None and hasattr(server, "apply_input_ack_policy"):
         install_runtime_projection_editing(server)
+        gateway = getattr(server, "artifact_gateway", None)
+        if gateway is not None:
+            install_runtime_projection_progress_middleware(server, gateway)
 
     application.add_handler(
         CommandHandler(list(_RUNTIME_CONTROL_COMMANDS), runtime_control_handler),
