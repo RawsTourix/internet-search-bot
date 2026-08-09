@@ -71,7 +71,7 @@ async def test_ir9_checkpoint_emits_structured_projection_only_after_durable_app
     outcome = CheckpointOutcome(
         checkpoint=CheckpointName.BEFORE_LLM,
         action=CheckpointAction.INPUT_APPLIED,
-        context_revision_id="revision-a",
+        context_revision_id="ctxrev_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         applied_through_cycle_sequence=3,
         applied_input_batch_ids=("batch-add",),
     )
@@ -136,7 +136,7 @@ async def test_ir9_checkpoint_suppresses_initial_cycle_and_non_applied_outcomes(
         outcome=CheckpointOutcome(
             checkpoint=CheckpointName.BEFORE_LLM,
             action=CheckpointAction.INPUT_APPLIED,
-            context_revision_id="revision-initial",
+            context_revision_id="ctxrev_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
             applied_input_batch_ids=("batch-initial",),
         ),
     )
@@ -243,7 +243,6 @@ def payload(*, generation: int = 4) -> dict:
             "session_id": "telegram:bot-a:10:root",
             "session_generation": generation,
             "chat_id": 10,
-            # This is the original run target and must not be edited.
             "message_id": 111,
         },
     }
