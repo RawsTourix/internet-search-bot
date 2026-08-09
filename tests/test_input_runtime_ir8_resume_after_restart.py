@@ -90,9 +90,6 @@ class FreshMCPRuntime:
         assert cycle.active_context_revision_id is not None
         assert cycle.messages_for_llm
         self.resume_calls.append((session_id, cycle_id))
-        # This test proves the fresh process resumes the exact recovered cycle.
-        # The existing IR-4/IR-5 suites own semantic CP-RESUME execution; return
-        # None here so no fake final/status projection is introduced.
         return None
 
 
@@ -231,7 +228,7 @@ async def test_paused_fresh_continue_uses_same_cycle_and_recovered_context(tmp_p
         session_id="session",
     )
     assert queued.target_cycle_id == initial.target_cycle_id
-    assert queued.action == InputAdmissionAction.QUEUE_PAUSED
+    assert queued.action == InputAdmissionAction.QUEUED_PAUSED
 
     result = await request_runtime_continue(
         api,
