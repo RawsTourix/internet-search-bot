@@ -24,7 +24,7 @@ from src.input_runtime.recovery import (
     InputRuntimeReadinessGate,
     InputRuntimeRecoveryError,
 )
-from src.input_runtime.recovery_hardening import InputRuntimeRecoveryCoordinator
+from src.input_runtime.recovery_terminal import InputRuntimeRecoveryCoordinator
 from src.input_runtime.serialization import atomic_write_model
 from src.runtime import ActiveAgentCycle, SessionExecutionCoordinator
 from src.storage import StorageConfigType
@@ -198,7 +198,7 @@ async def test_divergent_durable_cycle_session_authority_is_rejected(tmp_path):
         state.model_copy(
             update={
                 "session_id": "other",
-                "revision": 0,
+                "revision": 1,
                 "created_at": NOW,
                 "updated_at": NOW,
             }
