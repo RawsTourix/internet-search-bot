@@ -3,15 +3,16 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from types import SimpleNamespace
 
 import pytest
 
+from src.api.session_reset import reset_runtime_session
 from src.input_runtime.recovery import (
     InputRuntimeLifecycleState,
     InputRuntimeReadinessGate,
     InputRuntimeRecoveryCoordinator,
     InputRuntimeRecoveryError,
-    InputRuntimeRecoveryReport,
     InputRuntimeRecoveryPlan,
 )
 
@@ -57,8 +58,6 @@ async def test_gate_is_recovering_while_reconciliation_is_blocked():
     release.set()
     plan = await task
     assert plan.sessions == ()
-    # Recovery itself never opens READY; production composition still has to
-    # connect MCP and install runner ownership first.
     assert gate.state == InputRuntimeLifecycleState.RECOVERING
 
 
@@ -78,3 +77,16 @@ async def test_runner_waits_for_ready_without_polling_or_sleep():
     await entered.wait()
     await task
     assert gate.state == InputRuntimeLifecycleState.READY
+
+
+@pytest.mark.asyncio
+async def test_reset_is_rejected_before_runtime_ready():
+    gate = InputRuntimeReadinessGate()
+    api = SimpleNamespace(input_runtime_readiness_gate=gate)
+
+    with pytest.raises(InputRuntimeRecoveryError) as error:
+        await reset_runtime_session(api, "session")
+
+    assert error.value.reason_code == "input_runtime_not_ready"
+    assert error.value.fatal is False
+    assert gate.state == InputRuntimeLifecycleState.STOPPED
