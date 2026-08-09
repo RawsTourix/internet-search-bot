@@ -21,7 +21,9 @@ class RunScopedProgressTelegramGatewayClient(
     passes metadata directly. AUTO text admission creates its status only after
     the committed submission response, so the adapter keeps one bounded,
     one-shot `input_batch_id -> progress metadata` binding until `/run` consumes
-    it. This is not a redirect chain and does not make old messages writable.
+    it. IR-9 additionally retains a bounded presentation-only handle map so an
+    APPLIED addendum projection can update the exact status created for that
+    InputBatch. Neither map is semantic runtime authority.
     """
 
     def __init__(
@@ -43,6 +45,10 @@ class RunScopedProgressTelegramGatewayClient(
             str,
             dict[str, Any],
         ] = OrderedDict()
+        self._runtime_input_presentations: OrderedDict[
+            str,
+            dict[str, Any],
+        ] = OrderedDict()
         self._completed_output_states: OrderedDict[str, str] = OrderedDict()
 
     async def _close_one_group_for_batch(self, input_batch_id: str) -> None:
@@ -53,6 +59,89 @@ class RunScopedProgressTelegramGatewayClient(
             await self.close_input_group(group_key)
             return
         await super()._close_one_group_for_batch(input_batch_id)
+
+    async def remember_input_presentation_handle(
+        self,
+        submission: dict[str, Any],
+        *,
+        client_message_id: str,
+    ) -> None:
+        """Retain one bounded safe handle after normal durable binding succeeds."""
+
+        await super().remember_input_presentation_handle(
+            submission,
+            client_message_id=client_message_id,
+        )
+        batch_id = str(submission.get("input_batch_id") or "").strip()
+        ref = dict(submission.get("presentation_ref") or {})
+        presentation_id = str(ref.get("presentation_id") or "").strip()
+        if not batch_id or not presentation_id:
+            return
+        try:
+            message_id = str(int(client_message_id))
+        except (TypeError, ValueError):
+            return
+        generation = int(ref.get("presentation_generation") or 0)
+        async with self._run_presentation_lock:
+            current = self._runtime_input_presentations.get(batch_id)
+            if current is not None:
+                current_generation = int(
+                    current.get("presentation_generation") or 0
+                )
+                if generation < current_generation:
+                    return
+                if generation == current_generation:
+                    try:
+                        if int(message_id) < int(current.get("message_id") or 0):
+                            return
+                    except (TypeError, ValueError):
+                        pass
+            self._runtime_input_presentations[batch_id] = {
+                "presentation_id": presentation_id,
+                "message_id": message_id,
+                "presentation_generation": generation,
+            }
+            self._runtime_input_presentations.move_to_end(batch_id)
+            self._trim_locked(self._runtime_input_presentations)
+
+    async def runtime_input_presentation(
+        self,
+        input_batch_id: str,
+    ) -> dict[str, Any] | None:
+        """Read the current presentation-only target for one exact InputBatch."""
+
+        normalized = str(input_batch_id).strip()
+        if not normalized:
+            return None
+        async with self._run_presentation_lock:
+            value = self._runtime_input_presentations.get(normalized)
+            return dict(value) if value is not None else None
+
+    async def replace_runtime_input_presentation_message_id(
+        self,
+        input_batch_id: str,
+        *,
+        expected_presentation_id: str,
+        message_id: int | str,
+    ) -> bool:
+        """Adopt a deterministic fallback handle without changing runtime state."""
+
+        normalized = str(input_batch_id).strip()
+        if not normalized:
+            return False
+        async with self._run_presentation_lock:
+            current = self._runtime_input_presentations.get(normalized)
+            if current is None:
+                return False
+            if str(current.get("presentation_id") or "") != str(
+                expected_presentation_id
+            ):
+                return False
+            updated = dict(current)
+            updated["message_id"] = str(message_id)
+            self._runtime_input_presentations[normalized] = updated
+            self._runtime_input_presentations.move_to_end(normalized)
+            return True
 
     async def remember_run_presentation(
         self,
