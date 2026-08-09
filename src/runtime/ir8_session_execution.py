@@ -17,25 +17,32 @@ from .session_execution import (
 class SessionExecutionCoordinator(_BaseCoordinator):
     """Add fresh-process reservations and active admitted-task ownership.
 
-    The coordinator remains defensive process-local state only.  Generations and
-    active cycle identities installed here always come from durable recovery.
+    The coordinator remains defensive process-local state only. Generations,
+    cycle identities and recovered reservation owners installed here always
+    derive from durable recovery; none of them become durable authority.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._active_admitted_tasks: set[asyncio.Task[object]] = set()
+        self._recovered_reservation_owners: dict[
+            str, tuple[str, str, int]
+        ] = {}
 
     async def install_recovered_reservation(
         self,
         *,
         session_id: str,
         cycle_id: str,
+        input_batch_id: str,
         generation: int,
     ) -> None:
         session_id = self._session_id(session_id)
         cycle_id = cycle_id.strip()
-        if not cycle_id or generation < 0:
-            raise ValueError("recovered cycle identity/generation is invalid")
+        input_batch_id = input_batch_id.strip()
+        if not cycle_id or not input_batch_id or generation < 0:
+            raise ValueError("recovered runner identity/generation is invalid")
+        owner = (cycle_id, input_batch_id, generation)
         async with self._guard:
             if self._closing:
                 raise RuntimeError("session execution coordinator is shutting down")
@@ -50,8 +57,14 @@ class SessionExecutionCoordinator(_BaseCoordinator):
                 raise SessionExecutionReset(
                     "fresh process already reserves another cycle"
                 )
+            existing_owner = self._recovered_reservation_owners.get(session_id)
+            if existing_owner is not None and existing_owner != owner:
+                raise SessionExecutionReset(
+                    "fresh process recovered reservation owner changed"
+                )
             lane.generation = generation
             lane.reserved_cycle_id = cycle_id
+            self._recovered_reservation_owners[session_id] = owner
             lane.runtime_status = "recovered_pending"
             lane.stop_requested = False
             lane.wake_event.clear()
@@ -66,9 +79,11 @@ class SessionExecutionCoordinator(_BaseCoordinator):
         async with self._guard:
             lane = self._lanes.get(session_id)
             if lane is None:
+                self._recovered_reservation_owners.pop(session_id, None)
                 return
             if lane.reserved_cycle_id == cycle_id and lane.active_cycle_id is None:
                 lane.reserved_cycle_id = None
+                self._recovered_reservation_owners.pop(session_id, None)
                 lane.runtime_status = "idle"
 
     @asynccontextmanager
@@ -80,7 +95,7 @@ class SessionExecutionCoordinator(_BaseCoordinator):
         cycle_id: str,
         expected_generation: int | None = None,
     ) -> AsyncIterator[bool]:
-        """Consume a matching recovery reservation or reserve a normal runner."""
+        """Consume only the exact recovered owner or reserve a normal runner."""
 
         session_id = self._session_id(session_id)
         input_batch_id = input_batch_id.strip()
@@ -101,15 +116,18 @@ class SessionExecutionCoordinator(_BaseCoordinator):
                 expected_generation is None
                 or generation == expected_generation
             )
+            recovered_owner = self._recovered_reservation_owners.get(session_id)
             recovered_match = (
                 generation_matches
                 and lane.reserved_cycle_id == cycle_id
+                and recovered_owner == (cycle_id, input_batch_id, generation)
                 and lane.active_cycle_id is None
                 and not lane.run_lease.locked()
             )
             normal_available = (
                 generation_matches
                 and lane.reserved_cycle_id is None
+                and recovered_owner is None
                 and lane.active_cycle_id is None
                 and not lane.run_lease.locked()
             )
@@ -150,6 +168,9 @@ class SessionExecutionCoordinator(_BaseCoordinator):
                     self._active_admitted_tasks.discard(current_task)
                 if lane.reserved_cycle_id == cycle_id:
                     lane.reserved_cycle_id = None
+                    owner = self._recovered_reservation_owners.get(session_id)
+                    if owner is not None and owner[0] == cycle_id:
+                        self._recovered_reservation_owners.pop(session_id, None)
                 if lane.active_cycle_id == cycle_id:
                     lane.active_cycle_id = None
                     lane.active_input_batch_id = None
@@ -164,6 +185,7 @@ class SessionExecutionCoordinator(_BaseCoordinator):
             lane = self._lanes.setdefault(session_id, _SessionLane())
             if lane.generation != generation:
                 lane.reserved_cycle_id = None
+                self._recovered_reservation_owners.pop(session_id, None)
             lane.generation = generation
             lane.stop_requested = True
             lane.wake_event.set()
@@ -197,11 +219,12 @@ class SessionExecutionCoordinator(_BaseCoordinator):
                 for lane in self._lanes.values()
                 for item in lane.queue
             ]
-            for lane in self._lanes.values():
+            for session_id, lane in self._lanes.items():
                 lane.queue.clear()
                 lane.wake_event.set()
                 if lane.active_cycle_id is None:
                     lane.reserved_cycle_id = None
+                    self._recovered_reservation_owners.pop(session_id, None)
         for item in queued:
             if not item.future.done():
                 item.future.cancel()
@@ -212,3 +235,8 @@ class SessionExecutionCoordinator(_BaseCoordinator):
         pending = [*active, *workers]
         if pending:
             await asyncio.gather(*pending, return_exceptions=True)
+        async with self._guard:
+            self._recovered_reservation_owners.clear()
+            for lane in self._lanes.values():
+                if lane.active_cycle_id is None:
+                    lane.reserved_cycle_id = None
