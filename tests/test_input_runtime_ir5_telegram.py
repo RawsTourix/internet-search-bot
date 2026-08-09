@@ -101,10 +101,22 @@ def test_runtime_control_handlers_are_high_priority_and_ingress_cancel_is_untouc
     application = FakeApplication()
     runtime_control_handlers.install_runtime_control_handlers(application)
     runtime_control_handlers.install_runtime_control_handlers(application)
-    assert len(application.handlers) == 1
-    handler, group = application.handlers[0]
+    assert len(application.handlers) == 2
+    controls = [
+        item
+        for item in application.handlers
+        if set(getattr(item[0], "commands", set())) == {"stop", "continue"}
+    ]
+    statuses = [
+        item
+        for item in application.handlers
+        if set(getattr(item[0], "commands", set())) == {"status"}
+    ]
+    assert len(controls) == 1
+    assert len(statuses) == 1
+    handler, group = controls[0]
     assert group == -10
-    assert set(handler.commands) == {"stop", "continue"}
+    assert statuses[0][1] == -10
     assert "cancel" not in handler.commands
     assert "collect" not in handler.commands
     assert "send" not in handler.commands
@@ -119,8 +131,12 @@ def test_runtime_state_composition_seam_installs_into_real_host_shape(monkeypatc
         fake_host,
     )
     _install_ir5_runtime_control_handlers_if_host_ready()
-    assert len(application.handlers) == 1
-    assert application.handlers[0][1] == -10
+    assert len(application.handlers) == 2
+    assert all(group == -10 for _handler, group in application.handlers)
+    assert any(
+        set(getattr(handler, "commands", set())) == {"status"}
+        for handler, _group in application.handlers
+    )
 
 
 def test_canonical_telegram_app_registers_ir5_and_collection_handlers_once(monkeypatch):
@@ -143,6 +159,11 @@ def test_canonical_telegram_app_registers_ir5_and_collection_handlers_once(monke
         for handler in handlers.get(-10, [])
         if set(getattr(handler, "commands", set())) == {"stop", "continue"}
     ]
+    runtime_statuses = [
+        handler
+        for handler in handlers.get(-10, [])
+        if set(getattr(handler, "commands", set())) == {"status"}
+    ]
     collection_controls = [
         handler
         for handler in handlers.get(-1, [])
@@ -150,6 +171,7 @@ def test_canonical_telegram_app_registers_ir5_and_collection_handlers_once(monke
     ]
 
     assert len(runtime_controls) == 1
+    assert len(runtime_statuses) == 1
     assert len(collection_controls) == 1
     assert "reset" not in runtime_controls[0].commands
     assert set(runtime_controls[0].commands).isdisjoint({"collect", "send", "cancel"})
