@@ -179,7 +179,6 @@ async def _seed_terminal_runtime(tmp_path):
     assert record.state == FinalizationState.TERMINAL_COMMITTED
     marker = await repositories.handoffs.get(admission.admission_id)
     assert marker is not None and marker.state == RuntimeHandoffState.COMPLETED
-    # This is idempotent for durable COMPLETED and clears only process-local context.
     await service.complete_runtime_handoff(admission, handoff_token=token)
     return reader, record
 
@@ -196,8 +195,6 @@ async def _seed_terminal_marker_with_open_handoff(tmp_path):
     marker = await repositories.handoffs.get(admission.admission_id)
     assert marker is not None and marker.state == RuntimeHandoffState.HANDED_OFF
 
-    # Fault injection: expose a terminal marker/projection without using the
-    # coordinated IR-7 terminal command, so the bound handoff stays HANDED_OFF.
     terminal = record.model_copy(
         update={
             "state": FinalizationState.TERMINAL_COMMITTED,
@@ -337,6 +334,7 @@ def _compose_fresh_recovery(tmp_path, reader, output_store, monkeypatch):
     )
     install_production_recovery_types()
     lifecycle._ensure_components(api)
+    api.input_runtime_recovery.clock = lambda: NOW
     assert type(api.input_runtime_recovery) is ProductionInputRuntimeRecoveryCoordinator
     return api
 
@@ -417,7 +415,6 @@ async def test_production_composed_valid_terminal_restart_is_idempotent_and_loca
     assert api.mcp_client.tool_calls == 0
     assert api.mcp_client.delivery_calls == 0
 
-    # Production may connect MCP only after deterministic recovery has returned.
     await api.mcp_client.connect_to_servers(())
     assert api.mcp_client.connect_calls == 1
 
