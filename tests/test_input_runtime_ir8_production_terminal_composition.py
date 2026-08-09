@@ -12,6 +12,7 @@ from src.api.input_runtime_recovery_composition import (
     ProductionInputRuntimeRecoveryCoordinator,
     install_production_recovery_types,
 )
+from src.ingress.models import ClientResponseRoute
 from src.input_runtime import (
     CheckpointName,
     CycleInputApplier,
@@ -26,17 +27,26 @@ from src.input_runtime.recovery import (
     InputRuntimeLifecycleState,
     InputRuntimeRecoveryError,
 )
-from src.interaction.output_models import OutputBatchKind
+from src.interaction.capabilities import ClientCapabilitySnapshot
+from src.interaction.ids import new_capability_snapshot_id, new_output_part_id
+from src.interaction.output_models import (
+    OutputBatch,
+    OutputBatchKind,
+    OutputBatchState,
+    TextOutputPart,
+)
+from src.interaction.output_store import FileSystemOutputBatchStore
 from src.runtime import ActiveAgentCycle, SessionExecutionCoordinator
 from src.storage import StorageConfigType
 
 NOW = datetime(2026, 8, 9, 9, 0, tzinfo=timezone.utc)
+INPUT_ID = "ibat_" + "1" * 32
 OUTPUT_ID = "obat_" + "4" * 32
 
 
 @dataclass
 class Batch:
-    input_batch_id: str = "initial"
+    input_batch_id: str = INPUT_ID
     session_id: str = "session"
     sequence_number: int = 1
     payload_size: int = 10
@@ -68,18 +78,6 @@ class Reader:
         return (self.batch,)
 
 
-class OutputStore:
-    def __init__(self, output=None) -> None:
-        self.output = output
-        self.get_calls = 0
-
-    async def get(self, output_batch_id: str):
-        self.get_calls += 1
-        if self.output is None:
-            raise KeyError(output_batch_id)
-        return self.output
-
-
 class FakeMCP:
     def __init__(self) -> None:
         self.connect_calls = 0
@@ -105,7 +103,7 @@ async def _seed_active_runtime(tmp_path):
         clock=lambda: NOW,
         payload_size_resolver=lambda batch: batch.payload_size,
     )
-    outcome = await service.admit_committed_batch("initial", session_id="session")
+    outcome = await service.admit_committed_batch(INPUT_ID, session_id="session")
     admission = outcome.admission
     assert admission is not None
     cycle = ActiveAgentCycle(
@@ -123,7 +121,7 @@ async def _seed_active_runtime(tmp_path):
         ],
         cycle_trace=[],
         original_user_message_index=1,
-        original_input_batch_id="initial",
+        original_input_batch_id=INPUT_ID,
         input_runtime_generation=0,
     )
     applier = CycleInputApplier(
@@ -138,7 +136,7 @@ async def _seed_active_runtime(tmp_path):
         generation=0,
         checkpoint=CheckpointName.RESUME,
         active_cycle=cycle,
-        input_batch_id="initial",
+        input_batch_id=INPUT_ID,
     )
     return reader, repositories, service, admission
 
@@ -205,12 +203,40 @@ async def _seed_done_projection_without_marker(tmp_path):
     return reader
 
 
-def _matching_output():
-    return SimpleNamespace(
+def _matching_output() -> OutputBatch:
+    capability = ClientCapabilitySnapshot(
+        capability_snapshot_id=new_capability_snapshot_id(),
+        capability_contract_version=1,
+        client_type="telegram",
+        client_instance_id="bot-a",
+        features=(),
+        limits={},
+        fingerprint="sha256:" + "a" * 64,
+        captured_at=NOW,
+    )
+    return OutputBatch(
         output_batch_id=OUTPUT_ID,
+        input_batch_id=INPUT_ID,
         session_id="session",
         cycle_id="cycle",
+        sequence_number=1,
         kind=OutputBatchKind.FINAL,
+        response_route=ClientResponseRoute(
+            route_type="telegram",
+            conversation_id="100",
+        ),
+        locale="en",
+        capability_snapshot=capability,
+        parts=(
+            TextOutputPart(
+                part_id=new_output_part_id(),
+                index=0,
+                text="final",
+            ),
+        ),
+        state=OutputBatchState.READY,
+        created_at=NOW,
+        ready_at=NOW,
     )
 
 
@@ -254,7 +280,8 @@ async def test_production_composed_done_without_terminal_marker_fails_before_mcp
     monkeypatch,
 ):
     reader = await _seed_done_projection_without_marker(tmp_path)
-    api = _compose_fresh_recovery(tmp_path, reader, OutputStore(), monkeypatch)
+    output_store = FileSystemOutputBatchStore(tmp_path)
+    api = _compose_fresh_recovery(tmp_path, reader, output_store, monkeypatch)
 
     with pytest.raises(InputRuntimeRecoveryError) as error:
         await api.input_runtime_recovery.recover()
@@ -270,7 +297,8 @@ async def test_production_composed_terminal_marker_missing_output_fails_before_m
     monkeypatch,
 ):
     reader, _ = await _seed_terminal_runtime(tmp_path)
-    api = _compose_fresh_recovery(tmp_path, reader, OutputStore(), monkeypatch)
+    output_store = FileSystemOutputBatchStore(tmp_path)
+    api = _compose_fresh_recovery(tmp_path, reader, output_store, monkeypatch)
 
     with pytest.raises(InputRuntimeRecoveryError) as error:
         await api.input_runtime_recovery.recover()
@@ -286,10 +314,12 @@ async def test_production_composed_terminal_without_completed_handoff_is_rejecte
     monkeypatch,
 ):
     reader, _ = await _seed_terminal_runtime(tmp_path, bind_handoff=False)
+    output_store = FileSystemOutputBatchStore(tmp_path)
+    await output_store.commit(_matching_output())
     api = _compose_fresh_recovery(
         tmp_path,
         reader,
-        OutputStore(_matching_output()),
+        output_store,
         monkeypatch,
     )
 
@@ -306,7 +336,9 @@ async def test_production_composed_valid_terminal_restart_is_idempotent_and_loca
     monkeypatch,
 ):
     reader, terminal_before = await _seed_terminal_runtime(tmp_path)
-    output_store = OutputStore(_matching_output())
+    output_store = FileSystemOutputBatchStore(tmp_path)
+    output_before, created = await output_store.commit(_matching_output())
+    assert created is True
     api = _compose_fresh_recovery(tmp_path, reader, output_store, monkeypatch)
 
     plan = await api.input_runtime_recovery.recover()
@@ -324,5 +356,6 @@ async def test_production_composed_valid_terminal_restart_is_idempotent_and_loca
     terminal_after = await api.input_runtime_repositories.finalizations.get(
         terminal_before.finalization_id
     )
+    output_after = await output_store.get(OUTPUT_ID)
     assert terminal_after == terminal_before
-    assert output_store.get_calls >= 1
+    assert output_after == output_before
