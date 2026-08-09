@@ -4,15 +4,16 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-08
+last_reviewed: 2026-08-09
 ---
 
 # Finalization и recovery
 
-## Current boundary after corrected IR-7
+## Current boundary after IR-8
 
-Этот документ остаётся `partial`: durable finalization barrier реализован IR-7,
-а startup recovery/reconstruction остаётся IR-8 planned.
+Этот документ остаётся update-level `partial`: durable finalization barrier
+реализован IR-7, startup recovery/reconstruction реализован IR-8, а IR-9/IR-10
+остаются planned.
 
 Corrected IR-7 production path активирует existing `CycleFinalizationRecord` и
 закрывает:
@@ -28,12 +29,11 @@ Corrected IR-7 production path активирует existing `CycleFinalizationR
 - repository recreation/direct retry собственного finalization protocol;
 - completed-handoff/incomplete-terminal direct convergence без LLM/tool replay.
 
-IR-8 по-прежнему отвечает за startup-wide reconstruction/reconciliation retained
-`READY/UNKNOWN`, interrupted/paused/waiting runners, ambiguous handoffs,
-incomplete finalizations и startup readiness ordering. IR-7 не добавляет startup
-scanner или global recovery coordinator. Normal live admission-vs-terminal race
-разрешается IR-7 в исходном in-process admission call и не зависит от IR-8
-committed-but-unadmitted discovery.
+IR-8 добавляет startup-wide reconstruction/reconciliation retained
+`READY/UNKNOWN`, interrupted/paused/waiting cycles, ambiguous handoffs,
+incomplete finalizations, committed-but-unadmitted input и startup readiness/
+shutdown ordering. Normal live admission-vs-terminal race по-прежнему разрешается
+IR-7 в исходном in-process admission call и не зависит от startup repair.
 
 IR-6 conservative emission semantics сохранены:
 
@@ -62,7 +62,7 @@ authority.
 определяет durable order записи результата и conservative recovery после crash.
 
 Finalization часть реализована IR-7. Startup/process-restart recovery часть
-остаётся IR-8 specification.
+реализована IR-8 поверх тех же repository/service authorities.
 
 ## Проблема stale final answer
 
@@ -407,8 +407,8 @@ emissions до resume.
 
 ## IR-7 direct crash/retry classification — implemented
 
-IR-7 покрывает только replay собственного finalization protocol после repository
-recreation, без startup scanner:
+IR-7 покрывает replay собственного finalization protocol после repository
+recreation:
 
 | Persisted point | Direct retry/convergence |
 |---|---|
@@ -426,9 +426,9 @@ Durable `COMPLETED` handoff не переводится обратно в `HANDE
 Поздний API compatibility call `complete_runtime_handoff()` идемпотентен и
 возвращает тот же COMPLETED marker без нового token или `completed_at`.
 
-Эта таблица не является startup reconstruction coordinator. IR-8 должен только
-обнаруживать/reconcile такие records на startup; IR-7 direct retry уже умеет
-сойтись, когда известны exact IDs.
+IR-8 startup discovery теперь автоматически находит эти records и использует
+тот же IR-7 direct convergence, когда stronger durable authority делает local
+repair безопасным.
 
 ## Cancellation windows — corrected IR-7
 
@@ -441,73 +441,111 @@ Cancellation/failure не создаёт terminal delivery authority. Existing A
 ### После durable COMPLETED, до TERMINAL_COMMITTED
 
 Handoff остаётся `COMPLETED` и не может быть понижен до `AMBIGUOUS`. Output всё
-ещё fenced, потому что terminal marker отсутствует. Direct finalization retry
-заканчивает terminal convergence без side-effect replay.
+ещё fenced, потому что terminal marker отсутствует. IR-8 startup finalization
+reconciliation заканчивает terminal convergence без side-effect replay.
 
-## Restart classification — planned IR-8
+## Restart classification — implemented IR-8
 
-После process restart runtime не должен делать вид, что in-flight operation
-завершена.
+После process restart runtime не считает старый task/runner живым. Classification
+строится только из durable snapshot/handoff/finalization/control evidence.
 
 | Persisted state | Recovery classification |
 |---|---|
-| `running` | `interrupted`, resumable from last safe snapshot |
-| `pause_requested` | finish as `paused_by_user` if safe snapshot exists, else `interrupted` with pause intent |
-| `paused_by_user` | remain paused |
-| `waiting_user` | remain waiting |
-| `finalizing` + incomplete finalization | startup reconcile finalization record |
-| terminal committed | do not rerun cycle |
-| inbox claim expired | reconcile/requeue |
-| AgentEmission `READY` | retain durable pending intent; startup scheduling/reconcile policy is IR-8 |
+| `running` без unsafe handoff | same cycle reconstructed; safe runner can be scheduled after MCP connect |
+| `pause_requested` | finish as `paused_by_user` from existing safe snapshot; otherwise controlled interruption with pause intent |
+| `paused_by_user` | remain paused, same cycle/context, no runner |
+| `waiting_user` | remain waiting, same cycle/context/question |
+| `interrupted` | reconstruct same durable cycle; automatic replay only when policy proves safe |
+| `finalizing` + incomplete finalization | reconcile exact finalization/handoff authority locally when possible |
+| terminal committed | strict preflight; never rerun old cycle |
+| inbox claim expired | reconcile/requeue from snapshot authority |
+| AgentEmission `READY` | retain durable pending intent; no startup send |
 | AgentEmission `DELIVERING` lease expired | `UNKNOWN`, never automatic `READY` |
 | AgentEmission `UNKNOWN` | retain ambiguity; no blind client resend |
 
-IR-6/IR-7 repository recreation сохраняет durable records и direct retry
-idempotency, но startup-wide runner/outbox reconstruction — IR-8.
+`HANDED_OFF`/`AMBIGUOUS` without stronger completion evidence are conservative
+non-auto-replay states. Process restart itself is never permission to repeat an
+unknown LLM/tool/client side effect.
 
-## Startup recovery sequence — planned IR-8
+## Startup recovery sequence — implemented IR-8
 
-Recommended order:
-
-```text
-1. load/repair session runtime states
-2. reconcile committed batches without admission
-3. reconcile admission/session watermarks
-4. expire/reconcile inbox claims
-5. reconcile control commands/generation
-6. reconcile active-cycle snapshots
-7. reconcile emission claims/UNKNOWN receipts without blind resend
-8. discover/reconcile incomplete finalization and handoff records
-9. list resumable cycles and pending deliveries
-10. connect MCP/tool runtime
-11. allow new admission/runners
-```
-
-Admission should not race startup reconciliation. Gateway readiness policy for
-этот sequence относится к IR-8, не IR-7. Normal in-process admission-vs-terminal
-race уже разрешена IR-7 и не является startup item.
-
-## Active cycle recovery — planned IR-8
-
-Recovery requires last durable safe checkpoint snapshot.
+Production order:
 
 ```text
-snapshot valid + protocol-valid messages
-→ status interrupted/waiting/paused
-→ can_resume=true according to policy
+1. readiness gate → RECOVERING
+2. load/repair session runtime identity/frontiers
+3. strict immutable admission/cycle corruption preflight
+4. strict existing TERMINAL_COMMITTED handoff/output preflight
+5. converge already-durable RESET generation transitions
+6. reconcile all committed batches without admission
+7. repair admission/session watermarks and missing inbox relations
+8. reconcile expired CLAIMED/APPLYING ranges from snapshot-first authority
+9. reconcile remaining controls/generation
+10. validate active snapshots/context revisions/protocol/dependencies
+11. recover emission claims: READY retained, expired DELIVERING → UNKNOWN
+12. discover/reconcile incomplete finalization/handoff state
+13. build PAUSED/WAITING/INTERRUPTED/safe-runner plans
+14. validate durable planning/artifact/result refs
+15. connect MCP/tool runtime
+16. rehydrate/install ActiveAgentCycle and exact recovered runner ownership
+17. readiness gate → READY
 ```
 
-Snapshot validation:
+Whole-store discovery существует только в startup adapter operations; normal
+checkpoint/admission/control/emission/finalization hot paths не получают scan-all
+semantics.
 
-- session/cycle/generation ownership;
-- OpenAI tool sequence valid;
-- referenced committed batches exist;
-- applied sequence consistent with context revision/admissions;
-- required artifact/result refs resolvable or explicitly unavailable;
-- no terminal finalization already committed.
+Gateway не начинает ordinary work до `Api.start()` completion, но это не
+единственная authority: application public boundaries дополнительно вызывают
+process-local readiness gate. Structural recovery failure оставляет `FAILED` и
+startup не становится READY.
 
-Invalid snapshot produces controlled non-resumable error, not silent new cycle
-using partial state.
+## Active cycle recovery — implemented IR-8
+
+Recovery использует last durable safe checkpoint snapshot и exact referenced
+state.
+
+```text
+valid snapshot + protocol-valid messages + exact durable refs
+→ same cycle/context rehydration
+→ PAUSED | WAITING | INTERRUPTED | safe recovered runner plan
+```
+
+Snapshot validation включает:
+
+- exact session/cycle/generation ownership;
+- existing original/applied committed batches;
+- contiguous applied sequence;
+- context revision existence and watermark agreement;
+- OpenAI assistant/tool protocol validity, without orphan tool result;
+- safe checkpoint validity;
+- required artifact/result/plan refs;
+- absence of contradictory terminal authority.
+
+Invalid snapshot produces controlled non-resumable/fatal recovery outcome as
+appropriate, но не silent fresh cycle с partial context.
+
+PAUSED/WAITING fresh-process paths реально rehydrate `ActiveAgentCycle` и затем
+`/continue`/new reply продолжают тот же `cycle_id` и durable context.
+
+## Recovered runner ownership — implemented IR-8
+
+Safe recovered runners создаются после MCP connect, но mandatory startup не ждёт
+полный LLM run. До READY task зарегистрирована и ждёт gate.
+
+Process-local reservation identity:
+
+```text
+session_id
+cycle_id
+input_batch_id
+generation
+```
+
+Только designated recovered invocation может consume reservation. Foreign
+same-cycle input не запускает второй runner и остаётся обычным FIFO addition.
+Reservation owner очищается при consumption/release, generation change/reset и
+shutdown. Coordinator не становится durable truth.
 
 ## Ambiguous side effects
 
@@ -519,65 +557,138 @@ using partial state.
 - external operation, начатая после last safe snapshot;
 - final output delivery без reliable receipt.
 
-Recovery marks outcome unknown and requires agent/user reconciliation according to
-existing tool/delivery policies.
+Recovery сохраняет unknown/ambiguous evidence и требует later explicit policy или
+stronger durable evidence. Read-only/idempotent operations могут быть retried
+только при declared policy.
 
-Read-only/idempotent operations могут быть retried только при declared policy.
+IR-6 no-blind-retry правило для AgentEmission UNKNOWN сохраняется полностью.
 
-IR-6 уже реализует no-blind-retry правило для AgentEmission UNKNOWN; IR-7 его не
-ослабляет. Startup-specific reconciliation UX/decision остаётся IR-8.
+## Inbox recovery — implemented IR-8
 
-## Inbox recovery — planned/startup side
+### `CLAIMED` expired
 
-### `claimed` expired
+Если semantic apply ещё не начался/не подтверждён snapshot authority, range
+возвращается в `QUEUED`.
 
-Return to `queued` if snapshot watermark ниже item sequence.
-
-### `applying` expired
+### `APPLYING` expired
 
 ```text
-snapshot applied watermark >= item sequence
-→ mark item/admission applied
+snapshot generation matches
++ snapshot applied watermark covers contiguous range
++ applied_input_batch_ids contains range
+→ mark inbox/admission APPLIED only
 
 snapshot lower
 → requeue claimed range
 ```
 
-### Gaps
+Уже durable context revision/input update не создаётся второй раз. Contiguous
+range рассматривается целиком, чтобы startup не создал impossible partial range.
 
-Non-contiguous admissions/inbox sequence block application and terminalization.
-Recovery attempts deterministic repair from admission records. Missing immutable
-record is terminal consistency defect.
+### Gaps/corruption
 
-## Finalization startup recovery — planned IR-8
+Duplicate/gapped immutable admission sequence, conflicting cycle/session authority,
+missing referenced committed batch/context revision и incompatible handoff/
+finalization relation блокируют startup. Derived index/state lag repair-ится
+только когда immutable authorities согласованы.
 
-IR-7 уже делает direct retry/repository recreation идемпотентным. IR-8 должен
-добавить обнаружение и orchestration incomplete records на process startup,
-включая valid `RuntimeHandoff=COMPLETED` + incomplete terminal convergence.
+## Reset recovery — implemented IR-8
+
+Если RESET уже durable advanced session generation, generation является authority.
+Startup заканчивает old-generation cleanup **до** generic stale-snapshot
+validation и никогда не increment-ит generation второй раз.
+
+Already APPLIED admission остаётся immutable historical evidence; pending
+old-generation admissions/inbox/controls/snapshot/emissions/finalization получают
+существующий IR-5 cancellation/fencing. Defensive coordinator синхронизируется
+после durable convergence.
+
+## Terminal authority startup preflight — implemented IR-8
+
+Terminal projection не равна terminal authority.
+
+Для любого уже существующего `TERMINAL_COMMITTED` до repair operations required:
+
+```text
+same finalization identity
++ matching RuntimeHandoff exists
++ RuntimeHandoff == COMPLETED
++ final OutputBatch exists
++ OutputBatch session/cycle/kind identity matches
+```
+
+Contradiction даёт controlled fatal reason (`terminal_handoff_not_completed`,
+`finalization_output_missing`, `finalization_output_identity_mismatch`, etc.) и
+никакой repair не пытается задним числом завершить handoff.
+
+Отдельно recoverable:
+
+```text
+OUTPUT_READY
++ RuntimeHandoff COMPLETED
++ TERMINAL_COMMITTED missing
+```
+
+Startup использует IR-7 direct terminal command, сохраняет exact finalization ID,
+result_ref, OutputBatch ID, handoff token/completed_at и не запускает old
+AgentCycle. Если late committed input существует, COMPLETED authority сначала
+сходится terminal, затем batch становится `START_CYCLE` нового cycle. Если handoff
+ещё `HANDED_OFF`, late committed input сначала имеет право попасть в old cycle и
+invalidate stale finalization.
+
+## Finalization startup recovery — implemented IR-8
 
 ### `PREPARED`
 
-Startup coordinator решает abort/rerun final processing только после
-input/control authority recheck.
+Startup сначала recheck-ит generation/input/control/snapshot authority. Main LLM
+не вызывается. Consistent candidate без persisted result conservatively становится
+recoverable interruption/abort evidence для later same-cycle policy.
 
 ### `RESULT_PERSISTED`
 
-Startup coordinator может переиспользовать exact persisted result и продолжить
-output/terminal convergence без rerun whole AgentCycle.
+Exact persisted result reused; whole AgentCycle/final LLM не rerun-ится. Если
+authority valid, startup assemble/rebind-ит same logical final OutputBatch и
+продолжает local convergence. Если late input/control/generation invalidates
+candidate, finalization abort-ится, а result остаётся diagnostic evidence.
 
 ### `OUTPUT_READY`
 
-Startup coordinator должен проверить terminal/handoff authority:
-
-- terminal committed — enable/reconcile delivery;
-- handoff completed + terminal incomplete — invoke safe direct terminal convergence;
-- handoff still active + watermarks unchanged — run final recheck, then complete handoff and terminal commit;
-- new input/control exists before handoff completion — preserve abort/superseded evidence and resume cycle.
+Startup проверяет exact output/handoff relation. Strong completed evidence
+позволяет local terminal convergence; mismatch before handoff completion aborts
+stale finalization. Whole cycle replay не используется.
 
 ### `TERMINAL_COMMITTED`
 
-Cycle never reruns. Matching admitted-run RuntimeHandoff уже обязан быть
-`COMPLETED`. Output delivery/retrieval handled independently.
+Old cycle never reruns. Strict preflight проверяет completed handoff и final output,
+после чего допускается только lagging session/snapshot projection repair.
+
+## Emission startup recovery — implemented IR-8
+
+```text
+READY → retain durable semantic intent; no startup network send
+DELIVERING lease expired/missing → UNKNOWN
+DELIVERING valid lease → do not steal/retry
+UNKNOWN → remain UNKNOWN
+terminal old-cycle READY → CANCELLED/non-claimable
+```
+
+Delivery выполняется normal worker lifecycle после READY, а не startup recovery.
+
+## Shutdown lifecycle — implemented IR-8
+
+```text
+READY/RECOVERING
+→ STOPPING
+→ reject new runner starts
+→ cancel/await tracked recovered/admitted tasks
+→ cancellation-safe durable handoff cleanup
+→ preserve durable queues/controls/emissions/finalizations
+→ MCP cleanup in same owning lifespan task
+→ STOPPED
+```
+
+Completed handoff не downgrade-ится. PAUSED/WAITING без active runner остаются
+своими durable states и восстанавливаются идентично на следующем process start.
 
 ## Retention
 
@@ -591,11 +702,12 @@ Committed user inputs and artifacts are not treated as temporary queue files.
 
 In `v0.5` admission, watermarks, handoff completion, finalization and output intent
 can be committed in explicit SQL transactions with row locks. Recovery semantics
-and states remain the same; filesystem repair paths become migration/import tools.
+and states remain the same; filesystem startup scans become indexed SQL startup
+queries/transactions.
 
-IR-6 command-oriented emission acceptance/claim/receipt и corrected IR-7
-command-oriented terminal/admission operations естественно маппятся на SQL
-transactions/row locks без application dependency on filesystem layout.
+Application recovery coordinator не импортирует `Path`, filesystem layout или
+atomic-write helpers; adapter-specific scan/index repair остаётся filesystem
+implementation detail.
 
 ## Distributed preparation
 
@@ -654,15 +766,33 @@ Corrected code/test evidence:
 - `Validate v0.4 file artifacts PR` #669 — success;
 - workflow permission remains `contents: read`.
 
-### IR-8 — still planned
+### IR-8 — implemented and validated
 
-- startup reconstruction of interrupted/paused/waiting runners;
-- startup committed-but-unadmitted discovery/repair;
-- global ambiguous runtime handoff reconciliation;
-- startup reconciliation retained READY/UNKNOWN emissions;
-- startup discovery/convergence incomplete finalizations;
-- corruption matrix and startup readiness gate;
-- shutdown/startup lifecycle recovery ordering.
+- startup readiness closes ordinary runtime until deterministic recovery completes;
+- all committed-but-unadmitted batches discovered/repaired exactly once;
+- missing inbox/frontier lag and expired claims reconcile from durable authority;
+- snapshot-first APPLYING recovery does not duplicate semantic input application;
+- PAUSED/WAITING survive fresh restart and continue/reply use same cycle/context;
+- ambiguous handoff is not auto-replayed;
+- existing TERMINAL_COMMITTED is preflighted before repair against COMPLETED
+  handoff and valid final output;
+- valid completed-handoff partial terminal converges locally with same IDs;
+- partial reset converges before stale snapshot validation without second
+  generation increment;
+- READY emission retained, expired DELIVERING becomes UNKNOWN, UNKNOWN not
+  rearmed;
+- exact recovered runner reservation cannot be stolen by foreign same-cycle input;
+- shutdown owns/cancels recovered/admitted tasks before MCP cleanup;
+- structural corruption leaves readiness FAILED rather than guessing authority.
 
-Focused IR-7 live-race/direct-retry tests не переводят эти IR-8 contracts в
-implemented.
+Final code/test evidence:
+
+- `5c88c52faa837b8b58c33c4893292a0708f6776a`;
+- `Validate Input Runtime` #601 — success, production compile success;
+- focused IR-8 suite: `49 passed`, `0 failed`;
+- full input-runtime/config regression: `436 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #761 — success;
+- workflow permission remains `contents: read`.
+
+IR-9 complete projections/diagnostics и IR-10 randomized/full-system/live
+acceptance остаются planned.
