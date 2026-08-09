@@ -10,20 +10,9 @@ on:
     paths:
       - "src/input_runtime/**"
       - "src/ingress/recovery.py"
-      - "src/api/api.py"
-      - "src/api/__init__.py"
-      - "src/api/input_runtime_recovery.py"
-      - "src/api/input_runtime_recovery_composition.py"
-      - "src/api/input_runtime_recovery_dependencies.py"
-      - "src/api/input_runtime_controls.py"
-      - "src/api/session_reset.py"
-      - "src/api/ir8_final_output_recovery.py"
-      - "src/api/emission_outbox_routes.py"
-      - "src/api/output_outbox_routes.py"
-      - "src/interaction/output_claim.py"
-      - "src/interaction/output_outbox.py"
-      - "src/interaction/output_service.py"
-      - "src/interaction/ir7_output_barrier.py"
+      - "src/api/**"
+      - "src/interaction/**"
+      - "src/localization/**"
       - "src/runtime/finalization_bridge.py"
       - "src/runtime/input_runtime_rehydration.py"
       - "src/runtime/ir8_session_execution.py"
@@ -31,9 +20,9 @@ on:
       - "src/mcp/input_runtime_checkpoints.py"
       - "src/mcp/input_runtime_controls.py"
       - "src/mcp/input_runtime_emissions.py"
+      - "src/mcp/ir9_projection_checkpoints.py"
       - "src/mcp/artifact_delivery_runtime.py"
-      - "src/servers/telegram/emission_outbox.py"
-      - "src/servers/telegram/__init__.py"
+      - "src/servers/telegram/**"
       - "src/core/message_processor.py"
       - "src/runtime/session_execution.py"
       - "tests/conftest.py"
@@ -59,25 +48,14 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest pytest-asyncio pytest-timeout
-      - name: Compile input runtime and production IR-8 callers
+      - name: Compile input runtime and production IR-8/IR-9 callers
         run: >-
           python -m compileall -q
           src/input_runtime
           src/ingress/recovery.py
-          src/api/api.py
-          src/api/__init__.py
-          src/api/input_runtime_recovery.py
-          src/api/input_runtime_recovery_composition.py
-          src/api/input_runtime_recovery_dependencies.py
-          src/api/input_runtime_controls.py
-          src/api/session_reset.py
-          src/api/ir8_final_output_recovery.py
-          src/api/emission_outbox_routes.py
-          src/api/output_outbox_routes.py
-          src/interaction/output_claim.py
-          src/interaction/output_outbox.py
-          src/interaction/output_service.py
-          src/interaction/ir7_output_barrier.py
+          src/api
+          src/interaction
+          src/localization
           src/runtime/finalization_bridge.py
           src/runtime/input_runtime_rehydration.py
           src/runtime/ir8_session_execution.py
@@ -85,12 +63,14 @@ jobs:
           src/mcp/input_runtime_checkpoints.py
           src/mcp/input_runtime_controls.py
           src/mcp/input_runtime_emissions.py
+          src/mcp/ir9_projection_checkpoints.py
           src/mcp/artifact_delivery_runtime.py
-          src/servers/telegram/emission_outbox.py
-          src/servers/telegram/__init__.py
+          src/servers/telegram
           src/core/message_processor.py
           src/runtime/session_execution.py
       - name: Run focused IR-8 restart contracts
         run: python -m pytest -vv --timeout=20 --timeout-method=thread tests/test_input_runtime_ir8_*.py
+      - name: Run focused IR-9 projection contracts
+        run: python -m pytest -q --timeout=20 --timeout-method=thread tests/test_input_runtime_ir9_*.py
       - name: Run input-runtime contracts and common config audit
         run: python -m pytest -q --timeout=20 --timeout-method=thread tests/test_input_runtime_*.py tests/test_artifact_configuration_examples.py
