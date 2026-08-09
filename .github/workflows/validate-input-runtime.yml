@@ -36,6 +36,7 @@ on:
       - "src/servers/telegram/__init__.py"
       - "src/core/message_processor.py"
       - "src/runtime/session_execution.py"
+      - "tests/conftest.py"
       - "tests/test_input_runtime_*.py"
       - "src/api/mcp.config.example"
       - "scripts/audit_configuration_examples.py"
