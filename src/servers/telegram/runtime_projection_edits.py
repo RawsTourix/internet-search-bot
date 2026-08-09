@@ -203,7 +203,11 @@ def install_runtime_projection_editing(server) -> None:
             or submission.get("input_batch_id")
             or f"message:{message_id}"
         )
-        revision_value = ref.get("presentation_generation")
+        # ``presentation_generation`` belongs to relocation/handle identity and
+        # may legitimately stay constant across QUEUED -> APPLYING -> APPLIED.
+        # A dedicated optional projection revision may be supplied by a future
+        # presentation producer; otherwise this editor allocates one locally.
+        revision_value = ref.get("projection_revision")
         try:
             revision = int(revision_value) if revision_value is not None else None
         except (TypeError, ValueError):
