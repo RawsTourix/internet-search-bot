@@ -146,8 +146,6 @@ async def test_committed_without_admission_is_repaired_and_planned_once(tmp_path
     assert plan.sessions[0].disposition == RecoveryDisposition.START_ADMITTED
     assert gate.state == InputRuntimeLifecycleState.RECOVERING
 
-    # A second fresh process over the same durable root must keep the same
-    # admission/cycle identity rather than inventing runner #2 authority.
     fresh_repositories = create_filesystem_input_runtime_repositories(
         storage_config=StorageConfigType(root_dir=str(tmp_path))
     )
@@ -300,6 +298,7 @@ async def test_recovered_reservation_prevents_second_runner_and_shutdown_cancels
     await coordinator.install_recovered_reservation(
         session_id="session",
         cycle_id="cycle",
+        input_batch_id="initial",
         generation=4,
     )
     entered = asyncio.Event()
