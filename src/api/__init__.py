@@ -41,11 +41,9 @@ load_dotenv()
 if (os.getenv("AGENT_CONFIG_PATH") or "").strip():
     from . import api as _api_module  # noqa: E402
     from . import input_runtime_recovery as _ir8_lifecycle  # noqa: E402
-    from .ir8_final_output_recovery import FinalOutputRecovery  # noqa: E402
-    from ..input_runtime.recovery_hardening import (  # noqa: E402
-        InputRuntimeRecoveryCoordinator as _ConservativeRecoveryCoordinator,
+    from .input_runtime_recovery_composition import (  # noqa: E402
+        install_production_recovery_types,
     )
 
-    _ir8_lifecycle.InputRuntimeRecoveryCoordinator = _ConservativeRecoveryCoordinator
-    _ir8_lifecycle._FinalOutputRecovery = FinalOutputRecovery
+    install_production_recovery_types()
     _ir8_lifecycle.install_input_runtime_recovery_lifecycle(_api_module)
