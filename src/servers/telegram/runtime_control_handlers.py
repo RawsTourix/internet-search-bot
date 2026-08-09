@@ -1,7 +1,7 @@
-"""High-priority Telegram transport handlers for IR-5 runtime controls.
+"""High-priority Telegram handlers for runtime controls and IR-9 status.
 
 These handlers own only Telegram identity/projection plumbing. Runtime semantics
-remain in the Gateway application-layer InputRuntimeControlService.
+remain in the Gateway application-layer input-runtime services.
 """
 from __future__ import annotations
 
@@ -10,22 +10,103 @@ from typing import Any
 from uuid import uuid4
 
 from telegram import Update
-from telegram.ext import CommandHandler, ContextTypes
+from telegram.ext import (
+    ApplicationHandlerStop,
+    CommandHandler,
+    ContextTypes,
+)
+
+from .runtime_projection_edits import install_runtime_projection_editing
 
 
 _RUNTIME_CONTROL_COMMANDS = ("stop", "continue")
-_INSTALL_MARKER = "_input_runtime_ir5_control_handlers_installed"
+_INSTALL_MARKER = "_input_runtime_ir9_command_handlers_installed"
 
 
 def install_runtime_control_handlers(application: Any) -> None:
-    """Register control commands before ordinary Telegram command handlers."""
+    """Register runtime commands before ordinary Telegram command handlers."""
     if getattr(application, _INSTALL_MARKER, False):
         return
+
+    # app.py calls this before it captures the base input-ack callback, so the
+    # IR-9 presentation fence becomes the base for later relocation wrappers.
+    from . import telegram_server as server
+
+    install_runtime_projection_editing(server)
     application.add_handler(
         CommandHandler(list(_RUNTIME_CONTROL_COMMANDS), runtime_control_handler),
         group=-10,
     )
+    application.add_handler(
+        CommandHandler("status", runtime_status_handler),
+        group=-10,
+    )
     setattr(application, _INSTALL_MARKER, True)
+
+
+def _command_payload(update: Update, *, normalized: str, locale: str) -> dict[str, Any]:
+    from . import telegram_server as server
+
+    message = update.effective_message
+    full_text = message.text or ""
+    words = full_text.split()
+    command_token = words[0] if words else normalized
+    session_id = server._session_for_update(update)
+    thread_id = getattr(message, "message_thread_id", None)
+    return {
+        "id": str(uuid4()),
+        "timestamp": datetime.now().isoformat(),
+        "client_type": "telegram",
+        "message_type": "command",
+        "content": normalized,
+        "user_id": str(update.effective_user.id),
+        "user_name": update.effective_user.full_name,
+        "metadata": {
+            "bot_instance_id": server.TELEGRAM_BOT_INSTANCE_ID,
+            "chat_id": update.effective_chat.id,
+            "conversation_id": str(update.effective_chat.id),
+            "message_id": message.message_id,
+            "message_thread_id": thread_id,
+            "thread_id": thread_id,
+            "update_id": getattr(update, "update_id", None),
+            "session_id": session_id,
+            "progress_locale": locale,
+        },
+        "command": command_token,
+        "arguments": words[1:],
+    }
+
+
+async def runtime_status_handler(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Read trusted-session diagnostics without entering input/control FIFO."""
+    from . import telegram_server as server
+
+    locale = server.detect_progress_locale(update)
+    payload = _command_payload(update, normalized="/status", locale=locale)
+    success, response, _metadata = await server.send_to_gateway(payload)
+    if success:
+        text = response
+    else:
+        text = server._localized(
+            "input_runtime.status.unavailable",
+            locale=locale,
+            reason="diagnostics_unavailable",
+        )
+    try:
+        await server.telegram_reply_with_retries(
+            update,
+            text,
+            parse_mode=None,
+            max_retries=3,
+            base_delay=0.5,
+        )
+    finally:
+        # Prevent the legacy group-0 command handler from appending process-local
+        # transport diagnostics or issuing a second Gateway /status request.
+        raise ApplicationHandlerStop
 
 
 async def runtime_control_handler(
@@ -45,35 +126,12 @@ async def runtime_control_handler(
         return
 
     session_id = server._session_for_update(update)
-    thread_id = getattr(message, "message_thread_id", None)
-    source_update_id = getattr(update, "update_id", None)
     locale = server.detect_progress_locale(update)
     status_message = await server.send_initial_status_message(
         update,
         server._localized("input.command_received", locale=locale),
     )
-    payload = {
-        "id": str(uuid4()),
-        "timestamp": datetime.now().isoformat(),
-        "client_type": "telegram",
-        "message_type": "command",
-        "content": normalized,
-        "user_id": str(update.effective_user.id),
-        "user_name": update.effective_user.full_name,
-        "metadata": {
-            "bot_instance_id": server.TELEGRAM_BOT_INSTANCE_ID,
-            "chat_id": update.effective_chat.id,
-            "conversation_id": str(update.effective_chat.id),
-            "message_id": message.message_id,
-            "message_thread_id": thread_id,
-            "thread_id": thread_id,
-            "update_id": source_update_id,
-            "session_id": session_id,
-            "progress_locale": locale,
-        },
-        "command": command_token,
-        "arguments": words[1:],
-    }
+    payload = _command_payload(update, normalized=normalized, locale=locale)
     server.attach_progress_metadata(
         payload=payload,
         update=update,
