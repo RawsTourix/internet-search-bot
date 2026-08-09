@@ -17,7 +17,7 @@ from src.input_runtime import (
     create_filesystem_input_runtime_repositories,
 )
 from src.input_runtime.recovery import InputRuntimeReadinessGate
-from src.input_runtime.recovery_hardening import InputRuntimeRecoveryCoordinator
+from src.input_runtime.recovery_terminal import InputRuntimeRecoveryCoordinator
 from src.runtime import SessionExecutionCoordinator
 from src.storage import StorageConfigType
 
@@ -153,9 +153,14 @@ async def test_safe_recovered_runner_is_owned_after_connect_before_ready_and_no_
     # Task is installed and reservation exists, but the gate still prevents any
     # AgentCycle/LLM execution before the composition explicitly opens READY.
     assert runner_entered.is_set() is False
-    reserved = await coordinator.snapshot("session")
-    assert reserved.reserved_cycle_id == "cycle-recovered"
     assert len(api._ir8_runner_tasks) == 1
+    async with coordinator.admitted_run_lease(
+        session_id="session",
+        input_batch_id="duplicate-before-ready",
+        cycle_id="cycle-recovered",
+        expected_generation=0,
+    ) as acquired:
+        assert acquired is False
 
     gate.mark_ready()
     await runner_entered.wait()
