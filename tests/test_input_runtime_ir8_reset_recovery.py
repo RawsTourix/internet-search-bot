@@ -16,7 +16,7 @@ from src.input_runtime import (
     create_filesystem_input_runtime_repositories,
 )
 from src.input_runtime.recovery import InputRuntimeReadinessGate
-from src.input_runtime.recovery_hardening import InputRuntimeRecoveryCoordinator
+from src.input_runtime.recovery_terminal import InputRuntimeRecoveryCoordinator
 from src.runtime import ActiveAgentCycle, SessionExecutionCoordinator
 from src.storage import StorageConfigType
 
@@ -153,7 +153,6 @@ async def test_generation_advanced_partial_reset_finishes_without_second_increme
     old_snapshot = await repositories.snapshots.get(initial.target_cycle_id)
     assert old_snapshot.status == CycleStatus.RUNNING
 
-    # Fresh process: new bundle, service and coordinator, same durable root.
     fresh_repositories, fresh_coordinator, fresh_service = make_runtime(
         tmp_path,
         reader,
