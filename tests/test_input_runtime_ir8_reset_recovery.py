@@ -174,8 +174,17 @@ async def test_generation_advanced_partial_reset_finishes_without_second_increme
     assert state.cycle_status == CycleStatus.IDLE
     snapshot = await fresh_repositories.snapshots.get(initial.target_cycle_id)
     assert snapshot.status == CycleStatus.CANCELLED
-    admissions = await fresh_repositories.admissions.list_for_session("session")
-    assert all(item.state.value == "cancelled" for item in admissions)
+
+    # Reset preserves immutable evidence that the initial input was already
+    # semantically applied, while cancelling only still-pending old-generation
+    # work. This is the existing IR-5 reset contract.
+    admissions = {
+        item.input_batch_id: item
+        for item in await fresh_repositories.admissions.list_for_session("session")
+    }
+    assert admissions["initial"].state.value == "applied"
+    assert admissions["addition"].state.value == "cancelled"
+
     inbox = await fresh_repositories.inbox.list_for_cycle(initial.target_cycle_id)
     assert all(item.state.value == "cancelled" for item in inbox)
     controls = await fresh_repositories.controls.list_for_session("session")
