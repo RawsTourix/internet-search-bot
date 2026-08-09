@@ -76,6 +76,19 @@ class Wake:
         return True
 
 
+class GenerationCoordinator:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, int]] = []
+
+    async def synchronize_generation(
+        self,
+        session_id: str,
+        *,
+        generation: int,
+    ) -> None:
+        self.calls.append((session_id, generation))
+
+
 def active_cycle(cycle_id: str) -> ActiveAgentCycle:
     return ActiveAgentCycle(
         cycle_id=cycle_id,
@@ -114,11 +127,12 @@ async def test_ir9_fresh_process_projects_recovered_paused_durable_state(tmp_pat
         "initial",
         session_id="session",
     )
+    assert admitted.admission is not None
     active = active_cycle(admitted.target_cycle_id)
-    await initial_service.checkpoint_service.run_checkpoint(
+    await initial_service.checkpoint_service.ensure_initial_context(
         checkpoint=CheckpointName.RESUME,
         active_cycle=active,
-        desired_status=CycleStatus.RUNNING,
+        input_batch_id="initial",
     )
     await initial_service.control_service.request_pause(
         session_id="session",
@@ -133,28 +147,29 @@ async def test_ir9_fresh_process_projects_recovered_paused_durable_state(tmp_pat
     )
     assert pause_checkpoint.action == CheckpointAction.PAUSE
 
-    # Fresh process: no reuse of in-memory service/coordinator state.
+    # Fresh process: no reuse of the first process's service/coordination state.
     fresh_repositories = create_filesystem_input_runtime_repositories(
         storage_config=StorageConfigType(root_dir=str(tmp_path))
     )
     reader = Reader(batch)
-    coordinator = SessionExecutionCoordinator()
+    wake_coordinator = SessionExecutionCoordinator()
     fresh_service = InputAdmissionService(
         config=InputRuntimeConfigType(),
         repositories=fresh_repositories,
         committed_batches=reader,
-        wake_coordinator=coordinator,
+        wake_coordinator=wake_coordinator,
         cycle_id_factory=lambda: "must-not-be-used",
         clock=lambda: NOW,
         payload_size_resolver=lambda item: item.payload_size,
     )
+    generation_coordinator = GenerationCoordinator()
     gate = InputRuntimeReadinessGate()
     recovery = InputRuntimeRecoveryCoordinator(
         repositories=fresh_repositories,
         admission_service=fresh_service,
         committed_batches=reader,
         readiness_gate=gate,
-        generation_coordinator=coordinator,
+        generation_coordinator=generation_coordinator,
         clock=lambda: NOW,
     )
     plan = await recovery.recover()
@@ -189,3 +204,4 @@ async def test_ir9_fresh_process_projects_recovered_paused_durable_state(tmp_pat
     assert status.controls.applied_sequence == 1
     assert status.recovery_notice is not None
     assert status.recovery_notice.disposition == recovered.disposition.value
+    assert generation_coordinator.calls == [("session", 0)]
