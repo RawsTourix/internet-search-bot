@@ -211,6 +211,21 @@ async def _schedule_recovered_runner(
         await _resume_recovered_safe_cycle(api, session_plan)
 
 
+def _recovered_runner_input_batch_id(session_plan: Any) -> str:
+    if session_plan.disposition == RecoveryDisposition.START_ADMITTED:
+        outcome = session_plan.admission_outcome
+        admission = getattr(outcome, "admission", None) if outcome is not None else None
+        if admission is None or not admission.input_batch_id:
+            raise InputRuntimeRecoveryError("recovered_start_admission_missing")
+        return str(admission.input_batch_id)
+    if session_plan.disposition == RecoveryDisposition.AUTO_RESUME_SAFE:
+        snapshot = session_plan.snapshot
+        if snapshot is None or not snapshot.original_input_batch_id:
+            raise InputRuntimeRecoveryError("recovered_runner_snapshot_missing")
+        return str(snapshot.original_input_batch_id)
+    raise InputRuntimeRecoveryError("recovered_runner_owner_not_schedulable")
+
+
 async def _install_recovered_runtime(
     api: Any,
     plan: Any,
@@ -233,9 +248,11 @@ async def _install_recovered_runtime(
             installer(cycle)
         if not session_plan.should_auto_schedule:
             continue
+        reservation_owner = _recovered_runner_input_batch_id(session_plan)
         await api.execution_coordinator.install_recovered_reservation(
             session_id=session_plan.session_id,
             cycle_id=session_plan.cycle_id,
+            input_batch_id=reservation_owner,
             generation=session_plan.generation,
         )
         task = asyncio.create_task(
