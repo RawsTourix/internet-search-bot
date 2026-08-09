@@ -41,6 +41,44 @@ class InputRuntimeRecoveryCoordinator(_HardenedRecoveryCoordinator):
                 return code
         return _HardenedRecoveryCoordinator._safe_conflict_reason(error)
 
+    async def _preflight_admission_sequences(self) -> None:
+        """Classify immutable sequence contradictions before adapter repair."""
+
+        admissions = await self.repositories.admissions.list_all_for_recovery()  # type: ignore[attr-defined]
+        by_session: dict[str, list[object]] = {}
+        by_cycle: dict[tuple[str, int, str], list[object]] = {}
+        for admission in admissions:
+            by_session.setdefault(admission.session_id, []).append(admission)
+            by_cycle.setdefault(
+                (
+                    admission.session_id,
+                    admission.admitted_generation,
+                    admission.target_cycle_id,
+                ),
+                [],
+            ).append(admission)
+
+        for rows in by_session.values():
+            sequences = sorted(item.session_sequence for item in rows)
+            if len(sequences) != len(set(sequences)):
+                raise self._fatal("duplicate_admission_sequence")
+            if sequences and sequences != list(range(1, sequences[-1] + 1)):
+                raise self._fatal("admission_sequence_gap")
+
+        for rows in by_cycle.values():
+            sequences = sorted(item.cycle_sequence for item in rows)
+            if len(sequences) != len(set(sequences)):
+                raise self._fatal("duplicate_cycle_admission_sequence")
+            if sequences and sequences != list(range(0, sequences[-1] + 1)):
+                raise self._fatal("cycle_admission_sequence_gap")
+
+    async def _repair_identity_and_frontiers(self, states) -> None:
+        # Sequence contradictions are immutable-history corruption, not derived
+        # index/watermark lag. Give them stable typed startup reasons before any
+        # adapter repair is allowed to mutate derived state.
+        await self._preflight_admission_sequences()
+        await super()._repair_identity_and_frontiers(states)
+
     async def _terminal_records(self):
         records = await self.repositories.finalizations.list_for_recovery()  # type: ignore[attr-defined]
         return tuple(
