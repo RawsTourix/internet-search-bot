@@ -9,6 +9,7 @@ from dotenv import load_dotenv
 
 from . import output_outbox_routes as _output_routes
 from .emission_outbox_routes import add_emission_outbox_routes
+from .runtime_diagnostics_routes import add_runtime_diagnostics_routes
 
 
 if not getattr(_output_routes, "_ir6_emission_routes_installed", False):
@@ -25,6 +26,14 @@ if not getattr(_output_routes, "_ir6_emission_routes_installed", False):
             api_key_scopes=bound.arguments["api_key_scopes"],
             api_key_instance_scopes=bound.arguments.get("api_key_instance_scopes"),
         )
+        facade = bound.arguments["facade"]
+        if getattr(facade.api, "input_runtime_diagnostics", None) is not None:
+            add_runtime_diagnostics_routes(
+                router,
+                facade=facade,
+                auth_dependency=bound.arguments["auth_dependency"],
+                api_key_scopes=bound.arguments["api_key_scopes"],
+            )
         return router
 
     _output_routes.create_output_outbox_router = (
@@ -36,14 +45,22 @@ if not getattr(_output_routes, "_ir6_emission_routes_installed", False):
 # Keep importing `src.api.config`, artifact routes, etc. side-effect free when
 # no agent composition is configured. Production uses the same .env loading as
 # api.config; with a real AGENT_CONFIG_PATH the direct `src.api.api` import is
-# intercepted here and IR-8 is installed before the package import returns.
+# intercepted here and IR-8/IR-9 are installed before the package import returns.
 load_dotenv()
 if (os.getenv("AGENT_CONFIG_PATH") or "").strip():
     from . import api as _api_module  # noqa: E402
     from . import input_runtime_recovery as _ir8_lifecycle  # noqa: E402
+    from .input_runtime_diagnostics import (  # noqa: E402
+        install_input_runtime_diagnostics,
+    )
+    from .input_runtime_projection_compatibility import (  # noqa: E402
+        install_input_runtime_projection_compatibility,
+    )
     from .input_runtime_recovery_composition import (  # noqa: E402
         install_production_recovery_types,
     )
 
     install_production_recovery_types()
     _ir8_lifecycle.install_input_runtime_recovery_lifecycle(_api_module)
+    install_input_runtime_diagnostics(_api_module.API)
+    install_input_runtime_projection_compatibility(_api_module.API)
