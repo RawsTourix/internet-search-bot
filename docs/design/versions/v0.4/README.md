@@ -44,11 +44,13 @@ Code/test boundary:
 
 Validated на этой границе:
 
-- focused IR-9: `102 passed`, `0 failed`;
-- full input-runtime + configuration examples: `538 passed`, `0 failed`;
+- focused IR-8: `49 passed`, `0 failed`;
+- focused IR-9: `101 passed`, `0 failed`;
+- full input-runtime + configuration examples: `537 passed`, `0 failed`;
 - production compile: success;
 - `Validate Input Runtime` #685: success;
-- `Validate v0.4 file artifacts PR` #807: success.
+- `Validate v0.4 file artifacts PR` #803: success;
+- workflow token permissions: `Contents: read`, `Metadata: read`.
 
 IR-9 не меняет semantic authority предыдущих этапов. Status/timeline являются read-only projections durable IR-1—IR-8 records.
 
@@ -92,6 +94,7 @@ Timeline — bounded deterministic projection existing durable history.
 
 Она:
 
+- имеет default `limit = 20` и maximum `limit = 100`;
 - сохраняет per-stream sequence/identity;
 - использует durable timestamp + stable display tie-break для merge;
 - не вводит global semantic sequence;
