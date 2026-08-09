@@ -30,7 +30,9 @@ class InputRuntimeRecoveryCoordinator(_HardenedRecoveryCoordinator):
         text = str(error)
         canonical = {
             "duplicate authoritative session sequence": "duplicate_admission_sequence",
+            "duplicate session admission sequence": "duplicate_admission_sequence",
             "duplicate authoritative active-cycle sequence": "duplicate_cycle_admission_sequence",
+            "duplicate cycle admission sequence": "duplicate_cycle_admission_sequence",
             "gap in authoritative session sequence": "admission_sequence_gap",
             "gap in authoritative active-cycle sequence": "cycle_admission_sequence_gap",
         }
