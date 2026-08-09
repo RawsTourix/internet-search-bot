@@ -117,10 +117,12 @@ IR-9 реализован на code/test boundary
 Code evidence:
 
 - `Validate Input Runtime` #685 — success;
-- focused IR-9 — `102 passed`, `0 failed`;
-- full input-runtime/config regression — `538 passed`, `0 failed`;
+- focused IR-8 — `49 passed`, `0 failed`;
+- focused IR-9 — `101 passed`, `0 failed`;
+- full input-runtime/config regression — `537 passed`, `0 failed`;
 - production compile — success;
-- `Validate v0.4 file artifacts PR` #807 — success.
+- `Validate v0.4 file artifacts PR` #803 — success;
+- workflow token permissions: `Contents: read`, `Metadata: read`.
 
 IR-9 добавляет transport-neutral diagnostics/query layer:
 
@@ -241,7 +243,7 @@ Web key разрешается только в существующий `web:ses
 
 Все новые user-visible Telegram projection strings находятся в существующих `ru.json`/`en.json` catalogs. Deterministic tests проверяют parity required keys и formatter placeholders.
 
-IR-9 не добавил новых configuration knobs или environment reads. Поэтому `.env.example` и `src/api/mcp.config.example` не требуют новых полей. Existing common configuration-example audit сохранён и входит в green `538 passed` regression.
+IR-9 не добавил новых configuration knobs или environment reads. Поэтому `.env.example` и `src/api/mcp.config.example` не требуют новых полей. Existing common configuration-example audit сохранён и входит в green `537 passed` regression.
 
 ## Архитектурные инварианты после IR-9
 
