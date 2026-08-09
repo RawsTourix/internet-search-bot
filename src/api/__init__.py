@@ -50,6 +50,9 @@ load_dotenv()
 if (os.getenv("AGENT_CONFIG_PATH") or "").strip():
     from . import api as _api_module  # noqa: E402
     from . import input_runtime_recovery as _ir8_lifecycle  # noqa: E402
+    from ..mcp.ir9_projection_checkpoints import (  # noqa: E402
+        install_ir9_projection_checkpoint_hook,
+    )
     from .input_runtime_diagnostics import (  # noqa: E402
         install_input_runtime_diagnostics,
     )
@@ -62,5 +65,6 @@ if (os.getenv("AGENT_CONFIG_PATH") or "").strip():
 
     install_production_recovery_types()
     _ir8_lifecycle.install_input_runtime_recovery_lifecycle(_api_module)
+    install_ir9_projection_checkpoint_hook()
     install_input_runtime_diagnostics(_api_module.API)
     install_input_runtime_projection_compatibility(_api_module.API)
