@@ -7,6 +7,8 @@ authority and never creates AgentEmission/OutputBatch records.
 from __future__ import annotations
 
 import asyncio
+import hmac
+import json
 from collections import OrderedDict
 from dataclasses import dataclass
 from enum import Enum
@@ -150,8 +152,6 @@ class TelegramProjectionEditor:
             except BadRequest as error:
                 if "message is not modified" in str(error).lower():
                     return ProjectionEditResult(ProjectionEditDisposition.EDITED)
-                # Telegram rejected the edit deterministically. Fall back to a
-                # new presentation only while this revision/generation is current.
                 if not generation_valid() or not await self._is_current(key, candidate):
                     return ProjectionEditResult(ProjectionEditDisposition.SUPPRESSED_STALE)
                 try:
@@ -250,3 +250,198 @@ def install_runtime_projection_editing(server) -> None:
 
     server.apply_input_ack_policy = fenced_apply_input_ack_policy
     server._ir9_projection_editing_installed = True
+
+
+async def apply_applied_addendum_projection(
+    *,
+    server: Any,
+    gateway: Any,
+    payload: dict[str, Any],
+    editor: TelegramProjectionEditor = projection_editor,
+) -> dict[str, Any]:
+    """Edit the exact addendum presentation selected by structured InputBatch ID."""
+
+    event = dict(payload.get("event") or {})
+    target = dict(payload.get("target") or {})
+    data = dict(event.get("data") or {})
+    session_id = str(target.get("session_id") or "").strip()
+    target_generation = target.get("session_generation")
+    input_batch_id = str(data.get("input_batch_id") or "").strip()
+    if not session_id or target_generation is None or not input_batch_id:
+        return {"status": "ignored", "reason": "missing projection target"}
+    try:
+        session_generation = int(target_generation)
+    except (TypeError, ValueError):
+        return {"status": "ignored", "reason": "invalid session generation"}
+    if not server.session_generations.is_current(
+        session_id,
+        session_generation,
+    ):
+        return {"status": "ignored", "reason": "stale session generation"}
+
+    lookup = getattr(gateway, "runtime_input_presentation", None)
+    if not callable(lookup):
+        return {"status": "ignored", "reason": "presentation unavailable"}
+    presentation = await lookup(input_batch_id)
+    if not presentation:
+        return {"status": "ignored", "reason": "presentation unavailable"}
+    presentation_id = str(presentation.get("presentation_id") or "").strip()
+    message_id = presentation.get("message_id")
+    chat_id = target.get("chat_id") or target.get("conversation_id")
+    if not presentation_id or message_id is None or chat_id is None:
+        return {"status": "ignored", "reason": "presentation unavailable"}
+
+    locale = server.normalize_locale(data.get("locale"))
+    text = server._localized(
+        "input_runtime.addendum.applied",
+        locale=locale,
+    )
+
+    async def edit():
+        await server.application.bot.edit_message_text(
+            chat_id=int(chat_id),
+            message_id=int(message_id),
+            text=text,
+        )
+        return SimpleNamespace(message_id=int(message_id))
+
+    async def send_new():
+        return await server.application.bot.send_message(
+            chat_id=int(chat_id),
+            text=text,
+        )
+
+    result = await editor.update(
+        session_id=session_id,
+        presentation_id=presentation_id,
+        session_generation=session_generation,
+        edit=edit,
+        send_new=send_new,
+        generation_is_current=(
+            lambda: server.session_generations.is_current(
+                session_id,
+                session_generation,
+            )
+        ),
+    )
+    if (
+        result.disposition == ProjectionEditDisposition.FALLBACK_SENT
+        and result.message is not None
+    ):
+        replace = getattr(
+            gateway,
+            "replace_runtime_input_presentation_message_id",
+            None,
+        )
+        if callable(replace):
+            await replace(
+                input_batch_id,
+                expected_presentation_id=presentation_id,
+                message_id=result.message.message_id,
+            )
+    return {
+        "status": "handled",
+        "disposition": result.disposition.value,
+    }
+
+
+class _RuntimeProjectionProgressMiddleware:
+    """Intercept only IR-9 structured addendum projections before generic progress."""
+
+    def __init__(self, app: Any, *, server: Any, gateway: Any) -> None:
+        self.app = app
+        self.server = server
+        self.gateway = gateway
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope.get("type") != "http" or scope.get("path") != "/internal/progress":
+            await self.app(scope, receive, send)
+            return
+
+        messages: list[dict[str, Any]] = []
+        body = bytearray()
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message.get("type") != "http.request":
+                continue
+            body.extend(message.get("body") or b"")
+            if not message.get("more_body", False):
+                break
+
+        async def replay_receive():
+            if messages:
+                return messages.pop(0)
+            return {"type": "http.request", "body": b"", "more_body": False}
+
+        try:
+            payload = json.loads(bytes(body).decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            await self.app(scope, replay_receive, send)
+            return
+        if not isinstance(payload, dict):
+            await self.app(scope, replay_receive, send)
+            return
+        event = payload.get("event") or {}
+        if (
+            payload.get("client_type") != "telegram"
+            or not isinstance(event, dict)
+            or event.get("type") != "input_addendum_applied"
+            or event.get("visibility", "user") != "user"
+        ):
+            await self.app(scope, replay_receive, send)
+            return
+
+        configured_token = str(
+            getattr(self.server, "TELEGRAM_PROGRESS_CALLBACK_TOKEN", "") or ""
+        )
+        headers = {
+            key.decode("latin-1").lower(): value.decode("latin-1")
+            for key, value in scope.get("headers", [])
+        }
+        supplied_token = headers.get("x-progress-token", "")
+        if configured_token and not hmac.compare_digest(
+            supplied_token,
+            configured_token,
+        ):
+            # Preserve the canonical handler's existing 401 response.
+            await self.app(scope, replay_receive, send)
+            return
+
+        result = await apply_applied_addendum_projection(
+            server=self.server,
+            gateway=self.gateway,
+            payload=payload,
+        )
+        response_body = json.dumps(
+            result,
+            ensure_ascii=False,
+            separators=(",", ":"),
+        ).encode("utf-8")
+        await send(
+            {
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json; charset=utf-8"),
+                    (b"content-length", str(len(response_body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": response_body})
+
+
+def install_runtime_projection_progress_middleware(server: Any, gateway: Any) -> None:
+    """Install one presentation-only interception layer before FastAPI startup."""
+
+    if getattr(server, "_ir9_projection_progress_middleware_installed", False):
+        return
+    app = getattr(server, "app", None)
+    if app is None or not hasattr(app, "add_middleware"):
+        return
+    app.add_middleware(
+        _RuntimeProjectionProgressMiddleware,
+        server=server,
+        gateway=gateway,
+    )
+    server._ir9_projection_progress_middleware_installed = True
