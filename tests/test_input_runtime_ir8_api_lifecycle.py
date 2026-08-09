@@ -21,17 +21,20 @@ class FakeAPIError(RuntimeError):
 
 
 class FakeRecovery:
-    def __init__(self, *, entered=None, release=None, error=None):
+    def __init__(self, *, gate, entered=None, release=None, error=None):
+        self.gate = gate
         self.entered = entered
         self.release = release
         self.error = error
 
     async def recover(self):
+        self.gate.begin_recovery()
         if self.entered is not None:
             self.entered.set()
         if self.release is not None:
             await self.release.wait()
         if self.error is not None:
+            self.gate.mark_failed(self.error.reason_code)
             raise self.error
         return InputRuntimeRecoveryPlan(
             sessions=(),
@@ -87,7 +90,9 @@ class FakeApi:
     def __init__(self):
         self.events = []
         self.input_runtime_readiness_gate = InputRuntimeReadinessGate()
-        self.input_runtime_recovery = FakeRecovery()
+        self.input_runtime_recovery = FakeRecovery(
+            gate=self.input_runtime_readiness_gate
+        )
         self.input_runtime_recovery_plan = None
         self.input_runtime_recovery_report = None
         self.input_runtime_recovery_dependencies = RecoveredRuntimeDependencies(
@@ -177,7 +182,11 @@ async def test_api_start_recovery_connect_install_ready_order(monkeypatch):
     entered = asyncio.Event()
     release = asyncio.Event()
     api = FakeApi()
-    api.input_runtime_recovery = FakeRecovery(entered=entered, release=release)
+    api.input_runtime_recovery = FakeRecovery(
+        gate=api.input_runtime_readiness_gate,
+        entered=entered,
+        release=release,
+    )
     module = fake_module(api)
     events = api.events
 
@@ -223,7 +232,8 @@ async def test_api_start_recovery_connect_install_ready_order(monkeypatch):
 async def test_api_start_recovery_failure_never_connects_mcp(monkeypatch):
     api = FakeApi()
     api.input_runtime_recovery = FakeRecovery(
-        error=InputRuntimeRecoveryError("corrupt_history")
+        gate=api.input_runtime_readiness_gate,
+        error=InputRuntimeRecoveryError("corrupt_history"),
     )
     module = fake_module(api)
 
