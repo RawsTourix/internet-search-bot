@@ -1,13 +1,14 @@
 """IR-9 transient client projection hook for durable checkpoint outcomes.
 
 The hook runs strictly after the existing checkpoint implementation has durably
-applied an input range.  It emits a ProgressEvent-shaped presentation callback;
+applied an input range. It emits a ProgressEvent-shaped presentation callback;
 it does not create AgentEmission records, append assistant/user history, or
 participate in admission/control/finalization authority.
 """
 
 from __future__ import annotations
 
+import logging
 from contextvars import ContextVar
 from typing import Any
 
@@ -15,6 +16,7 @@ from ..input_runtime import CheckpointAction
 from . import input_runtime_checkpoints as checkpoint_module
 
 
+logger = logging.getLogger("MCPClient.IR9Projection")
 _INSTALL_MARKER = "_ir9_projection_checkpoint_hook_installed"
 _projection_progress_state: ContextVar[Any | None] = ContextVar(
     "ir9_projection_progress_state",
@@ -57,16 +59,17 @@ async def _emit_applied_projection(
             progress_callback=progress_callback,
             cycle_trace=getattr(active_cycle, "cycle_trace", None),
             event_type="input_addendum_applied",
-            # This marker is never rendered directly by the IR-9-aware clients;
-            # they localize from the structured event type/data. It remains a
-            # safe fallback for a client that has not implemented this event.
+            # IR-9-aware clients localize the structured event type/data. The
+            # marker is content-free and safe for an older progress consumer.
             message="input_addendum_applied",
             visibility="user",
             data={
                 "input_batch_id": input_batch_id,
                 "cycle_sequence": cycle_sequence,
                 "generation": generation,
-                "locale": str(getattr(progress_state, "progress_locale", "ru") or "ru"),
+                "locale": str(
+                    getattr(progress_state, "progress_locale", "ru") or "ru"
+                ),
             },
         )
 
@@ -100,7 +103,9 @@ def install_ir9_projection_checkpoint_hook() -> None:
     async def run_input_checkpoint(self, *args, **kwargs):
         explicit_cycle = kwargs.get("active_cycle")
         outcome = await original_checkpoint(self, *args, **kwargs)
-        active_cycle = explicit_cycle or checkpoint_module._checkpoint_active_cycle.get()
+        active_cycle = (
+            explicit_cycle or checkpoint_module._checkpoint_active_cycle.get()
+        )
         try:
             await _emit_applied_projection(
                 self,
@@ -109,7 +114,7 @@ def install_ir9_projection_checkpoint_hook() -> None:
             )
         except Exception as error:
             # Client projection failure must never change durable runtime state.
-            checkpoint_module.logger.warning(
+            logger.warning(
                 "IR-9 applied-input projection failed: error_type=%s",
                 type(error).__name__,
             )
