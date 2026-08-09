@@ -88,7 +88,7 @@ def install_input_runtime_projection_compatibility(api: Any) -> None:
             key = (
                 "input_runtime.control.pause.paused"
                 if command.state == ControlState.APPLIED
-                else "input_runtime.control.pause.pause_pending"
+                else "input_runtime.control.pause.accepted"
             )
             return localized(self, key, locale=locale)
         if command.command.value == "continue":
