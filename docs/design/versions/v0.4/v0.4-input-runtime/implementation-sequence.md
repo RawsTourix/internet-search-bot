@@ -4,7 +4,7 @@ version: v0.4
 update: v0.4-input-runtime
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-08
+last_reviewed: 2026-08-09
 ---
 
 # Последовательность реализации v0.4-input-runtime
@@ -18,9 +18,61 @@ last_reviewed: 2026-08-08
 - `IR-5 — Durable control plane /stop, /continue, /reset`: implemented and validated;
 - `IR-6 — AgentEmission и intermediate messages`: implemented and validated;
 - `IR-7 — Finalization barrier`: implemented and validated after corrective passes;
-- `IR-8`—`IR-10`: planned.
+- `IR-8 — Startup recovery и lifecycle`: implemented and validated;
+- `IR-9`—`IR-10`: planned.
 
 Общий `v0.4-input-runtime` остаётся `partial`.
+
+Финальный IR-8 code/test boundary:
+
+- code/test HEAD:
+  `5c88c52faa837b8b58c33c4893292a0708f6776a`;
+- `Validate Input Runtime` #601 — success, production compile success;
+- focused IR-8 restart contracts — `49 passed`, `0 failed`;
+- full input-runtime/config regression — `436 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #761 — success, all validation groups green;
+- workflow permission remains `contents: read`.
+
+IR-8 production composition:
+
+```text
+base recovery
+→ recovery_hardening
+→ recovery_terminal
+→ Api lifecycle
+```
+
+Mandatory startup order:
+
+```text
+RECOVERING
+→ startup-only durable discovery/reconciliation
+→ committed-but-unadmitted admission repair
+→ admission/session/inbox/control/reset/snapshot reconciliation
+→ handoff/finalization/emission recovery
+→ durable dependency validation
+→ MCP connect
+→ ActiveAgentCycle rehydration
+→ exact recovered runner ownership installation
+→ READY
+```
+
+Existing `TERMINAL_COMMITTED` проходит strict preflight до repair mutations и
+требует matching `RuntimeHandoff=COMPLETED` и valid matching final `OutputBatch`.
+`OUTPUT_READY + COMPLETED + marker missing` остаётся recoverable partial terminal
+и сходится локально теми же IR-7 IDs без AgentCycle/LLM/tool replay.
+
+Recovered runner reservation принадлежит exact
+`cycle_id + input_batch_id + generation`; foreign same-cycle addition не может
+consume designated runner lease. Already-durable reset generation сходится до
+generic stale old-generation snapshot validation и не increment-ится повторно.
+PAUSED/WAITING rehydrate-ятся как тот же cycle/context. `HANDED_OFF`/`AMBIGUOUS`
+без stronger durable evidence не replay-ятся. READY emission сохраняется без
+startup send, expired `DELIVERING → UNKNOWN`, UNKNOWN не re-arm-ится.
+
+Shutdown закрывает readiness до новых runner starts, отменяет/await-ит tracked
+recovered/admitted tasks через cancellation-safe cleanup и только затем закрывает
+MCP lifecycle.
 
 Финальный corrected IR-7 code/test boundary:
 
@@ -104,7 +156,7 @@ snapshot/session/marker или output delivery authority.
 Crash после durable handoff COMPLETED, но до terminal writes, direct-retry-ится по
 известному finalization ID: same handoff token/completed_at, finalization ID,
 result_ref и OutputBatch ID сохраняются, LLM/tool work не replay-ится. Startup
-обнаружение/reconstruction такого состояния остаётся IR-8.
+обнаружение/reconstruction такого состояния реализовано IR-8.
 
 WAITING candidate получает отдельный barrier
 `CP-BEFORE-WAITING → exact input/control recheck → one durable question authority
@@ -121,7 +173,7 @@ Deterministic corrected IR-7 tests покрывают finalization phases,
 waiting/control/reset, output gate, claim-vs-terminal ordering, handoff completion
 fault, exact durable write order, output worker в pre-handoff terminal window,
 completed-handoff/incomplete-terminal direct retry, late input/control before
-completion, cancellation вокруг completion, terminal-first admission
+completion, cancellation around completion, terminal-first admission
 reclassification, admission-first terminal abort и pre-write stale-decision
 contract без raw Pydantic `ValidationError`. Real LLM/MCP/Telegram/Web/internet
 calls не используются.
@@ -224,11 +276,13 @@ watermark. Continue без additions не создаёт fake input/revision; `W
 повышает её ровно один раз на logical command, cancels/fences old-generation
 records и синхронизирует defensive in-process coordinator только после durable
 transition. Mutable session memory очищается после safe execution lease boundary.
+IR-8 теперь additionally завершает already-durable partial reset до generic stale
+snapshot validation без второго generation increment.
 
 Checkpoint-level pause/reset suppression перед terminal transition реализовано,
 а IR-7 добавляет repeated authoritative recheck и закрывает late terminal race.
-Startup-wide runner reconstruction/reconciliation остаётся IR-8. Полная corruption
-matrix `recover_cycle_authority()` остаётся IR-8/IR-10.
+Startup-wide runner/control reconstruction реализовано IR-8. Полная randomized
+corruption/restart matrix остаётся IR-10.
 
 Финальный подтверждённый IR-4 code/test boundary:
 
@@ -259,7 +313,8 @@ WAITING reply проходит тот же common FIFO `CP-RESUME`, не обх�
 queued additions и не владеет legacy semantic continuation path. Claim acquisition
 и apply cancellation-safe. Runtime handoff completion предшествует terminal
 snapshot synchronization; corrected IR-7 теперь фактически сохраняет этот
-IR-3/IR-4 invariant на terminal path.
+IR-3/IR-4 invariant на terminal path. IR-8 startup snapshot-first reconciliation
+может домаркировать lagging durable records, но не повторяет semantic apply.
 
 Финальный подтверждённый IR-3 code boundary сохраняется как предыдущий stage
 evidence:
@@ -302,7 +357,7 @@ Cancellation contract IR-3:
   `interrupted`, duplicate не запускает runtime повторно;
 - WAITING cancellation после claim, но до marker, requeue-ит claim;
 - WAITING cancellation после marker не requeue-ит claim, оставляет его evidence,
-  переводит marker в `AMBIGUOUS`, cycle — в `interrupted`;
+  `AMBIGUOUS` + `interrupted`, duplicate no-rerun;
 - cleanup запускается отдельной task, ожидается через `asyncio.shield`, завершается
   даже при повторной cancellation, затем исходный `CancelledError` re-raise-ится.
 
@@ -315,14 +370,16 @@ Corrected IR-7 уточняет два уже принятых IR-3 contracts:
   terminal session: terminal-first relation reclassifies тот же committed batch в
   new-cycle START admission, не оставляя old-cycle admission/inbox evidence.
 
+IR-8 startup использует handoff evidence для safe/ambiguous reconstruction и не
+считает process restart разрешением повторить неизвестный side effect.
+
 Поздний API compatibility `complete_runtime_handoff()` идемпотентен и не меняет
 `completed_at`.
 
-После IR-7 следующие mandatory contracts остаются:
+После IR-8 следующие mandatory stages остаются:
 
-- IR-8: ambiguous/startup recovery policy без blind replay;
 - IR-9: complete client projections/diagnostics/config examples;
-- IR-10: full race/restart/synthetic/live acceptance, включая corruption matrix.
+- IR-10: full randomized/restart/synthetic/live acceptance.
 
 Scheduler/parallel branches и Telegram history rewind в текущий implemented
 baseline не входят.
@@ -495,6 +552,9 @@ Defaults conservative и valid для current single-process mode.
 - не менять transport command handlers;
 - не переносить agent loop.
 
+Эти ограничения описывают историческую boundary IR-1; последующие stages
+подключили созданные contracts.
+
 ---
 
 # IR-2 — Filesystem repositories и coordination service
@@ -551,7 +611,8 @@ reconcile by authoritative watermark in later stages
 ```
 
 IR-4 реализовал snapshot-watermark reconciliation для applied active-cycle
-ranges. Startup-wide ambiguous/corruption reconciliation остаётся IR-8/IR-10.
+ranges. IR-8 реализовал startup-wide deterministic claim/identity reconciliation;
+full randomized permutations остаются IR-10.
 
 ## Tests
 
@@ -676,7 +737,7 @@ submit/commit
 8. complete handoff marker.
 
 Initial context revision и active snapshot ownership были intentionally deferred
-из IR-3 в IR-4; теперь IR-4 реализует initial `R1` + durable snapshot до first main
+из IR-3 в IR-4; IR-4 реализовал initial `R1` + durable snapshot до first main
 LLM/result.
 
 ## Running addition и capacity authority
@@ -704,6 +765,9 @@ Corrected IR-7 reclassification recomputes capacity together with kind/action/
 target after a recognized terminal race; stale old-cycle capacity result does not
 leak into the new-cycle START outcome.
 
+IR-8 startup additionally discovers committed batches with no admission and
+repairs missing inbox relation without a second admission/sequence.
+
 ## Runtime handoff contract
 
 ```text
@@ -723,6 +787,8 @@ IR-4 сохраняет этот ownership: successful handoff completion вып
 terminal snapshot synchronization. Corrected IR-7 переносит exact successful
 completion внутрь final terminal coordination, но только после second terminal
 recheck; поздний API completion остаётся idempotent compatibility call.
+IR-8 classifies unfinished handoff after process death and never treats restart
+itself as permission to replay an ambiguous external side effect.
 
 ## Cancellation contract
 
@@ -752,7 +818,8 @@ Initial:
 
 Corrected terminal nuance: cancellation/failure после durable handoff COMPLETED
 не переводит marker обратно в AMBIGUOUS. Если terminal marker ещё не записан,
-direct known-ID IR-7 retry завершает convergence без side-effect replay.
+direct known-ID IR-7 retry/IR-8 discovery завершает convergence без side-effect
+replay.
 
 WAITING compatibility на IR-3:
 
@@ -760,7 +827,7 @@ WAITING compatibility на IR-3:
 - cancellation после marker: не requeue claim, сохранить claim evidence,
   `AMBIGUOUS` + `interrupted`, duplicate no-rerun.
 
-IR-4 дополнительно делает cancellation-safe common claim acquisition/apply на
+IR-4 additionally делает cancellation-safe common claim acquisition/apply на
 checkpoint path.
 
 ## SessionExecutionCoordinator
@@ -768,6 +835,10 @@ checkpoint path.
 Coordinator остаётся in-process execution lease/wakeup foundation, но не durable
 queue. `wake(session_id, cycle_id=...)` выставляет event только при exact match
 reserved/active cycle; mismatch возвращает `False` и event не меняет.
+
+IR-8 adds process-local recovered reservation identity
+`cycle_id + input_batch_id + generation`; only the designated recovered runner
+may consume it. Generation sync/reset/shutdown clears that defensive ownership.
 
 ## Tests
 
@@ -821,7 +892,8 @@ cycle watermark before terminal recheck.
 - не удалять WAITING compatibility before common applier;
 - не начинать IR-4 внутри IR-3 patch.
 
-Эти пункты фиксируют историческую stage boundary; IR-4 теперь реализован отдельно.
+Эти пункты фиксируют историческую stage boundary; IR-4—IR-8 теперь реализованы
+отдельными stages.
 
 ---
 
@@ -938,7 +1010,7 @@ Accepted IR-4 protocol сохраняется:
   linear context revision;
 - несколько contiguous batches внутри range сохраняют batch boundaries и ordered
   `cycle_sequence`;
-- IR-6 отдельно реализует durable `AgentEmission`; emission persistence не
+- IR-6 separately реализует durable `AgentEmission`; emission persistence не
   участвует в input revision/watermark protocol;
 - checkpoint outcomes/runtime traces не подменяют IR-6 semantic emissions.
 
@@ -967,17 +1039,22 @@ append next context revision
 watermark является authority. Следующий checkpoint/reconciliation домаркировывает
 inbox/admission без duplicate `input_batch_update`, без второй revision и без
 повторного semantic apply. Retry после repair — no-op для уже applied range.
+IR-8 выполняет ту же marker reconciliation на process startup через startup-only
+commands.
 
 ## Cancellation-safe claim/apply
 
 Claim acquisition и apply обрабатывают cancellation так, чтобы durable state
 оставался recoverable:
 
-- до persisted snapshot claim может быть безопасно requeued/reconciled;
+- до persisted snapshot claim может быть safely requeued/reconciled;
 - после persisted snapshot watermark marking завершается из snapshot authority;
 - cancellation не создаёт duplicate update/revision;
 - repeated cleanup/cancellation не ослабляет existing IR-3 no-blind-replay
   contract.
+
+IR-8 expired CLAIMED/APPLYING startup recovery также использует snapshot authority
+и рассматривает contiguous range целиком.
 
 ## Mandatory WAITING contract
 
@@ -988,6 +1065,9 @@ contiguous range строго в cycle-sequence order.
 На реализованном IR-4 WAITING reply проходит common FIFO `CP-RESUME`. Legacy
 adapter больше не владеет semantic continuation и не подменяет
 `original_input_batch_id`; initial batch identity сохраняется.
+
+IR-8 fresh-process WAITING reconstruction устанавливает тот же cycle/context и
+waiting question; новый reply остаётся existing `RESUME_WAITING` admission.
 
 ## Terminal snapshot ordering
 
@@ -1000,7 +1080,8 @@ RuntimeHandoffRecord.complete
 
 IR-4 не ослабляет handoff authority ради terminal persistence. Corrected IR-7
 сохраняет этот invariant, выполняя completion после second terminal recheck и до
-terminal snapshot/session/finalization marker.
+terminal snapshot/session/finalization marker. IR-8 strict terminal preflight не
+достраивает contradictory handoff задним числом.
 
 ## Checkpoint-level stale candidate suppression
 
@@ -1038,9 +1119,10 @@ completion.
 
 Cross-stage scenarios:
 
-- ambiguous IR-3 handoff/startup claim reconciliation — IR-8;
+- ambiguous IR-3 handoff/startup claim reconciliation — реализован IR-8;
 - late terminal race/durable output barrier — реализован corrected IR-7;
-- `recover_cycle_authority()` corruption/restart matrix — IR-8/IR-10.
+- deterministic `recover_cycle_authority()` corruption/restart core — IR-8;
+- full randomized permutations — IR-10.
 
 ## Done
 
@@ -1061,7 +1143,9 @@ Cross-stage scenarios:
 - не reset plan automatically;
 - не реализовывать IR-5 controls в IR-4;
 - не смешивать checkpoint suppression и durable finalization ownership;
-- не притягивать IR-8 startup/ambiguous recovery в IR-4.
+- не притягивать startup/ambiguous recovery в IR-4.
+
+Эти пункты фиксируют историческую IR-4 boundary; IR-5—IR-8 реализованы отдельно.
 
 ---
 
@@ -1176,7 +1260,8 @@ Input does not behave as `/continue`.
 - rapid `pause → continue` before pause application can reduce to running without
   phantom paused state or second runner.
 
-Process-restart runner reconstruction остаётся IR-8.
+IR-8 fresh-process PAUSED reconstruction rehydrates the same cycle/context, so
+explicit `/continue` uses this unchanged durable frozen-target protocol.
 
 ## `/reset`
 
@@ -1192,6 +1277,12 @@ Process-restart runner reconstruction остаётся IR-8.
 - coordinator synchronizes to already-durable generation;
 - open ingress drafts/collections are cancelled;
 - mutable MCP/session memory clears only after old execution lease boundary.
+
+IR-8 startup specifically handles the crash window where generation already
+advanced but old-generation snapshot/records cleanup is incomplete. Existing reset
+record converges before generic stale-snapshot validation; generation is never
+incremented a second time. Already APPLIED immutable history remains historical
+evidence while pending old-generation work is cancelled/fenced.
 
 ## Checkpoint reducer
 
@@ -1275,8 +1366,8 @@ Covered barriers/contracts:
 - не promise force cancellation confirmed external side effects;
 - IR-6 durable emissions реализованы отдельным stage и не принадлежат IR-5;
 - IR-7 finalization barrier реализован отдельно и не принадлежит IR-5;
-- не implement IR-8 startup reconstruction/reconciliation;
-- не expand current exact-session repair into full IR-8/IR-10 corruption matrix;
+- не implement startup reconstruction/reconciliation внутри IR-5;
+- не expand current exact-session repair into full randomized IR-10 corruption matrix;
 - не claim IR-9/IR-10 completion.
 
 ---
@@ -1393,6 +1484,10 @@ blind-retry-ится.
 - concurrent READY claim vs terminal commit упорядочен IR-7 общей exact-session
   authority, без network await под lock.
 
+IR-8 startup preserves READY without send, converts expired DELIVERING to UNKNOWN,
+keeps UNKNOWN unknown and cancels terminal old-cycle READY before a new worker
+claim.
+
 ## Telegram и reply binding
 
 Telegram semantic message — separate `send_message`, `parse_mode=None`, не
@@ -1455,7 +1550,7 @@ Covered critical windows:
 - не convert all progress to emissions;
 - не migrate question finalization;
 - IR-7 finalization barrier реализован отдельным stage и не принадлежит IR-6;
-- не implement IR-8 startup reconstruction/reconciliation;
+- не implement startup reconstruction/reconciliation внутри IR-6;
 - не build IR-9 full timeline/status/Web UX;
 - не run IR-10 full randomized/live roast;
 - не build distributed event bus;
@@ -1711,10 +1806,9 @@ Focused IR-7 direct retry/repository recreation covers:
 
 Crash после handoff COMPLETED не reopens handoff и не replay-ит LLM/MCP/tool.
 Direct retry сохраняет exact handoff token/completed_at, finalization ID,
-result_ref и OutputBatch ID и продолжает только terminal convergence.
-
-These are direct finalization-protocol replay tests, not startup discovery or
-reconstruction.
+result_ref и OutputBatch ID и продолжает только terminal convergence. IR-8 startup
+automatically discovers the same safe local convergence when stronger durable
+evidence proves it.
 
 ## Deterministic tests
 
@@ -1776,15 +1870,16 @@ Corrective mandatory coverage asserts exact durable states/IDs/watermarks for:
 
 ## Не делать
 
-- не implement startup scanner/reconstruction coordinator;
-- не reconstruct paused/interrupted/waiting runners on process start;
-- не implement committed-but-unadmitted startup discovery/repair as part of this
-  live race fix;
-- не reconcile all UNKNOWN emissions at startup;
-- не automatically discover incomplete finalization/handoff state on startup;
-- не build startup readiness gate/shutdown recovery;
+- не implement startup scanner/reconstruction coordinator внутри IR-7;
+- не reconstruct paused/interrupted/waiting runners в IR-7;
+- не implement committed-but-unadmitted startup discovery/repair as part of live
+  admission-terminal race;
+- не reconcile all UNKNOWN emissions в IR-7;
+- не build startup readiness gate/shutdown recovery в IR-7;
 - не expand to IR-9 full projections or IR-10 roast;
 - не add scheduler/branches/distributed runtime.
+
+Эти пункты фиксируют историческую IR-7 boundary; IR-8 реализован отдельным stage.
 
 ---
 
@@ -1792,60 +1887,376 @@ Corrective mandatory coverage asserts exact durable states/IDs/watermarks for:
 
 ## Статус
 
-Planned. IR-7 direct finalization retry/repository recreation, exact
-`RuntimeHandoff=COMPLETED + incomplete terminal` retry и live
-admission-vs-terminal reclassification не являются startup recovery.
+Implemented and validated на final code/test HEAD
+`5c88c52faa837b8b58c33c4893292a0708f6776a`:
+
+- `Validate Input Runtime` #601 — success, production compile success;
+- focused `tests/test_input_runtime_ir8_*.py` — `49 passed`, `0 failed`;
+- full input-runtime/config regression — `436 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #761 — success, all validation groups green;
+- workflow permission remains `contents: read`.
 
 ## Цель
 
-Recover durable runtime before accepting new work and shutdown without orphan
-claims/runners.
+Recover durable runtime before accepting new work, reconstruct safe same-cycle
+process state without semantic guessing and shut down without orphan runner/
+external-side-effect replay.
 
-## Startup
+## Реализованный ownership
 
-- reconcile sessions/admissions/inbox/controls/emissions;
-- repair committed-but-unadmitted inputs discovered after restart;
-- inspect runtime handoff markers;
-- keep ambiguous external operation non-replayable;
-- reconcile post-handoff/UNKNOWN emission evidence by explicit policy;
-- discover/reconcile incomplete finalization/handoff records;
-- reconstruct resumable/paused/waiting runner only when safe;
-- enable new admission after mandatory recovery.
+```text
+src/input_runtime/recovery.py
+src/input_runtime/recovery_hardening.py
+src/input_runtime/recovery_terminal.py
+src/input_runtime/ir8_admission_recovery.py
+src/input_runtime/ir8_control_recovery.py
+src/input_runtime/ir8_emissions.py
+src/input_runtime/ir8_filesystem.py
+src/input_runtime/ir8_snapshot_recovery.py
+src/runtime/input_runtime_rehydration.py
+src/runtime/ir8_session_execution.py
+src/api/input_runtime_recovery.py
+src/api/input_runtime_recovery_composition.py
+src/api/input_runtime_recovery_dependencies.py
+src/api/ir8_final_output_recovery.py
+```
 
-Normal in-process terminal-wins admission race is not an IR-8 case: corrected
-IR-7 resolves it inside the original admission call by bounded stale-decision
-reclassification.
+Application coordinator зависит от repository/service command/query ports.
+Filesystem scan/index repair остаётся adapter-only startup operation и не
+перенесён в checkpoint/admission/control/emission/finalization hot path.
+Production composition использует final chain:
 
-IR-3 marker, IR-4 snapshot-first marking repair, IR-5 same-delivery control repair,
-IR-6 repository recreation/UNKNOWN preservation и IR-7 direct finalization/live
-race protocols не являются готовой startup recovery implementation.
+```text
+base recovery
+→ conservative recovery_hardening
+→ strict recovery_terminal
+→ Api lifecycle
+```
 
-`recover_cycle_authority()` corruption matrix также не считается закрытой:
-её authoritative corruption/restart policy и negative cases относятся к IR-8, а
-полная randomized/restart acceptance — к IR-10.
+## Readiness и startup ordering
+
+Process-local states:
+
+```text
+RECOVERING
+READY
+FAILED
+STOPPING
+STOPPED
+```
+
+Ordinary submission/admission/start/resume/call_agent/reset boundaries требуют
+READY. Gateway lifespan по-прежнему не yield-ит до `Api.start()`, но application
+gate остаётся отдельной defensive authority.
+
+Фактический startup:
+
+```text
+1. gate → RECOVERING
+2. startup-only session/admission identity/frontier discovery
+3. immutable admission/cycle sequence corruption preflight
+4. existing TERMINAL_COMMITTED handoff/output preflight
+5. already-durable RESET generation convergence
+6. reconcile all committed batches without admission
+7. repair session/admission watermarks and missing inbox relation
+8. reconcile expired CLAIMED/APPLYING ranges from snapshot-first authority
+9. reconcile remaining controls/generation
+10. validate active snapshots/context revisions/OpenAI tool protocol/refs
+11. recover AgentEmission delivery claims: READY retained, expiry → UNKNOWN
+12. discover/reconcile incomplete finalization and handoff authority
+13. build PAUSED/WAITING/INTERRUPTED/safe-runner recovery plan
+14. validate planning/artifact/result dependencies
+15. connect MCP/tool runtime
+16. rehydrate/install ActiveAgentCycle
+17. install exact recovered runner reservation/task ownership
+18. gate → READY
+```
+
+Structural recovery failure marks `FAILED`; MCP is not connected when mandatory
+local reconciliation itself fails. Mandatory recovery does not invoke LLM, MCP
+tools, Telegram/Web send or external HTTP.
+
+## Committed-but-unadmitted и admission repair
+
+Recovery reads all durable committed batches through startup-only store query,
+not only batches returned by current `commit_ready_drafts()`.
+
+For every durable committed batch:
+
+- existing admission returns the same relation;
+- no admission invokes common reconciliation/admission once;
+- deterministic committed-store ordering is preserved;
+- duplicate startup pass does not allocate second admission/sequence;
+- existing admission with missing inbox repairs the same inbox relation;
+- state watermark lag is repaired from authoritative records;
+- duplicate/gapped immutable sequence is controlled fatal corruption.
+
+Normal live terminal-first admission race remains IR-7 and still resolves inside
+the original admission call.
+
+## Snapshot/claim/context recovery
+
+Expired claim semantics:
+
+```text
+CLAIMED expired + no apply authority
+→ QUEUED
+
+APPLYING expired + snapshot below range
+→ QUEUED
+
+APPLYING expired
++ snapshot generation matches
++ snapshot watermark covers range
++ applied_input_batch_ids contains range
+→ inbox/admission APPLIED marker reconciliation only
+```
+
+Snapshot/context revision is authority for semantic apply. Startup never creates a
+second `input_batch_update` or context revision for a range already persisted in
+snapshot. Contiguous claimed ranges reconcile consistently as a whole.
+
+Snapshot validation requires exact session/cycle/generation ownership, original
+and applied committed batches, contiguous applied sequence, matching context
+revision/watermarks, protocol-valid assistant/tool blocks, safe checkpoint and
+required durable refs. Invalid snapshot never becomes a fresh partial-context
+cycle.
+
+## ActiveAgentCycle rehydration
+
+Durable snapshot rehydrates at least:
+
+```text
+cycle_id / session_id / generation
+original_input_batch_id / original_user_request
+messages_for_llm / cycle_trace
+status / waiting_question / interruption metadata
+artifact/read-artifact/result refs
+active plan identity + exact durable plan state
+applied_input_batch_ids / applied watermark
+active_context_revision_id
+safe checkpoint / snapshot revision
+```
+
+Missing durable state that changes semantics is a recovery error/non-resumable
+classification; runtime does not invent an empty replacement.
+
+### PAUSED
+
+`PAUSED_BY_USER` remains paused with no automatic runner. Queued additions remain
+FIFO. Explicit `/continue` after fresh process resumes the same cycle/context and
+uses the existing atomically frozen continue target semantics.
+
+### WAITING
+
+`WAITING_USER` preserves the same question/context/cycle. A fresh user reply is
+admitted as existing `RESUME_WAITING` relation and continues the same cycle.
+
+### RUNNING / INTERRUPTED
+
+Fresh process has no old task. Safe pre-handoff RUNNING with valid snapshot can be
+scheduled as same-cycle recovered work after MCP connect. `HANDED_OFF` or
+`AMBIGUOUS` without stronger durable completion evidence becomes conservative
+non-auto-replay interruption. Process restart itself never permits repeating an
+unknown side effect.
+
+## Terminal authority preflight
+
+Terminal projection is not terminal authority.
+
+For every already persisted `TERMINAL_COMMITTED`, **before any projection repair**
+startup requires:
+
+```text
+matching finalization identity
++ matching RuntimeHandoff exists
++ RuntimeHandoff == COMPLETED
++ final OutputBatch exists
++ OutputBatch session/cycle/kind identity matches
+```
+
+Failure is structural corruption (`terminal_handoff_not_completed`,
+`finalization_output_missing`, `finalization_output_identity_mismatch`, etc.) and
+READY is not opened. Recovery never "fixes" an irreversible marker by completing
+its handoff retroactively.
+
+Recoverable partial terminal remains distinct:
+
+```text
+OUTPUT_READY
++ RuntimeHandoff COMPLETED
++ TERMINAL_COMMITTED missing
+→ IR-7 direct local terminal convergence
+→ same finalization/result/output/handoff IDs
+→ no AgentCycle/LLM/tool replay
+```
+
+Critical late-input ordering:
+
+- if handoff is still `HANDED_OFF`, late committed input may be admitted to old
+  cycle before final recheck and abort stale finalization;
+- if handoff is already `COMPLETED`, startup first converges old terminal authority
+  and only then late committed batch becomes new-cycle `START_CYCLE`.
+
+## PREPARED / RESULT_PERSISTED / OUTPUT_READY
+
+- `PREPARED`: recheck durable authority; no startup LLM. Without persisted result,
+  preserve conservative recoverable interruption/abort policy;
+- `RESULT_PERSISTED`: reuse exact persisted result; assemble/rebind same logical
+  final OutputBatch if authority remains valid; no main/final LLM rerun;
+- `OUTPUT_READY`: validate exact output/handoff relation; complete only safe local
+  finalization commands or abort on late input/control/generation mismatch.
+
+## Reset recovery
+
+If durable reset already advanced `SessionInputRuntimeState.generation`, that
+generation is authority. Startup finishes the same existing reset transition
+**before** generic stale old-generation active-snapshot validation.
+
+- no second generation increment;
+- already APPLIED admissions remain immutable historical evidence;
+- pending old-generation admissions/inbox/controls/snapshot/emissions/finalization
+  are cancelled/fenced through existing IR-5 semantics;
+- defensive coordinator synchronizes to durable generation only after convergence.
+
+Generation mismatch without durable reset evidence remains corruption; recovery
+does not guess that every mismatch is a reset.
+
+## Emission recovery
+
+```text
+READY
+→ retain durable intent
+→ no startup send
+
+DELIVERING expired/missing lease
+→ UNKNOWN
+
+DELIVERING valid lease
+→ do not steal/retry
+
+UNKNOWN
+→ remain UNKNOWN
+
+terminal old-cycle READY
+→ CANCELLED/non-claimable
+```
+
+Actual delivery remains normal worker lifecycle after readiness.
+
+## Recovered runner ownership
+
+Safe recovered runner is installed only after MCP connection. Mandatory startup
+does not wait for the long AgentCycle; task is registered and waits for readiness.
+
+Process-local exact reservation owner:
+
+```text
+session_id
+cycle_id
+input_batch_id
+generation
+```
+
+`START_ADMITTED` owner is the exact admitted input batch. `AUTO_RESUME_SAFE` owner
+is the reconstructed cycle original admitted input identity. Foreign same-cycle
+input cannot consume reservation and therefore cannot start runner #2; it remains
+ordinary FIFO work. Reservation owner is cleared on consumption/release,
+generation change/reset and shutdown. Coordinator remains defensive, not durable
+truth.
+
+## Corruption policy
+
+Allowed repair only when immutable durable authorities agree:
+
+- missing/dangling derived index/pointer;
+- lagging session/admission/control marker;
+- snapshot-first applied marker lag;
+- lagging terminal session/snapshot projection after already valid terminal
+  authority.
+
+Fatal contradictions include:
+
+- same cycle assigned to different sessions;
+- duplicate/gapped immutable admission sequence;
+- missing referenced committed batch;
+- missing/mismatched active context revision;
+- incompatible multiple nonterminal handoffs;
+- finalization/handoff identity conflict;
+- `TERMINAL_COMMITTED` without completed handoff/output evidence.
+
+No newest/mtime/majority/lexicographic winner is chosen.
 
 ## Shutdown
 
-- stop new runner starts;
-- persist resumable/interrupted state where possible;
-- cancel in-process wakeups;
-- retain durable admissions/inbox/claims/controls/emissions/finalizations;
-- leave ambiguous external operations unknown;
-- close runtime after agent/tool lifecycle.
+```text
+gate → STOPPING
+→ reject new runner starts
+→ cancel/await tracked recovered runner tasks
+→ coordinator cancels/awaits active admitted tasks and wakes
+→ existing cancellation-safe handoff cleanup persists retryable/ambiguous evidence
+→ retain durable queues/controls/emissions/finalizations
+→ MCP cleanup in the same owning lifespan task
+→ gate → STOPPED
+```
+
+Pre-handoff cancellation remains retryable; uncertain post-handoff invocation is
+conservative/ambiguous; completed handoff is never downgraded. PAUSED/WAITING
+without active runner remain their durable states.
 
 ## Tests
 
-Two service instances over same temporary root:
+Focused IR-8 suites use fresh repository bundles/services/coordinators/runtime
+composition over the same temporary root, fake clocks and explicit
+`asyncio.Event` barriers. No sleep-based ordering proof and no real external
+calls.
 
-- pause/wait/inbox/emission survive recreation;
-- committed unadmitted repaired on startup;
-- ambiguous marker does not rerun runtime;
-- post-handoff claim evidence preserved/reconciled;
-- UNKNOWN emission is not blindly re-sent;
-- incomplete finalization/handoff discovered/reconciled by startup coordinator;
-- `recover_cycle_authority()` corrupted/missing/divergent authority cases;
-- no new work before recovery ready;
-- shutdown deterministic.
+Final focused evidence: `49 passed`, `0 failed`.
+
+Covered deterministic contracts:
+
+- readiness and MCP-connect/install/READY ordering;
+- committed-unadmitted repair/idempotency/order;
+- missing inbox and watermark repair;
+- CLAIMED/APPLYING snapshot-first recovery;
+- PAUSED/WAITING fresh same-cycle continuation;
+- safe RUNNING vs ambiguous handoff classification;
+- pause/continue/reset recovery and coordinator generation;
+- READY/DELIVERING/UNKNOWN emissions;
+- PREPARED/RESULT_PERSISTED/OUTPUT_READY/TERMINAL_COMMITTED recovery;
+- strict terminal preflight and valid partial terminal local convergence;
+- HANDED_OFF/COMPLETED late-input ordering;
+- deterministic authority corruption cases;
+- exact recovered reservation owner / immediate foreign addition race;
+- shutdown gate/task cancellation/ownership.
+
+## Done
+
+- mandatory recovery gate closes ordinary runtime before READY;
+- durable active state reconstructed from repository authority, not coordinator
+  memory;
+- all committed-unadmitted input reconciled exactly once;
+- missing inbox/frontier lag and expired claims reconciled;
+- snapshot/context/protocol refs validated;
+- PAUSED/WAITING retain same cycle/context;
+- safe runner scheduling after MCP connect, ambiguity no-auto-replay;
+- terminal authority preflight prevents repair of contradictory irreversible
+  marker;
+- partial completed-handoff terminal converges locally;
+- reset generation convergence precedes stale snapshot validation;
+- retained READY/UNKNOWN emission semantics preserved;
+- recovered runner reservation cannot be stolen;
+- shutdown owns active/recovered tasks and MCP cleanup ordering;
+- focused IR-8, full input-runtime regression, compile and artifact validation
+  green.
+
+## Не делать
+
+- не реализовывать full `/status`/timeline/client diagnostics — IR-9;
+- не выполнять randomized/full restart roast/live Telegram acceptance — IR-10;
+- не добавлять PostgreSQL/Redis/distributed leases;
+- не добавлять scheduler/AgentRun/TaskRun/branches/fork-join;
+- не реализовывать Telegram edited-history rewind.
 
 ---
 
@@ -1853,9 +2264,9 @@ Two service instances over same temporary root:
 
 ## Статус
 
-Planned. IR-6 добавил минимальную transport-neutral emission/reply projection, а
-IR-7 — transport-neutral final-output eligibility fence, но полный IR-9 не
-реализован.
+Planned. IR-6 добавил минимальную transport-neutral emission/reply projection,
+IR-7 — transport-neutral final-output eligibility fence, IR-8 — structured safe
+recovery report/reason codes, но полный IR-9 не реализован.
 
 ## Цель
 
@@ -1898,7 +2309,7 @@ last error code
 
 ## Статус
 
-Planned. IR-7 deterministic focused CI не заменяет full IR-10 acceptance.
+Planned. IR-8 deterministic fresh-process CI не заменяет full IR-10 acceptance.
 
 ## Цель
 
@@ -1927,7 +2338,7 @@ compile/config example audit
 - additions with files;
 - shutdown while queued/claimed/applying;
 - cancellation before/after handoff and during cleanup;
-- `recover_cycle_authority()` corruption/restart matrix;
+- randomized `recover_cycle_authority()` corruption/restart permutations;
 - broader randomized emission delivery/finalization interactions.
 
 Every randomized run records seed and selector.
@@ -1973,8 +2384,9 @@ localization и synthetic harness могли разрабатываться па
 Admission, checkpoint integration, controls и finalization выполняются
 последовательно, поскольку разделяют session state/watermarks.
 
-IR-7 завершён после stable cycle/context/control/emission/handoff/admission
-identity. Следующий stage — только IR-8 startup recovery/reconstruction.
+IR-8 завершён после stable cycle/context/control/emission/handoff/finalization
+identity и corrected IR-7 ordering. Следующий planned stage — IR-9, но в рамках
+IR-8 implementation/evidence pass он не начинается.
 
 Scheduler/parallel branches не реализуются этим update stage sequence; future
 scheduler остаётся отдельной orchestration layer.
@@ -1999,13 +2411,17 @@ fix(input-runtime): complete handoff before terminal authority
 fix(input-runtime): reclassify admission after terminal race
 test(input-runtime): cover IR-7 finalization races
 feat(input-runtime): recover durable active runtime state
+fix(input-runtime): harden IR-8 recovery ordering
+fix(runtime): fence recovered runner reservation
+test(input-runtime): cover IR-8 restart recovery
+docs(input-runtime): record IR-8 implementation evidence
 test(input-runtime): add full race restart and transport coverage
 docs(input-runtime): finalize acceptance and current baseline
 ```
 
-Corrected IR-7 documentation evidence фиксируется только после green code/test
-gate `6bd0dce0018b20520ed28236211fccdf0a8075fb`; documentation commits не
-начинают IR-8.
+IR-8 documentation evidence фиксируется только после green code/test boundary
+`5c88c52faa837b8b58c33c4893292a0708f6776a`; IR-9/IR-10 этим documentation pass
+не начинаются.
 
 Один commit не должен одновременно вводить новый state contract, переписывать
 agent loop и менять transport presentation без characterization tests.
