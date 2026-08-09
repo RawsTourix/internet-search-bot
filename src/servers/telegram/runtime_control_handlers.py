@@ -5,6 +5,7 @@ remain in the Gateway application-layer input-runtime services.
 """
 from __future__ import annotations
 
+import sys
 from datetime import datetime
 from typing import Any
 from uuid import uuid4
@@ -28,11 +29,14 @@ def install_runtime_control_handlers(application: Any) -> None:
     if getattr(application, _INSTALL_MARKER, False):
         return
 
-    # app.py calls this before it captures the base input-ack callback, so the
-    # IR-9 presentation fence becomes the base for later relocation wrappers.
-    from . import telegram_server as server
+    # Never force-import the Telegram host here: IR-5 characterization and
+    # composition seams intentionally install handlers without a real bot token.
+    # In production app.py has already imported telegram_server, so the IR-9
+    # presentation wrapper can be installed without changing host lifecycle.
+    server = sys.modules.get(f"{__package__}.telegram_server")
+    if server is not None and hasattr(server, "apply_input_ack_policy"):
+        install_runtime_projection_editing(server)
 
-    install_runtime_projection_editing(server)
     application.add_handler(
         CommandHandler(list(_RUNTIME_CONTROL_COMMANDS), runtime_control_handler),
         group=-10,
