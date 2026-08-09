@@ -3,7 +3,7 @@ id: design.v0.4.index
 version: v0.4
 spec_status: accepted
 implementation_status: partial
-last_reviewed: 2026-08-08
+last_reviewed: 2026-08-09
 ---
 
 # v0.4 — реестр обновлений Agent Workspace
@@ -29,7 +29,7 @@ Application/hosting profiles определены в
 | 5 | [`v0.4-file-artifacts`](v0.4-file-artifacts.md) | implemented | Artifact identity, versions, manager tools и delivery foundation |
 | 6 | [`v0.4-file-artifacts-advanced`](v0.4-file-artifacts-advanced/README.md) | implemented | Semantic input/output, capabilities, localization, `OutputBatch` и durable Telegram/file recovery |
 | 7 | [`v0.4-batch-workflows`](v0.4-batch-workflows/README.md) | implemented | AUTO/EXPLICIT assembly, canonical controls, collection/run presentations, output grouping и bounded same-session artifact handoff |
-| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1—IR-7 implemented; IR-8—IR-10 planned: startup recovery, complete projections и full acceptance |
+| 8 | [`v0.4-input-runtime`](v0.4-input-runtime/README.md) | partial | IR-1—IR-8 implemented; IR-9—IR-10 planned: complete projections и full acceptance |
 | 9 | [`v0.4-runtime-modularization`](v0.4-runtime-modularization/README.md) | planned | Reusable `AgentRuntime`, Service Application composition, independent ports, `ConfigProvider`, `agent.config` и revisioned configuration snapshots |
 | 10 | [`v0.4-mcp-registry-foundation`](v0.4-mcp-registry-foundation/README.md) | planned | Local scopes, trusted MCP metadata, retry/outcome semantics, remote-resource lifecycle и profile-aware transport admission |
 
@@ -79,8 +79,8 @@ suites. Точный последний head и результаты run фик�
 [`../../../../reports/v0.4-transport-artifact-roast.md`](../../../../reports/v0.4-transport-artifact-roast.md),
 тематических README и описании PR.
 
-`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1—IR-7
-реализованы и подтверждены CI; IR-8—IR-10 остаются planned.
+`v0.4-input-runtime` остаётся update со статусом `partial`. IR-1—IR-8
+реализованы и подтверждены CI; IR-9—IR-10 остаются planned.
 
 IR-5 final code evidence:
 
@@ -192,7 +192,7 @@ IR-7 закрывает durable pre-terminal races, которые IR-6 intentio
   terminal-first не позволяет начать новый old-cycle attempt;
 - crash после durable handoff COMPLETED, но до terminal marker, direct-retry-ится
   по известному finalization ID с теми же handoff/finalization/result/output IDs и
-  без LLM/tool replay; startup discovery остаётся IR-8;
+  без LLM/tool replay; startup discovery реализован IR-8;
 - network/LLM/tool awaits не выполняются под finalization/session lock.
 
 Corrected IR-7 final code evidence:
@@ -206,18 +206,51 @@ Corrected IR-7 final code evidence:
   deterministic terminal-first/admission-first admission races без real
   LLM/MCP/Telegram/Web/internet calls.
 
-Startup-wide reconstruction/reconcile `READY/UNKNOWN`, paused/interrupted/waiting
-runtime, committed-but-unadmitted discovery и incomplete finalization scan
-остаются IR-8. Полный client timeline, `/status`, Web/CLI projections и addendum
-UX остаются IR-9; randomized/full-system/live roast — IR-10.
+IR-8 реализует startup-wide reconstruction/reconciliation без blind replay:
 
-IR-1—IR-6 implementation evidence и исторические boundary подробно сохранены в
+- `RECOVERING` закрывает ordinary admission/runner/control boundary до завершения
+  deterministic durable reconciliation;
+- все durable committed-but-unadmitted batches обнаруживаются startup query и
+  получают ровно одну admission relation; missing inbox/frontier lag repair-ятся
+  через storage-neutral commands;
+- snapshot-first apply сохраняет context authority и доводит только lagging
+  markers, не создавая duplicate context revision/input update;
+- production recovery chain:
+  `base recovery → recovery_hardening → recovery_terminal → Api lifecycle`;
+- existing `TERMINAL_COMMITTED` до любых repair mutations требует matching
+  `RuntimeHandoff=COMPLETED` и valid matching final `OutputBatch`; DONE projection
+  сама terminal authority не создаёт;
+- `OUTPUT_READY + COMPLETED` без marker остаётся recoverable partial terminal и
+  сходится локально с теми же finalization/result/output IDs;
+- PAUSED/WAITING rehydrate-ятся как тот же cycle/context; safe RUNNING может быть
+  запланирован, а `HANDED_OFF`/`AMBIGUOUS` без stronger evidence не replay-ится;
+- retained emission `READY` не отправляется в recovery, expired `DELIVERING`
+  становится `UNKNOWN`, UNKNOWN не re-arm-ится;
+- already-durable reset generation convergence выполняется до stale old-generation
+  snapshot validation и не увеличивает generation повторно;
+- safe recovered runner reservation принадлежит exact
+  `cycle_id + input_batch_id + generation` owner и не может быть consumed foreign
+  same-cycle addition;
+- shutdown закрывает gate, отменяет tracked recovered/admitted tasks через
+  cancellation-safe cleanup и только затем закрывает MCP lifecycle.
+
+IR-8 final code evidence:
+
+- code/test boundary `5c88c52faa837b8b58c33c4893292a0708f6776a`;
+- `Validate Input Runtime` #601 — success, compile success;
+- focused IR-8 restart suite — `49 passed`, `0 failed`;
+- full input-runtime/config regression — `436 passed`, `0 failed`, `0 skipped`;
+- `Validate v0.4 file artifacts PR` #761 — success, all validation groups green;
+- workflow permission остаётся `contents: read`;
+- deterministic restart tests не используют real LLM/MCP network/Telegram/Web/
+  internet calls.
+
+IR-1—IR-7 implementation evidence и исторические boundary подробно сохранены в
 [`v0.4-input-runtime/README.md`](v0.4-input-runtime/README.md) и
 [`v0.4-input-runtime/implementation-sequence.md`](v0.4-input-runtime/implementation-sequence.md).
 
-Этапы IR-8—IR-10 planned. Явно пока не реализованы:
+Этапы IR-9—IR-10 planned. Явно пока не реализованы:
 
-- IR-8 startup recovery/reconstruction;
 - IR-9 complete client projections/diagnostics/config examples;
 - IR-10 full race/restart/synthetic/live acceptance;
 - scheduler/parallel branches/fork-join semantics;
@@ -259,11 +292,11 @@ v0.4-storage-foundation
 - Текущий Telegram FIFO dispatcher является in-process acceptance boundary, а не
   заменой `CycleInbox`.
 - [`v0.4-input-runtime`](v0.4-input-runtime/README.md) отвечает за durable
-  admission, `CycleInbox`, checkpoints, pause/resume, emissions и terminal
-  barrier. Пошаговая реализация находится в
+  admission, `CycleInbox`, checkpoints, pause/resume, emissions, terminal
+  barrier и startup recovery/reconstruction. Пошаговая реализация находится в
   [`implementation-sequence.md`](v0.4-input-runtime/implementation-sequence.md).
-- IR-1—IR-7 уже реализованы; IR-8 startup recovery, IR-9 completion и IR-10 full
-  acceptance ещё planned.
+- IR-1—IR-8 уже реализованы; IR-9 completion и IR-10 full acceptance остаются
+  planned.
 - `AgentEmission` — отдельное durable semantic intermediate message; transient
   `ProgressEvent`, `Question/WAITING_USER` и final `OutputBatch` остаются иными
   semantic lifecycles.
@@ -273,13 +306,14 @@ v0.4-storage-foundation
 - Persisted result и final `OutputBatch READY` не являются terminal authority;
   corrected IR-7 order сначала завершает matching RuntimeHandoff, затем terminal
   snapshot/session и только потом `TERMINAL_COMMITTED`, после которого разрешён
-  claim.
+  claim. IR-8 startup дополнительно preflight-ит уже существующий marker против
+  COMPLETED handoff и matching final OutputBatch до projection repair.
 - Admission-vs-terminal ordering также durable: admission-first aborts stale
   terminal candidate; terminal-first reclassifies stale optimistic continuation
-  в new-cycle `START_CYCLE` within the same call. IR-8 startup repair для normal
-  live race не требуется.
-- Ambiguous/startup reconstruction/reconciliation остаётся IR-8; полная
-  `recover_cycle_authority()` corruption matrix — IR-8/IR-10.
+  в new-cycle `START_CYCLE` within the same call. Startup committed-unadmitted
+  recovery покрывает только process-restart windows, а не эту normal live race.
+- Ambiguous startup runtime не replay-ится blindly; полная randomized corruption/
+  restart permutation matrix остаётся IR-10.
 - Scheduler/parallel branches и Telegram history rewind не реализованы текущим
   input-runtime stage.
 - `v0.4-runtime-modularization` меняет ownership, вводит reusable AgentRuntime,
