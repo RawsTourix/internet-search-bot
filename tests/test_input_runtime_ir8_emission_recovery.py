@@ -155,6 +155,13 @@ async def recover(tmp_path, reader, *, now):
     return repositories, gate, plan
 
 
+async def get_emission(repositories, emission):
+    return await repositories.emissions.get_by_idempotency_key(
+        emission.cycle_id,
+        emission.idempotency_key,
+    )
+
+
 @pytest.fixture(autouse=True)
 def _fresh_handoff_context():
     clear_runtime_handoff_context_for_tests()
@@ -166,7 +173,8 @@ def _fresh_handoff_context():
 async def test_ready_emission_survives_restart_without_transport_send(tmp_path):
     reader, _, _, _, emission = await seed_running(tmp_path)
     fresh, gate, plan = await recover(tmp_path, reader, now=NOW)
-    recovered = await fresh.emissions.get(emission.emission_id)
+    recovered = await get_emission(fresh, emission)
+    assert recovered is not None
     assert recovered.state == EmissionState.READY
     assert recovered.delivery_attempt_count == 0
     assert plan.report.emissions_retained == 1
@@ -189,7 +197,8 @@ async def test_expired_delivering_becomes_unknown_never_ready(tmp_path):
         reader,
         now=NOW + timedelta(seconds=2),
     )
-    recovered = await fresh.emissions.get(emission.emission_id)
+    recovered = await get_emission(fresh, emission)
+    assert recovered is not None
     assert recovered.state == EmissionState.UNKNOWN
     assert recovered.error_code == "delivery_claim_expired"
     assert recovered.delivery_claim_token is None
@@ -216,7 +225,8 @@ async def test_unknown_emission_survives_restart_and_is_not_rearmed(tmp_path):
     assert unknown.state == EmissionState.UNKNOWN
 
     fresh, _, _ = await recover(tmp_path, reader, now=NOW + timedelta(seconds=60))
-    recovered = await fresh.emissions.get(emission.emission_id)
+    recovered = await get_emission(fresh, emission)
+    assert recovered is not None
     assert recovered.state == EmissionState.UNKNOWN
     assert recovered.error_code == "transport_outcome_unknown"
     assert recovered.delivery_attempt_count == 1
@@ -257,7 +267,8 @@ async def test_terminal_old_cycle_ready_is_cancelled_not_claimed(tmp_path):
     clear_runtime_handoff_context_for_tests()
 
     fresh, _, plan = await recover(tmp_path, reader, now=NOW)
-    recovered = await fresh.emissions.get(emission.emission_id)
+    recovered = await get_emission(fresh, emission)
+    assert recovered is not None
     assert recovered.state == EmissionState.CANCELLED
     assert recovered.cancellation_reason_code == "terminal_cycle_startup_fence"
     assert recovered.delivery_attempt_count == 0
