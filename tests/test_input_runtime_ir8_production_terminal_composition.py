@@ -228,12 +228,14 @@ def _compose_fresh_recovery(tmp_path, reader, output_store, monkeypatch):
         clock=lambda: NOW,
         payload_size_resolver=lambda batch: batch.payload_size,
     )
+    mcp = FakeMCP()
     api = SimpleNamespace(
         ingress_services=SimpleNamespace(batch_store=object()),
         input_runtime_repositories=repositories,
         input_admission_service=service,
         execution_coordinator=coordinator,
         output_store=output_store,
+        mcp_client=mcp,
     )
     monkeypatch.setattr(
         lifecycle,
@@ -252,7 +254,6 @@ async def test_production_composed_done_without_terminal_marker_fails_before_mcp
     monkeypatch,
 ):
     reader = await _seed_done_projection_without_marker(tmp_path)
-    mcp = FakeMCP()
     api = _compose_fresh_recovery(tmp_path, reader, OutputStore(), monkeypatch)
 
     with pytest.raises(InputRuntimeRecoveryError) as error:
@@ -260,7 +261,7 @@ async def test_production_composed_done_without_terminal_marker_fails_before_mcp
     assert error.value.reason_code == "terminal_session_without_authoritative_marker"
     assert api.input_runtime_readiness_gate.state == InputRuntimeLifecycleState.FAILED
     assert api.input_runtime_readiness_gate.is_ready is False
-    assert mcp.connect_calls == 0
+    assert api.mcp_client.connect_calls == 0
 
 
 @pytest.mark.asyncio
@@ -269,7 +270,6 @@ async def test_production_composed_terminal_marker_missing_output_fails_before_m
     monkeypatch,
 ):
     reader, _ = await _seed_terminal_runtime(tmp_path)
-    mcp = FakeMCP()
     api = _compose_fresh_recovery(tmp_path, reader, OutputStore(), monkeypatch)
 
     with pytest.raises(InputRuntimeRecoveryError) as error:
@@ -277,7 +277,7 @@ async def test_production_composed_terminal_marker_missing_output_fails_before_m
     assert error.value.reason_code == "finalization_output_missing"
     assert api.input_runtime_readiness_gate.state == InputRuntimeLifecycleState.FAILED
     assert api.input_runtime_readiness_gate.is_ready is False
-    assert mcp.connect_calls == 0
+    assert api.mcp_client.connect_calls == 0
 
 
 @pytest.mark.asyncio
@@ -297,6 +297,7 @@ async def test_production_composed_terminal_without_completed_handoff_is_rejecte
         await api.input_runtime_recovery.recover()
     assert error.value.reason_code == "terminal_handoff_not_completed"
     assert api.input_runtime_readiness_gate.state == InputRuntimeLifecycleState.FAILED
+    assert api.mcp_client.connect_calls == 0
 
 
 @pytest.mark.asyncio
@@ -307,19 +308,18 @@ async def test_production_composed_valid_terminal_restart_is_idempotent_and_loca
     reader, terminal_before = await _seed_terminal_runtime(tmp_path)
     output_store = OutputStore(_matching_output())
     api = _compose_fresh_recovery(tmp_path, reader, output_store, monkeypatch)
-    mcp = FakeMCP()
 
     plan = await api.input_runtime_recovery.recover()
     assert plan.sessions == ()
     assert api.input_runtime_readiness_gate.state == InputRuntimeLifecycleState.RECOVERING
     assert api.input_runtime_readiness_gate.is_ready is False
-    assert mcp.connect_calls == 0
-    assert mcp.tool_calls == 0
-    assert mcp.delivery_calls == 0
+    assert api.mcp_client.connect_calls == 0
+    assert api.mcp_client.tool_calls == 0
+    assert api.mcp_client.delivery_calls == 0
 
     # Production may connect MCP only after deterministic recovery has returned.
-    await mcp.connect_to_servers(())
-    assert mcp.connect_calls == 1
+    await api.mcp_client.connect_to_servers(())
+    assert api.mcp_client.connect_calls == 1
 
     terminal_after = await api.input_runtime_repositories.finalizations.get(
         terminal_before.finalization_id
