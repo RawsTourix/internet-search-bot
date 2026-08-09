@@ -116,26 +116,41 @@ async def test_ir9_complete_projection_scenario_uses_one_semantic_cycle(tmp_path
         session_id="session",
     )
     assert initial.action == InputAdmissionAction.START_CYCLE
-    active = active_cycle(initial.target_cycle_id)
-    initial_checkpoint = await admission.checkpoint_service.run_checkpoint(
-        checkpoint=CheckpointName.RESUME,
-        active_cycle=active,
-        desired_status=CycleStatus.RUNNING,
-    )
-    assert initial_checkpoint.action in {
-        CheckpointAction.CONTINUE,
-        CheckpointAction.INPUT_APPLIED,
-    }
+    assert initial.admission is not None
+    assert initial.should_start_runner is True
+
+    # START_CYCLE admission itself establishes RUNNING durable authority. The
+    # production runner then owns a fenced runtime handoff and creates the
+    # initial snapshot before ordinary safe checkpoints begin.
     running = await diagnostics.status("session")
     assert running.session_status == CycleStatus.RUNNING
     assert running.initial_request is not None
     assert running.initial_request.cycle_id == "cycle-a"
+
+    handoff_token = "integration-runtime-handoff"
+    assert await admission.begin_runtime_handoff(
+        initial.admission,
+        handoff_token=handoff_token,
+    ) is True
+    active = active_cycle(initial.target_cycle_id)
+    initial_context = await admission.checkpoint_service.ensure_initial_context(
+        checkpoint=CheckpointName.RESUME,
+        active_cycle=active,
+        input_batch_id="initial",
+    )
+    assert initial_context.action in {
+        CheckpointAction.CONTINUE,
+        CheckpointAction.INPUT_APPLIED,
+    }
+    running_after_context = await diagnostics.status("session")
+    assert running_after_context.session_status == CycleStatus.RUNNING
 
     queued_outcome = await admission.admit_committed_batch(
         "addition",
         session_id="session",
     )
     assert queued_outcome.action == InputAdmissionAction.QUEUED_RUNNING
+    assert queued_outcome.target_cycle_id == "cycle-a"
     queued = await diagnostics.status("session")
     assert queued.input.queued == 1
     assert queued.additions[0].state.value == "input_addendum_admitted"
@@ -198,7 +213,9 @@ async def test_ir9_complete_projection_scenario_uses_one_semantic_cycle(tmp_path
         session_id="session",
         cycle_id="cycle-a",
     )
-    record = (await admission.finalization_service.prepare(candidate)).record
+    prepared = await admission.finalization_service.prepare(candidate)
+    assert prepared.record is not None
+    record = prepared.record
     record = await admission.finalization_service.persist_result(
         record.finalization_id,
         {"content": "final"},
@@ -211,10 +228,16 @@ async def test_ir9_complete_projection_scenario_uses_one_semantic_cycle(tmp_path
         record.finalization_id
     )
     assert terminal_record.state == FinalizationState.TERMINAL_COMMITTED
+    completed_handoff = await admission.complete_runtime_handoff(
+        initial.admission,
+        handoff_token=handoff_token,
+    )
+    assert completed_handoff.state.value == "completed"
 
     terminal = await diagnostics.status("session")
     assert terminal.session_status == CycleStatus.DONE
     assert terminal.terminal is True
     assert terminal.finalization_state == FinalizationState.TERMINAL_COMMITTED
+    assert terminal.handoff_state.value == "completed"
     assert terminal.active_cycle_id == "cycle-a"
     assert terminal.input.applied_sequence == terminal.input.accepted_sequence == 1
