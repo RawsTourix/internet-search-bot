@@ -1,6 +1,8 @@
-"""Shared compatibility fixtures for pre-IR-8 runtime tests."""
+"""Shared compatibility fixtures for staged input-runtime tests."""
 
 from __future__ import annotations
+
+from datetime import datetime, timezone
 
 import pytest
 
@@ -46,4 +48,26 @@ def _legacy_ir5_api_shells_are_post_start_ready(request, monkeypatch):
         _control_api,
         "_require_runtime_ready",
         _mark_api_ready_then(_control_api._require_runtime_ready),
+    )
+
+
+@pytest.fixture(autouse=True)
+def _ir10_injected_clock_precedes_filesystem_wall_clock(request, monkeypatch):
+    """Keep the IR-10 fake clock deterministic without placing it in the future.
+
+    A few filesystem cleanup methods intentionally stamp durable mutations with
+    their repository-owned UTC clock rather than the service clock.  The IR-10
+    harness therefore injects a fixed time safely before the release run instead
+    of a future timestamp that would make a legitimate cleanup look older than
+    the snapshot it updates.
+    """
+
+    module_name = getattr(request.module, "__name__", "")
+    if module_name != "test_input_runtime_ir10_release":
+        return
+
+    monkeypatch.setattr(
+        request.module,
+        "NOW",
+        datetime(2026, 8, 9, 0, 0, tzinfo=timezone.utc),
     )
