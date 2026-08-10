@@ -27,6 +27,7 @@ on:
       - "src/runtime/session_execution.py"
       - "tests/conftest.py"
       - "tests/test_input_runtime_*.py"
+      - "tests/input_runtime_ir10_external_guard.py"
       - "src/api/mcp.config.example"
       - "scripts/audit_configuration_examples.py"
       - ".github/workflows/validate-input-runtime.yml"
@@ -55,13 +56,17 @@ jobs:
       - name: Run focused IR-9 projection contracts
         run: python -m pytest -q --timeout=20 --timeout-method=thread tests/test_input_runtime_ir9_*.py
       - name: Run focused IR-10 release acceptance
-        run: python -m pytest -q --timeout=30 --timeout-method=thread tests/test_input_runtime_ir10_*.py
+        run: >-
+          python -m pytest -q --timeout=30 --timeout-method=thread
+          -p tests.input_runtime_ir10_external_guard
+          tests/test_input_runtime_ir10_*.py
       - name: Run IR-10 seeded release roast
         env:
           IR10_SEED_SET: release
           IR10_RANDOM_STEPS: "240"
         run: >-
           python -m pytest -q --timeout=30 --timeout-method=thread
+          -p tests.input_runtime_ir10_external_guard
           tests/test_input_runtime_ir10_release.py
           -k seeded_multisession_state_machine
       - name: Run input-runtime contracts and common config audit
