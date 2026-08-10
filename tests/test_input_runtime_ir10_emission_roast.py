@@ -27,6 +27,7 @@ from tests.test_input_runtime_ir10_release import ACTIVE_SEEDS
 
 START = datetime(2026, 8, 9, 0, 0, tzinfo=timezone.utc)
 TRACE_LIMIT = 24
+READY_LIST_LIMIT = 200
 
 
 class Clock:
@@ -177,7 +178,7 @@ async def assert_invariants(
             ready = await repos.emissions.list_ready_for_client(
                 client_type="telegram",
                 client_instance_id="bot-ir10",
-                limit=1000,
+                limit=READY_LIST_LIMIT,
                 now=START + timedelta(days=2),
             )
             assert record.emission_id not in {item.emission_id for item in ready}, trace
