@@ -48,29 +48,23 @@ jobs:
           cache: pip
       - name: Install dependencies
         run: python -m pip install --upgrade pip && python -m pip install -r requirements.txt pytest pytest-asyncio pytest-timeout
-      - name: Compile input runtime and production IR-8/IR-9 callers
-        run: >-
-          python -m compileall -q
-          src/input_runtime
-          src/ingress/recovery.py
-          src/api
-          src/interaction
-          src/localization
-          src/runtime/finalization_bridge.py
-          src/runtime/input_runtime_rehydration.py
-          src/runtime/ir8_session_execution.py
-          src/runtime/__init__.py
-          src/mcp/input_runtime_checkpoints.py
-          src/mcp/input_runtime_controls.py
-          src/mcp/input_runtime_emissions.py
-          src/mcp/ir9_projection_checkpoints.py
-          src/mcp/artifact_delivery_runtime.py
-          src/servers/telegram
-          src/core/message_processor.py
-          src/runtime/session_execution.py
+      - name: Compile complete production tree
+        run: python -m compileall -q src
       - name: Run focused IR-8 restart contracts
         run: python -m pytest -vv --timeout=20 --timeout-method=thread tests/test_input_runtime_ir8_*.py
       - name: Run focused IR-9 projection contracts
         run: python -m pytest -q --timeout=20 --timeout-method=thread tests/test_input_runtime_ir9_*.py
+      - name: Run focused IR-10 release acceptance
+        run: python -m pytest -q --timeout=30 --timeout-method=thread tests/test_input_runtime_ir10_*.py
+      - name: Run IR-10 seeded release roast
+        env:
+          IR10_SEED_SET: release
+          IR10_RANDOM_STEPS: "240"
+        run: >-
+          python -m pytest -q --timeout=30 --timeout-method=thread
+          tests/test_input_runtime_ir10_release.py
+          -k seeded_multisession_state_machine
       - name: Run input-runtime contracts and common config audit
-        run: python -m pytest -q --timeout=20 --timeout-method=thread tests/test_input_runtime_*.py tests/test_artifact_configuration_examples.py
+        run: python -m pytest -q --timeout=30 --timeout-method=thread tests/test_input_runtime_*.py tests/test_artifact_configuration_examples.py
+      - name: Run full repository baseline
+        run: python -m pytest -q --timeout=30 --timeout-method=thread
