@@ -151,6 +151,16 @@ async def assert_invariants(
     records = await all_tracked(repos, tracked)
     assert len({record.emission_id for record in records}) == len(records), trace
 
+    ready = await repos.emissions.list_ready_for_client(
+        client_type="telegram",
+        client_instance_id="bot-ir10",
+        limit=READY_LIST_LIMIT,
+        now=START + timedelta(days=2),
+    )
+    ready_ids = {record.emission_id for record in ready}
+    pending = await repos.emissions.list_pending_delivery()
+    pending_ids = {record.emission_id for record in pending}
+
     for record in records:
         identity = (record.cycle_id, record.idempotency_key)
         expected_id = identities.setdefault(identity, record.emission_id)
@@ -175,13 +185,8 @@ async def assert_invariants(
             EmissionState.DELIVERED,
             EmissionState.CANCELLED,
         }:
-            ready = await repos.emissions.list_ready_for_client(
-                client_type="telegram",
-                client_instance_id="bot-ir10",
-                limit=READY_LIST_LIMIT,
-                now=START + timedelta(days=2),
-            )
-            assert record.emission_id not in {item.emission_id for item in ready}, trace
+            assert record.emission_id not in ready_ids, trace
+            assert record.emission_id not in pending_ids, trace
 
         state = await repos.sessions.get(record.session_id)
         assert state is not None, trace
@@ -190,17 +195,6 @@ async def assert_invariants(
                 EmissionState.READY,
                 EmissionState.DELIVERING,
             }, trace
-
-    pending = await repos.emissions.list_pending_delivery()
-    pending_ids = {record.emission_id for record in pending}
-    for record in records:
-        if record.state in {
-            EmissionState.UNKNOWN,
-            EmissionState.FAILED,
-            EmissionState.DELIVERED,
-            EmissionState.CANCELLED,
-        }:
-            assert record.emission_id not in pending_ids, trace
 
 
 @pytest.mark.asyncio
