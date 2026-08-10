@@ -169,8 +169,4 @@ async def test_ir10_live_profile_30_artifacts_7_messages_and_repeated_addition(t
     snapshot = await repositories.snapshots.get("cycle-live-shape")
     assert snapshot.artifact_refs == expected_active_refs
     revisions = await repositories.context_revisions.list_for_cycle("cycle-live-shape")
-    assert revisions[-1].added_artifact_refs == [
-        *artifacts,
-        artifacts[0],
-        "art_ffffffffffffffffffffffffffffffff",
-    ]
+    assert revisions[-1].added_artifact_refs == expected_active_refs
