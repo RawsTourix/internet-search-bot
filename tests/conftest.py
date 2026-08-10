@@ -52,14 +52,14 @@ def _legacy_ir5_api_shells_are_post_start_ready(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _ir10_injected_clock_precedes_filesystem_wall_clock(request, monkeypatch):
-    """Keep the IR-10 fake clock deterministic without placing it in the future.
+def _ir10_deterministic_harness(request, monkeypatch):
+    """Keep IR-10 deterministic while preserving real recovery semantics.
 
-    A few filesystem cleanup methods intentionally stamp durable mutations with
-    their repository-owned UTC clock rather than the service clock.  The IR-10
-    harness therefore injects a fixed time safely before the release run instead
-    of a future timestamp that would make a legitimate cleanup look older than
-    the snapshot it updates.
+    The filesystem repositories own a few UTC cleanup timestamps independently
+    from the injected service clock, so the fixed IR-10 clock must precede the
+    release run.  The reset/crash scenario also models its post-restart input as
+    genuinely new: it must not be visible in the committed store while startup
+    recovery is reconciling the interrupted reset.
     """
 
     module_name = getattr(request.module, "__name__", "")
@@ -71,3 +71,20 @@ def _ir10_injected_clock_precedes_filesystem_wall_clock(request, monkeypatch):
         "NOW",
         datetime(2026, 8, 9, 0, 0, tzinfo=timezone.utc),
     )
+
+    if request.node.name != (
+        "test_ir10_reset_crash_restart_finishes_once_and_old_generation_stays_fenced"
+    ):
+        return
+
+    original_recover = request.module.recover
+
+    async def recover_before_new_input(root, reader):
+        future_input = reader.batches.pop("new-input", None)
+        try:
+            return await original_recover(root, reader)
+        finally:
+            if future_input is not None:
+                reader.add(future_input)
+
+    monkeypatch.setattr(request.module, "recover", recover_before_new_input)
