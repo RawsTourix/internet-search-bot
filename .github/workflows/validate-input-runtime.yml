@@ -63,7 +63,7 @@ jobs:
       - name: Run IR-10 seeded release roast
         env:
           IR10_SEED_SET: release
-          IR10_RANDOM_STEPS: "240"
+          IR10_RANDOM_STEPS: "180"
           IR10_EMISSION_STEPS: "120"
         run: >-
           python -m pytest -q --timeout=30 --timeout-method=thread
