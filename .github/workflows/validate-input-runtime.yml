@@ -74,4 +74,7 @@ jobs:
       - name: Run full repository baseline
         env:
           AGENT_CONFIG_PATH: src/api/mcp.config.example
+          WEBHOOK_SECRET: ir10-ci-webhook-secret
+          TELEGRAM_FILE_PROVIDER_URL: http://127.0.0.1:8001
+          TELEGRAM_FILE_PROVIDER_TOKEN: ir10-ci-file-provider-token
         run: python -m pytest -q --timeout=30 --timeout-method=thread
