@@ -9,7 +9,7 @@ import pytest
 from src.api import input_runtime_controls as _control_api
 from src.api import session_reset as _reset_api
 from src.input_runtime.recovery import InputRuntimeReadinessGate
-from src.runtime.finalization_bridge import clear_finalization_bridge_for_tests
+from src.runtime import finalization_bridge as _finalization_bridge
 
 
 def _mark_api_ready_then(check):
@@ -53,7 +53,10 @@ def _legacy_ir5_api_shells_are_post_start_ready(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
-def _standalone_output_tests_do_not_inherit_global_ir7_composition(request):
+def _standalone_output_tests_do_not_inherit_global_ir7_composition(
+    request,
+    monkeypatch,
+):
     """Standalone interaction stores must not inherit another test's Api bridge.
 
     IR-7 deliberately binds one process-local final-output eligibility checker
@@ -62,6 +65,9 @@ def _standalone_output_tests_do_not_inherit_global_ir7_composition(request):
     compatibility boundary without an InputRuntime composition root. In a full
     repository run, an earlier Api import can otherwise leak its bridge into
     those stores and make test results collection-order dependent.
+
+    monkeypatch restores the exact prior bridge after each test, so this fixture
+    cannot erase production-composition state needed by later tests.
     """
 
     module_name = getattr(request.module, "__name__", "")
@@ -74,11 +80,8 @@ def _standalone_output_tests_do_not_inherit_global_ir7_composition(request):
     if module_name not in standalone_modules:
         return
 
-    clear_finalization_bridge_for_tests()
-    try:
-        yield
-    finally:
-        clear_finalization_bridge_for_tests()
+    monkeypatch.setattr(_finalization_bridge, "_final_output_assembler", None)
+    monkeypatch.setattr(_finalization_bridge, "_output_eligibility", None)
 
 
 @pytest.fixture(autouse=True)
