@@ -72,4 +72,6 @@ jobs:
       - name: Run input-runtime contracts and common config audit
         run: python -m pytest -q --timeout=30 --timeout-method=thread tests/test_input_runtime_*.py tests/test_artifact_configuration_examples.py
       - name: Run full repository baseline
+        env:
+          AGENT_CONFIG_PATH: src/api/mcp.config.example
         run: python -m pytest -q --timeout=30 --timeout-method=thread
