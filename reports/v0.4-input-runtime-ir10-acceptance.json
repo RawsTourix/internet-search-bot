@@ -4,48 +4,50 @@
   "target_branch": "feature",
   "pull_request": 6,
   "starting_sha": "1f16ede96d76de213433884ce888fbd8007937c9",
-  "code_sha": "8a299202e7a9e5040c9b463a2813aabf99e4612a",
-  "tested_pr_merge_sha": "21be48893c5ec29bac43a45b74a16e8eb2951d0c",
+  "ir9_code_sha": "068f8f6682e7b7b805b60dbb640b53b671cc8565",
+  "code_sha": "315ccd9e9fe6ab457bb39e9529774453fe4ad894",
+  "tested_pr_merge_sha": "867af57ec36c89c2cd17dd5e8d6cabe570d52098",
   "tested_base_sha": "59d23c5fb6b69c3916a3cd94bcde914acf81aa4c",
-  "timestamp": "2026-08-10T07:46:15Z",
+  "timestamp": "2026-08-10T08:00:25Z",
   "python": "CPython 3.12.13",
   "platform": "Ubuntu 24.04.4 / ubuntu-24.04 GitHub Actions",
   "production_changes": 0,
   "history_rewrite": false,
   "compile": {
     "command": "python -m compileall -q src",
-    "status": "success"
+    "status": "success",
+    "duration_seconds_approx": 0.61
   },
   "focused_ir8": {
     "passed": 49,
     "failed": 0,
     "skipped": 0,
-    "duration_seconds": 2.63
+    "duration_seconds": 2.65
   },
   "focused_ir9": {
     "passed": 101,
     "failed": 0,
     "skipped": 0,
-    "duration_seconds": 1.19
+    "duration_seconds": 1.27
   },
   "focused_ir10": {
     "passed": 25,
     "failed": 0,
     "skipped": 0,
-    "duration_seconds": 34.85
+    "duration_seconds": 35.44
   },
   "input_runtime_regression": {
     "passed": 562,
     "failed": 0,
     "skipped": 0,
-    "duration_seconds": 54.84
+    "duration_seconds": 54.5
   },
   "full_repository_baseline": {
     "passed": 1332,
     "subtests_passed": 108,
     "failed": 0,
     "skipped": 0,
-    "duration_seconds": 112.6,
+    "duration_seconds": 112.3,
     "intentional_test_exclusions": []
   },
   "randomized": {
@@ -65,9 +67,11 @@
       999983,
       2147483647
     ],
-    "runtime_transitions": 2880,
+    "runtime_steps_per_seed": 180,
+    "emission_delivery_steps_per_seed": 120,
+    "runtime_transitions": 2160,
     "emission_delivery_transitions": 1440,
-    "transitions": 4320,
+    "transitions": 3600,
     "sessions_per_model": 3,
     "capacity_boundary_scenarios": 24,
     "release_pytest": {
@@ -75,12 +79,32 @@
       "failed": 0,
       "skipped": 0,
       "deselected_non_roast": 7,
-      "duration_seconds": 117.47
+      "duration_seconds": 93.21
     },
     "failures": 0,
     "reproduced_production_failures": 0,
     "unreproduced_failures": 0,
-    "flaky": 0
+    "flaky": 0,
+    "retained_seed_failures": []
+  },
+  "flake_investigation": {
+    "events": [
+      {
+        "workflow": "Validate Input Runtime #759",
+        "run_id": 31367446449,
+        "classification": "acceptance_harness_performance_flake",
+        "symptom": "30 second per-test timeout during normal filesystem os.fsync in 240-step runtime model",
+        "semantic_invariant_failure": false,
+        "external_calls": 0,
+        "seed_removed": false,
+        "timeout_increased": false,
+        "resolution": "reduce filesystem-heavy runtime repetitions from 240 to 180 per seed while preserving all 12 seeds, operations and invariants",
+        "verification_workflow": "Validate Input Runtime #761",
+        "verification_run_id": 31367804201,
+        "verification_result": "success"
+      }
+    ],
+    "remaining_flaky": 0
   },
   "restart": {
     "focused_ir8_tests": 49,
@@ -124,21 +148,23 @@
   },
   "ci": {
     "validate_input_runtime": {
-      "run_number": 755,
-      "run_id": 31366811919,
+      "run_number": 761,
+      "run_id": 31367804201,
+      "job_id": 93389906743,
       "status": "completed",
       "conclusion": "success"
     },
     "validate_v04_file_artifacts_pr": {
-      "run_number": 838,
-      "run_id": 31366811751,
+      "run_number": 841,
+      "run_id": 31367804207,
       "status": "completed",
       "conclusion": "success"
     },
     "permissions": {
       "contents": "read"
     },
-    "job_timeout_minutes": 10
+    "job_timeout_minutes": 10,
+    "per_test_timeout_seconds_release": 30
   },
   "defects": {
     "blocking_production": 0,
