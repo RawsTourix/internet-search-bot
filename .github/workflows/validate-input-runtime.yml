@@ -70,7 +70,8 @@ jobs:
           -p tests.input_runtime_ir10_external_guard
           tests/test_input_runtime_ir10_release.py
           tests/test_input_runtime_ir10_emission_roast.py
-          -k "seeded_multisession_state_machine or seeded_emission_delivery_state_machine"
+          tests/test_input_runtime_ir10_capacity_roast.py
+          -k "seeded_multisession_state_machine or seeded_emission_delivery_state_machine or seeded_exact_"
       - name: Run input-runtime contracts and common config audit
         run: python -m pytest -q --timeout=30 --timeout-method=thread tests/test_input_runtime_*.py tests/test_artifact_configuration_examples.py
       - name: Run full repository baseline
