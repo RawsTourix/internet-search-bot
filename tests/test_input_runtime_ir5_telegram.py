@@ -125,6 +125,16 @@ def test_runtime_control_handlers_are_high_priority_and_ingress_cancel_is_untouc
 def test_runtime_state_composition_seam_installs_into_real_host_shape(monkeypatch):
     application = FakeApplication()
     fake_host = SimpleNamespace(application=application)
+    # The compatibility seam intentionally discovers an already-created host by
+    # scanning sys.modules. A full repository run may have imported the real
+    # Telegram host earlier, so remove only that competing entry for this
+    # synthetic host-shape test; otherwise its result depends on collection
+    # order while the isolated focused run passes.
+    monkeypatch.delitem(
+        sys.modules,
+        "src.servers.telegram.telegram_server",
+        raising=False,
+    )
     monkeypatch.setitem(
         sys.modules,
         "test.servers.telegram.telegram_server",
