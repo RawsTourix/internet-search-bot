@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import sys
 from collections import deque
 from contextlib import asynccontextmanager
 from contextvars import ContextVar
@@ -120,7 +121,7 @@ class TelegramSessionDispatcher:
             raise RuntimeError("Telegram session dispatcher is shutting down")
 
         # A callback that is already executing inside its own lane must not
-        # enqueue behind itself and deadlock.  Execute it inline instead.
+        # enqueue behind itself and deadlock. Execute it inline instead.
         if _CURRENT_DISPATCH_KEY.get() == normalized:
             return operation()
 
@@ -306,3 +307,25 @@ class SessionGenerationRegistry:
 
     def is_current(self, session_id: str, generation: int) -> bool:
         return self.current(session_id) == generation
+
+
+def _install_ir5_runtime_control_handlers_if_host_ready() -> None:
+    """Use this transport composition seam without importing app authority.
+
+    ``telegram_server`` creates its ``Application`` before importing this module,
+    so the concrete transport can register high-priority runtime-control
+    handlers here while the application/domain layers remain Telegram-neutral.
+    The handler itself lazily resolves server helpers only when an update runs.
+    """
+    from .runtime_control_handlers import install_runtime_control_handlers
+
+    for module_name, module in tuple(sys.modules.items()):
+        if not module_name.endswith(".servers.telegram.telegram_server"):
+            continue
+        application = getattr(module, "application", None)
+        if application is not None:
+            install_runtime_control_handlers(application)
+            return
+
+
+_install_ir5_runtime_control_handlers_if_host_ready()

@@ -3,7 +3,7 @@ id: design.v0.6.index
 version: v0.6
 spec_status: draft
 implementation_status: planned
-last_reviewed: 2026-08-02
+last_reviewed: 2026-08-05
 ---
 
 # v0.6 — Distributed runtime
@@ -19,8 +19,14 @@ DIRECT | SINGLE_TASK | PLANNED_TASK | WORKFLOW
 → scheduler, safe fork/join and adaptive workflow revisions
 ```
 
-`CycleInbox` остаётся durable delivery/admission boundary. Поверх него новые
+`CycleInbox` сохраняет durable delivery/admission boundary из
+[`v0.4-input-runtime`](../v0.4/v0.4-input-runtime/README.md). Поверх неё новые
 inputs получают intervention semantics относительно active run/workflow.
+
+Линейные `CycleContextRevision` v0.4 становятся основой task-local revisions и
+controlled merge, но v0.6 не переносит полные sibling LLM histories в общую
+ветку. Scheduler объединяет structured results, exact refs, constraints и
+provenance.
 
 Локальная scope-модель и config-backed MCP registry foundation создаются в
 [`v0.4-mcp-registry-foundation`](../v0.4/v0.4-mcp-registry-foundation/README.md).
@@ -58,12 +64,41 @@ Single-process self-hosted development остаётся Service Application и �
 | 2 | `v0.6.2-agent-run-lifecycle` | Durable request/run API и deadlines |
 | 3 | `v0.6.3-task-runtime` | Execution modes, TaskRun и bounded context |
 | 4 | `v0.6.4-workflow-orchestration` | Workflow scheduler, revisions и fork/join |
-| 5 | `v0.6.5-interventions-and-cycle-inbox` | User input во время active run |
-| 6 | `v0.6.6-event-bus-and-delivery` | Progress bus и Notification/Delivery boundary |
+| 5 | `v0.6.5-interventions-and-cycle-inbox` | User input во время active run поверх v0.4 admission/watermarks |
+| 6 | `v0.6.6-event-bus-and-delivery` | Progress/emission bus и Notification/Delivery boundary |
 | 7 | `v0.6.7-background-workers` | Extraction/conversion/summarization/cleanup workers |
 | 8 | `v0.6.8-object-storage-and-payload-runtime` | Multi-process payload transport |
 | 9 | [`v0.6.9-distributed-capability-registry`](distributed-capability-registry.md) | Durable MCP registry, worker-visible revisions и ownership-ready scopes |
 | 10 | `v0.6.10-service-boundary-stabilization` | Process/service hardening и readiness |
+
+## Наследуемые контракты input runtime
+
+v0.6 расширяет, но не заменяет:
+
+```text
+CommittedInputBatch → InputAdmissionRecord
+ordered CycleInbox delivery
+session/cycle sequence and watermarks
+idempotent application
+control priority/generation fencing
+context revision identity
+AgentEmission identity
+finalization barrier
+```
+
+Distributed additions:
+
+```text
+worker lease/fencing token
+agent_run_id/workflow_id/task_run_id
+UserIntervention classification
+workflow revision
+parallel task branch
+controlled structured merge
+```
+
+Redis/event bus является signal/acceleration layer; PostgreSQL остаётся source of
+truth для admission, interventions, task state, results и terminal commit.
 
 ## Зависимости
 
@@ -74,7 +109,9 @@ Single-process self-hosted development остаётся Service Application и �
 - [`../v0.4/v0.4-runtime-modularization/README.md`](../v0.4/v0.4-runtime-modularization/README.md);
 - [`../v0.4/v0.4-mcp-registry-foundation/README.md`](../v0.4/v0.4-mcp-registry-foundation/README.md);
 - [`../v0.4/v0.4-dag-planning.md`](../v0.4/v0.4-dag-planning.md);
-- [`../v0.4/v0.4-input-runtime.md`](../v0.4/v0.4-input-runtime.md);
+- [`../v0.4/v0.4-input-runtime/README.md`](../v0.4/v0.4-input-runtime/README.md);
+- [`../v0.4/v0.4-input-runtime/domain-models-and-state-machines.md`](../v0.4/v0.4-input-runtime/domain-models-and-state-machines.md);
+- [`../v0.4/v0.4-input-runtime/checkpoints-and-context-revisions.md`](../v0.4/v0.4-input-runtime/checkpoints-and-context-revisions.md);
 - [`../v0.4/v0.4-file-artifacts-advanced/output-delivery.md`](../v0.4/v0.4-file-artifacts-advanced/output-delivery.md).
 
 Skills используют orchestration boundaries v0.6 и описаны в

@@ -47,6 +47,13 @@ class ActiveAgentCycle:
     activity: AgentActivity | None = None
     plan_reconciliation_attempts: int = 0
 
+    input_runtime_generation: int = 0
+    active_context_revision_id: str | None = None
+    applied_input_batch_ids: list[str] = field(default_factory=list)
+    applied_through_cycle_sequence: int = 0
+    input_runtime_safe_checkpoint: str | None = None
+    input_runtime_snapshot_revision: int = 0
+
     tools_used: list[str] = field(default_factory=list)
     progress_events: list[dict[str, Any]] = field(default_factory=list)
 

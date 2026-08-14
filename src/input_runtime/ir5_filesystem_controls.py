@@ -1,0 +1,407 @@
+"""IR-5 filesystem control adapter extensions.
+
+The application layer uses command-oriented methods only; these audit reads are
+also useful to deterministic tests and future diagnostics without exposing file
+paths or layout.
+"""
+from __future__ import annotations
+
+from ._filesystem_common import validated_copy
+from ._filesystem_identity_recovery_common import recover_cycle_authority
+from . import _filesystem_identity_recovery_session as _session_control_module
+from ._filesystem_session import _same_control_relation
+from .errors import InputRuntimeConflictError, InputRuntimeNotFoundError
+from .models import (
+    ControlCommandType,
+    ControlState,
+    CycleStatus,
+    SessionControlCommand,
+    SessionInputRuntimeState,
+)
+from .serialization import read_model
+
+
+_BaseControlRepository = _session_control_module.FileSystemSessionControlRepository
+_TERMINAL_OR_IDLE = {
+    CycleStatus.IDLE,
+    CycleStatus.DONE,
+    CycleStatus.ERROR,
+    CycleStatus.CANCELLED,
+}
+
+
+def atomic_write_model(path, model):
+    """Preserve both legacy and IR-5 deterministic fault-injection seams."""
+    return _session_control_module.atomic_write_model(path, model)
+
+
+def _external_source_ref(command: SessionControlCommand) -> dict:
+    ref = command.source_message_ref or {}
+    source = ref.get("source")
+    return source if isinstance(source, dict) else {}
+
+
+def _same_continue_delivery_relation(
+    existing: SessionControlCommand,
+    incoming: SessionControlCommand,
+) -> bool:
+    """Compare only caller-owned continue identity, never frozen authority."""
+    return (
+        existing.session_id,
+        existing.command,
+        existing.idempotency_key,
+        existing.source_client_type,
+        _external_source_ref(existing),
+    ) == (
+        incoming.session_id,
+        incoming.command,
+        incoming.idempotency_key,
+        incoming.source_client_type,
+        _external_source_ref(incoming),
+    )
+
+
+class FileSystemSessionControlRepository(_BaseControlRepository):
+    async def get(self, control_id: str) -> SessionControlCommand | None:
+        return self._recover_by_id(control_id)
+
+    async def list_for_session(
+        self,
+        session_id: str,
+    ) -> tuple[SessionControlCommand, ...]:
+        return await self._all(session_id)
+
+    def _restore_indexes(self, command: SessionControlCommand) -> None:
+        if (
+            command.target_cycle_id is not None
+            and command.state != ControlState.REJECTED
+        ):
+            recover_cycle_authority(
+                self,
+                command.target_cycle_id,
+                command.session_id,
+            )
+        self._index(command)
+        if (
+            command.target_cycle_id is not None
+            and command.state != ControlState.REJECTED
+        ):
+            self._ensure_cycle_authority(
+                command.target_cycle_id,
+                command.session_id,
+            )
+
+    async def _repair_control_frontier_locked(
+        self,
+        state_path,
+        state: SessionInputRuntimeState,
+    ) -> SessionInputRuntimeState:
+        rows = await self._all(state.session_id)
+        by_sequence: dict[int, str] = {}
+        frontier = state.pending_control_sequence
+        frontier_time = state.updated_at
+        for row in rows:
+            previous = by_sequence.get(row.sequence_number)
+            if previous is not None and previous != row.control_id:
+                raise InputRuntimeConflictError(
+                    "duplicate durable control sequence for session"
+                )
+            by_sequence[row.sequence_number] = row.control_id
+            frontier = max(frontier, row.sequence_number)
+            frontier_time = max(frontier_time, row.created_at)
+        if frontier <= state.pending_control_sequence:
+            return state
+        repaired = validated_copy(
+            state,
+            pending_control_sequence=frontier,
+            revision=state.revision + 1,
+            updated_at=frontier_time,
+        )
+        atomic_write_model(state_path, repaired)
+        return repaired
+
+    async def allocate(
+        self,
+        command: SessionControlCommand,
+    ) -> SessionControlCommand:
+        async with self.locks.hold_identity_then_session(
+            self.root,
+            command.session_id,
+        ):
+            state_path = self.layout.state(command.session_id)
+            if not state_path.exists():
+                raise InputRuntimeNotFoundError(
+                    "session runtime state required for control allocation"
+                )
+            state = read_model(state_path, SessionInputRuntimeState)
+            state = await self._repair_control_frontier_locked(state_path, state)
+
+            existing = await self.get_by_idempotency_key(
+                command.session_id,
+                command.idempotency_key,
+            )
+            if existing is not None:
+                if not _same_control_relation(existing, command):
+                    raise InputRuntimeConflictError(
+                        "control idempotency relation changed"
+                    )
+                self._restore_indexes(existing)
+                await self._repair_existing_pending(state_path, state, existing)
+                return existing
+            if command.generation != state.generation:
+                raise InputRuntimeConflictError("control generation changed")
+
+            allocated = validated_copy(
+                command,
+                sequence_number=state.pending_control_sequence + 1,
+            )
+            by_id = self._recover_by_id(allocated.control_id)
+            if by_id is not None:
+                if by_id != allocated:
+                    raise InputRuntimeConflictError(
+                        "control stable ID collision"
+                    )
+                self._restore_indexes(by_id)
+                await self._repair_existing_pending(state_path, state, by_id)
+                return by_id
+
+            if (
+                allocated.target_cycle_id is not None
+                and allocated.state != ControlState.REJECTED
+            ):
+                recover_cycle_authority(
+                    self,
+                    allocated.target_cycle_id,
+                    allocated.session_id,
+                )
+            atomic_write_model(
+                self.layout.control(
+                    allocated.session_id,
+                    allocated.control_id,
+                ),
+                allocated,
+            )
+            self._index(allocated)
+            if (
+                allocated.target_cycle_id is not None
+                and allocated.state != ControlState.REJECTED
+            ):
+                self._ensure_cycle_authority(
+                    allocated.target_cycle_id,
+                    allocated.session_id,
+                )
+            atomic_write_model(
+                state_path,
+                self._state_after_control(state, allocated),
+            )
+            return allocated
+
+    async def accept_continue(
+        self,
+        command: SessionControlCommand,
+    ) -> SessionControlCommand:
+        """Freeze the continue input target at its durable session boundary."""
+        if command.command != ControlCommandType.CONTINUE:
+            raise InputRuntimeConflictError(
+                "accept_continue requires continue command"
+            )
+        async with self.locks.hold_identity_then_session(
+            self.root,
+            command.session_id,
+        ):
+            state_path = self.layout.state(command.session_id)
+            if state_path.exists():
+                state = read_model(state_path, SessionInputRuntimeState)
+            else:
+                state = SessionInputRuntimeState(
+                    session_id=command.session_id,
+                    generation=0,
+                    created_at=command.created_at,
+                    updated_at=command.created_at,
+                )
+                atomic_write_model(state_path, state)
+            state = await self._repair_control_frontier_locked(state_path, state)
+
+            existing = await self.get_by_idempotency_key(
+                command.session_id,
+                command.idempotency_key,
+            )
+            if existing is not None:
+                if not _same_continue_delivery_relation(existing, command):
+                    raise InputRuntimeConflictError(
+                        "continue idempotency relation changed"
+                    )
+                self._restore_indexes(existing)
+                await self._repair_existing_pending(state_path, state, existing)
+                return existing
+
+            active = (
+                state.active_cycle_id is not None
+                and state.cycle_status not in _TERMINAL_OR_IDLE
+            )
+            source_ref = {"source": _external_source_ref(command)}
+            if active:
+                source_ref["runtime"] = {
+                    "accepted_input_through_sequence": (
+                        state.active_cycle_accepted_through_sequence
+                    ),
+                }
+
+            allocated = validated_copy(
+                command,
+                target_cycle_id=(
+                    state.active_cycle_id
+                    if active
+                    else command.target_cycle_id
+                ),
+                generation=state.generation,
+                sequence_number=state.pending_control_sequence + 1,
+                state=(
+                    ControlState.QUEUED
+                    if active
+                    else ControlState.REJECTED
+                ),
+                source_message_ref=source_ref,
+                rejection_code=(
+                    None if active else "nothing_to_continue"
+                ),
+            )
+            by_id = self._recover_by_id(allocated.control_id)
+            if by_id is not None:
+                if by_id != allocated:
+                    raise InputRuntimeConflictError(
+                        "control stable ID collision"
+                    )
+                self._restore_indexes(by_id)
+                await self._repair_existing_pending(state_path, state, by_id)
+                return by_id
+
+            if allocated.state != ControlState.REJECTED:
+                recover_cycle_authority(
+                    self,
+                    allocated.target_cycle_id,
+                    allocated.session_id,
+                )
+            atomic_write_model(
+                self.layout.control(
+                    allocated.session_id,
+                    allocated.control_id,
+                ),
+                allocated,
+            )
+            self._index(allocated)
+            if allocated.state != ControlState.REJECTED:
+                self._ensure_cycle_authority(
+                    allocated.target_cycle_id,
+                    allocated.session_id,
+                )
+            atomic_write_model(
+                state_path,
+                self._state_after_control(state, allocated),
+            )
+            return allocated
+
+    async def accept_reset(
+        self,
+        command: SessionControlCommand,
+    ) -> tuple[SessionControlCommand, SessionInputRuntimeState]:
+        async with self.locks.hold_identity_then_session(
+            self.root,
+            command.session_id,
+        ):
+            state_path = self.layout.state(command.session_id)
+            if not state_path.exists():
+                raise InputRuntimeNotFoundError(
+                    "session runtime state required for reset"
+                )
+            state = read_model(state_path, SessionInputRuntimeState)
+            state = await self._repair_control_frontier_locked(state_path, state)
+
+            existing = await self.get_by_idempotency_key(
+                command.session_id,
+                command.idempotency_key,
+            )
+            if existing is not None:
+                if not _same_control_relation(existing, command):
+                    raise InputRuntimeConflictError(
+                        "control idempotency relation changed"
+                    )
+                self._restore_indexes(existing)
+                if state.generation == existing.generation:
+                    next_state = validated_copy(
+                        state,
+                        generation=state.generation + 1,
+                        active_cycle_id=None,
+                        cycle_status=CycleStatus.IDLE,
+                        active_cycle_accepted_through_sequence=0,
+                        active_cycle_applied_through_sequence=0,
+                        active_context_revision_id=None,
+                        finalization_id=None,
+                        pending_control_sequence=max(
+                            state.pending_control_sequence,
+                            existing.sequence_number,
+                        ),
+                        revision=state.revision + 1,
+                        updated_at=max(state.updated_at, existing.created_at),
+                    )
+                    atomic_write_model(state_path, next_state)
+                    return existing, next_state
+                if state.generation >= existing.generation + 1:
+                    repaired = await self._repair_existing_pending(
+                        state_path,
+                        state,
+                        existing,
+                    )
+                    return existing, repaired
+                raise InputRuntimeConflictError("reset generation diverged")
+
+            if command.generation != state.generation:
+                raise InputRuntimeConflictError("reset generation changed")
+            allocated = validated_copy(
+                command,
+                sequence_number=state.pending_control_sequence + 1,
+            )
+            by_id = self._recover_by_id(allocated.control_id)
+            if by_id is not None:
+                if by_id != allocated:
+                    raise InputRuntimeConflictError(
+                        "control stable ID collision"
+                    )
+                self._restore_indexes(by_id)
+                raise InputRuntimeConflictError(
+                    "reset record exists without idempotency relation"
+                )
+            if allocated.target_cycle_id is not None:
+                recover_cycle_authority(
+                    self,
+                    allocated.target_cycle_id,
+                    allocated.session_id,
+                )
+            atomic_write_model(
+                self.layout.control(
+                    allocated.session_id,
+                    allocated.control_id,
+                ),
+                allocated,
+            )
+            self._index(allocated)
+            if allocated.target_cycle_id is not None:
+                self._ensure_cycle_authority(
+                    allocated.target_cycle_id,
+                    allocated.session_id,
+                )
+            next_state = validated_copy(
+                state,
+                generation=state.generation + 1,
+                active_cycle_id=None,
+                cycle_status=CycleStatus.IDLE,
+                active_cycle_accepted_through_sequence=0,
+                active_cycle_applied_through_sequence=0,
+                active_context_revision_id=None,
+                finalization_id=None,
+                pending_control_sequence=allocated.sequence_number,
+                revision=state.revision + 1,
+                updated_at=max(state.updated_at, allocated.created_at),
+            )
+            atomic_write_model(state_path, next_state)
+            return allocated, next_state

@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from ..runtime.finalization_bridge import output_delivery_allowed
 from .errors import OutputBatchConflictError
 from .ids import is_interaction_id
 from .output_models import OutputBatch, OutputBatchKind, OutputBatchState
@@ -70,9 +71,8 @@ class ReadyOutputOutboxRef(BaseModel):
 class ReadyOutputOutboxService:
     """Expose only delivery attempts that are still safe to start.
 
-    The filesystem implementation scans the v0.4 store and returns a bounded
-    minimal projection. A future database/queue repository can implement the
-    same application contract without changing transport workers.
+    READY persistence is not delivery authority for a final aggregate. IR-7
+    therefore filters final records through the durable terminal-commit gate.
     """
 
     MAX_LIMIT = 500
@@ -120,18 +120,20 @@ class ReadyOutputOutboxService:
         )
 
         candidates = await self.store.list_recoverable()
-        ready = [
-            batch
-            for batch in candidates
-            if batch.state == OutputBatchState.READY
-            and batch.kind == kind
-            and (batch.ready_at or batch.created_at) <= ready_before
-            and batch.capability_snapshot.client_type == normalized_client
-            and (
-                batch.capability_snapshot.client_instance_id
-                == normalized_instance
-            )
-        ]
+        ready: list[OutputBatch] = []
+        for batch in candidates:
+            if (
+                batch.state != OutputBatchState.READY
+                or batch.kind != kind
+                or (batch.ready_at or batch.created_at) > ready_before
+                or batch.capability_snapshot.client_type != normalized_client
+                or batch.capability_snapshot.client_instance_id
+                != normalized_instance
+            ):
+                continue
+            if not await output_delivery_allowed(batch):
+                continue
+            ready.append(batch)
         ready.sort(
             key=lambda batch: (
                 batch.ready_at or batch.created_at,

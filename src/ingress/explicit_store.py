@@ -5,20 +5,21 @@ from __future__ import annotations
 import asyncio
 from collections import defaultdict
 
-from ..artifacts.errors import ArtifactIntegrityError
-from ..storage.config import StorageConfigType
-from .collection_models import InputCollectionRecord, InputDraftScope
-from .collection_store import FileSystemInputCollectionStore
-from .explicit_policy import (
+from src.artifacts.errors import ArtifactIntegrityError
+from src.storage.config import StorageConfigType
+from src.ingress.collection_models import InputCollectionRecord, InputDraftScope
+from src.ingress.collection_store import FileSystemInputCollectionStore
+from src.ingress.committed_sequence_compat import SchemaAwareCommittedSequenceMixin
+from src.ingress.explicit_policy import (
     EXPLICIT_COLLECTION_COMMIT_REASON,
     EXPLICIT_COLLECTION_GROUPING_MODE,
     is_explicit_collection_draft,
     is_legacy_explicit_collection_draft,
 )
-from .grouping import _OPEN_STATES
-from .models import InputBatchDraft, InputBatchDraftState, utc_now
-from .resilient_store import ResilientFileSystemCoordinatedInputBatchStore
-from .store import IngressConflictError
+from src.ingress.grouping import _OPEN_STATES
+from src.ingress.models import InputBatchDraft, InputBatchDraftState, utc_now
+from src.ingress.resilient_store import ResilientFileSystemCoordinatedInputBatchStore
+from src.ingress.store import IngressConflictError
 
 
 class FileSystemExplicitInputCollectionStore(FileSystemInputCollectionStore):
@@ -67,7 +68,8 @@ class FileSystemExplicitInputCollectionStore(FileSystemInputCollectionStore):
 
 
 class ExplicitCollectionInputBatchStore(
-    ResilientFileSystemCoordinatedInputBatchStore
+    SchemaAwareCommittedSequenceMixin,
+    ResilientFileSystemCoordinatedInputBatchStore,
 ):
     """Persist explicit drafts without transport quiet/deadline semantics."""
 

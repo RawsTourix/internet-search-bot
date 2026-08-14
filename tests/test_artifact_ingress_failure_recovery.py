@@ -23,6 +23,7 @@ from src.ingress import (
     create_ingress_services,
 )
 from src.ingress.store import FileSystemInputBatchStore, IngressConflictError
+from src.input_runtime.recovery import InputRuntimeReadinessGate
 from src.storage import StorageConfigType, create_storage_services
 
 
@@ -176,8 +177,6 @@ class ArtifactIngressFailureRecoveryTests(unittest.IsolatedAsyncioTestCase):
             failed.failure_code,
             "artifact_ingress_storage_failed",
         )
-        # The exact failed media-group key remains as a terminal tombstone,
-        # but it is not returned by list_open_drafts.
         self.assertEqual(
             len(list(self.ingress.batch_store.group_index_dir.glob("*.json"))),
             1,
@@ -255,10 +254,17 @@ class ArtifactIngressFailureRecoveryTests(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(result.state, "collecting")
 
+        gate = InputRuntimeReadinessGate()
+        gate.begin_recovery()
+        gate.mark_ready()
         fake_mcp = _FakeMcpClient()
         fake_api = SimpleNamespace(
             ingress_services=self.ingress,
             mcp_client=fake_mcp,
+            input_runtime_readiness_gate=gate,
+            input_runtime_repositories=SimpleNamespace(
+                sessions=SimpleNamespace(get=AsyncMock(return_value=None))
+            ),
         )
         reset = await reset_runtime_session(fake_api, self.session_id)
 

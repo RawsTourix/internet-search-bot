@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timezone
-from pathlib import Path
 
+from ..runtime.finalization_bridge import output_delivery_allowed
 from .errors import (
     InteractionIntegrityError,
     InteractionStorageError,
@@ -20,9 +20,9 @@ class IdempotentOutputClaimService:
     """Persist one stable request key for a durable OutputBatch claim.
 
     A retry with the same request ID receives the original attempt. Another
-    request ID cannot join an active claim. The filesystem implementation uses
-    the OutputBatch store lock and byte rollback; a future SQL repository maps
-    this contract to a unique constraint and one transaction.
+    request ID cannot join an active claim. New READY final claims additionally
+    require IR-7 terminal authority; an already-started DELIVERING replay keeps
+    the pre-existing transport attempt.
     """
 
     def __init__(self, store: FileSystemOutputBatchStore) -> None:
@@ -42,6 +42,14 @@ class IdempotentOutputClaimService:
         claim_request_id: str,
         now: datetime | None = None,
     ) -> tuple[OutputBatch, str]:
+        current = await self.store.get(output_batch_id)
+        if (
+            current.state == OutputBatchState.READY
+            and not await output_delivery_allowed(current)
+        ):
+            raise OutputBatchConflictError(
+                "final OutputBatch is not terminal-committed"
+            )
         return await asyncio.to_thread(
             self._claim_sync,
             output_batch_id,

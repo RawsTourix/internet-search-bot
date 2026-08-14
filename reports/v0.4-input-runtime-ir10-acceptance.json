@@ -1,0 +1,189 @@
+{
+  "repository": "RawsTourix/internet-search-bot",
+  "branch": "feat/v0.4-input-runtime",
+  "target_branch": "feature",
+  "pull_request": 6,
+  "starting_sha": "1f16ede96d76de213433884ce888fbd8007937c9",
+  "ir9_code_sha": "068f8f6682e7b7b805b60dbb640b53b671cc8565",
+  "code_sha": "315ccd9e9fe6ab457bb39e9529774453fe4ad894",
+  "tested_pr_merge_sha": "867af57ec36c89c2cd17dd5e8d6cabe570d52098",
+  "tested_base_sha": "59d23c5fb6b69c3916a3cd94bcde914acf81aa4c",
+  "timestamp": "2026-08-10T08:00:25Z",
+  "python": "CPython 3.12.13",
+  "platform": "Ubuntu 24.04.4 / ubuntu-24.04 GitHub Actions",
+  "production_changes": 0,
+  "history_rewrite": false,
+  "compile": {
+    "command": "python -m compileall -q src",
+    "status": "success",
+    "duration_seconds_approx": 0.61
+  },
+  "focused_ir8": {
+    "passed": 49,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 2.65
+  },
+  "focused_ir9": {
+    "passed": 101,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 1.27
+  },
+  "focused_ir10": {
+    "passed": 25,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 35.44
+  },
+  "input_runtime_regression": {
+    "passed": 562,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 54.5
+  },
+  "full_repository_baseline": {
+    "passed": 1332,
+    "subtests_passed": 108,
+    "failed": 0,
+    "skipped": 0,
+    "duration_seconds": 112.3,
+    "intentional_test_exclusions": []
+  },
+  "randomized": {
+    "status": "success",
+    "seed_count": 12,
+    "seeds": [
+      20260810,
+      104729,
+      8675309,
+      424242,
+      1,
+      7,
+      42,
+      271828,
+      314159,
+      1618033,
+      999983,
+      2147483647
+    ],
+    "runtime_steps_per_seed": 180,
+    "emission_delivery_steps_per_seed": 120,
+    "runtime_transitions": 2160,
+    "emission_delivery_transitions": 1440,
+    "transitions": 3600,
+    "sessions_per_model": 3,
+    "capacity_boundary_scenarios": 24,
+    "release_pytest": {
+      "passed": 48,
+      "failed": 0,
+      "skipped": 0,
+      "deselected_non_roast": 7,
+      "duration_seconds": 93.21
+    },
+    "failures": 0,
+    "reproduced_production_failures": 0,
+    "unreproduced_failures": 0,
+    "flaky": 0,
+    "retained_seed_failures": []
+  },
+  "flake_investigation": {
+    "events": [
+      {
+        "workflow": "Validate Input Runtime #759",
+        "run_id": 31367446449,
+        "classification": "acceptance_harness_performance_flake",
+        "symptom": "30 second per-test timeout during normal filesystem os.fsync in 240-step runtime model",
+        "semantic_invariant_failure": false,
+        "external_calls": 0,
+        "seed_removed": false,
+        "timeout_increased": false,
+        "resolution": "reduce filesystem-heavy runtime repetitions from 240 to 180 per seed while preserving all 12 seeds, operations and invariants",
+        "verification_workflow": "Validate Input Runtime #761",
+        "verification_run_id": 31367804201,
+        "verification_result": "success"
+      }
+    ],
+    "remaining_flaky": 0
+  },
+  "restart": {
+    "focused_ir8_tests": 49,
+    "ir10_scenarios": 5,
+    "fresh_interpreter_scenarios": 2,
+    "fresh_interpreter_recovery_launches": 3,
+    "repeated_same_root_waiting_recovery": 3,
+    "repetitions": 3,
+    "status": "success"
+  },
+  "corruption": {
+    "scenarios": 37,
+    "derived_identity_index_cases": 30,
+    "core_cycle_authority_cases": 7,
+    "silent_immutable_contradiction_repair": 0,
+    "status": "success"
+  },
+  "synthetic": {
+    "scenarios": [
+      "running_burst",
+      "pause_resume_frozen_target",
+      "waiting_restart_reply_same_cycle",
+      "reset_cleanup_crash_restart",
+      "partial_terminal_ordering",
+      "live_shaped_30_artifacts_7_messages",
+      "multi_session_randomized_marathon",
+      "production_like_ir9_integration"
+    ],
+    "scenario_count": 8,
+    "failures": 0,
+    "duplicate_external_side_effects": 0,
+    "status": "success"
+  },
+  "external_calls_automated": {
+    "llm": 0,
+    "mcp_network": 0,
+    "telegram": 0,
+    "web": 0,
+    "internet": 0,
+    "agent_cycle_external_path": 0
+  },
+  "ci": {
+    "validate_input_runtime": {
+      "run_number": 761,
+      "run_id": 31367804201,
+      "job_id": 93389906743,
+      "status": "completed",
+      "conclusion": "success"
+    },
+    "validate_v04_file_artifacts_pr": {
+      "run_number": 841,
+      "run_id": 31367804207,
+      "status": "completed",
+      "conclusion": "success"
+    },
+    "permissions": {
+      "contents": "read"
+    },
+    "job_timeout_minutes": 10,
+    "per_test_timeout_seconds_release": 30
+  },
+  "defects": {
+    "blocking_production": 0,
+    "required_production_hardening": 0,
+    "production_fixes": []
+  },
+  "live_acceptance": {
+    "status": "pending",
+    "tested_sha": null,
+    "reason": "No safe direct maintainer Telegram/runtime environment was available in this automated GitHub execution. Real Telegram, LLM and safe read-only MCP acceptance must be performed manually."
+  },
+  "canonical_status": {
+    "ir10": "acceptance_in_progress",
+    "v0.4_input_runtime": "partial",
+    "docs_updated": false,
+    "pr_ir10_checkbox_updated": false
+  },
+  "reports": {
+    "markdown": "reports/v0.4-input-runtime-ir10-acceptance.md",
+    "json": "reports/v0.4-input-runtime-ir10-acceptance.json"
+  }
+}

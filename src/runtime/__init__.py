@@ -4,10 +4,10 @@ from .config import RuntimeConfigType
 from .cycle import ActiveAgentCycle, AgentCycleSnapshot
 from .errors import RuntimeConfigValidationError
 from .session_execution import (
-    SessionExecutionCoordinator,
     SessionExecutionReset,
     SessionExecutionSnapshot,
 )
+from .ir8_session_execution import SessionExecutionCoordinator
 
 __all__ = [
     "ActiveAgentCycle",

@@ -70,7 +70,7 @@ class _Client(WaitingUserBatchContinuationMixin, _GuardedBaseClient):
 
 
 class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
-    async def test_waiting_cycle_preserves_old_refs_and_accepts_new_batch(self):
+    async def test_waiting_cycle_preserves_initial_identity_for_fifo_runtime(self):
         client = _Client()
         client.pending_cycle = SimpleNamespace(status="waiting_user")
         active_cycle = SimpleNamespace(
@@ -92,20 +92,12 @@ class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIs(result, active_cycle)
-        self.assertEqual(client.observed_batch_id, "ibat-new")
-        self.assertEqual(active_cycle.artifact_refs, ["art-old", "art-new"])
-        self.assertEqual(
-            client.trace[-1],
-            {
-                "type": "waiting_user_input_batch_continued",
-                "previous_input_batch_id": "ibat-old",
-                "input_batch_id": "ibat-new",
-                "artifact_count": 1,
-                "text_part_count": 1,
-            },
-        )
+        self.assertEqual(client.observed_batch_id, "ibat-old")
+        self.assertEqual(active_cycle.original_input_batch_id, "ibat-old")
+        self.assertEqual(active_cycle.artifact_refs, ["art-old"])
+        self.assertEqual(client.trace, [])
 
-    async def test_interrupted_cycle_preserves_old_refs_and_accepts_resume_batch(
+    async def test_interrupted_cycle_preserves_initial_identity_for_fifo_runtime(
         self,
     ):
         client = _Client()
@@ -129,18 +121,13 @@ class WaitingUserBatchContinuationTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertIs(result, active_cycle)
-        self.assertEqual(client.observed_batch_id, "ibat-resume-message")
-        self.assertEqual(active_cycle.artifact_refs, ["art-uploaded-file"])
+        self.assertEqual(client.observed_batch_id, "ibat-before-timeout")
         self.assertEqual(
-            client.trace[-1],
-            {
-                "type": "interrupted_input_batch_continued",
-                "previous_input_batch_id": "ibat-before-timeout",
-                "input_batch_id": "ibat-resume-message",
-                "artifact_count": 0,
-                "text_part_count": 1,
-            },
+            active_cycle.original_input_batch_id,
+            "ibat-before-timeout",
         )
+        self.assertEqual(active_cycle.artifact_refs, ["art-uploaded-file"])
+        self.assertEqual(client.trace, [])
 
     async def test_fresh_cycle_does_not_bypass_batch_guard(self):
         client = _Client()
