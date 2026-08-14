@@ -190,6 +190,12 @@ class InputAdmissionService(_IR7InputAdmissionService):
         queue = self._recovery_deferred.get(session_id.strip())
         return tuple(queue) if queue is not None else ()
 
+    def clear_recovery_deferred_session(self, session_id: str) -> int:
+        """Drop process-local backlog after durable lifecycle expiration/reset."""
+
+        queue = self._recovery_deferred.pop(session_id.strip(), None)
+        return len(queue) if queue is not None else 0
+
     async def _discard_already_admitted_heads_locked(self, session_id: str) -> None:
         queue = self._recovery_deferred.get(session_id)
         while queue:
