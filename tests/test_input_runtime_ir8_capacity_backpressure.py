@@ -15,7 +15,13 @@ from src.input_runtime.recovery import (
     RecoveryDisposition,
 )
 from src.input_runtime.recovery_backpressure import InputRuntimeRecoveryCoordinator
-from tests.test_input_runtime_ir10_release import Batch, Reader, active_cycle, runtime
+from tests.test_input_runtime_ir10_release import (
+    NOW,
+    Batch,
+    Reader,
+    active_cycle,
+    runtime,
+)
 
 
 def _config(*, queue_limit: int) -> InputRuntimeConfigType:
@@ -42,6 +48,7 @@ async def _recover(root, reader: Reader, *, queue_limit: int, cycle_prefix: str)
         committed_batches=reader,
         readiness_gate=gate,
         generation_coordinator=coordinator,
+        clock=lambda: NOW,
     )
     plan = await recovery.recover()
     return repos, service, gate, plan
