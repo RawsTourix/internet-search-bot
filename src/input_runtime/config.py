@@ -21,9 +21,17 @@ class InputRuntimeConfigType(BaseModel):
     max_batches_per_checkpoint: int = 8
     max_batch_bytes_per_checkpoint: int = 67_108_864
     claim_lease_seconds: int = 300
+    recovery_auto_resume_max_age_seconds: int = 21_600
     max_intermediate_messages_per_cycle: int = 16
     min_intermediate_message_interval_seconds: float = 15.0
     max_intermediate_message_chars: int = 3500
+
+    @field_validator("recovery_auto_resume_max_age_seconds")
+    @classmethod
+    def validate_recovery_age(cls, value: int) -> int:
+        if isinstance(value, bool) or value < 0:
+            raise ValueError("recovery auto-resume age must be a non-negative integer")
+        return value
 
     @field_validator(
         "max_queued_batches_per_session", "max_queued_bytes_per_session",
