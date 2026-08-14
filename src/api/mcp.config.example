@@ -88,6 +88,7 @@
         "max_batches_per_checkpoint": 8,
         "max_batch_bytes_per_checkpoint": 67108864,
         "claim_lease_seconds": 300,
+        "recovery_auto_resume_max_age_seconds": 21600,
         "max_intermediate_messages_per_cycle": 16,
         "min_intermediate_message_interval_seconds": 15.0,
         "max_intermediate_message_chars": 3500
